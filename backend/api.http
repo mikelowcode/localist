@@ -1,0 +1,81 @@
+### LORA API — quick endpoint tests
+### Requires the REST Client extension (humao.rest-client)
+### Run the server first:  uvicorn main:app --reload  (from backend/)
+
+@base = http://127.0.0.1:8001
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Health check
+# ─────────────────────────────────────────────────────────────────────────────
+
+### GET /health
+GET {{base}}/health
+Accept: application/json
+
+###
+
+# ─────────────────────────────────────────────────────────────────────────────
+# List agents
+# ─────────────────────────────────────────────────────────────────────────────
+
+### GET /agents
+GET {{base}}/agents
+Accept: application/json
+
+###
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Submit a research task (blocking)
+# ─────────────────────────────────────────────────────────────────────────────
+
+### POST /task — research query
+POST {{base}}/task
+Content-Type: application/json
+
+{
+  "instruction": "What do we know about transformer attention mechanisms?",
+  "context": {
+    "query": "What do we know about transformer attention mechanisms?",
+    "max_sources": 5,
+    "max_iterations": 2,
+    "use_embeddings": false
+  }
+}
+
+###
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Submit a wiki ingestion task (blocking)
+# ─────────────────────────────────────────────────────────────────────────────
+
+### POST /task — wiki ingest (auto_apply false = dry run)
+POST {{base}}/task
+Content-Type: application/json
+
+{
+  "instruction": "Ingest the raw file and create wiki pages.",
+  "context": {
+    "raw_path": "/Users/michaelfilanc/Projects/lora-app-demo/backend/raw/LORA Master Project Outline.md",
+    "auto_apply": true
+  }
+}
+
+
+###
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Submit a task and stream the answer (SSE)
+# ─────────────────────────────────────────────────────────────────────────────
+
+### POST /task/stream — research query, streamed
+POST {{base}}/task/stream
+Content-Type: application/json
+
+{
+  "instruction": "Research the latest findings on local LLM inference.",
+  "context": {
+    "query": "local LLM inference performance and memory usage"
+  }
+}
+
+###

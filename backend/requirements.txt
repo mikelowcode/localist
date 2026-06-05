@@ -1,0 +1,15 @@
+# LORA backend dependencies
+# Install with:  pip install -r requirements.txt
+
+# Web framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Settings management (.env file support)
+pydantic-settings>=2.2.0
+
+# HTTP client (used by FoundryRuntimeClient)
+requests>=2.31.0
+
+# Pydantic v2 (FastAPI pulls this in; pin for stability)
+pydantic>=2.7.0
