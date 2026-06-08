@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { tasksStore, submitTask, type Task } from '$lib/stores/tasks';
+  import MarkdownRenderer from '$lib/components/MarkdownRenderer.svelte';
 
   let instruction = '';
   let messagesEl: HTMLElement;
@@ -39,6 +40,38 @@
       };
       turns = turns; // trigger reactivity
       scrollToBottom();
+    }
+  }
+
+  // Pick up tasks injected by ingestFile() before navigation
+  $: {
+    const state = $tasksStore;
+    if (state.active_task_id) {
+      const task = state.tasks[state.active_task_id];
+      if (
+        task &&
+        task.status === 'complete' &&
+        !turns.some((t) => t.task_id === task.task_id)
+      ) {
+        turns = [
+          ...turns,
+          {
+            role:      'user',
+            content:   task.instruction,
+            timestamp: task.started_at,
+          },
+          {
+            role:           'assistant',
+            content:        task.answer,
+            task_id:        task.task_id,
+            timestamp:      task.started_at + 1,  // +1ms ensures unique key
+            status:         task.status,
+            sources:        task.sources,
+            status_message: task.status_message,
+          },
+        ];
+        scrollToBottom();
+      }
     }
   }
 
@@ -144,12 +177,10 @@
               {/if}
 
               {#if turn.content}
-                <div
-                  class="prose answer-text"
-                  class:cursor-blink={turn.status === 'streaming'}
-                >
-                  {turn.content}
-                </div>
+                <MarkdownRenderer
+                  content={turn.content}
+                  streaming={turn.status === 'streaming'}
+                />
               {:else if turn.status === 'planning'}
                 <span class="placeholder-pulse">···</span>
               {/if}
@@ -341,11 +372,6 @@
     margin-bottom: var(--sp-2);
   }
 
-  .answer-text {
-    white-space: pre-wrap;
-    font-size: var(--text-base);
-  }
-
   .placeholder-pulse {
     color: var(--text-tertiary);
     font-family: var(--font-mono);
@@ -416,13 +442,8 @@
     overflow-y: auto;
   }
 
-  .chat-input:disabled {
-    opacity: 0.5;
-  }
-
-  .chat-input::placeholder {
-    color: var(--text-tertiary);
-  }
+  .chat-input:disabled { opacity: 0.5; }
+  .chat-input::placeholder { color: var(--text-tertiary); }
 
   .send-btn {
     display: flex;
@@ -440,9 +461,7 @@
       opacity var(--dur-fast) var(--ease);
   }
 
-  .send-btn:hover:not(:disabled) {
-    background: #6fa3ff;
-  }
+  .send-btn:hover:not(:disabled) { background: #6fa3ff; }
 
   .send-btn:disabled {
     background: var(--bg-active);

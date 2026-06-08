@@ -13,3 +13,4 @@ requests>=2.31.0
 
 # Pydantic v2 (FastAPI pulls this in; pin for stability)
 pydantic>=2.7.0
+python-multipart==0.0.32

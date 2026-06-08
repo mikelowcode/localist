@@ -42,6 +42,22 @@ Endpoints
       Returns the list of registered agent names.  Useful for the UI to
       show which capabilities are active without parsing log files.
 
+  GET /files/raw
+      List all .md and .txt files in the raw/ directory.
+      Returns an array of FileEntry objects (name, path, size, modified).
+
+  GET /files/wiki
+      List all .md files in the wiki/ directory.
+      Returns an array of FileEntry objects (name, path, size, modified).
+
+  GET /files/content
+      Return the plain-text content of any file under raw/ or wiki/.
+      Query param: path (absolute path, must be inside raw_dir or wiki_dir).
+
+  POST /files/upload
+      Accept a multipart .md or .txt file upload and save it to raw/.
+      Returns the FileEntry for the newly saved file.
+
 Running locally
 ---------------
   uvicorn main:app --reload --host 127.0.0.1 --port 8000
@@ -71,12 +87,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -325,6 +343,26 @@ class AgentsResponse(BaseModel):
     agents: list[str]
 
 
+class FileEntry(BaseModel):
+    """Metadata for a single file in raw/ or wiki/."""
+    name:     str           # filename without extension
+    filename: str           # filename with extension, e.g. "my-doc.md"
+    path:     str           # absolute path — passed back as context.raw_path for ingest
+    size:     int           # bytes
+    modified: str           # ISO-8601 UTC timestamp
+
+
+class FilesResponse(BaseModel):
+    """Response body for GET /files/raw and GET /files/wiki."""
+    files: list[FileEntry]
+
+
+class FileContentResponse(BaseModel):
+    """Response body for GET /files/content."""
+    path:    str
+    content: str
+
+
 # ---------------------------------------------------------------------------
 # Dependency helpers
 # ---------------------------------------------------------------------------
@@ -494,6 +532,164 @@ async def get_agents() -> AgentsResponse:
     # _agents is an internal dict keyed by agent name
     agent_names = list(controller._agents.keys())
     return AgentsResponse(agents=agent_names)
+
+
+# ---------------------------------------------------------------------------
+# File management endpoints
+# ---------------------------------------------------------------------------
+
+def _file_entry(path: Path) -> FileEntry:
+    """Build a FileEntry from a Path.  path must exist and be a file."""
+    stat = path.stat()
+    return FileEntry(
+        name     = path.stem,
+        filename = path.name,
+        path     = str(path.resolve()),
+        size     = stat.st_size,
+        modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+    )
+
+
+def _list_dir(directory: Path, suffixes: set[str]) -> list[FileEntry]:
+    """Return sorted FileEntry list for all matching files in directory."""
+    if not directory.exists():
+        return []
+    entries = [
+        _file_entry(p)
+        for p in sorted(directory.iterdir())
+        if p.is_file() and p.suffix.lower() in suffixes
+    ]
+    return entries
+
+
+def _require_dir(attr: str, label: str) -> Path:
+    """Return a resolved directory from _state or raise 503."""
+    directory = getattr(_state, attr, None)
+    if directory is None:
+        raise HTTPException(status_code=503, detail=f"{label} directory not configured.")
+    return directory
+
+
+@app.get(
+    "/files/raw",
+    response_model = FilesResponse,
+    summary        = "List files in the raw/ corpus directory",
+)
+async def get_files_raw() -> FilesResponse:
+    """
+    Return metadata for every .md and .txt file in the raw/ directory.
+
+    The ``path`` field of each FileEntry is the absolute path suitable for
+    passing directly as ``context.raw_path`` in a ``POST /task`` or
+    ``POST /task/stream`` ingest request.
+    """
+    raw_dir = _require_dir("raw_dir", "raw/")
+    files   = await asyncio.to_thread(_list_dir, raw_dir, {".md", ".txt"})
+    return FilesResponse(files=files)
+
+
+@app.get(
+    "/files/wiki",
+    response_model = FilesResponse,
+    summary        = "List pages in the wiki/ directory",
+)
+async def get_files_wiki() -> FilesResponse:
+    """Return metadata for every .md file in the wiki/ directory."""
+    wiki_dir = _require_dir("wiki_dir", "wiki/")
+    files    = await asyncio.to_thread(_list_dir, wiki_dir, {".md"})
+    return FilesResponse(files=files)
+
+
+@app.get(
+    "/files/content",
+    response_model = FileContentResponse,
+    summary        = "Return the text content of a file",
+)
+async def get_file_content(path: str) -> FileContentResponse:
+    """
+    Return the plain-text content of a file under raw/ or wiki/.
+
+    The ``path`` query parameter must be an absolute path previously
+    returned by ``GET /files/raw`` or ``GET /files/wiki``.  Requests for
+    paths outside those two directories are rejected with 403.
+    """
+    raw_dir  = _require_dir("raw_dir",  "raw/")
+    wiki_dir = _require_dir("wiki_dir", "wiki/")
+
+    target = Path(path).resolve()
+
+    # Security check — only serve files that live inside the configured dirs.
+    try:
+        target.relative_to(raw_dir.resolve())
+        in_raw = True
+    except ValueError:
+        in_raw = False
+
+    try:
+        target.relative_to(wiki_dir.resolve())
+        in_wiki = True
+    except ValueError:
+        in_wiki = False
+
+    if not in_raw and not in_wiki:
+        raise HTTPException(
+            status_code = 403,
+            detail      = "Path is outside the configured raw/ and wiki/ directories.",
+        )
+
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+
+    try:
+        content = await asyncio.to_thread(target.read_text, "utf-8")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read file: {exc}") from exc
+
+    return FileContentResponse(path=str(target), content=content)
+
+
+@app.post(
+    "/files/upload",
+    response_model = FileEntry,
+    summary        = "Upload a .md or .txt file to raw/",
+)
+async def post_files_upload(file: UploadFile = File(...)) -> FileEntry:
+    """
+    Accept a multipart file upload and save it to the raw/ directory.
+
+    Only .md and .txt files are accepted.  The file is saved with its
+    original filename; if a file with that name already exists it is
+    overwritten (the assumption is the user is re-uploading a newer
+    version of the same document).
+
+    Returns the FileEntry for the saved file, including the absolute
+    ``path`` that can be passed directly as ``context.raw_path``.
+    """
+    raw_dir = _require_dir("raw_dir", "raw/")
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Upload has no filename.")
+
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in {".md", ".txt"}:
+        raise HTTPException(
+            status_code = 400,
+            detail      = f"Only .md and .txt files are accepted, got: {suffix!r}",
+        )
+
+    dest = raw_dir / file.filename
+
+    try:
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        contents = await file.read()
+        await asyncio.to_thread(dest.write_bytes, contents)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {exc}") from exc
+    finally:
+        await file.close()
+
+    logger.info("Uploaded file: %s (%d bytes)", dest, dest.stat().st_size)
+    return _file_entry(dest)
 
 
 # ---------------------------------------------------------------------------

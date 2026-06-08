@@ -1,15 +1,14 @@
 <script lang="ts">
   import { tasksStore, submitTask, type Task, type Source } from '$lib/stores/tasks';
+  import MarkdownRenderer from '$lib/components/MarkdownRenderer.svelte';
   import { tick } from 'svelte';
 
   let query = '';
   let submitting = false;
   let currentTask: Task | null = null;
-  let taskHistory: Task[] = [];
 
   $: streaming = $tasksStore.streaming;
 
-  // Watch active task and keep local reference in sync
   $: {
     const id = $tasksStore.active_task_id;
     if (id && $tasksStore.tasks[id]) {
@@ -36,19 +35,15 @@
     }
   }
 
-  function confidenceColor(conf: string): string {
-    if (conf === 'high')   return 'badge-success';
-    if (conf === 'medium') return 'badge-warning';
-    return 'badge-muted';
-  }
-
   function formatElapsed(task: Task): string {
     if (!task.completed_at) return '';
     const ms = task.completed_at - task.started_at;
     return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
   }
 
-  // Parse the report into sections for structured display
+  // Parse ##-headed sections for the structured card layout.
+  // The body of each section is passed to MarkdownRenderer so nested
+  // ### headings, bullets, and bold text all render correctly.
   function parseSections(report: string): Array<{ heading: string; body: string }> {
     const sections: Array<{ heading: string; body: string }> = [];
     const lines = report.split('\n');
@@ -101,7 +96,6 @@
   <!-- Results area -->
   <div class="results-area">
     {#if !currentTask}
-      <!-- Empty state -->
       <div class="empty-state">
         <div class="empty-icon" aria-hidden="true">
           <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round">
@@ -113,7 +107,6 @@
         <p class="empty-sub">Enter a research question above to query the agent corpus.</p>
       </div>
     {:else}
-      <!-- Active / completed task view -->
       <div class="result-content">
 
         <!-- Query header -->
@@ -150,23 +143,19 @@
                 {#each sections as section, i}
                   <div class="section-card card fade-in" style="animation-delay: {i * 60}ms">
                     <h3 class="section-heading">{section.heading}</h3>
-                    <div
-                      class="prose section-body"
-                      class:cursor-blink={currentTask.status === 'streaming' && i === sections.length - 1}
-                    >
-                      {section.body.trim()}
-                    </div>
+                    <MarkdownRenderer
+                      content={section.body.trim()}
+                      streaming={currentTask.status === 'streaming' && i === sections.length - 1}
+                    />
                   </div>
                 {/each}
               {:else}
-                <!-- Fallback: raw text -->
+                <!-- Fallback: no ## sections found, render the whole answer -->
                 <div class="card">
-                  <div
-                    class="prose"
-                    class:cursor-blink={currentTask.status === 'streaming'}
-                  >
-                    {currentTask.answer}
-                  </div>
+                  <MarkdownRenderer
+                    content={currentTask.answer}
+                    streaming={currentTask.status === 'streaming'}
+                  />
                 </div>
               {/if}
             {:else if currentTask.status === 'planning' || currentTask.status === 'streaming'}
@@ -185,12 +174,9 @@
             {/if}
           </div>
 
-          <!-- Sidebar: sources + sub-queries -->
+          <!-- Sidebar: sources + task meta -->
           <div class="meta-col">
 
-            <!-- Sub-queries (from task context if available) -->
-
-            <!-- Sources -->
             {#if currentTask.sources && currentTask.sources.length > 0}
               <div class="meta-card card-sm fade-in">
                 <h4 class="meta-heading">
@@ -218,7 +204,6 @@
               </div>
             {/if}
 
-            <!-- Task metadata -->
             {#if currentTask.status === 'complete'}
               <div class="meta-card card-sm fade-in">
                 <h4 class="meta-heading">
@@ -285,10 +270,7 @@
     box-shadow: 0 0 0 3px var(--border-focus);
   }
 
-  .query-icon {
-    color: var(--text-tertiary);
-    flex-shrink: 0;
-  }
+  .query-icon { color: var(--text-tertiary); flex-shrink: 0; }
 
   .query-input {
     flex: 1;
@@ -326,7 +308,6 @@
     opacity: 1;
   }
 
-  /* Spinner */
   .spinner {
     display: inline-block;
     width: 11px; height: 11px;
@@ -359,7 +340,6 @@
   .empty-title { font-size: var(--text-lg); font-weight: 500; color: var(--text-secondary); }
   .empty-sub { font-size: var(--text-sm); max-width: 320px; line-height: 1.6; color: var(--text-tertiary); }
 
-  /* Result layout */
   .result-content { display: flex; flex-direction: column; gap: var(--sp-6); }
 
   .result-header {
@@ -380,7 +360,6 @@
   .query-text { font-size: var(--text-xl); font-weight: 600; line-height: 1.3; }
   .result-meta { flex-shrink: 0; }
 
-  /* Two-column grid */
   .result-grid {
     display: grid;
     grid-template-columns: 1fr 260px;
@@ -394,19 +373,14 @@
 
   /* Section cards */
   .section-card { margin-bottom: var(--sp-4); }
+
   .section-heading {
-    font-size: var(--text-base);
+    font-size: var(--text-xs);
     font-weight: 600;
     color: var(--text-secondary);
     text-transform: uppercase;
     letter-spacing: 0.07em;
-    font-size: var(--text-xs);
     margin-bottom: var(--sp-3);
-  }
-  .section-body {
-    font-size: var(--text-sm);
-    white-space: pre-wrap;
-    line-height: 1.75;
   }
 
   /* Planning skeleton */
@@ -422,12 +396,7 @@
 
   /* Meta sidebar */
   .meta-col { display: flex; flex-direction: column; gap: var(--sp-4); }
-
-  .meta-card {
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-3);
-  }
+  .meta-card { display: flex; flex-direction: column; gap: var(--sp-3); }
 
   .meta-heading {
     display: flex;
@@ -450,7 +419,6 @@
     font-family: var(--font-mono);
   }
 
-  /* Source list */
   .source-list {
     list-style: none;
     display: flex;
@@ -502,7 +470,6 @@
     font-family: var(--font-mono);
   }
 
-  /* Task meta DL */
   .task-meta-list { display: flex; flex-direction: column; gap: var(--sp-2); }
   .task-meta-row {
     display: flex;
