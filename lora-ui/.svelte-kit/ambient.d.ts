@@ -43,6 +43,7 @@ declare module '$env/static/private' {
 	export const INIT_CWD: string;
 	export const TERM: string;
 	export const SHELL: string;
+	export const npm_config_allow_scripts: string;
 	export const CLICOLOR: string;
 	export const TMPDIR: string;
 	export const npm_config_global_prefix: string;
@@ -195,6 +196,7 @@ declare module '$env/dynamic/private' {
 		INIT_CWD: string;
 		TERM: string;
 		SHELL: string;
+		npm_config_allow_scripts: string;
 		CLICOLOR: string;
 		TMPDIR: string;
 		npm_config_global_prefix: string;

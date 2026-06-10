@@ -43,8 +43,11 @@ details need to be filled in once the oMLX API surface is confirmed.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import mimetypes
+from pathlib import Path
 from typing import Generator
 
 import requests
@@ -325,6 +328,155 @@ class OMLXRuntimeClient:
             raise RuntimeError(
                 f"Error reading oMLX SSE stream: {exc}"
             ) from exc
+
+    # -----------------------------------------------------------------------
+    # oMLX-specific capability: native file ingestion via MarkItDown
+    # -----------------------------------------------------------------------
+
+    def infer_with_file(
+        self,
+        file_path:   Path,
+        prompt:      str,
+        system:      str   = "",
+        max_tokens:  int   = 2048,
+        temperature: float = 0.2,
+    ) -> str:
+        """
+        Submit a file alongside a text prompt using oMLX 0.4.2 native
+        MarkItDown document processing.
+
+        The file is base64-encoded and sent as a ``type="file"`` content
+        block in the user message.  oMLX converts it through MarkItDown
+        before the model sees it, producing clean extracted text rather
+        than raw bytes.  The text prompt is appended as a second content
+        block so the model receives both document and instructions.
+
+        This method is intentionally NOT part of BaseRuntimeClient.
+        It is an oMLX-only capability detected at call sites with
+        ``hasattr(runtime, "infer_with_file")``.
+
+        Parameters
+        ----------
+        file_path:
+            Absolute path to the file to ingest.  Any format supported by
+            MarkItDown is valid (.md, .txt, .pdf, .docx, .pptx, …).
+        prompt:
+            The instruction text appended after the file content block.
+            Should be the slim wiki-agent prompt (schema + example + rules)
+            with the raw-file section omitted.
+        system:
+            Optional system prompt.
+        max_tokens:
+            Hard cap on generated tokens.
+        temperature:
+            Sampling temperature.
+
+        Returns
+        -------
+        str
+            The fully accumulated model response (same contract as infer()).
+
+        Raises
+        ------
+        RuntimeError
+            On any I/O, network, or SSE decode failure.
+        ValueError
+            If file_path does not exist or is not a file.
+        """
+        if not file_path.exists() or not file_path.is_file():
+            raise ValueError(f"infer_with_file: path does not exist or is not a file: {file_path}")
+
+        # Encode file bytes as base64 string.
+        try:
+            file_bytes = file_path.read_bytes()
+            b64_data   = base64.b64encode(file_bytes).decode("utf-8")
+        except Exception as exc:
+            raise RuntimeError(f"infer_with_file: could not read {file_path}: {exc}") from exc
+
+        # Resolve MIME type — default to text/plain for .md / .txt.
+        mime_type = mimetypes.guess_type(str(file_path))[0] or "text/plain"
+
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+
+        # oMLX 0.4.2 multimodal content block array.
+        # type="file" triggers MarkItDown processing server-side.
+        # type="text" carries the instruction prompt.
+        messages.append({
+            "role": "user",
+            "content": [
+                {
+                    "type": "file",
+                    "file": {
+                        "filename":  file_path.name,
+                        "mime_type": mime_type,
+                        "file_data": b64_data,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": prompt,
+                },
+            ],
+        })
+
+        payload = {
+            "model":       self._chat_model,
+            "messages":    messages,
+            "stream":      True,
+            "max_tokens":  max_tokens,
+            "temperature": temperature,
+        }
+
+        logger.debug(
+            "infer_with_file() → %s  file=%s  mime=%s  b64_bytes=%d  max_tokens=%d",
+            self._chat_endpoint,
+            file_path.name,
+            mime_type,
+            len(b64_data),
+            max_tokens,
+        )
+
+        try:
+            response = requests.post(
+                self._chat_endpoint,
+                headers = {"Content-Type": "application/json"},
+                data    = json.dumps(payload),
+                stream  = True,
+                timeout = self._stream_timeout,   # MarkItDown adds prefill latency
+            )
+        except requests.ConnectionError as exc:
+            raise RuntimeError(
+                f"Cannot reach oMLX at {self._chat_endpoint}. "
+                f"Is the service running?  Detail: {exc}"
+            ) from exc
+        except requests.Timeout:
+            raise RuntimeError(
+                f"oMLX did not respond within {self._stream_timeout}s "
+                f"during infer_with_file() for {file_path.name}."
+            )
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"oMLX returned HTTP {response.status_code} "
+                f"from {self._chat_endpoint}: {response.text[:400]}"
+            )
+
+        try:
+            chunks = list(_iter_sse_chunks(response))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Error reading oMLX SSE stream in infer_with_file(): {exc}"
+            ) from exc
+
+        result = "".join(chunks)
+        logger.debug(
+            "infer_with_file() ← %d chars received for %s.",
+            len(result),
+            file_path.name,
+        )
+        return result
 
     # -----------------------------------------------------------------------
     # Diagnostics

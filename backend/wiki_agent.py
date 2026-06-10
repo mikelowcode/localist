@@ -408,6 +408,83 @@ OUTPUT RULES (read before generating):
     return textwrap.dedent(prompt).strip()
 
 
+def build_slim_prompt(
+    schema_text:  str,
+    templates:    dict[str, str],
+    wiki_context: str,
+    raw_filename: str,
+) -> str:
+    """
+    Assemble the slim user-turn prompt for oMLX native file ingestion.
+
+    Used when the runtime exposes ``infer_with_file()``.  The raw document
+    is delivered as a ``type="file"`` content block and processed by
+    MarkItDown server-side, so this prompt omits the RAW FILE TO INGEST
+    section entirely.
+
+    Keeps everything else from ``build_user_prompt()``:
+    - Schema (truncated to 120 lines)
+    - Page templates
+    - Existing wiki pages (relevance-filtered wiki_context)
+    - Task rules and output contract
+    - Full RESEARCH_NOTE example
+
+    Parameters
+    ----------
+    schema_text:
+        The contents of SCHEMA.md.
+    templates:
+        Dict of template name → content (keys: SYSTEM, CONCEPT, RESEARCH_NOTE).
+    wiki_context:
+        Output of build_wiki_context() — relevance-ranked wiki index + full pages.
+        build_wiki_context() is still called by the agent regardless of which
+        inference path is taken so the wiki substrate informs the model.
+    raw_filename:
+        Basename of the raw file being ingested.  Used only in the task
+        rules so the model can reference it in Revision History entries.
+    """
+    template_block = "".join(
+        f"### TEMPLATE: {key}\n\n{content}\n"
+        for key, content in templates.items()
+    )
+
+    schema_lines   = schema_text.splitlines()
+    schema_snippet = "\n".join(schema_lines[:_MAX_SCHEMA_LINES])
+    if len(schema_lines) > _MAX_SCHEMA_LINES:
+        schema_snippet += "\n... [schema truncated for context budget]"
+
+    today = date.today().isoformat()
+
+    prompt = f"""\
+# SCHEMA (rules you must follow)
+{schema_snippet}
+
+# PAGE TEMPLATES
+{template_block}
+
+# EXISTING WIKI PAGES
+{wiki_context}
+
+# YOUR TASK
+The file "{raw_filename}" has been provided directly for processing.
+1. Create exactly one RESEARCH_NOTE for the raw file. It MUST include all five
+   sections in order: Summary · Details · Related Pages · Revision History,
+   each as an H2 heading, plus front-matter at the top.
+2. Details MUST contain three H3 subsections: Extracted Concepts · Mapped Pages
+   · Proposed New Pages. Use the string "null" when a subsection is empty.
+3. Optionally propose new CONCEPT or SYSTEM pages only if clearly justified.
+4. For existing wiki pages, propose minimal unified diffs only where necessary.
+5. Page names MUST be kebab-case (lowercase letters, digits, hyphens only).
+6. Use {today} as the date in all Revision History entries.
+{_EXAMPLE}
+OUTPUT RULES (read before generating):
+- Output ONLY the <actions> XML block. Nothing before it. Nothing after it.
+- No prose, no code fences, no explanations outside the XML.
+- Every <content> block MUST follow the example structure above exactly.\
+"""
+    return textwrap.dedent(prompt).strip()
+
+
 # ---------------------------------------------------------------------------
 # XML parser
 # ---------------------------------------------------------------------------
@@ -417,11 +494,13 @@ def _extract_actions_xml(text: str) -> str | None:
     Extract the first complete <actions>…</actions> block from the raw string.
 
     Uses str.find / str.rfind rather than regex so that nested angle brackets
-    inside <content> blocks do not confuse the extractor.  Validates the
-    candidate with ET.fromstring before returning it; returns None on failure.
+    inside <content> blocks do not confuse the extractor.
 
-    This matches the original standalone script's extract_actions_xml() logic
-    exactly.
+    Validation is intentionally deferred to parse_model_xml() which calls
+    ET.fromstring() on the shielded block.  Pre-validating here caused false
+    negatives when <content> blocks contained Markdown syntax (**, [[...]],
+    ---) that is valid inside XML text content but trips ET.fromstring() when
+    the overall document structure is intact.
     """
     start = text.find("<actions")
     if start == -1:
@@ -429,12 +508,43 @@ def _extract_actions_xml(text: str) -> str | None:
     end = text.rfind("</actions>")
     if end == -1:
         return None
-    candidate = text[start : end + len("</actions>")].strip()
-    try:
-        ET.fromstring(candidate)
-        return candidate
-    except ET.ParseError:
-        return None
+    return text[start : end + len("</actions>")].strip()
+
+
+def _shield_content_blocks(xml_text: str) -> tuple[str, list[str]]:
+    """
+    Replace <content>...</content> blocks with safe placeholders before
+    XML parsing.
+
+    <content> blocks written by the model contain Markdown syntax such as
+    **bold**, [[wiki links]], and --- front-matter separators.  These are
+    valid text content in XML but ET.fromstring() rejects them as invalid
+    tokens when they appear unescaped.
+
+    Strategy: extract every <content>…</content> block, store the raw text,
+    substitute a plain-text placeholder, parse the clean XML structure, then
+    restore the original content strings at the call site.
+
+    Returns
+    -------
+    shielded : str
+        The XML string with content replaced by __CONTENT_N__ placeholders.
+    contents : list[str]
+        The original content strings in insertion order.
+    """
+    contents: list[str] = []
+
+    def _replacer(m: re.Match) -> str:
+        contents.append(m.group(1))
+        return f"<content>__CONTENT_{len(contents) - 1}__</content>"
+
+    shielded = re.sub(
+        r"<content>(.*?)</content>",
+        _replacer,
+        xml_text,
+        flags=re.DOTALL,
+    )
+    return shielded, contents
 
 
 def parse_model_xml(raw_output: str) -> Actions:
@@ -456,6 +566,10 @@ def parse_model_xml(raw_output: str) -> Actions:
           </action>
         </actions>
 
+    <content> blocks may contain Markdown syntax that is invalid XML.
+    _shield_content_blocks() extracts them before parsing and they are
+    restored after ET.fromstring() succeeds on the clean structure.
+
     Malformed individual <action> elements (missing required child elements)
     are logged as warnings and skipped.  ValueError is raised only if no
     valid <actions> block exists or the block cannot be parsed as XML at all.
@@ -470,8 +584,9 @@ def parse_model_xml(raw_output: str) -> Actions:
     if xml_block is None:
         raise ValueError("No valid <actions> XML block found in model output.")
 
+    shielded, contents = _shield_content_blocks(xml_block)
     try:
-        root = ET.fromstring(xml_block)
+        root = ET.fromstring(shielded)
     except ET.ParseError as exc:
         raise ValueError(f"Failed to parse <actions> XML: {exc}") from exc
 
@@ -485,10 +600,14 @@ def parse_model_xml(raw_output: str) -> Actions:
         action_name = action.get("name", "")
 
         if action_name == "create_page":
+            raw_content = action.findtext("content") or ""
+            if raw_content.startswith("__CONTENT_") and raw_content.endswith("__"):
+                idx = int(raw_content[10:-2])
+                raw_content = contents[idx] if idx < len(contents) else ""
             entry = {
                 "page_name": (action.findtext("page_name") or "").strip(),
                 "page_type": (action.findtext("page_type") or "").strip(),
-                "content":   action.findtext("content") or "",
+                "content":   raw_content,
             }
             if not entry["page_name"] or not entry["page_type"]:
                 logger.warning(
@@ -624,7 +743,8 @@ def _parse_unified_hunks(diff_text: str) -> list[tuple[int, list[str]]]:
 
 _WIKI_KEYWORDS: frozenset[str] = frozenset({
     "ingest", "wiki", "research note", "research_note",
-    "create page", "update page", "raw file", "extract concepts",
+    "create page", "update page", "raw file", "document",
+    "knowledge base", "summarise", "summarize", "extract concepts",
 })
 
 
@@ -691,8 +811,10 @@ class WikiAgent:
         --------
         1. Resolve and validate paths from subtask.context.
         2. Load schema, templates, wiki index, and raw document.
-        3. Build the model prompt.
-        4. Call the model via RuntimeClient.
+        3. Build wiki_context (always — informs model regardless of path).
+        4. Detect runtime capability and call model:
+             - infer_with_file() if runtime supports it (oMLX 0.4.2+)
+             - infer() with full string prompt otherwise (Foundry + others)
         5. Parse the model's XML response into Actions.
         6. Optionally journal the result.
         7. Optionally write changes to disk (auto_apply=True only).
@@ -737,6 +859,9 @@ class WikiAgent:
         )
 
         # -- 3. Load inputs --------------------------------------------------
+        #
+        # raw_content is always loaded — build_wiki_context() needs it for
+        # keyword-overlap scoring regardless of which inference path is taken.
 
         try:
             schema_text = read_text_file(schema_path)
@@ -747,30 +872,74 @@ class WikiAgent:
             return self._fail(subtask, f"File load error: {exc}")
 
         # -- 4. Build prompt -------------------------------------------------
+        #
+        # wiki_context is always built — the wiki substrate informs the model
+        # regardless of which inference path is taken below.
 
         wiki_context = build_wiki_context(wiki_pages, raw_content)
 
-        try:
-            user_prompt = build_user_prompt(
-                schema_text  = schema_text,
-                templates    = templates,
-                wiki_context = wiki_context,
-                raw_filename = raw_path.name,
-                raw_content  = raw_content,
-            )
-        except Exception as exc:
-            return self._fail(subtask, f"Prompt build error: {exc}")
-
         # -- 5. Call model via RuntimeClient ---------------------------------
+        #
+        # Two paths depending on runtime capability:
+        #
+        #   infer_with_file() path (oMLX 0.4.2+):
+        #     The raw file is sent as a base64 file content block.  oMLX
+        #     processes it through MarkItDown server-side before the model
+        #     sees it.  The slim prompt omits the RAW FILE TO INGEST section
+        #     since the file content arrives via the content block instead.
+        #
+        #   infer() path (Foundry + all other backends):
+        #     The full prompt is built with the raw file content injected as
+        #     a string.  Existing behaviour, unchanged.
+
+        use_file_upload = hasattr(self._runtime, "infer_with_file")
+        logger.debug(
+            "[%s] inference path: %s",
+            self.name,
+            "infer_with_file (oMLX native)" if use_file_upload else "infer (string prompt)",
+        )
 
         try:
-            raw_output = self._runtime.infer(
-                system      = SYSTEM_PROMPT,
-                prompt      = user_prompt,
-                max_tokens  = max_tokens,
-                temperature = temperature,
-            )
-        except RuntimeError as exc:
+            if use_file_upload:
+                slim_prompt = build_slim_prompt(
+                    schema_text  = schema_text,
+                    templates    = templates,
+                    wiki_context = wiki_context,
+                    raw_filename = raw_path.name,
+                )
+                logger.debug(
+                    "[%s] slim_prompt_chars=%d  file=%s",
+                    self.name, len(slim_prompt), raw_path.name,
+                )
+                raw_output = self._runtime.infer_with_file(
+                    file_path   = raw_path,
+                    prompt      = slim_prompt,
+                    system      = SYSTEM_PROMPT,
+                    max_tokens  = max_tokens,
+                    temperature = temperature,
+                )
+            else:
+                try:
+                    user_prompt = build_user_prompt(
+                        schema_text  = schema_text,
+                        templates    = templates,
+                        wiki_context = wiki_context,
+                        raw_filename = raw_path.name,
+                        raw_content  = raw_content,
+                    )
+                except Exception as exc:
+                    return self._fail(subtask, f"Prompt build error: {exc}")
+                logger.debug(
+                    "[%s] user_prompt_chars=%d",
+                    self.name, len(user_prompt),
+                )
+                raw_output = self._runtime.infer(
+                    system      = SYSTEM_PROMPT,
+                    prompt      = user_prompt,
+                    max_tokens  = max_tokens,
+                    temperature = temperature,
+                )
+        except (RuntimeError, ValueError) as exc:
             return self._fail(subtask, f"Inference error: {exc}")
 
         # -- 6. Parse XML response -------------------------------------------

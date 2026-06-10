@@ -251,7 +251,7 @@ class Planner:
             prompt  = self._user_prompt(task),
         )
 
-        subtasks = self._parse_plan(task.task_id, raw_plan, agents)
+        subtasks = self._parse_plan(task.task_id, raw_plan, agents, task.context)
         if not subtasks:
             logger.warning("Planner produced no subtasks; falling back to single-agent plan.")
             subtasks = self._fallback_plan(task, agents)
@@ -268,13 +268,19 @@ class Planner:
             "Given a user instruction, output a JSON array of subtasks.\n"
             "Each subtask must have keys: \"agent\" and \"instruction\".\n\n"
             "Available agents and when to use them:\n"
-            "- research_agent : use for ANY question, research request, or analysis\n"
-            "- wiki_agent     : use ONLY when the instruction explicitly mentions ingesting, "
-            "uploading, or adding a specific file to the wiki (must include a file path)\n\n"
+            "- research_agent : use for questions, research requests, analysis, synthesis,\n"
+            "                   cross-document reasoning, and corpus-wide queries.\n"
+            "- wiki_agent     : use ONLY when the instruction explicitly mentions ingesting,\n"
+            "                   uploading, or adding a specific file to the wiki\n"
+            "                   (must include a file path).\n\n"
             "Rules:\n"
-            "1. For questions and all general research instructions -> use research_agent\n"
-            "2. For wiki ingestion tasks that include a file path -> use wiki_agent\n"
-            "3. Output ONLY the JSON array. No prose, no markdown fences, no commentary.\n\n"
+            "1. For questions and all general research instructions -> use research_agent ONLY.\n"
+            "2. For wiki ingestion tasks that include a file path -> use wiki_agent ONLY.\n"
+            "   DO NOT add research_agent as a follow-on step after wiki_agent.\n"
+            "   The wiki_agent creates the research note itself. Adding research_agent\n"
+            "   is redundant and wrong.\n"
+            "3. Never schedule both agents for the same task. Each task uses exactly one agent.\n"
+            "4. Output ONLY the JSON array. No prose, no markdown fences, no commentary.\n\n"
             "Example outputs:\n"
             "[{\"agent\": \"research_agent\", \"instruction\": \"What do we know about X?\"}]\n"
             "[{\"agent\": \"wiki_agent\", \"instruction\": \"Ingest /path/to/file.md\"}]\n"
@@ -286,9 +292,10 @@ class Planner:
 
     @staticmethod
     def _parse_plan(
-        task_id: str,
-        raw:     str,
-        agents:  list[AgentInterface],
+        task_id:      str,
+        raw:          str,
+        agents:       list[AgentInterface],
+        task_context: dict[str, Any] = {},
     ) -> list[SubTask]:
         import json, re
         agent_map = {a.name: a for a in agents}
@@ -303,11 +310,14 @@ class Planner:
                 if agent_name not in agent_map:
                     logger.warning("Planner referenced unknown agent '%s'; skipping.", agent_name)
                     continue
+                # Merge task-level context (raw_path, wiki_dir, etc.) with any
+                # per-step context the model supplies.  Model values win on conflict.
+                merged_context = {**task_context, **step.get("context", {})}
                 subtasks.append(SubTask(
                     subtask_id  = f"{task_id}-{i}",
                     agent_name  = agent_name,
                     instruction = step.get("instruction", ""),
-                    context     = step.get("context", {}),
+                    context     = merged_context,
                 ))
             return subtasks
         except Exception as exc:
@@ -451,19 +461,13 @@ class IntentClassifier:
 
     _SYSTEM = (
         "You are an intent classifier for a local research agent system. "
-        "Classify the user instruction into exactly one of these categories:\n\n"
-        "  conversational — greetings, small talk, general knowledge questions, "
-        "advice, opinions, or anything the model can answer from its own knowledge "
-        "WITHOUT needing to search documents or files "
-        "(e.g. 'hello', 'give me tips on X', 'what is Y', 'how does Z work', "
-        "'what are best practices for...')\n\n"
-        "  research       — questions that specifically require searching THIS system's "
-        "documents, wiki pages, or uploaded files to answer accurately "
-        "(e.g. 'what does our wiki say about X', 'summarise the uploaded file', "
-        "'what have we found about Y in our research')\n\n"
+        "Classify the user instruction into exactly one of these categories:\n"
+        "  conversational — greetings, small talk, meta questions "
+        "(e.g. 'hello', 'how are you', 'what can you do')\n"
+        "  research       — questions, analysis, research requests, "
+        "anything that needs looking up\n"
         "  ingest         — explicit requests to add, upload, or ingest "
         "a specific file into the wiki\n\n"
-        "When in doubt, prefer conversational over research.\n\n"
         "Output ONLY one word: conversational, research, or ingest. Nothing else."
     )
 
@@ -688,42 +692,11 @@ class ControllerAgent:
                 error   = "Planner could not construct a valid execution plan.",
             )
 
-        # Propagate Task-level context into every SubTask before dispatch.
-        # The Planner model rarely emits context keys in its JSON output, so
-        # without this step agents that require context keys (WikiAgent needs
-        # raw_path; ResearchAgent needs wiki_dir/raw_dir) always receive an
-        # empty context dict and fail immediately.
-        subtasks = self._propagate_context(task, subtasks)
-
         # 2. Dispatch
         results = self._dispatch(subtasks, memory)
 
         # 3. Synthesize
         return self._synthesizer.synthesize(task, results, memory)
-
-    @staticmethod
-    def _propagate_context(task: Task, subtasks: list[SubTask]) -> list[SubTask]:
-        """
-        Merge Task-level context into each SubTask before dispatch.
-
-        Merge order: Task.context is the base; SubTask.context overlays it.
-        SubTask-specific keys always win so the Planner can still override
-        per-step when it does emit context keys in its JSON plan.
-
-        This ensures that raw_path, wiki_dir, raw_dir, auto_apply, and any
-        other caller-supplied keys reach the agents that need them, even
-        when the model omits a context key in its plan output.
-        """
-        propagated = []
-        for subtask in subtasks:
-            merged_context = {**task.context, **subtask.context}
-            propagated.append(SubTask(
-                subtask_id  = subtask.subtask_id,
-                agent_name  = subtask.agent_name,
-                instruction = subtask.instruction,
-                context     = merged_context,
-            ))
-        return propagated
 
     def _dispatch(
         self,
