@@ -10,6 +10,7 @@ That standalone script has been deleted.  All logic now lives here.
 Layer placement
 ---------------
   ControllerAgent  →  WikiAgent  →  FoundryRuntimeClient (inference)
+                                 →  MemoryManager (optional — index updates)
 
 Architectural contract
 ----------------------
@@ -25,6 +26,10 @@ Architectural contract
   or a human review step to approve.
 - Journal entries are written to SubTask.context["journal_path"] when
   provided; silently skipped otherwise.
+- When a MemoryManager is supplied at construction time, every page
+  successfully written to disk is immediately indexed via
+  memory_manager.index_document().  This keeps the document index current
+  without requiring a full corpus re-scan on the next ResearchAgent call.
 
 SubTask.context schema
 ----------------------
@@ -95,7 +100,7 @@ import textwrap
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -105,6 +110,9 @@ from controller_agent import (
     TaskStatus,
 )
 
+if TYPE_CHECKING:
+    from memory_manager import MemoryManager
+
 logger = logging.getLogger(__name__)
 
 
@@ -112,16 +120,15 @@ logger = logging.getLogger(__name__)
 # KV-cache guard rails (match original constants)
 # ---------------------------------------------------------------------------
 
-_MAX_WIKI_CHARS   = 6_000   # hard cap on total wiki text injected per call
-_RELEVANT_PAGES_N = 4       # max pages selected by keyword relevance
-_SUMMARY_LINES    = 3       # lines used for the compact index entry
-_MAX_SCHEMA_LINES = 120     # schema is truncated to this many lines
+_MAX_WIKI_CHARS   = 6_000
+_RELEVANT_PAGES_N = 4
+_SUMMARY_LINES    = 3
+_MAX_SCHEMA_LINES = 120
 
 
 # ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
-# Taken verbatim from agent_wiki_loop_streaming.py.
 
 SYSTEM_PROMPT = (
     "You are a deterministic wiki agent. Your ONLY job is to output a single "
@@ -136,8 +143,8 @@ SYSTEM_PROMPT = (
 
 class CreatePage(BaseModel):
     """A request to create a new wiki page."""
-    page_name: str                                              # kebab-case enforced by prompt
-    page_type: Literal["SYSTEM", "CONCEPT", "RESEARCH_NOTE"]   # matches original Literal
+    page_name: str
+    page_type: Literal["SYSTEM", "CONCEPT", "RESEARCH_NOTE"]
     content:   str
 
 
@@ -154,13 +161,7 @@ class Actions(BaseModel):
 
 
 class JournalEntry(BaseModel):
-    """
-    One append-only record in the agent journal file.
-
-    Matches the original model's fields exactly: step, timestamp, actions,
-    approved, error.  The journal_path is now supplied via SubTask.context
-    rather than written to a CWD-relative file.
-    """
+    """One append-only record in the agent journal file."""
     step:      str
     timestamp: datetime       = Field(default_factory=lambda: datetime.now(timezone.utc))
     actions:   Actions | None = None
@@ -173,23 +174,15 @@ class JournalEntry(BaseModel):
 # ---------------------------------------------------------------------------
 
 def read_text_file(path: Path) -> str:
-    """Read a UTF-8 text file and return its contents as a string."""
     return path.read_text(encoding="utf-8")
 
 
 def write_text_file(path: Path, content: str) -> None:
-    """Write a UTF-8 string to a file, creating parent directories as needed."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
 
 
 def is_text_file(path: Path) -> bool:
-    """
-    Return True if the file is readable UTF-8 text with no null bytes.
-
-    Matches the original standalone script's detection strategy:
-    read all bytes, reject on null byte, reject on UnicodeDecodeError.
-    """
     try:
         data = path.read_bytes()
     except Exception:
@@ -208,12 +201,10 @@ def is_text_file(path: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 def _tokenize(text: str) -> set[str]:
-    """Cheap word-level token set for keyword-overlap relevance scoring."""
     return set(re.findall(r"[a-z0-9]+", text.lower()))
 
 
 def _one_line_summary(content: str, n: int = _SUMMARY_LINES) -> str:
-    """First n non-blank lines joined as a single pipe-separated string."""
     lines = [line.strip() for line in content.splitlines() if line.strip()]
     return " | ".join(lines[:n])
 
@@ -222,19 +213,15 @@ def build_wiki_context(wiki_pages: dict[str, str], raw_content: str) -> str:
     """
     Build a prompt-safe wiki context block.
 
-    Strategy (matches original agent_wiki_loop_streaming.py exactly):
-    - Compact one-line index of ALL pages (always included, token-cheap).
-    - Full content for the top RELEVANT_PAGES_N keyword-overlap matches,
-      hard-capped at MAX_WIKI_CHARS across all full-content blocks.
-
-    This keeps the KV cache stable regardless of wiki size.
+    Accepts a plain dict (stem → content) as before, so callers that load
+    pages from the filesystem or from MemoryManager.get_all_documents() both
+    work after normalising to this shape.
     """
     if not wiki_pages:
         return "(no existing wiki pages)"
 
     raw_tokens = _tokenize(raw_content)
 
-    # Score every page by keyword overlap with the raw document.
     scored = sorted(
         (
             (len(raw_tokens & _tokenize(content)), name, content)
@@ -244,13 +231,11 @@ def build_wiki_context(wiki_pages: dict[str, str], raw_content: str) -> str:
         reverse=True,
     )
 
-    # Compact index — one line per page, all pages.
     index_lines = ["## WIKI PAGE INDEX (all pages)\n"]
     for _, name, content in scored:
         index_lines.append(f"- {name}: {_one_line_summary(content)}")
     index_block = "\n".join(index_lines)
 
-    # Full content for top-N pages, within the character budget.
     full_blocks: list[str] = []
     budget = _MAX_WIKI_CHARS
 
@@ -274,10 +259,6 @@ def build_wiki_context(wiki_pages: dict[str, str], raw_content: str) -> str:
 # Prompt construction
 # ---------------------------------------------------------------------------
 
-# Fully-populated RESEARCH_NOTE example embedded in the user prompt.
-# Matches the original standalone script verbatim — governs output structure
-# for small models (Phi-4-mini) that need a concrete exemplar in the
-# highest-attention zone of the prompt.
 _EXAMPLE = """
 # EXAMPLE OUTPUT (follow this structure exactly)
 <actions>
@@ -333,40 +314,11 @@ def build_user_prompt(
     raw_filename: str,
     raw_content:  str,
 ) -> str:
-    """
-    Assemble the full user-turn prompt for the wiki ingestion model call.
-
-    Matches the original standalone script's prompt structure exactly:
-    - Schema (truncated to 120 lines to protect the context budget)
-    - Page templates
-    - Existing wiki pages (relevance-filtered by build_wiki_context)
-    - Raw file to ingest
-    - Numbered task rules including today's date for Revision History entries
-    - Fully-populated RESEARCH_NOTE example (highest-attention zone)
-    - Output rules
-
-    Parameters
-    ----------
-    schema_text:
-        The contents of SCHEMA.md.
-    templates:
-        Dict of template name → content (keys: SYSTEM, CONCEPT, RESEARCH_NOTE).
-    wiki_context:
-        Output of build_wiki_context() — relevance-ranked wiki index + full pages.
-    raw_filename:
-        Basename of the raw file being ingested (for model context only).
-    raw_content:
-        Full text of the raw document.  Not truncated here — build_wiki_context
-        applies the budget cap on the wiki side so the raw document arrives
-        intact for accurate extraction.
-    """
     template_block = "".join(
         f"### TEMPLATE: {key}\n\n{content}\n"
         for key, content in templates.items()
     )
 
-    # Truncate schema to 120 lines — forces the most load-bearing rules to
-    # the top of SCHEMA.md and keeps the context budget predictable.
     schema_lines   = schema_text.splitlines()
     schema_snippet = "\n".join(schema_lines[:_MAX_SCHEMA_LINES])
     if len(schema_lines) > _MAX_SCHEMA_LINES:
@@ -415,33 +367,10 @@ def build_slim_prompt(
     raw_filename: str,
 ) -> str:
     """
-    Assemble the slim user-turn prompt for oMLX native file ingestion.
+    Slim prompt for the oMLX native file ingestion path.
 
-    Used when the runtime exposes ``infer_with_file()``.  The raw document
-    is delivered as a ``type="file"`` content block and processed by
-    MarkItDown server-side, so this prompt omits the RAW FILE TO INGEST
-    section entirely.
-
-    Keeps everything else from ``build_user_prompt()``:
-    - Schema (truncated to 120 lines)
-    - Page templates
-    - Existing wiki pages (relevance-filtered wiki_context)
-    - Task rules and output contract
-    - Full RESEARCH_NOTE example
-
-    Parameters
-    ----------
-    schema_text:
-        The contents of SCHEMA.md.
-    templates:
-        Dict of template name → content (keys: SYSTEM, CONCEPT, RESEARCH_NOTE).
-    wiki_context:
-        Output of build_wiki_context() — relevance-ranked wiki index + full pages.
-        build_wiki_context() is still called by the agent regardless of which
-        inference path is taken so the wiki substrate informs the model.
-    raw_filename:
-        Basename of the raw file being ingested.  Used only in the task
-        rules so the model can reference it in Revision History entries.
+    Omits the RAW FILE TO INGEST section — the file content is delivered as
+    a ``type="file"`` content block and processed by MarkItDown server-side.
     """
     template_block = "".join(
         f"### TEMPLATE: {key}\n\n{content}\n"
@@ -491,16 +420,11 @@ OUTPUT RULES (read before generating):
 
 def _extract_actions_xml(text: str) -> str | None:
     """
-    Extract the first complete <actions>…</actions> block from the raw string.
+    Extract the first complete <actions>…</actions> block.
 
     Uses str.find / str.rfind rather than regex so that nested angle brackets
-    inside <content> blocks do not confuse the extractor.
-
-    Validation is intentionally deferred to parse_model_xml() which calls
-    ET.fromstring() on the shielded block.  Pre-validating here caused false
-    negatives when <content> blocks contained Markdown syntax (**, [[...]],
-    ---) that is valid inside XML text content but trips ET.fromstring() when
-    the overall document structure is intact.
+    inside <content> blocks do not confuse the extractor.  Validation is
+    deferred to parse_model_xml() via ET.fromstring() on the shielded block.
     """
     start = text.find("<actions")
     if start == -1:
@@ -514,23 +438,7 @@ def _extract_actions_xml(text: str) -> str | None:
 def _shield_content_blocks(xml_text: str) -> tuple[str, list[str]]:
     """
     Replace <content>...</content> blocks with safe placeholders before
-    XML parsing.
-
-    <content> blocks written by the model contain Markdown syntax such as
-    **bold**, [[wiki links]], and --- front-matter separators.  These are
-    valid text content in XML but ET.fromstring() rejects them as invalid
-    tokens when they appear unescaped.
-
-    Strategy: extract every <content>…</content> block, store the raw text,
-    substitute a plain-text placeholder, parse the clean XML structure, then
-    restore the original content strings at the call site.
-
-    Returns
-    -------
-    shielded : str
-        The XML string with content replaced by __CONTENT_N__ placeholders.
-    contents : list[str]
-        The original content strings in insertion order.
+    XML parsing to prevent Markdown syntax inside them from tripping ET.
     """
     contents: list[str] = []
 
@@ -551,34 +459,10 @@ def parse_model_xml(raw_output: str) -> Actions:
     """
     Parse the model's XML response into an Actions object.
 
-    The original standalone script — and therefore this module — uses an
-    attribute-keyed action schema:
-
-        <actions>
-          <action name="create_page">
-            <page_name>…</page_name>
-            <page_type>…</page_type>
-            <content>…</content>
-          </action>
-          <action name="apply_diff">
-            <page_name>…</page_name>
-            <diff>…</diff>
-          </action>
-        </actions>
-
-    <content> blocks may contain Markdown syntax that is invalid XML.
-    _shield_content_blocks() extracts them before parsing and they are
-    restored after ET.fromstring() succeeds on the clean structure.
-
-    Malformed individual <action> elements (missing required child elements)
-    are logged as warnings and skipped.  ValueError is raised only if no
-    valid <actions> block exists or the block cannot be parsed as XML at all.
-
     Raises
     ------
     ValueError
-        If no <actions>…</actions> block is found, or if the block fails
-        XML parsing entirely.
+        If no <actions>…</actions> block is found, or if it cannot be parsed.
     """
     xml_block = _extract_actions_xml(raw_output)
     if xml_block is None:
@@ -648,38 +532,24 @@ def apply_unified_diff(original: str, diff_text: str) -> str:
     patched result.
 
     BUG FIX vs original: agent_wiki_loop_streaming.py called
-    ``difflib.restore(diff_lines, 2)``, which is designed for *ndiff* format
-    (2-char prefixes "  ", "- ", "+ ") — not unified diff format (1-char
-    prefixes " ", "-", "+").  Since the prompt instructs the model to emit
-    unified diffs, restore() always returned an empty list in practice.
-
-    This implementation correctly parses unified diff @@ hunks and applies
-    them with context-line verification, raising ValueError if any hunk
-    does not match the file content.
-
-    Hunks are applied in reverse order so that earlier line-number shifts do
-    not invalidate the offsets of later hunks.
+    ``difflib.restore(diff_lines, 2)``, which is designed for *ndiff* format,
+    not unified diff format.  This implementation correctly parses @@ hunks.
 
     Raises
     ------
     ValueError
-        If the diff contains no @@ hunks, or if a hunk's context lines do
-        not match the actual file content at the expected position.
+        If the diff contains no @@ hunks, or if context lines don't match.
     """
     hunks = _parse_unified_hunks(diff_text)
     if not hunks:
         raise ValueError("Diff contains no recognisable @@ hunks.")
 
     result_lines = original.splitlines(keepends=True)
-    offset = 0  # cumulative delta from previously applied hunks
+    offset = 0
 
     for orig_start, hunk_lines in hunks:
-        # orig_start is 1-based; convert to 0-based index and adjust for
-        # any previously applied hunks that shifted line numbers.
         idx = orig_start - 1 + offset
 
-        # Reconstruct what the file must contain (context + removed lines)
-        # and what it should become (context + added lines).
         before: list[str] = []
         after:  list[str] = []
 
@@ -689,7 +559,6 @@ def apply_unified_diff(original: str, diff_text: str) -> str:
             elif line.startswith("+"):
                 after.append(line[1:])
             else:
-                # Context line (space prefix or bare)
                 ctx = line[1:] if line.startswith(" ") else line
                 before.append(ctx)
                 after.append(ctx)
@@ -709,12 +578,6 @@ def apply_unified_diff(original: str, diff_text: str) -> str:
 
 
 def _parse_unified_hunks(diff_text: str) -> list[tuple[int, list[str]]]:
-    """
-    Parse a unified diff string into a list of (orig_start_line, hunk_lines).
-
-    Skips --- / +++ header lines.  Returns an empty list if no @@ markers
-    are found.  orig_start_line is the 1-based line number from the @@ header.
-    """
     hunks:         list[tuple[int, list[str]]] = []
     current_start: int        = 0
     current_lines: list[str]  = []
@@ -756,10 +619,6 @@ class WikiAgent:
     """
     Self-contained wiki ingestion agent satisfying the AgentInterface Protocol.
 
-    Reads a raw document, calls the model through the injected RuntimeClient,
-    parses the model's XML response into structured wiki actions, and either
-    returns those actions for review or writes them to disk immediately.
-
     Parameters
     ----------
     runtime :
@@ -768,15 +627,23 @@ class WikiAgent:
         Fallback root for resolving wiki_dir, schema_path, and templates_dir
         when they are not supplied in SubTask.context.  Defaults to the
         directory containing this file.
+    memory_manager :
+        Optional SQLite-backed MemoryManager.  When supplied, every page
+        written to disk is immediately passed to
+        memory_manager.index_document() so the document index stays current
+        without a full corpus re-scan.  When absent, disk writes are
+        unchanged — the index is simply not updated automatically.
     """
 
     def __init__(
         self,
-        runtime:      Any,          # RuntimeClient — typed Any to avoid circular import
-        project_root: Path | None = None,
+        runtime:        Any,
+        project_root:   Path | None = None,
+        memory_manager: "MemoryManager | None" = None,
     ) -> None:
-        self._runtime      = runtime
-        self._project_root = project_root or Path(__file__).resolve().parent
+        self._runtime        = runtime
+        self._project_root   = project_root or Path(__file__).resolve().parent
+        self._memory_manager = memory_manager
 
     # -----------------------------------------------------------------------
     # AgentInterface — name
@@ -791,11 +658,6 @@ class WikiAgent:
     # -----------------------------------------------------------------------
 
     def can_handle(self, instruction: str) -> bool:
-        """
-        Return True when the instruction mentions wiki ingestion concepts.
-        The Planner uses this as a routing hint for fallback decisions only —
-        the primary routing path is the model-generated plan.
-        """
         lowered = instruction.lower()
         return any(kw in lowered for kw in _WIKI_KEYWORDS)
 
@@ -818,7 +680,8 @@ class WikiAgent:
         5. Parse the model's XML response into Actions.
         6. Optionally journal the result.
         7. Optionally write changes to disk (auto_apply=True only).
-        8. Return an AgentResult.
+        8. Index newly written pages in MemoryManager (if available).
+        9. Return an AgentResult.
 
         No stdin.  No sys.exit().  No interactive prompts.
         """
@@ -860,37 +723,36 @@ class WikiAgent:
 
         # -- 3. Load inputs --------------------------------------------------
         #
-        # raw_content is always loaded — build_wiki_context() needs it for
-        # keyword-overlap scoring regardless of which inference path is taken.
+        # wiki_pages dict is built either from the MemoryManager index (fast,
+        # no filesystem walk) or from disk (fallback when no manager is present).
+        # raw_content is always loaded from disk — needed for build_wiki_context()
+        # keyword scoring and for the string-prompt infer() path.
 
         try:
             schema_text = read_text_file(schema_path)
             templates   = self._load_templates(templates_dir)
-            wiki_pages  = self._load_wiki_pages(wiki_dir)
             raw_content = read_text_file(raw_path)
+
+            if self._memory_manager is not None:
+                wiki_pages = self._load_wiki_pages_from_index(wiki_dir)
+                logger.debug(
+                    "[%s] wiki_pages loaded from MemoryManager index (%d pages).",
+                    self.name, len(wiki_pages),
+                )
+            else:
+                wiki_pages = self._load_wiki_pages(wiki_dir)
+                logger.debug(
+                    "[%s] wiki_pages loaded from filesystem (%d pages).",
+                    self.name, len(wiki_pages),
+                )
         except Exception as exc:
             return self._fail(subtask, f"File load error: {exc}")
 
         # -- 4. Build prompt -------------------------------------------------
-        #
-        # wiki_context is always built — the wiki substrate informs the model
-        # regardless of which inference path is taken below.
 
         wiki_context = build_wiki_context(wiki_pages, raw_content)
 
         # -- 5. Call model via RuntimeClient ---------------------------------
-        #
-        # Two paths depending on runtime capability:
-        #
-        #   infer_with_file() path (oMLX 0.4.2+):
-        #     The raw file is sent as a base64 file content block.  oMLX
-        #     processes it through MarkItDown server-side before the model
-        #     sees it.  The slim prompt omits the RAW FILE TO INGEST section
-        #     since the file content arrives via the content block instead.
-        #
-        #   infer() path (Foundry + all other backends):
-        #     The full prompt is built with the raw file content injected as
-        #     a string.  Existing behaviour, unchanged.
 
         use_file_upload = hasattr(self._runtime, "infer_with_file")
         logger.debug(
@@ -966,7 +828,35 @@ class WikiAgent:
                 actions, wiki_dir
             )
 
-        # -- 9. Build and return AgentResult ---------------------------------
+            # -- 9. Update MemoryManager index for every written page --------
+            #
+            # Called here, after disk writes are confirmed, so the index only
+            # ever reflects pages that actually exist on disk.  Each call is
+            # idempotent (content-hash checked inside index_document), so
+            # re-indexing an unchanged page is a no-op.
+
+            if self._memory_manager is not None and written:
+                for page_name in written:
+                    page_path = wiki_dir / f"{page_name}.md"
+                    if page_path.exists():
+                        try:
+                            self._memory_manager.index_document(
+                                path     = page_path,
+                                doc_type = "wiki",
+                                embed    = True,
+                            )
+                            logger.debug(
+                                "[%s] Indexed '%s' in MemoryManager.", self.name, page_name
+                            )
+                        except Exception as exc:
+                            # Non-fatal — disk write succeeded; index can be
+                            # rebuilt by calling index_directory() later.
+                            logger.warning(
+                                "[%s] MemoryManager.index_document failed for '%s': %s",
+                                self.name, page_name, exc,
+                            )
+
+        # -- 10. Build and return AgentResult --------------------------------
 
         output: dict[str, Any] = {
             "new_pages":       [p.model_dump() for p in actions.new_pages],
@@ -1002,7 +892,6 @@ class WikiAgent:
 
     @staticmethod
     def _resolve_raw_path(ctx: dict[str, Any]) -> Path:
-        """Extract and validate the raw_path from subtask context."""
         if "raw_path" not in ctx:
             raise KeyError(
                 "'raw_path' is required in SubTask.context. "
@@ -1025,16 +914,6 @@ class WikiAgent:
 
     @staticmethod
     def _load_templates(templates_dir: Path) -> dict[str, str]:
-        """
-        Load template files from the templates directory.
-
-        Expected files: system.md, concept.md, research-note.md.
-        Missing files are silently skipped — templates are advisory.
-        Key mapping matches the original standalone script:
-            system.md        → SYSTEM
-            concept.md       → CONCEPT
-            research-note.md → RESEARCH_NOTE
-        """
         templates: dict[str, str] = {}
         for name in ["system", "concept", "research-note"]:
             p = templates_dir / f"{name}.md"
@@ -1054,25 +933,41 @@ class WikiAgent:
             if p.is_file() and p.suffix == ".md"
         }
 
+    def _load_wiki_pages_from_index(self, wiki_dir: Path) -> dict[str, str]:
+        """
+        Load wiki page content from the MemoryManager index.
+
+        Falls back to the filesystem walk if the index returns no results
+        for this wiki_dir (e.g. on first run before any pages are indexed).
+        Filters by the absolute wiki_dir so pages from other projects don't
+        bleed in when a single MemoryManager is shared.
+        """
+        assert self._memory_manager is not None  # guarded by caller
+
+        docs = self._memory_manager.get_all_documents(doc_type="wiki")
+
+        # Filter to pages that live under this wiki_dir
+        wiki_dir_str = str(wiki_dir.resolve())
+        filtered = {
+            d.name: d.content
+            for d in docs
+            if str(d.path).startswith(wiki_dir_str)
+        }
+
+        if not filtered and wiki_dir.exists():
+            logger.debug(
+                "[%s] MemoryManager index empty for wiki_dir=%s — falling back to filesystem.",
+                self.name, wiki_dir,
+            )
+            return self._load_wiki_pages(wiki_dir)
+
+        return filtered
+
     @staticmethod
     def _apply_changes(
         actions:  Actions,
         wiki_dir: Path,
     ) -> tuple[bool, list[str], list[str], list[str]]:
-        """
-        Write approved wiki actions to disk.
-
-        Returns
-        -------
-        applied : bool
-            True if at least one change was written without error.
-        written : list[str]
-            Page names successfully created or patched.
-        skipped : list[str]
-            Page names skipped (page already existed for new-page actions).
-        diff_errors : list[str]
-            Page names where diff application failed.
-        """
         written:     list[str] = []
         skipped:     list[str] = []
         diff_errors: list[str] = []
@@ -1108,7 +1003,6 @@ class WikiAgent:
 
     @staticmethod
     def _write_journal(actions: Actions, journal_path: Path) -> None:
-        """Append a journal entry to the specified path (silently on failure)."""
         try:
             entry = JournalEntry(step="wiki_agent_run", actions=actions)
             journal_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1119,7 +1013,6 @@ class WikiAgent:
 
     @staticmethod
     def _fail(subtask: SubTask, reason: str) -> AgentResult:
-        """Construct a FAILED AgentResult without raising."""
         logger.error("[wiki_agent] subtask %s failed: %s", subtask.subtask_id, reason)
         return AgentResult(
             subtask_id = subtask.subtask_id,
@@ -1135,7 +1028,6 @@ class WikiAgent:
 # ---------------------------------------------------------------------------
 
 def _assert_protocol_conformance() -> None:
-    """Verify WikiAgent satisfies AgentInterface at import time (debug aid)."""
     from controller_agent import AgentInterface
 
     class _MockRuntime:
@@ -1168,7 +1060,6 @@ if __name__ == "__main__":
     wiki_agent = WikiAgent(runtime=runtime)
     controller = ControllerAgent(runtime=runtime, agents=[wiki_agent])
 
-    # The controller receives this dict from FastAPI.
     result = controller.handle_task({
         "task_id":     str(uuid.uuid4()),
         "instruction": "Ingest the raw file and create a wiki research note.",
@@ -1176,7 +1067,7 @@ if __name__ == "__main__":
             "raw_path":    "/absolute/path/to/your/raw/file.md",
             "wiki_dir":    "/absolute/path/to/your/wiki",
             "schema_path": "/absolute/path/to/your/SCHEMA.md",
-            "auto_apply":  False,   # set True to write to disk immediately
+            "auto_apply":  False,
         },
     })
 

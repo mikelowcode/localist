@@ -65,6 +65,7 @@ declare module '$env/static/private' {
 	export const VIRTUAL_ENV: string;
 	export const PYDEVD_DISABLE_FILE_VALIDATION: string;
 	export const LSCOLORS: string;
+	export const HF_HOME: string;
 	export const PATH: string;
 	export const npm_package_json: string;
 	export const _: string;
@@ -218,6 +219,7 @@ declare module '$env/dynamic/private' {
 		VIRTUAL_ENV: string;
 		PYDEVD_DISABLE_FILE_VALIDATION: string;
 		LSCOLORS: string;
+		HF_HOME: string;
 		PATH: string;
 		npm_package_json: string;
 		_: string;

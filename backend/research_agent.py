@@ -5,9 +5,10 @@ A multi-step, iterative research and synthesis agent.
 
 Layer placement
 ---------------
-  ControllerAgent  →  ResearchAgent  →  FoundryRuntimeClient (inference + embed)
-                                     →  wiki/ directory          (read-only)
-                                     →  raw/ directory           (read-only)
+  ControllerAgent  →  ResearchAgent  →  RuntimeClient (inference + embed)
+                                     →  MemoryManager (optional — corpus retrieval)
+                                     →  wiki/ directory  (read-only fallback)
+                                     →  raw/ directory   (read-only fallback)
 
 Architectural contract
 ----------------------
@@ -19,33 +20,22 @@ Architectural contract
   Writing is the WikiAgent's responsibility.
 - No user-facing prompts, no interactive loops.
 
-Responsibilities
-----------------
-The ResearchAgent handles tasks that require *reasoning across multiple
-sources* rather than ingesting a single raw file.  Concretely:
-
-  1. Query decomposition  — break a complex question into focused sub-queries.
-  2. Corpus retrieval     — find relevant wiki pages and raw files for each
-                           sub-query using keyword overlap and embedding
-                           cosine similarity (when embeddings are available).
-  3. Iterative reading    — read retrieved documents, extract relevant passages,
-                           and decide whether more sources are needed.
-  4. Claim extraction     — identify discrete factual claims with source refs.
-  5. Synthesis            — combine claims into a structured research report
-                           with provenance for every assertion.
-  6. Gap detection        — note what the corpus does NOT answer, so the
-                           Controller or WikiAgent can act on those gaps.
-
-Difference from WikiAgent
+Corpus retrieval strategy
 --------------------------
-  WikiAgent   : one raw file in  →  structured wiki actions out  (write path)
-  ResearchAgent : a question in   →  research report + sources out (read path)
+When a MemoryManager is supplied at construction time:
+  - Corpus retrieval is delegated to memory_manager.query_corpus(), which
+    queries the SQLite document index rather than walking the filesystem.
+  - Scoring (keyword overlap + optional embedding cosine re-ranking) is
+    handled inside MemoryManager, using pre-computed token sets and stored
+    embedding blobs.
+  - The full corpus is NOT loaded into memory; only the top-N results per
+    sub-query are fetched.  This makes ResearchAgent fast on large wikis.
 
-They are complementary halves of a research workflow.  A typical multi-step
-task might be:
-  1. Controller → ResearchAgent  ("what do we know about X?")
-  2. Controller → WikiAgent      ("ingest this new raw file about X")
-  3. Controller → ResearchAgent  ("synthesise updated findings about X")
+When no MemoryManager is supplied (tests, standalone runs):
+  - The original _load_corpus() filesystem walk is used as a fallback.
+  - _retrieve() scores documents in memory using keyword overlap and, when
+    use_embeddings=True, live embedding calls via runtime.embed().
+  - Behaviour is identical to the pre-MemoryManager implementation.
 
 SubTask.context schema
 -----------------------
@@ -56,8 +46,10 @@ Required keys
 Optional keys
     wiki_dir : str | Path
         Wiki pages directory.  Defaults to <project_root>/wiki.
+        Used only when no MemoryManager is present (filesystem fallback).
     raw_dir : str | Path
         Raw files directory.  Defaults to <project_root>/raw.
+        Used only when no MemoryManager is present (filesystem fallback).
     max_sources : int
         Maximum number of source documents to retrieve per sub-query.
         Default 5.
@@ -70,9 +62,11 @@ Optional keys
         Sampling temperature.  Default 0.2.
     use_embeddings : bool
         If True, supplement keyword retrieval with embedding cosine
-        similarity re-ranking (requires embed() support in the runtime).
-        Default False — safe to enable once your embedding model is
-        confirmed working via health_check().
+        similarity re-ranking.  When MemoryManager is present, re-ranking
+        uses stored embedding blobs (no live embed() calls per document).
+        When falling back to filesystem mode, live runtime.embed() calls
+        are made for each candidate document.
+        Default False.
 
 AgentResult.output schema (on success)
 ---------------------------------------
@@ -99,13 +93,16 @@ import logging
 import math
 import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from controller_agent import (
     AgentResult,
     SubTask,
     TaskStatus,
 )
+
+if TYPE_CHECKING:
+    from memory_manager import MemoryManager, DocumentResult
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +120,7 @@ _RESEARCH_KEYWORDS: frozenset[str] = frozenset({
 
 
 # ---------------------------------------------------------------------------
-# Lightweight text utilities
+# Lightweight text utilities  (used by the filesystem-fallback path)
 # ---------------------------------------------------------------------------
 
 def _tokenize(text: str) -> set[str]:
@@ -159,11 +156,19 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Document index
+# Internal document type  (filesystem-fallback path only)
 # ---------------------------------------------------------------------------
 
 class _Document:
-    """A single retrievable document (wiki page or raw file)."""
+    """
+    A single retrievable document loaded from the filesystem.
+
+    Used only by the fallback path (_load_corpus / _retrieve).  When a
+    MemoryManager is present, DocumentResult objects from query_corpus()
+    are used instead — they expose the same interface (.name, .path,
+    .doc_type, .content, .relevance_score, .to_source_dict()) so the rest
+    of run() is path-agnostic.
+    """
 
     __slots__ = ("name", "path", "doc_type", "content", "relevance_score")
 
@@ -171,7 +176,7 @@ class _Document:
         self,
         name:     str,
         path:     Path,
-        doc_type: str,   # "wiki" | "raw"
+        doc_type: str,
         content:  str,
     ) -> None:
         self.name            = name
@@ -189,8 +194,22 @@ class _Document:
         }
 
 
+# _AnyDoc covers both _Document (filesystem path) and DocumentResult
+# (MemoryManager path) — both expose the same public attributes.
+_AnyDoc = Any
+
+
+# ---------------------------------------------------------------------------
+# Filesystem-fallback corpus loader and retriever
+# ---------------------------------------------------------------------------
+
 def _load_corpus(wiki_dir: Path, raw_dir: Path) -> list[_Document]:
-    """Load all wiki pages and raw files into an in-memory document list."""
+    """
+    Load all wiki pages and raw files into an in-memory document list.
+
+    Used only when no MemoryManager is present.  When a MemoryManager is
+    available, corpus retrieval is delegated to query_corpus() instead.
+    """
     docs: list[_Document] = []
 
     if wiki_dir.exists():
@@ -209,10 +228,12 @@ def _load_corpus(wiki_dir: Path, raw_dir: Path) -> list[_Document]:
                 except Exception as exc:
                     logger.warning("Could not read raw file %s: %s", p, exc)
 
-    logger.debug("Corpus loaded: %d documents (%d wiki, %d raw).",
-                 len(docs),
-                 sum(1 for d in docs if d.doc_type == "wiki"),
-                 sum(1 for d in docs if d.doc_type == "raw"))
+    logger.debug(
+        "Corpus loaded from filesystem: %d documents (%d wiki, %d raw).",
+        len(docs),
+        sum(1 for d in docs if d.doc_type == "wiki"),
+        sum(1 for d in docs if d.doc_type == "raw"),
+    )
     return docs
 
 
@@ -224,13 +245,17 @@ def _retrieve(
     use_embeddings: bool,
 ) -> list[_Document]:
     """
-    Retrieve the top-N most relevant documents for a query.
+    Retrieve the top-N most relevant documents from an in-memory corpus.
+
+    Used only by the filesystem-fallback path.  When a MemoryManager is
+    present, retrieval is handled by memory_manager.query_corpus() which
+    uses pre-scored token sets and stored embedding blobs.
 
     Strategy
     --------
     1. Score every document by keyword overlap with the query tokens.
-    2. If use_embeddings=True and the runtime supports embed(), re-rank
-       the top-2N candidates by embedding cosine similarity, then take top-N.
+    2. If use_embeddings=True, re-rank the top-2N candidates by embedding
+       cosine similarity via live runtime.embed() calls.
     3. Return sorted by final relevance_score descending.
     """
     query_tokens = _tokenize(query)
@@ -245,12 +270,13 @@ def _retrieve(
         try:
             query_vec = runtime.embed(query)
             for doc in pool:
-                # Embed just the first 500 chars to stay within token budget
                 doc_vec = runtime.embed(doc.content[:500])
                 doc.relevance_score = _cosine_similarity(query_vec, doc_vec)
             candidates = sorted(pool, key=lambda d: d.relevance_score, reverse=True)
         except Exception as exc:
-            logger.warning("Embedding re-rank failed (%s); falling back to keyword scores.", exc)
+            logger.warning(
+                "Embedding re-rank failed (%s); falling back to keyword scores.", exc
+            )
 
     top = candidates[:max_sources]
     logger.debug("Retrieved %d documents for query '%s...'.", len(top), query[:60])
@@ -301,7 +327,7 @@ _SYSTEM_SYNTHESISE = (
 )
 
 
-def _build_extract_prompt(sub_query: str, doc: _Document, max_chars: int) -> str:
+def _build_extract_prompt(sub_query: str, doc: _AnyDoc, max_chars: int) -> str:
     return (
         f"Sub-query: {sub_query}\n\n"
         f"Document name: {doc.name} (type: {doc.doc_type})\n\n"
@@ -310,8 +336,8 @@ def _build_extract_prompt(sub_query: str, doc: _Document, max_chars: int) -> str
     )
 
 
-def _build_gap_prompt(query: str, claims: list[dict], sources: list[_Document]) -> str:
-    claims_str  = json.dumps(claims[:40], indent=2)   # cap to avoid token blowout
+def _build_gap_prompt(query: str, claims: list[dict], sources: list[_AnyDoc]) -> str:
+    claims_str  = json.dumps(claims[:40], indent=2)
     sources_str = ", ".join(d.name for d in sources) or "(none)"
     return (
         f"Research query: {query}\n\n"
@@ -322,10 +348,10 @@ def _build_gap_prompt(query: str, claims: list[dict], sources: list[_Document]) 
 
 
 def _build_synthesis_prompt(
-    query:      str,
+    query:       str,
     sub_queries: list[str],
-    claims:     list[dict],
-    sources:    list[_Document],
+    claims:      list[dict],
+    sources:     list[_AnyDoc],
 ) -> str:
     claims_str = json.dumps(claims, indent=2)
     sq_str     = "\n".join(f"  - {sq}" for sq in sub_queries)
@@ -376,19 +402,28 @@ class ResearchAgent:
     Parameters
     ----------
     runtime :
-        A RuntimeClient instance (FoundryRuntimeClient or compatible mock).
+        A RuntimeClient instance (FoundryRuntimeClient, OMLXRuntimeClient,
+        or compatible mock).
     project_root :
         Fallback root for resolving wiki_dir and raw_dir when not supplied
-        in SubTask.context.
+        in SubTask.context.  Used only when no MemoryManager is present.
+    memory_manager :
+        Optional SQLite-backed MemoryManager.  When supplied, corpus
+        retrieval uses the document index (query_corpus()) instead of
+        walking the filesystem on every call.  Embeddings stored in the
+        index are used for re-ranking when use_embeddings=True, avoiding
+        live embed() calls per document.
     """
 
     def __init__(
         self,
-        runtime:      Any,
-        project_root: Path | None = None,
+        runtime:        Any,
+        project_root:   Path | None = None,
+        memory_manager: "MemoryManager | None" = None,
     ) -> None:
-        self._runtime      = runtime
-        self._project_root = project_root or Path(__file__).resolve().parents[2]
+        self._runtime        = runtime
+        self._project_root   = project_root or Path(__file__).resolve().parents[2]
+        self._memory_manager = memory_manager
 
     # -----------------------------------------------------------------------
     # AgentInterface — name
@@ -414,8 +449,8 @@ class ResearchAgent:
         """
         Execute a multi-step research workflow:
 
-          1. Validate context and resolve paths
-          2. Load corpus (wiki + raw)
+          1. Validate context and resolve parameters
+          2. Load / query corpus
           3. Decompose query into sub-queries
           4. For each sub-query: retrieve → read → extract claims  (iterative)
           5. Detect gaps
@@ -430,55 +465,92 @@ class ResearchAgent:
 
         query = ctx.get("query", "").strip()
         if not query:
-            # Fall back to the subtask instruction if query not in context
             query = subtask.instruction.strip()
         if not query:
-            return self._fail(subtask, "No query provided in context['query'] or subtask.instruction.")
+            return self._fail(
+                subtask,
+                "No query provided in context['query'] or subtask.instruction.",
+            )
 
-        wiki_dir   = Path(ctx.get("wiki_dir",  self._project_root / "wiki"))
-        raw_dir    = Path(ctx.get("raw_dir",   self._project_root / "raw"))
-        max_src    = int(ctx.get("max_sources",         5))
-        max_iter   = int(ctx.get("max_iterations",      3))
-        max_tok    = int(ctx.get("max_tokens_per_call", 1024))
-        temperature      = float(ctx.get("temperature",    0.2))
-        use_embeddings   = bool(ctx.get("use_embeddings", False))
+        max_src          = int(ctx.get("max_sources",         5))
+        max_iter         = int(ctx.get("max_iterations",      3))
+        max_tok          = int(ctx.get("max_tokens_per_call", 1024))
+        temperature      = float(ctx.get("temperature",       0.2))
+        use_embeddings   = bool(ctx.get("use_embeddings",     False))
 
         logger.info("[%s] Starting research — query: '%s...'", self.name, query[:80])
 
-        # -- 2. Load corpus --------------------------------------------------
+        # -- 2. Load / query corpus ------------------------------------------
+        #
+        # Two paths:
+        #   A. MemoryManager present → use query_corpus() per sub-query
+        #      (corpus is NOT pre-loaded; retrieval happens in the loop below)
+        #   B. No MemoryManager → load full corpus from filesystem once,
+        #      then score in memory with _retrieve()
 
-        try:
-            corpus = _load_corpus(wiki_dir, raw_dir)
-        except Exception as exc:
-            return self._fail(subtask, f"Corpus load error: {exc}")
-
-        if not corpus:
-            logger.warning("[%s] Corpus is empty — wiki_dir=%s  raw_dir=%s",
-                           self.name, wiki_dir, raw_dir)
+        if self._memory_manager is not None:
+            # Path A — corpus queried on-demand inside the iteration loop.
+            # We pass None here so the loop below knows to call query_corpus().
+            corpus: list[_Document] | None = None
+            logger.info(
+                "[%s] Using MemoryManager for corpus retrieval "
+                "(wiki=%d  raw=%d).",
+                self.name,
+                self._memory_manager.document_count("wiki"),
+                self._memory_manager.document_count("raw"),
+            )
+        else:
+            # Path B — filesystem walk, done once before the loop.
+            wiki_dir = Path(ctx.get("wiki_dir", self._project_root / "wiki"))
+            raw_dir  = Path(ctx.get("raw_dir",  self._project_root / "raw"))
+            try:
+                corpus = _load_corpus(wiki_dir, raw_dir)
+            except Exception as exc:
+                return self._fail(subtask, f"Corpus load error: {exc}")
+            if not corpus:
+                logger.warning(
+                    "[%s] Corpus is empty — wiki_dir=%s  raw_dir=%s",
+                    self.name, wiki_dir, raw_dir,
+                )
 
         # -- 3. Decompose query ----------------------------------------------
 
         sub_queries = self._decompose(query, max_tok, temperature)
         if not sub_queries:
-            logger.warning("[%s] Decomposition returned no sub-queries; using original query.",
-                           self.name)
+            logger.warning(
+                "[%s] Decomposition returned no sub-queries; using original query.",
+                self.name,
+            )
             sub_queries = [query]
 
         logger.info("[%s] Sub-queries: %s", self.name, sub_queries)
 
         # -- 4. Iterative retrieve → read → extract --------------------------
 
-        all_claims:  list[dict]      = []
-        all_sources: list[_Document] = []
-        seen_docs:   set[str]        = set()
-        iterations                   = 0
+        all_claims:  list[dict]    = []
+        all_sources: list[_AnyDoc] = []
+        seen_docs:   set[str]      = set()
+        iterations                 = 0
 
         for iteration in range(max_iter):
             iterations = iteration + 1
             new_claims_this_round = 0
 
             for sq in sub_queries:
-                docs = _retrieve(sq, corpus, max_src, self._runtime, use_embeddings)
+                # Retrieve documents for this sub-query.
+                if self._memory_manager is not None:
+                    # Path A — query the index; scoring + embedding re-rank
+                    # handled inside MemoryManager.
+                    docs: list[_AnyDoc] = self._memory_manager.query_corpus(
+                        query          = sq,
+                        max_results    = max_src,
+                        use_embeddings = use_embeddings,
+                    )
+                else:
+                    # Path B — score the pre-loaded in-memory corpus.
+                    docs = _retrieve(
+                        sq, corpus, max_src, self._runtime, use_embeddings  # type: ignore[arg-type]
+                    )
 
                 for doc in docs:
                     if doc.name in seen_docs:
@@ -487,7 +559,6 @@ class ResearchAgent:
 
                     claims = self._extract_claims(sq, doc, max_tok, temperature)
                     if claims:
-                        # Annotate each claim with its source
                         for c in claims:
                             c["source"] = doc.name
                         all_claims.extend(claims)
@@ -498,13 +569,15 @@ class ResearchAgent:
 
             logger.info(
                 "[%s] Iteration %d complete — new claims: %d  total: %d  docs seen: %d",
-                self.name, iterations, new_claims_this_round, len(all_claims), len(seen_docs),
+                self.name, iterations, new_claims_this_round,
+                len(all_claims), len(seen_docs),
             )
 
-            # Early exit — no new information found this round
             if new_claims_this_round == 0:
-                logger.info("[%s] No new claims in iteration %d; stopping early.",
-                            self.name, iterations)
+                logger.info(
+                    "[%s] No new claims in iteration %d; stopping early.",
+                    self.name, iterations,
+                )
                 break
 
         # -- 5. Detect gaps --------------------------------------------------
@@ -560,7 +633,6 @@ class ResearchAgent:
                 temperature = temperature,
             )
             result = _parse_json_array(raw, "decompose")
-            # Validate: all items must be non-empty strings
             return [s for s in result if isinstance(s, str) and s.strip()]
         except Exception as exc:
             logger.warning("[%s] Decomposition failed: %s", self.name, exc)
@@ -569,17 +641,17 @@ class ResearchAgent:
     def _extract_claims(
         self,
         sub_query:   str,
-        doc:         _Document,
+        doc:         _AnyDoc,
         max_tokens:  int,
         temperature: float,
     ) -> list[dict]:
         """
         Ask the model to extract relevant claims from a single document.
 
-        Caps document content at 4000 chars to protect the KV cache —
-        the same guard Phi-4-mini needs that the WikiAgent already applies.
+        Caps document content at 2000 chars to protect the KV cache.
+        (Reduced from 4000 — see deferred items in session notes.)
         """
-        prompt = _build_extract_prompt(sub_query, doc, max_chars=4_000)
+        prompt = _build_extract_prompt(sub_query, doc, max_chars=2_000)
         try:
             raw    = self._runtime.infer(
                 system      = _SYSTEM_EXTRACT,
@@ -588,7 +660,6 @@ class ResearchAgent:
                 temperature = temperature,
             )
             result = _parse_json_array(raw, f"extract/{doc.name}")
-            # Validate shape: must have "claim" key; "confidence" is optional
             valid = []
             for item in result:
                 if isinstance(item, dict) and isinstance(item.get("claim"), str):
@@ -596,15 +667,16 @@ class ResearchAgent:
                     valid.append(item)
             return valid
         except Exception as exc:
-            logger.warning("[%s] Claim extraction failed for %s: %s",
-                           self.name, doc.name, exc)
+            logger.warning(
+                "[%s] Claim extraction failed for %s: %s", self.name, doc.name, exc
+            )
             return []
 
     def _detect_gaps(
         self,
         query:       str,
         claims:      list[dict],
-        sources:     list[_Document],
+        sources:     list[_AnyDoc],
         max_tokens:  int,
         temperature: float,
     ) -> list[str]:
@@ -630,7 +702,7 @@ class ResearchAgent:
         query:       str,
         sub_queries: list[str],
         claims:      list[dict],
-        sources:     list[_Document],
+        sources:     list[_AnyDoc],
         max_tokens:  int,
         temperature: float,
     ) -> str:
@@ -645,12 +717,11 @@ class ResearchAgent:
             return self._runtime.infer(
                 system      = _SYSTEM_SYNTHESISE,
                 prompt      = prompt,
-                max_tokens  = max_tokens * 2,   # synthesis needs more room than extraction
+                max_tokens  = max_tokens * 2,
                 temperature = temperature,
             )
         except Exception as exc:
             logger.error("[%s] Synthesis failed: %s", self.name, exc)
-            # Fallback: return a minimal report from raw claims
             lines = [f"## Research Report: {query}\n", "## Findings\n"]
             for c in claims:
                 src = c.get("source", "unknown")
@@ -706,14 +777,13 @@ if __name__ == "__main__":
     from controller_agent import ControllerAgent
     import uuid
 
-    runtime          = FoundryRuntimeClient()
-    research_agent   = ResearchAgent(runtime=runtime)
+    runtime        = FoundryRuntimeClient()
+    research_agent = ResearchAgent(runtime=runtime)
 
-    # Run standalone (no controller) for quick iteration during development
     from controller_agent import SubTask
     result = research_agent.run(SubTask(
-        subtask_id = str(uuid.uuid4()),
-        agent_name = "research_agent",
+        subtask_id  = str(uuid.uuid4()),
+        agent_name  = "research_agent",
         instruction = "What do we know about transformer attention mechanisms?",
         context = {
             "query":          "What do we know about transformer attention mechanisms?",
@@ -726,19 +796,3 @@ if __name__ == "__main__":
     ))
 
     print(_json.dumps(result.output, indent=2))
-
-    # Or wire through the full Controller stack:
-    #
-    # controller = ControllerAgent(
-    #     runtime = runtime,
-    #     agents  = [research_agent, WikiAgent(runtime=runtime)],
-    # )
-    # output = controller.handle_task({
-    #     "instruction": "Research transformer attention mechanisms.",
-    #     "context": {
-    #         "query":    "What do we know about transformer attention?",
-    #         "wiki_dir": "/absolute/path/to/your/wiki",
-    #         "raw_dir":  "/absolute/path/to/your/raw",
-    #     },
-    # })
-    # print(_json.dumps(output, indent=2))

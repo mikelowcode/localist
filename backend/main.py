@@ -6,15 +6,16 @@ The HTTP boundary between the Svelte UI and the agent core.
 Layer placement
 ---------------
   Svelte UI  →  FastAPI (this module)  →  ControllerAgent  →  Sub-agents / Runtime
+                                       →  MemoryManager    →  SQLite (local file)
 
 Architectural contract
 ----------------------
 - This is the ONLY module that imports FastAPI, Pydantic, or anything HTTP-related.
 - All agent logic lives in controller_agent.py, wiki_agent.py, research_agent.py.
-- All model inference flows through FoundryRuntimeClient.
-- This module constructs the runtime, agents, and controller once at startup
-  and holds them as app-level state.  No agent or runtime is constructed
-  per-request.
+- All model inference flows through the active RuntimeClient.
+- This module constructs the runtime, MemoryManager, agents, and controller
+  once at startup and holds them as app-level state.  No singleton is
+  constructed per-request.
 - Long-running synchronous calls (controller.handle_task, runtime.infer) are
   dispatched to a thread pool via asyncio.to_thread so they never block the
   event loop.
@@ -34,7 +35,7 @@ Endpoints
 
   GET /health
       Calls runtime.health_check() and returns its dict.  Returns HTTP 200
-      even when Foundry is unreachable so the UI can display a degraded
+      even when the runtime is unreachable so the UI can display a degraded
       state rather than a hard error page.  A separate "healthy" boolean in
       the body signals true service health to automated monitors.
 
@@ -42,36 +43,25 @@ Endpoints
       Returns the list of registered agent names.  Useful for the UI to
       show which capabilities are active without parsing log files.
 
-  GET /files/raw
-      List all .md and .txt files in the raw/ directory.
-      Returns an array of FileEntry objects (name, path, size, modified).
-
-  GET /files/wiki
-      List all .md files in the wiki/ directory.
-      Returns an array of FileEntry objects (name, path, size, modified).
-
-  GET /files/content
-      Return the plain-text content of any file under raw/ or wiki/.
-      Query param: path (absolute path, must be inside raw_dir or wiki_dir).
-
-  POST /files/upload
-      Accept a multipart .md or .txt file upload and save it to raw/.
-      Returns the FileEntry for the newly saved file.
+  GET /memory/stats
+      Returns MemoryManager statistics: document counts, DB size, embedding
+      coverage, cache state.  Always HTTP 200 — degraded values are shown
+      when the MemoryManager is not initialised.
 
 Running locally
 ---------------
-  uvicorn main:app --reload --host 127.0.0.1 --port 8000
+  uvicorn main:app --reload --host 127.0.0.1 --port 8001
 
 Environment / configuration
 ----------------------------
 All tuneable values are in the ``Settings`` class (pydantic-settings).  They
 can be overridden via environment variables or a .env file:
 
-  LORA_RUNTIME_BACKEND    Runtime backend to use: "foundry" | "omlx" (default "foundry")
+  LORA_RUNTIME_BACKEND    Runtime backend: "foundry" | "omlx" (default "foundry")
   LORA_CHAT_MODEL         Chat model ID (interpreted by the active backend)
   LORA_EMBEDDING_MODEL    Embedding model ID (interpreted by the active backend)
-  LORA_FOUNDRY_URL        Override auto-resolved Foundry base URL (foundry backend only)
-  LORA_OMLX_URL           oMLX server base URL (omlx backend only, default http://localhost:8000)
+  LORA_FOUNDRY_URL        Override auto-resolved Foundry base URL (foundry only)
+  LORA_OMLX_URL           oMLX server base URL (omlx only, default http://localhost:8000)
   LORA_LOG_LEVEL          Root log level (default INFO)
   LORA_WIKI_DIR           Absolute path to the wiki directory
   LORA_RAW_DIR            Absolute path to the raw files directory
@@ -80,6 +70,11 @@ can be overridden via environment variables or a .env file:
   LORA_AUTO_APPLY         Whether WikiAgent writes to disk immediately (bool)
   LORA_STREAM_TIMEOUT     Streaming timeout in seconds (float)
   LORA_REQUEST_TIMEOUT    Non-streaming timeout in seconds (float)
+  LORA_MEMORY_DB          Absolute path to the SQLite memory DB file.
+                          Defaults to <project_root>/lora_memory.db
+  LORA_MEMORY_EMBED       Whether to embed documents at startup (bool, default True).
+                          Set False to skip embedding on the initial index pass —
+                          useful when the embedding model is not yet available.
 """
 
 from __future__ import annotations
@@ -87,14 +82,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import shutil
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -106,7 +99,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from base_runtime_client import BaseRuntimeClient
 from controller_agent import ControllerAgent
-from foundry_runtime_client import _iter_sse_chunks
+from memory_manager import MemoryManager
 from research_agent import ResearchAgent
 from runtime_factory import create_runtime
 from wiki_agent import WikiAgent
@@ -122,19 +115,15 @@ class Settings(BaseSettings):
     """
     model_config = SettingsConfigDict(env_prefix="LORA_", env_file=".env", extra="ignore")
 
-    # Runtime backend selection — determines which client create_runtime() builds.
-    # "foundry" uses FoundryRuntimeClient (Azure AI Foundry, local).
-    # "omlx"    uses OMLXRuntimeClient (oMLX, local).
+    # Runtime backend selection
     runtime_backend: str = "foundry"
 
-    # Model IDs — interpreted by the active backend.
-    # Foundry defaults are kept here; oMLX defaults live in omlx_runtime_client.py
-    # and are used automatically when runtime_backend="omlx" and these are not set.
+    # Model IDs — interpreted by the active backend
     chat_model:       str = "Phi-4-mini-instruct-generic-gpu:5"
     embedding_model:  str = "text-embedding-3-small"
 
     # Foundry network (foundry backend only)
-    foundry_url:      str | None = None   # None → auto-resolve from CLI
+    foundry_url:      str | None = None
 
     # oMLX network (omlx backend only)
     omlx_url:         str = "http://localhost:8000"
@@ -143,14 +132,18 @@ class Settings(BaseSettings):
     stream_timeout:   float = 60.0
     request_timeout:  float = 30.0
 
-    # Paths — resolved at startup; defaults are relative to this file's parent
+    # Paths — resolved at startup; defaults are relative to project root
     wiki_dir:        str | None = None
     raw_dir:         str | None = None
     schema_path:     str | None = None
     templates_dir:   str | None = None
 
+    # MemoryManager
+    memory_db:       str | None = None   # None → <project_root>/lora_memory.db
+    memory_embed:    bool = True          # embed documents during startup index pass
+
     # Agent behaviour
-    auto_apply:      bool = False   # WikiAgent: write to disk immediately
+    auto_apply:      bool = False
 
     # Logging
     log_level:       str = "INFO"
@@ -164,9 +157,10 @@ class AppState:
     """Holds singletons that live for the lifetime of the process."""
 
     def __init__(self) -> None:
-        self.runtime:    BaseRuntimeClient | None = None
-        self.controller: ControllerAgent   | None = None
-        self.settings:   Settings          | None = None
+        self.runtime:        BaseRuntimeClient | None = None
+        self.controller:     ControllerAgent   | None = None
+        self.memory_manager: MemoryManager     | None = None
+        self.settings:       Settings          | None = None
 
 
 _state = AppState()
@@ -179,8 +173,8 @@ _state = AppState()
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
-    Construct the runtime, agents, and controller once at startup.
-    Runs in the main thread before the first request is accepted.
+    Construct the runtime, MemoryManager, agents, and controller once at
+    startup.  Runs in the main thread before the first request is accepted.
     """
     settings = Settings()
     _state.settings = settings
@@ -193,12 +187,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     logger.info("LORA backend starting up.")
 
-    # Resolve project root (two parents above this file by convention)
     project_root = Path(__file__).resolve().parent
 
-    # Build runtime via factory — backend selected by LORA_RUNTIME_BACKEND.
-    # All settings are passed as kwargs; each backend's factory function
-    # extracts only the keys it needs and ignores the rest.
+    # -- Runtime -------------------------------------------------------------
+
     runtime = create_runtime(
         backend         = settings.runtime_backend,
         chat_model      = settings.chat_model,
@@ -210,7 +202,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     _state.runtime = runtime
 
-    # Log health at startup (non-blocking — don't fail if runtime is cold)
     health = runtime.health_check()
     if health["reachable"]:
         logger.info(
@@ -228,31 +219,86 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             health.get("base_url"),
         )
 
-    # Resolve path defaults
+    # -- Resolve path defaults -----------------------------------------------
+
     wiki_dir      = Path(settings.wiki_dir)      if settings.wiki_dir      else project_root / "wiki"
     raw_dir       = Path(settings.raw_dir)       if settings.raw_dir       else project_root / "raw"
     schema_path   = Path(settings.schema_path)   if settings.schema_path   else project_root / "SCHEMA.md"
     templates_dir = Path(settings.templates_dir) if settings.templates_dir else project_root / "templates"
+    memory_db     = Path(settings.memory_db)     if settings.memory_db     else project_root / "lora_memory.db"
 
-    # Build agents
-    wiki_agent     = WikiAgent(runtime=runtime,     project_root=project_root)
-    research_agent = ResearchAgent(runtime=runtime, project_root=project_root)
+    # -- MemoryManager -------------------------------------------------------
+    #
+    # The embed_fn passed to MemoryManager is runtime.embed when the runtime
+    # has an embedding model configured and reachable.  If embed() would raise
+    # NotImplementedError (oMLX without an embedding model loaded) or if the
+    # runtime is unreachable, we pass None so MemoryManager falls back to
+    # keyword-only retrieval without surfacing errors at startup.
 
-    # Attach resolved paths as defaults on the agents' project_root.
-    # The agents respect per-SubTask context overrides; these are fallbacks.
-    wiki_agent._project_root     = project_root
-    research_agent._project_root = project_root
+    embed_fn = None
+    if settings.memory_embed and health.get("embed_model_found"):
+        embed_fn = runtime.embed
+        logger.info("MemoryManager: embedding enabled via %s.", settings.runtime_backend)
+    else:
+        logger.info(
+            "MemoryManager: embedding disabled at startup "
+            "(memory_embed=%s  embed_model_found=%s).",
+            settings.memory_embed,
+            health.get("embed_model_found"),
+        )
 
-    # Store resolved paths in state so endpoints can inject them into context
+    memory_manager = MemoryManager(db_path=memory_db, embed_fn=embed_fn)
+    _state.memory_manager = memory_manager
+
+    # Seed the document index from disk on startup.  index_directory() is
+    # idempotent — unchanged files are skipped via content-hash comparison.
+    # This ensures the index is always current even after pages were written
+    # while the server was down.
+    if wiki_dir.exists():
+        n_wiki = memory_manager.index_directory(wiki_dir, doc_type="wiki", embed=settings.memory_embed)
+        logger.info("MemoryManager: indexed %d wiki pages from %s.", n_wiki, wiki_dir)
+    else:
+        logger.warning("MemoryManager: wiki_dir does not exist yet (%s) — skipping seed.", wiki_dir)
+
+    if raw_dir.exists():
+        n_raw = memory_manager.index_directory(raw_dir, doc_type="raw", embed=settings.memory_embed)
+        logger.info("MemoryManager: indexed %d raw files from %s.", n_raw, raw_dir)
+    else:
+        logger.info("MemoryManager: raw_dir does not exist yet (%s) — skipping seed.", raw_dir)
+
+    stats = memory_manager.stats()
+    logger.info(
+        "MemoryManager ready — wiki=%d  raw=%d  db_size=%.1f KB  embeddings=%.0f%%",
+        stats["wiki_docs"], stats["raw_docs"],
+        stats["db_size_kb"], stats["embeddings_pct"],
+    )
+
+    # -- Agents --------------------------------------------------------------
+
+    wiki_agent = WikiAgent(
+        runtime        = runtime,
+        project_root   = project_root,
+        memory_manager = memory_manager,
+    )
+    research_agent = ResearchAgent(
+        runtime        = runtime,
+        project_root   = project_root,
+        memory_manager = memory_manager,
+    )
+
+    # -- Store resolved paths in state so endpoints can inject them ----------
+
     _state.wiki_dir      = wiki_dir
     _state.raw_dir       = raw_dir
     _state.schema_path   = schema_path
     _state.templates_dir = templates_dir
 
-    # Build controller
+    # -- Controller ----------------------------------------------------------
+
     controller = ControllerAgent(
-        runtime = runtime,
-        agents  = [wiki_agent, research_agent],
+        runtime        = runtime,
+        agents         = [wiki_agent, research_agent],
+        memory_manager = memory_manager,
     )
     _state.controller = controller
 
@@ -272,15 +318,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title       = "LORA — Local Reasoning Agent",
-    description = "Multi-agent research system powered by Azure AI Foundry.",
-    version     = "0.1.0",
+    description = "Multi-agent research system with persistent SQLite memory.",
+    version     = "0.2.0",
     lifespan    = lifespan,
 )
 
 logger = logging.getLogger(__name__)
 
-# Allow the Svelte dev server (default :5173) and any localhost origin during
-# development.  Tighten this list before any production deployment.
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = ["http://localhost:5173", "http://127.0.0.1:5173",
@@ -299,15 +343,12 @@ class TaskRequest(BaseModel):
     """
     Payload accepted by POST /task and POST /task/stream.
 
-    ``instruction`` is the only required field — the controller will handle
-    planning, dispatch, and synthesis from it alone.
-
-    ``context`` is passed through verbatim to the controller and then on to
-    each agent.  Use it to supply paths, flags, or sub-agent hints:
+    ``instruction`` is the only required field.  ``context`` is passed
+    through verbatim to the controller and then on to each agent:
 
         {
-            "query":     "What do we know about attention mechanisms?",
-            "raw_path":  "/abs/path/to/paper.md",
+            "query":      "What do we know about attention mechanisms?",
+            "raw_path":   "/abs/path/to/paper.md",
             "auto_apply": false
         }
     """
@@ -329,13 +370,13 @@ class TaskResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     """Response body for GET /health."""
-    healthy:          bool
-    reachable:        bool
-    base_url:         str
-    models:           list[str]           = Field(default_factory=list)
-    chat_model_found: bool                = False
-    embed_model_found: bool               = False
-    error:            str | None          = None
+    healthy:           bool
+    reachable:         bool
+    base_url:          str
+    models:            list[str]  = Field(default_factory=list)
+    chat_model_found:  bool       = False
+    embed_model_found: bool       = False
+    error:             str | None = None
 
 
 class AgentsResponse(BaseModel):
@@ -343,24 +384,17 @@ class AgentsResponse(BaseModel):
     agents: list[str]
 
 
-class FileEntry(BaseModel):
-    """Metadata for a single file in raw/ or wiki/."""
-    name:     str           # filename without extension
-    filename: str           # filename with extension, e.g. "my-doc.md"
-    path:     str           # absolute path — passed back as context.raw_path for ingest
-    size:     int           # bytes
-    modified: str           # ISO-8601 UTC timestamp
-
-
-class FilesResponse(BaseModel):
-    """Response body for GET /files/raw and GET /files/wiki."""
-    files: list[FileEntry]
-
-
-class FileContentResponse(BaseModel):
-    """Response body for GET /files/content."""
-    path:    str
-    content: str
+class MemoryStatsResponse(BaseModel):
+    """Response body for GET /memory/stats."""
+    db_path:          str
+    db_size_kb:       float
+    wiki_docs:        int
+    raw_docs:         int
+    conv_log_rows:    int
+    cache_valid:      int
+    cache_invalid:    int
+    embeddings_pct:   float
+    available:        bool   # False when MemoryManager is not initialised
 
 
 # ---------------------------------------------------------------------------
@@ -368,14 +402,12 @@ class FileContentResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _require_controller() -> ControllerAgent:
-    """Return the app-level ControllerAgent or raise 503 if not ready."""
     if _state.controller is None:
         raise HTTPException(status_code=503, detail="Controller not initialised.")
     return _state.controller
 
 
 def _require_runtime() -> BaseRuntimeClient:
-    """Return the app-level runtime or raise 503 if not ready."""
     if _state.runtime is None:
         raise HTTPException(status_code=503, detail="Runtime not initialised.")
     return _state.runtime
@@ -408,8 +440,8 @@ def _enrich_context(context: dict[str, Any]) -> dict[str, Any]:
 
 @app.post(
     "/task",
-    response_model   = TaskResponse,
-    summary          = "Submit a task (blocking)",
+    response_model       = TaskResponse,
+    summary              = "Submit a task (blocking)",
     response_description = "The completed task result.",
 )
 async def post_task(request: TaskRequest) -> TaskResponse:
@@ -417,12 +449,7 @@ async def post_task(request: TaskRequest) -> TaskResponse:
     Submit an instruction to the LORA multi-agent system.
 
     The call blocks until the full pipeline (plan → dispatch → synthesize)
-    completes and returns the final answer.  For long research tasks this
-    may take tens of seconds.  Use ``POST /task/stream`` to receive tokens
-    incrementally during synthesis.
-
-    The controller runs synchronously in a thread pool so the event loop
-    is never blocked.
+    completes.  Use POST /task/stream to receive tokens incrementally.
     """
     controller = _require_controller()
 
@@ -452,22 +479,13 @@ async def post_task_stream(request: TaskRequest) -> StreamingResponse:
     """
     Submit a task and receive the synthesis answer as a Server-Sent Events stream.
 
-    **Event format** (each line is one SSE event):
+    Event format:
 
         data: {"type": "status",  "message": "Planning..."}
         data: {"type": "token",   "token": "The"}
-        data: {"type": "token",   "token": " capital"}
         data: {"type": "sources", "sources": [...]}
         data: {"type": "done",    "task_id": "...", "status": "complete"}
         data: [DONE]
-
-    Status events are emitted at the start of each pipeline phase so the UI
-    can show progress without polling.  Token events carry individual text
-    chunks from the SSE stream returned by Foundry.  The [DONE] sentinel
-    signals that the stream is closed.
-
-    Planning and sub-agent dispatch run in a thread pool and complete before
-    streaming begins.  Only the final synthesis call streams.
     """
     controller = _require_controller()
     runtime    = _require_runtime()
@@ -483,8 +501,8 @@ async def post_task_stream(request: TaskRequest) -> StreamingResponse:
         _stream_task(controller, runtime, task_dict, request.task_id),
         media_type = "text/event-stream",
         headers    = {
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",   # disable nginx buffering for SSE
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",
         },
     )
 
@@ -497,19 +515,11 @@ async def post_task_stream(request: TaskRequest) -> StreamingResponse:
 async def get_health() -> HealthResponse:
     """
     Check whether the active runtime backend is reachable and the configured
-    models are available.
-
-    Always returns HTTP 200 — the ``healthy`` and ``reachable`` fields in
-    the body carry the actual health signal.  This lets the Svelte UI render
-    a degraded-state banner rather than hitting an error boundary.
+    models are available.  Always returns HTTP 200.
     """
     runtime = _require_runtime()
-
-    # health_check() is synchronous and makes a real HTTP call.
     raw: dict[str, Any] = await asyncio.to_thread(runtime.health_check)
 
-    # embed_model_found may be None (not applicable) for inference-only backends.
-    # Coerce to bool for the response schema — None → False.
     return HealthResponse(
         healthy           = bool(raw.get("reachable") and raw.get("chat_model_found")),
         reachable         = bool(raw.get("reachable", False)),
@@ -529,167 +539,47 @@ async def get_health() -> HealthResponse:
 async def get_agents() -> AgentsResponse:
     """Return the names of all agents currently registered with the controller."""
     controller = _require_controller()
-    # _agents is an internal dict keyed by agent name
-    agent_names = list(controller._agents.keys())
-    return AgentsResponse(agents=agent_names)
+    return AgentsResponse(agents=list(controller._agents.keys()))
 
 
-# ---------------------------------------------------------------------------
-# File management endpoints
-# ---------------------------------------------------------------------------
+@app.get(
+    "/memory/stats",
+    response_model = MemoryStatsResponse,
+    summary        = "MemoryManager statistics",
+)
+async def get_memory_stats() -> MemoryStatsResponse:
+    """
+    Return MemoryManager statistics.
 
-def _file_entry(path: Path) -> FileEntry:
-    """Build a FileEntry from a Path.  path must exist and be a file."""
-    stat = path.stat()
-    return FileEntry(
-        name     = path.stem,
-        filename = path.name,
-        path     = str(path.resolve()),
-        size     = stat.st_size,
-        modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+    Always HTTP 200.  When the MemoryManager is not initialised (e.g. startup
+    failure), all numeric fields are 0 and ``available`` is False.
+    """
+    mm = _state.memory_manager
+    if mm is None:
+        return MemoryStatsResponse(
+            db_path        = "",
+            db_size_kb     = 0.0,
+            wiki_docs      = 0,
+            raw_docs       = 0,
+            conv_log_rows  = 0,
+            cache_valid    = 0,
+            cache_invalid  = 0,
+            embeddings_pct = 0.0,
+            available      = False,
+        )
+
+    raw: dict[str, Any] = await asyncio.to_thread(mm.stats)
+    return MemoryStatsResponse(
+        db_path        = raw["db_path"],
+        db_size_kb     = raw["db_size_kb"],
+        wiki_docs      = raw["wiki_docs"],
+        raw_docs       = raw["raw_docs"],
+        conv_log_rows  = raw["conv_log_rows"],
+        cache_valid    = raw["cache_valid"],
+        cache_invalid  = raw["cache_invalid"],
+        embeddings_pct = raw["embeddings_pct"],
+        available      = True,
     )
-
-
-def _list_dir(directory: Path, suffixes: set[str]) -> list[FileEntry]:
-    """Return sorted FileEntry list for all matching files in directory."""
-    if not directory.exists():
-        return []
-    entries = [
-        _file_entry(p)
-        for p in sorted(directory.iterdir())
-        if p.is_file() and p.suffix.lower() in suffixes
-    ]
-    return entries
-
-
-def _require_dir(attr: str, label: str) -> Path:
-    """Return a resolved directory from _state or raise 503."""
-    directory = getattr(_state, attr, None)
-    if directory is None:
-        raise HTTPException(status_code=503, detail=f"{label} directory not configured.")
-    return directory
-
-
-@app.get(
-    "/files/raw",
-    response_model = FilesResponse,
-    summary        = "List files in the raw/ corpus directory",
-)
-async def get_files_raw() -> FilesResponse:
-    """
-    Return metadata for every .md and .txt file in the raw/ directory.
-
-    The ``path`` field of each FileEntry is the absolute path suitable for
-    passing directly as ``context.raw_path`` in a ``POST /task`` or
-    ``POST /task/stream`` ingest request.
-    """
-    raw_dir = _require_dir("raw_dir", "raw/")
-    files   = await asyncio.to_thread(_list_dir, raw_dir, {".md", ".txt"})
-    return FilesResponse(files=files)
-
-
-@app.get(
-    "/files/wiki",
-    response_model = FilesResponse,
-    summary        = "List pages in the wiki/ directory",
-)
-async def get_files_wiki() -> FilesResponse:
-    """Return metadata for every .md file in the wiki/ directory."""
-    wiki_dir = _require_dir("wiki_dir", "wiki/")
-    files    = await asyncio.to_thread(_list_dir, wiki_dir, {".md"})
-    return FilesResponse(files=files)
-
-
-@app.get(
-    "/files/content",
-    response_model = FileContentResponse,
-    summary        = "Return the text content of a file",
-)
-async def get_file_content(path: str) -> FileContentResponse:
-    """
-    Return the plain-text content of a file under raw/ or wiki/.
-
-    The ``path`` query parameter must be an absolute path previously
-    returned by ``GET /files/raw`` or ``GET /files/wiki``.  Requests for
-    paths outside those two directories are rejected with 403.
-    """
-    raw_dir  = _require_dir("raw_dir",  "raw/")
-    wiki_dir = _require_dir("wiki_dir", "wiki/")
-
-    target = Path(path).resolve()
-
-    # Security check — only serve files that live inside the configured dirs.
-    try:
-        target.relative_to(raw_dir.resolve())
-        in_raw = True
-    except ValueError:
-        in_raw = False
-
-    try:
-        target.relative_to(wiki_dir.resolve())
-        in_wiki = True
-    except ValueError:
-        in_wiki = False
-
-    if not in_raw and not in_wiki:
-        raise HTTPException(
-            status_code = 403,
-            detail      = "Path is outside the configured raw/ and wiki/ directories.",
-        )
-
-    if not target.exists() or not target.is_file():
-        raise HTTPException(status_code=404, detail=f"File not found: {path}")
-
-    try:
-        content = await asyncio.to_thread(target.read_text, "utf-8")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Could not read file: {exc}") from exc
-
-    return FileContentResponse(path=str(target), content=content)
-
-
-@app.post(
-    "/files/upload",
-    response_model = FileEntry,
-    summary        = "Upload a .md or .txt file to raw/",
-)
-async def post_files_upload(file: UploadFile = File(...)) -> FileEntry:
-    """
-    Accept a multipart file upload and save it to the raw/ directory.
-
-    Only .md and .txt files are accepted.  The file is saved with its
-    original filename; if a file with that name already exists it is
-    overwritten (the assumption is the user is re-uploading a newer
-    version of the same document).
-
-    Returns the FileEntry for the saved file, including the absolute
-    ``path`` that can be passed directly as ``context.raw_path``.
-    """
-    raw_dir = _require_dir("raw_dir", "raw/")
-
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="Upload has no filename.")
-
-    suffix = Path(file.filename).suffix.lower()
-    if suffix not in {".md", ".txt"}:
-        raise HTTPException(
-            status_code = 400,
-            detail      = f"Only .md and .txt files are accepted, got: {suffix!r}",
-        )
-
-    dest = raw_dir / file.filename
-
-    try:
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        contents = await file.read()
-        await asyncio.to_thread(dest.write_bytes, contents)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Upload failed: {exc}") from exc
-    finally:
-        await file.close()
-
-    logger.info("Uploaded file: %s (%d bytes)", dest, dest.stat().st_size)
-    return _file_entry(dest)
 
 
 # ---------------------------------------------------------------------------
@@ -708,31 +598,17 @@ async def _stream_task(
     Pipeline
     --------
     1.  Emit a "Planning..." status event.
-    2.  Run plan + dispatch in a thread (synchronous).  These steps do not
-        stream — they complete and their results are held in memory.
-    3.  Emit a "Synthesising..." status event.
-    4.  Re-run synthesis via the runtime's SSE stream, yielding tokens.
-    5.  Emit sources, done, and [DONE] sentinel.
-
-    This approach keeps the streaming path simple: the controller's existing
-    handle_task() path is used for planning and dispatch, then we intercept
-    the synthesis step by calling runtime.infer() directly with streaming.
-
-    For the streaming synthesis we bypass the controller and call
-    runtime.infer() ourselves, using the same prompt the Synthesizer would
-    build.  The non-streaming /task endpoint continues to use the full
-    controller pipeline unchanged.
+    2.  Run the full handle_task() pipeline in a thread pool.
+    3.  Emit a "Streaming answer…" status event.
+    4.  Replay the completed answer word-by-word as token events.
+    5.  Emit sources, done, and the [DONE] sentinel.
     """
 
     def _sse(payload: dict[str, Any]) -> str:
         return f"data: {json.dumps(payload)}\n\n"
 
-    # -- Phase 1: Planning + dispatch (in thread) ----------------------------
-
     yield _sse({"type": "status", "message": "Planning task…", "task_id": task_id})
 
-    # Run the full handle_task pipeline synchronously in a thread.
-    # We use this to get sub-agent results; we'll re-synthesise with streaming.
     try:
         result: dict[str, Any] = await asyncio.to_thread(
             controller.handle_task, task_dict
@@ -743,7 +619,6 @@ async def _stream_task(
         yield "data: [DONE]\n\n"
         return
 
-    # If the controller already failed during planning/dispatch, surface it.
     if result.get("status") == "failed":
         yield _sse({
             "type":    "error",
@@ -753,33 +628,14 @@ async def _stream_task(
         yield "data: [DONE]\n\n"
         return
 
-    # -- Phase 2: Stream the answer token-by-token ---------------------------
-    #
-    # The controller has already synthesised the answer inside handle_task().
-    # We stream that answer token-by-token by replaying it from the result
-    # dict. This keeps things simple and avoids duplicating the synthesis
-    # prompt logic here.
-    #
-    # If you later want true streaming synthesis (tokens arriving in real time
-    # before the agent pipeline finishes), replace this section with a call to
-    # runtime._chat_endpoint via _iter_sse_chunks in a separate thread and
-    # pipe the chunks here. The endpoint contract for the Svelte client remains
-    # identical either way.
-
     yield _sse({"type": "status", "message": "Streaming answer…", "task_id": task_id})
 
     answer: str = result.get("answer", "")
-
-    # Yield the answer in word-sized chunks to simulate token streaming and
-    # give the UI something to render progressively.
     words = answer.split(" ")
     for i, word in enumerate(words):
         chunk = word if i == 0 else " " + word
         yield _sse({"type": "token", "token": chunk})
-        # Tiny yield point so the event loop can flush each chunk to the client.
         await asyncio.sleep(0)
-
-    # -- Phase 3: Sources + done sentinel ------------------------------------
 
     yield _sse({"type": "sources",  "sources": result.get("sources", [])})
     yield _sse({
@@ -797,10 +653,6 @@ async def _stream_task(
 
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    """
-    Catch any unhandled exception and return a structured JSON error rather
-    than an HTML 500 page.  Keeps the Svelte client's error handling simple.
-    """
     logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
     return JSONResponse(
         status_code = 500,
@@ -819,8 +671,8 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "main:app",
-        host    = "127.0.0.1",
-        port    = 8000,
-        reload  = True,
+        host      = "127.0.0.1",
+        port      = 8001,
+        reload    = True,
         log_level = "info",
     )

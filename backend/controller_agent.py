@@ -12,9 +12,18 @@ Architectural contract
 - All public methods are synchronous; async variants can be added later
   by wrapping the runtime calls in asyncio.to_thread if needed.
 
+Memory
+------
+ControllerAgent accepts an optional ``memory_manager`` argument.  When
+supplied (the normal production case), it is the SQLite-backed MemoryManager
+from memory_manager.py and all conversation-log writes are persisted across
+requests.  When absent (tests, standalone runs), a lightweight in-process
+_EphemeralMemory shim is used instead so nothing else in the codebase changes.
+
 Layer placement
 ---------------
   Svelte UI  →  FastAPI  →  ControllerAgent  →  Sub-agents / Runtime
+                                             →  MemoryManager (SQLite)
 """
 
 from __future__ import annotations
@@ -23,7 +32,13 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    # Avoid a hard circular import at runtime; memory_manager imports nothing
+    # from controller_agent, but being explicit about the direction keeps
+    # the dependency graph clean.
+    from memory_manager import MemoryManager
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +153,7 @@ class AgentInterface(Protocol):
 @runtime_checkable
 class RuntimeClient(Protocol):
     """
-    Abstraction over the Local Runtime Layer (Azure AI Foundry).
+    Abstraction over the Local Runtime Layer (Azure AI Foundry / oMLX).
     The Controller and sub-agents call this — never a model API directly.
     """
 
@@ -158,67 +173,74 @@ class RuntimeClient(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Memory manager
+# Ephemeral memory shim
 # ---------------------------------------------------------------------------
+# Used only when no MemoryManager is injected (tests, standalone scripts).
+# The public API intentionally mirrors MemoryManager so call sites are
+# identical regardless of which object is in use.
 
-class MemoryManager:
+class _EphemeralMemory:
     """
-    Manages the context window across a multi-step workflow.
+    In-process memory store — zero persistence, zero dependencies.
 
-    In the initial skeleton this is an in-process list.  Replace the
-    storage backend (e.g. with a vector store or SQLite) without changing
-    the interface.
+    Accepts the same keyword arguments as MemoryManager.add() / .add_agent_result()
+    so ControllerAgent._execute() and Synthesizer.synthesize() call both
+    objects identically.  task_id is accepted but ignored — this shim holds
+    only one flat list of entries.
     """
 
-    def __init__(self, max_tokens: int = 8192) -> None:
-        self._entries:    list[dict[str, Any]] = []
-        self._max_tokens: int                  = max_tokens
+    def __init__(self) -> None:
+        self._entries: list[dict[str, Any]] = []
 
-    # -- write --
-
-    def add(self, role: str, content: str, metadata: dict[str, Any] | None = None) -> None:
+    def add(
+        self,
+        role:     str,
+        content:  str,
+        metadata: dict[str, Any] | None = None,
+        task_id:  str = "global",        # accepted, ignored
+    ) -> None:
         self._entries.append({
             "role":     role,
             "content":  content,
             "metadata": metadata or {},
         })
-        self._evict_if_needed()
+        # Naive eviction
+        if len(self._entries) > 200:
+            self._entries = self._entries[-200:]
 
-    def add_agent_result(self, result: AgentResult) -> None:
+    def add_agent_result(
+        self,
+        result:  AgentResult,
+        task_id: str = "global",         # accepted, ignored
+    ) -> None:
         self.add(
-            role    = "agent",
-            content = str(result.output),
+            role     = "agent",
+            content  = str(result.output),
             metadata = {"agent": result.agent_name, "subtask_id": result.subtask_id},
+            task_id  = task_id,
         )
 
-    # -- read --
+    def get_context_window(
+        self,
+        task_id: str = "global",
+        limit:   int = 50,
+    ) -> list[dict[str, Any]]:
+        return list(self._entries[-limit:])
 
-    def get_context_window(self) -> list[dict[str, Any]]:
-        """Return entries suitable for passing to the runtime as conversation history."""
-        return list(self._entries)
+    def format_for_prompt(
+        self,
+        task_id: str = "global",
+        limit:   int = 50,
+    ) -> str:
+        entries = self.get_context_window(task_id=task_id, limit=limit)
+        return "\n".join(f"[{e['role'].upper()}] {e['content']}" for e in entries)
 
-    def format_for_prompt(self) -> str:
-        """Flatten memory into a single string for inclusion in a prompt."""
-        lines = []
-        for e in self._entries:
-            lines.append(f"[{e['role'].upper()}] {e['content']}")
-        return "\n".join(lines)
-
-    # -- maintenance --
-
-    def clear(self) -> None:
+    def clear(self, task_id: str | None = None) -> None:
         self._entries.clear()
 
-    def _evict_if_needed(self) -> None:
-        """
-        Naive eviction: drop oldest entries when the list exceeds a soft cap.
-        Replace with a token-counting strategy once a tokenizer is available.
-        """
-        soft_cap = 200  # entries
-        if len(self._entries) > soft_cap:
-            dropped = len(self._entries) - soft_cap
-            self._entries = self._entries[dropped:]
-            logger.debug("MemoryManager evicted %d old entries.", dropped)
+
+# Union type used for internal type hints — both objects satisfy this duck type.
+_AnyMemory = Any   # MemoryManager | _EphemeralMemory
 
 
 # ---------------------------------------------------------------------------
@@ -245,13 +267,12 @@ class Planner:
         """Return an ordered list of SubTasks for the given task."""
         agent_names = [a.name for a in agents]
 
-        # Ask the model to propose a plan.
         raw_plan = self._runtime.infer(
             system  = self._system_prompt(agent_names),
             prompt  = self._user_prompt(task),
         )
 
-        subtasks = self._parse_plan(task.task_id, raw_plan, agents, task.context)
+        subtasks = self._parse_plan(task.task_id, raw_plan, agents)
         if not subtasks:
             logger.warning("Planner produced no subtasks; falling back to single-agent plan.")
             subtasks = self._fallback_plan(task, agents)
@@ -292,10 +313,9 @@ class Planner:
 
     @staticmethod
     def _parse_plan(
-        task_id:      str,
-        raw:          str,
-        agents:       list[AgentInterface],
-        task_context: dict[str, Any] = {},
+        task_id: str,
+        raw:     str,
+        agents:  list[AgentInterface],
     ) -> list[SubTask]:
         import json, re
         agent_map = {a.name: a for a in agents}
@@ -310,14 +330,11 @@ class Planner:
                 if agent_name not in agent_map:
                     logger.warning("Planner referenced unknown agent '%s'; skipping.", agent_name)
                     continue
-                # Merge task-level context (raw_path, wiki_dir, etc.) with any
-                # per-step context the model supplies.  Model values win on conflict.
-                merged_context = {**task_context, **step.get("context", {})}
                 subtasks.append(SubTask(
                     subtask_id  = f"{task_id}-{i}",
                     agent_name  = agent_name,
                     instruction = step.get("instruction", ""),
-                    context     = merged_context,
+                    context     = step.get("context", {}),
                 ))
             return subtasks
         except Exception as exc:
@@ -327,8 +344,6 @@ class Planner:
     @staticmethod
     def _fallback_plan(task: Task, agents: list[AgentInterface]) -> list[SubTask]:
         """Route to research_agent by preference, then first can_handle() match."""
-        # Prefer research_agent as the safe fallback — it handles open-ended
-        # instructions without requiring context keys that wiki_agent needs.
         for agent in agents:
             if agent.name == "research_agent":
                 return [SubTask(
@@ -337,7 +352,6 @@ class Planner:
                     instruction = task.instruction,
                     context     = task.context,
                 )]
-        # Then try can_handle() routing
         for agent in agents:
             if agent.can_handle(task.instruction):
                 return [SubTask(
@@ -346,7 +360,6 @@ class Planner:
                     instruction = task.instruction,
                     context     = task.context,
                 )]
-        # Last resort: first registered agent
         if agents:
             return [SubTask(
                 subtask_id  = f"{task.task_id}-0",
@@ -374,7 +387,7 @@ class Synthesizer:
         self,
         task:    Task,
         results: list[AgentResult],
-        memory:  MemoryManager,
+        memory:  _AnyMemory,
     ) -> ControllerResult:
         """Produce the final ControllerResult from all collected AgentResults."""
 
@@ -396,8 +409,9 @@ class Synthesizer:
                 error   = f"All sub-agents failed: {errors}",
             )
 
-        context_str  = memory.format_for_prompt()
-        results_str  = self._format_results(results)
+        # Both MemoryManager and _EphemeralMemory accept task_id as a kwarg.
+        context_str = memory.format_for_prompt(task_id=task.task_id)
+        results_str = self._format_results(results)
 
         answer = self._runtime.infer(
             system = (
@@ -484,7 +498,6 @@ class IntentClassifier:
                 temperature = 0.0,
             ).strip().lower()
 
-            # Accept the first word in case the model adds punctuation
             first_word = raw.split()[0].rstrip(".,!") if raw else ""
             if first_word in {"conversational", "research", "ingest"}:
                 logger.info(
@@ -537,8 +550,6 @@ class ConversationalAgent:
         return "conversational_agent"
 
     def can_handle(self, instruction: str) -> bool:
-        # Always False — the Planner must never route here.
-        # Routing is done exclusively via IntentClassifier in _execute().
         return False
 
     def run(self, subtask: SubTask) -> AgentResult:
@@ -572,6 +583,11 @@ class ConversationalAgent:
             output     = {"answer": answer, "sources": []},
         )
 
+
+# ---------------------------------------------------------------------------
+# ControllerAgent
+# ---------------------------------------------------------------------------
+
 class ControllerAgent:
     """
     The executive function of the LORA system.
@@ -579,14 +595,28 @@ class ControllerAgent:
     FastAPI instantiates one ControllerAgent at startup and calls
     ``handle_task(task_dict)`` for every incoming request.
 
+    Parameters
+    ----------
+    runtime :
+        RuntimeClient used for planning, synthesis, classification, and
+        conversational turns.
+    agents :
+        Sub-agents to register.  Each must satisfy AgentInterface.
+    memory_manager :
+        Optional SQLite-backed MemoryManager from memory_manager.py.
+        When supplied, all conversation-log writes persist across requests
+        and process restarts.  When absent, an _EphemeralMemory shim is
+        used — identical API, zero persistence.
+
     This class does not know about HTTP, request/response objects,
     streaming, or the Svelte UI.  It is a pure Python reasoning coordinator.
     """
 
     def __init__(
         self,
-        runtime: RuntimeClient,
-        agents:  list[AgentInterface],
+        runtime:        RuntimeClient,
+        agents:         list[AgentInterface],
+        memory_manager: "MemoryManager | None" = None,
     ) -> None:
         self._runtime              = runtime
         self._agents               = {a.name: a for a in agents}
@@ -594,9 +624,19 @@ class ControllerAgent:
         self._synthesizer          = Synthesizer(runtime)
         self._classifier           = IntentClassifier(runtime)
         self._conversational_agent = ConversationalAgent(runtime)
+        self._memory_manager       = memory_manager   # None → use ephemeral shim per request
 
         if not agents:
             logger.warning("ControllerAgent initialized with no sub-agents.")
+
+        if memory_manager is not None:
+            logger.info(
+                "ControllerAgent: using persistent MemoryManager (%r).", memory_manager
+            )
+        else:
+            logger.info(
+                "ControllerAgent: no MemoryManager supplied — using ephemeral memory per request."
+            )
 
     # -----------------------------------------------------------------------
     # Public API (called by FastAPI)
@@ -628,8 +668,14 @@ class ControllerAgent:
 
         logger.info("Controller received task %s: '%s'", task.task_id, task.instruction[:80])
 
-        memory = MemoryManager()
-        memory.add("user", task.instruction, metadata={"task_id": task.task_id})
+        # Use the persistent manager if available; otherwise a fresh ephemeral shim.
+        memory: _AnyMemory = self._memory_manager or _EphemeralMemory()
+        memory.add(
+            "user",
+            task.instruction,
+            metadata={"task_id": task.task_id},
+            task_id=task.task_id,
+        )
 
         try:
             result = self._execute(task, memory)
@@ -654,13 +700,12 @@ class ControllerAgent:
     # Internal execution pipeline
     # -----------------------------------------------------------------------
 
-    def _execute(self, task: Task, memory: MemoryManager) -> ControllerResult:
+    def _execute(self, task: Task, memory: _AnyMemory) -> ControllerResult:
         """Classify intent → route → [Dispatch →] Synthesize."""
 
-        # 0. Classify intent — fast single-token call, always returns a valid bucket
         intent = self._classifier.classify(task.instruction)
 
-        # Conversational shortcut — skip Planner, corpus, and Synthesizer entirely
+        # Conversational shortcut — skip Planner, corpus, and Synthesizer entirely.
         if intent == "conversational":
             logger.info("Intent=conversational — routing direct to ConversationalAgent.")
             subtask = SubTask(
@@ -670,7 +715,7 @@ class ControllerAgent:
                 context     = task.context,
             )
             result = self._conversational_agent.run(subtask)
-            memory.add_agent_result(result)
+            memory.add_agent_result(result, task_id=task.task_id)
             return ControllerResult(
                 task_id  = task.task_id,
                 status   = TaskStatus.COMPLETE,
@@ -679,7 +724,7 @@ class ControllerAgent:
                 metadata = {"intent": intent},
             )
 
-        # Research / ingest — run the full Planner → Dispatch → Synthesize pipeline
+        # Research / ingest — run the full Planner → Dispatch → Synthesize pipeline.
         logger.info("Intent=%s — routing through Planner pipeline.", intent)
         agent_list = list(self._agents.values())
         subtasks   = self._planner.plan(task, agent_list)
@@ -692,16 +737,14 @@ class ControllerAgent:
                 error   = "Planner could not construct a valid execution plan.",
             )
 
-        # 2. Dispatch
-        results = self._dispatch(subtasks, memory)
-
-        # 3. Synthesize
+        results = self._dispatch(subtasks, memory, task.task_id)
         return self._synthesizer.synthesize(task, results, memory)
 
     def _dispatch(
         self,
         subtasks: list[SubTask],
-        memory:   MemoryManager,
+        memory:   _AnyMemory,
+        task_id:  str,
     ) -> list[AgentResult]:
         """
         Execute subtasks in order, feeding each result into memory so that
@@ -735,7 +778,7 @@ class ControllerAgent:
                     error      = str(exc),
                 )
 
-            memory.add_agent_result(result)
+            memory.add_agent_result(result, task_id=task_id)
             results.append(result)
 
         return results
@@ -746,9 +789,6 @@ class ControllerAgent:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # This block exists only to illustrate how FastAPI wires things together.
-    # It is NOT FastAPI code — it shows the pure-Python call pattern.
-
     class _MockRuntime:
         def infer(self, prompt: str, system: str = "", **_) -> str:
             return '[{"agent": "wiki_agent", "instruction": "Look up the topic."}]'
