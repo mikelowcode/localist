@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Node (if frontend exists)
+node_modules/
+
+# ML models
+backend/models/
+*.safetensors
+*.bin
+
+# Hugging Face cache
+huggingface/
+hf_cache/
+.cache/
+
+# macOS junk
+.DS_Store
+
+# Logs
+*.log
+
+# Local runtime artifacts
+lora_memory.db
+backend/models/
