@@ -272,7 +272,7 @@ class Planner:
             prompt  = self._user_prompt(task),
         )
 
-        subtasks = self._parse_plan(task.task_id, raw_plan, agents)
+        subtasks = self._parse_plan(task.task_id, raw_plan, agents, task.context)
         if not subtasks:
             logger.warning("Planner produced no subtasks; falling back to single-agent plan.")
             subtasks = self._fallback_plan(task, agents)
@@ -289,21 +289,19 @@ class Planner:
             "Given a user instruction, output a JSON array of subtasks.\n"
             "Each subtask must have keys: \"agent\" and \"instruction\".\n\n"
             "Available agents and when to use them:\n"
-            "- research_agent : use for questions, research requests, analysis, synthesis,\n"
-            "                   cross-document reasoning, and corpus-wide queries.\n"
-            "- wiki_agent     : use ONLY when the instruction explicitly mentions ingesting,\n"
-            "                   uploading, or adding a specific file to the wiki\n"
-            "                   (must include a file path).\n\n"
+            "- conversational_agent : use for ALL questions, research, analysis, chitchat,\n"
+            "                         and anything the user wants to know or discuss.\n"
+            "                         This is the default agent for every non-ingest task.\n"
+            "- wiki_agent           : use ONLY when the instruction explicitly mentions\n"
+            "                         ingesting, uploading, or adding a specific file to\n"
+            "                         the wiki (must include a file path or file name).\n\n"
             "Rules:\n"
-            "1. For questions and all general research instructions -> use research_agent ONLY.\n"
-            "2. For wiki ingestion tasks that include a file path -> use wiki_agent ONLY.\n"
-            "   DO NOT add research_agent as a follow-on step after wiki_agent.\n"
-            "   The wiki_agent creates the research note itself. Adding research_agent\n"
-            "   is redundant and wrong.\n"
+            "1. For all questions and general instructions -> use conversational_agent ONLY.\n"
+            "2. For wiki ingestion tasks that include a file -> use wiki_agent ONLY.\n"
             "3. Never schedule both agents for the same task. Each task uses exactly one agent.\n"
             "4. Output ONLY the JSON array. No prose, no markdown fences, no commentary.\n\n"
             "Example outputs:\n"
-            "[{\"agent\": \"research_agent\", \"instruction\": \"What do we know about X?\"}]\n"
+            "[{\"agent\": \"conversational_agent\", \"instruction\": \"What do we know about X?\"}]\n"
             "[{\"agent\": \"wiki_agent\", \"instruction\": \"Ingest /path/to/file.md\"}]\n"
         )
 
@@ -313,9 +311,10 @@ class Planner:
 
     @staticmethod
     def _parse_plan(
-        task_id: str,
-        raw:     str,
-        agents:  list[AgentInterface],
+        task_id:      str,
+        raw:          str,
+        agents:       list[AgentInterface],
+        task_context: dict[str, Any] = {},
     ) -> list[SubTask]:
         import json, re
         agent_map = {a.name: a for a in agents}
@@ -330,11 +329,16 @@ class Planner:
                 if agent_name not in agent_map:
                     logger.warning("Planner referenced unknown agent '%s'; skipping.", agent_name)
                     continue
+                # Merge task_context (raw_path, wiki_dir, schema_path, etc.) with
+                # any context the model chose to emit.  Model-supplied keys win so
+                # the Planner can in principle override defaults, but in practice
+                # the model never emits a context key — task_context carries everything.
+                merged_context = {**task_context, **step.get("context", {})}
                 subtasks.append(SubTask(
                     subtask_id  = f"{task_id}-{i}",
                     agent_name  = agent_name,
                     instruction = step.get("instruction", ""),
-                    context     = step.get("context", {}),
+                    context     = merged_context,
                 ))
             return subtasks
         except Exception as exc:
@@ -343,9 +347,9 @@ class Planner:
 
     @staticmethod
     def _fallback_plan(task: Task, agents: list[AgentInterface]) -> list[SubTask]:
-        """Route to research_agent by preference, then first can_handle() match."""
+        """Route to conversational_agent by preference, then first can_handle() match."""
         for agent in agents:
-            if agent.name == "research_agent":
+            if agent.name == "conversational_agent":
                 return [SubTask(
                     subtask_id  = f"{task.task_id}-0",
                     agent_name  = agent.name,
@@ -461,35 +465,38 @@ class Synthesizer:
 
 class IntentClassifier:
     """
-    Classifies a user instruction into one of three buckets before planning.
+    Classifies a user instruction into one of two buckets before routing.
 
     Buckets
     -------
-    conversational  — greetings, chitchat, meta questions about the system
-    research        — questions, analysis, synthesis, anything needing lookup
-    ingest          — explicit requests to add/upload a specific file to the wiki
+    query   — anything the user wants to know, understand, or discuss.
+              Routes to ConversationalAgent (corpus RAG + single inference).
+    ingest  — explicit requests to add/upload a specific file to the wiki.
+              Routes to WikiAgent via the Planner.
 
     One fast model call with a constrained output format.  Falls back to
-    "research" on any parse failure so the pipeline always continues.
+    "query" on any parse failure so the pipeline always continues.
+
+    Note: the former "conversational" and "research" buckets have been merged
+    into "query".  ConversationalAgent now handles both chitchat and deep
+    factual questions via corpus-grounded inference.
     """
 
     _SYSTEM = (
         "You are an intent classifier for a local research agent system. "
         "Classify the user instruction into exactly one of these categories:\n"
-        "  conversational — greetings, small talk, meta questions "
-        "(e.g. 'hello', 'how are you', 'what can you do')\n"
-        "  research       — questions, analysis, research requests, "
-        "anything that needs looking up\n"
-        "  ingest         — explicit requests to add, upload, or ingest "
+        "  query  — questions, research, analysis, chitchat, "
+        "anything the user wants to know or discuss\n"
+        "  ingest — explicit requests to add, upload, or ingest "
         "a specific file into the wiki\n\n"
-        "Output ONLY one word: conversational, research, or ingest. Nothing else."
+        "Output ONLY one word: query or ingest. Nothing else."
     )
 
     def __init__(self, runtime: RuntimeClient) -> None:
         self._runtime = runtime
 
     def classify(self, instruction: str) -> str:
-        """Return 'conversational', 'research', or 'ingest'.  Never raises."""
+        """Return 'query' or 'ingest'.  Never raises."""
         try:
             raw = self._runtime.infer(
                 system      = self._SYSTEM,
@@ -499,89 +506,18 @@ class IntentClassifier:
             ).strip().lower()
 
             first_word = raw.split()[0].rstrip(".,!") if raw else ""
-            if first_word in {"conversational", "research", "ingest"}:
+            if first_word in {"query", "ingest"}:
                 logger.info(
                     "IntentClassifier: '%s' → %s", instruction[:60], first_word
                 )
                 return first_word
         except Exception as exc:
             logger.warning(
-                "IntentClassifier failed (%s); defaulting to research.", exc
+                "IntentClassifier failed (%s); defaulting to query.", exc
             )
 
-        logger.info("IntentClassifier: unrecognised output, defaulting to research.")
-        return "research"
-
-
-# ---------------------------------------------------------------------------
-# Conversational agent
-# ---------------------------------------------------------------------------
-
-class ConversationalAgent:
-    """
-    Fast-path agent for natural-language chat.
-
-    Bypasses the Planner, corpus, embeddings, and Synthesizer entirely.
-    Satisfies AgentInterface so it can be called uniformly by _execute(),
-    but can_handle() always returns False — routing is exclusively by
-    IntentClassifier, never by the Planner's fallback logic.
-
-    Output contract
-    ---------------
-    AgentResult.output["answer"] is a single plain-text paragraph.
-    Never JSON, never a list, never a code block.
-    """
-
-    _SYSTEM = (
-        "You are LORA, a helpful local research assistant. "
-        "Respond naturally and concisely to the user's message in plain text only. "
-        "Write a single short paragraph — two to four sentences at most. "
-        "Be warm, direct, and helpful. "
-        "Do not output JSON, XML, bullet lists, numbered lists, or code blocks. "
-        "Do not reference tools, agents, internal system details, or file paths. "
-        "Do not start your reply with a label, heading, or role description."
-    )
-
-    def __init__(self, runtime: RuntimeClient) -> None:
-        self._runtime = runtime
-
-    @property
-    def name(self) -> str:
-        return "conversational_agent"
-
-    def can_handle(self, instruction: str) -> bool:
-        return False
-
-    def run(self, subtask: SubTask) -> AgentResult:
-        """
-        Handle a conversational turn with a single low-token model call.
-
-        No corpus access.  No embeddings.  No file I/O.
-        max_tokens and temperature are intentionally small — fast path.
-        """
-        ctx         = subtask.context
-        max_tokens  = int(ctx.get("max_tokens",   256))
-        temperature = float(ctx.get("temperature", 0.7))
-
-        try:
-            answer = self._runtime.infer(
-                system      = self._SYSTEM,
-                prompt      = subtask.instruction,
-                max_tokens  = max_tokens,
-                temperature = temperature,
-            )
-        except Exception as exc:
-            logger.warning(
-                "[conversational_agent] infer() failed (%s); using fallback.", exc
-            )
-            answer = "Hello! I'm LORA, your local research assistant. How can I help?"
-
-        return AgentResult(
-            subtask_id = subtask.subtask_id,
-            agent_name = self.name,
-            status     = TaskStatus.COMPLETE,
-            output     = {"answer": answer, "sources": []},
-        )
+        logger.info("IntentClassifier: unrecognised output, defaulting to query.")
+        return "query"
 
 
 # ---------------------------------------------------------------------------
@@ -618,13 +554,12 @@ class ControllerAgent:
         agents:         list[AgentInterface],
         memory_manager: "MemoryManager | None" = None,
     ) -> None:
-        self._runtime              = runtime
-        self._agents               = {a.name: a for a in agents}
-        self._planner              = Planner(runtime)
-        self._synthesizer          = Synthesizer(runtime)
-        self._classifier           = IntentClassifier(runtime)
-        self._conversational_agent = ConversationalAgent(runtime)
-        self._memory_manager       = memory_manager   # None → use ephemeral shim per request
+        self._runtime        = runtime
+        self._agents         = {a.name: a for a in agents}
+        self._planner        = Planner(runtime)
+        self._synthesizer    = Synthesizer(runtime)
+        self._classifier     = IntentClassifier(runtime)
+        self._memory_manager = memory_manager   # None → use ephemeral shim per request
 
         if not agents:
             logger.warning("ControllerAgent initialized with no sub-agents.")
@@ -701,31 +636,17 @@ class ControllerAgent:
     # -----------------------------------------------------------------------
 
     def _execute(self, task: Task, memory: _AnyMemory) -> ControllerResult:
-        """Classify intent → route → [Dispatch →] Synthesize."""
+        """
+        Classify intent → route via Planner → Dispatch → return.
+
+        query  → ConversationalAgent (corpus RAG, single inference call,
+                 short-circuits the Synthesizer)
+        ingest → WikiAgent via Planner → Synthesizer
+        """
 
         intent = self._classifier.classify(task.instruction)
-
-        # Conversational shortcut — skip Planner, corpus, and Synthesizer entirely.
-        if intent == "conversational":
-            logger.info("Intent=conversational — routing direct to ConversationalAgent.")
-            subtask = SubTask(
-                subtask_id  = f"{task.task_id}-0",
-                agent_name  = self._conversational_agent.name,
-                instruction = task.instruction,
-                context     = task.context,
-            )
-            result = self._conversational_agent.run(subtask)
-            memory.add_agent_result(result, task_id=task.task_id)
-            return ControllerResult(
-                task_id  = task.task_id,
-                status   = TaskStatus.COMPLETE,
-                answer   = result.output.get("answer", ""),
-                sources  = [],
-                metadata = {"intent": intent},
-            )
-
-        # Research / ingest — run the full Planner → Dispatch → Synthesize pipeline.
         logger.info("Intent=%s — routing through Planner pipeline.", intent)
+
         agent_list = list(self._agents.values())
         subtasks   = self._planner.plan(task, agent_list)
 
@@ -738,6 +659,25 @@ class ControllerAgent:
             )
 
         results = self._dispatch(subtasks, memory, task.task_id)
+
+        # For query intent: ConversationalAgent returns a complete answer
+        # directly — no synthesis step needed.
+        if intent == "query" and len(results) == 1:
+            r = results[0]
+            if r.status == TaskStatus.COMPLETE:
+                return ControllerResult(
+                    task_id  = task.task_id,
+                    status   = TaskStatus.COMPLETE,
+                    answer   = r.output.get("answer", ""),
+                    sources  = r.output.get("sources", []),
+                    metadata = {
+                        "intent":   intent,
+                        "grounded": r.output.get("grounded", False),
+                        "agent":    r.agent_name,
+                    },
+                )
+
+        # Ingest (and any failed query) → synthesize
         return self._synthesizer.synthesize(task, results, memory)
 
     def _dispatch(

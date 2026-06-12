@@ -79,9 +79,9 @@ def _make_omlx(kwargs: dict[str, Any]) -> BaseRuntimeClient:
     """Construct an OMLXRuntimeClient from flattened settings kwargs."""
     from omlx_runtime_client import OMLXRuntimeClient
     return OMLXRuntimeClient(
-        chat_model      = kwargs.get("chat_model",      "mlx-community/Phi-4-mini-instruct-4bit"),
-        embedding_model = kwargs.get("embedding_model", "mlx-community/text-embedding-3-small"),
-        base_url        = kwargs.get("omlx_url",        "http://127.0.0.1:8080"),
+        chat_model      = kwargs.get("chat_model",      "gemma-4-e4b-it-4bit"),
+        embedding_model = "",
+        base_url        = kwargs.get("omlx_url",        "http://127.0.0.1:8000"),
         request_timeout = kwargs.get("request_timeout", 30.0),
         stream_timeout  = kwargs.get("stream_timeout",  60.0),
     )

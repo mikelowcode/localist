@@ -11,7 +11,7 @@ Layer placement
 Architectural contract
 ----------------------
 - This is the ONLY module that imports FastAPI, Pydantic, or anything HTTP-related.
-- All agent logic lives in controller_agent.py, wiki_agent.py, research_agent.py.
+- All agent logic lives in controller_agent.py, wiki_agent.py, conversational_agent.py.
 - All model inference flows through the active RuntimeClient.
 - This module constructs the runtime, MemoryManager, agents, and controller
   once at startup and holds them as app-level state.  No singleton is
@@ -48,6 +48,20 @@ Endpoints
       coverage, cache state.  Always HTTP 200 — degraded values are shown
       when the MemoryManager is not initialised.
 
+  GET /files/raw
+      List all .md and .txt files in the raw/ directory.
+
+  GET /files/wiki
+      List all .md files in the wiki/ directory.
+
+  GET /files/content?path=<absolute_path>
+      Return the plain-text content of a file.  Only paths inside raw_dir
+      or wiki_dir are permitted — anything else returns HTTP 403.
+
+  POST /files/upload
+      Accept a multipart .md or .txt file upload and save it to raw/.
+      Immediately indexes the file in MemoryManager.
+
 Running locally
 ---------------
   uvicorn main:app --reload --host 127.0.0.1 --port 8001
@@ -57,29 +71,29 @@ Environment / configuration
 All tuneable values are in the ``Settings`` class (pydantic-settings).  They
 can be overridden via environment variables or a .env file:
 
-  LORA_RUNTIME_BACKEND    Runtime backend: "foundry" | "omlx" (default "foundry")
-  LORA_CHAT_MODEL         Chat model ID (interpreted by the active backend)
-  LORA_EMBEDDING_MODEL    Embedding model ID (interpreted by the active backend)
-  LORA_FOUNDRY_URL        Override auto-resolved Foundry base URL (foundry only)
-  LORA_OMLX_URL           oMLX server base URL (omlx only, default http://localhost:8000)
-  LORA_LOG_LEVEL          Root log level (default INFO)
-  LORA_WIKI_DIR           Absolute path to the wiki directory
-  LORA_RAW_DIR            Absolute path to the raw files directory
-  LORA_SCHEMA_PATH        Absolute path to SCHEMA.md
-  LORA_TEMPLATES_DIR      Absolute path to the templates directory
-  LORA_AUTO_APPLY         Whether WikiAgent writes to disk immediately (bool)
-  LORA_STREAM_TIMEOUT     Streaming timeout in seconds (float)
-  LORA_REQUEST_TIMEOUT    Non-streaming timeout in seconds (float)
-  LORA_MEMORY_DB          Absolute path to the SQLite memory DB file.
-                          Defaults to <project_root>/lora_memory.db
-  LORA_MEMORY_EMBED       Whether to embed documents at startup (bool, default True).
-                          Set False to skip embedding on the initial index pass —
-                          useful when the embedding model is not yet available.
+  LORA_RUNTIME_BACKEND             Runtime backend: "foundry" | "omlx" (default "foundry")
+  LORA_CHAT_MODEL                  Chat model ID (interpreted by the active backend)
+  LORA_FOUNDRY_URL                 Override auto-resolved Foundry base URL (foundry only)
+  LORA_OMLX_URL                    oMLX server base URL (omlx only, default http://localhost:8000)
+  LORA_LOG_LEVEL                   Root log level (default INFO)
+  LORA_WIKI_DIR                    Absolute path to the wiki directory
+  LORA_RAW_DIR                     Absolute path to the raw files directory
+  LORA_SCHEMA_PATH                 Absolute path to SCHEMA.md
+  LORA_TEMPLATES_DIR               Absolute path to the templates directory
+  LORA_AUTO_APPLY                  Whether WikiAgent writes to disk immediately (bool)
+  LORA_STREAM_TIMEOUT              Streaming timeout in seconds (float)
+  LORA_REQUEST_TIMEOUT             Non-streaming timeout in seconds (float)
+  LORA_MEMORY_DB                   Absolute path to the SQLite memory DB file.
+                                   Defaults to <project_root>/lora_memory.db
+  LORA_EMBEDDING_ENGINE_ENABLED    Load the standalone MLX-LM EmbeddingEngine at
+                                   startup (bool, default True).  Set False to run
+                                   in keyword-only mode without loading the model.
 """
 
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import uuid
@@ -87,7 +101,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -99,8 +113,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from base_runtime_client import BaseRuntimeClient
 from controller_agent import ControllerAgent
+from conversational_agent import ConversationalAgent
+from embedding_engine import EmbeddingEngine
 from memory_manager import MemoryManager
-from research_agent import ResearchAgent
 from runtime_factory import create_runtime
 from wiki_agent import WikiAgent
 
@@ -118,9 +133,9 @@ class Settings(BaseSettings):
     # Runtime backend selection
     runtime_backend: str = "foundry"
 
-    # Model IDs — interpreted by the active backend
+    # Model ID — chat only; embeddings are handled by EmbeddingEngine (MLX-LM),
+    # not by the runtime backend.
     chat_model:       str = "Phi-4-mini-instruct-generic-gpu:5"
-    embedding_model:  str = "text-embedding-3-small"
 
     # Foundry network (foundry backend only)
     foundry_url:      str | None = None
@@ -139,8 +154,11 @@ class Settings(BaseSettings):
     templates_dir:   str | None = None
 
     # MemoryManager
-    memory_db:       str | None = None   # None → <project_root>/lora_memory.db
-    memory_embed:    bool = True          # embed documents during startup index pass
+    memory_db:                str | None = None   # None → <project_root>/lora_memory.db
+
+    # EmbeddingEngine — standalone MLX-LM embedding, backend-agnostic.
+    # Set False to skip model load and run MemoryManager in keyword-only mode.
+    embedding_engine_enabled: bool = True
 
     # Agent behaviour
     auto_apply:      bool = False
@@ -157,10 +175,16 @@ class AppState:
     """Holds singletons that live for the lifetime of the process."""
 
     def __init__(self) -> None:
-        self.runtime:        BaseRuntimeClient | None = None
-        self.controller:     ControllerAgent   | None = None
-        self.memory_manager: MemoryManager     | None = None
-        self.settings:       Settings          | None = None
+        self.runtime:           BaseRuntimeClient | None = None
+        self.controller:        ControllerAgent   | None = None
+        self.memory_manager:    MemoryManager     | None = None
+        self.embedding_engine:  EmbeddingEngine   | None = None
+        self.settings:          Settings          | None = None
+        # Resolved at startup by lifespan()
+        self.wiki_dir:          Path | None = None
+        self.raw_dir:           Path | None = None
+        self.schema_path:       Path | None = None
+        self.templates_dir:     Path | None = None
 
 
 _state = AppState()
@@ -194,7 +218,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     runtime = create_runtime(
         backend         = settings.runtime_backend,
         chat_model      = settings.chat_model,
-        embedding_model = settings.embedding_model,
         foundry_url     = settings.foundry_url,
         omlx_url        = settings.omlx_url,
         request_timeout = settings.request_timeout,
@@ -227,24 +250,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     templates_dir = Path(settings.templates_dir) if settings.templates_dir else project_root / "templates"
     memory_db     = Path(settings.memory_db)     if settings.memory_db     else project_root / "lora_memory.db"
 
-    # -- MemoryManager -------------------------------------------------------
+    # -- EmbeddingEngine (standalone MLX-LM, backend-agnostic) ---------------
     #
-    # The embed_fn passed to MemoryManager is runtime.embed when the runtime
-    # has an embedding model configured and reachable.  If embed() would raise
-    # NotImplementedError (oMLX without an embedding model loaded) or if the
-    # runtime is unreachable, we pass None so MemoryManager falls back to
-    # keyword-only retrieval without surfacing errors at startup.
+    # Embeddings are now independent of the runtime backend.  EmbeddingEngine
+    # loads mlx-community/embeddinggemma-300m-4bit via mlx_lm at startup.
+    # On failure it logs a warning and sets available=False — MemoryManager
+    # then falls back to keyword-only retrieval without surfacing errors.
 
     embed_fn = None
-    if settings.memory_embed and health.get("embed_model_found"):
-        embed_fn = runtime.embed
-        logger.info("MemoryManager: embedding enabled via %s.", settings.runtime_backend)
+    if settings.embedding_engine_enabled:
+        embedding_engine = EmbeddingEngine()
+        _state.embedding_engine = embedding_engine
+        if embedding_engine.available:
+            embed_fn = embedding_engine.embed
+            logger.info("EmbeddingEngine ready — embeddings enabled.")
+        else:
+            logger.warning(
+                "EmbeddingEngine failed to load — MemoryManager will run "
+                "in keyword-only mode.  Install mlx-lm and retry."
+            )
     else:
         logger.info(
-            "MemoryManager: embedding disabled at startup "
-            "(memory_embed=%s  embed_model_found=%s).",
-            settings.memory_embed,
-            health.get("embed_model_found"),
+            "EmbeddingEngine disabled (LORA_EMBEDDING_ENGINE_ENABLED=false) — "
+            "MemoryManager will run in keyword-only mode."
         )
 
     memory_manager = MemoryManager(db_path=memory_db, embed_fn=embed_fn)
@@ -255,13 +283,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # This ensures the index is always current even after pages were written
     # while the server was down.
     if wiki_dir.exists():
-        n_wiki = memory_manager.index_directory(wiki_dir, doc_type="wiki", embed=settings.memory_embed)
+        n_wiki = memory_manager.index_directory(wiki_dir, doc_type="wiki", embed=bool(embed_fn))
         logger.info("MemoryManager: indexed %d wiki pages from %s.", n_wiki, wiki_dir)
     else:
         logger.warning("MemoryManager: wiki_dir does not exist yet (%s) — skipping seed.", wiki_dir)
 
     if raw_dir.exists():
-        n_raw = memory_manager.index_directory(raw_dir, doc_type="raw", embed=settings.memory_embed)
+        n_raw = memory_manager.index_directory(raw_dir, doc_type="raw", embed=bool(embed_fn))
         logger.info("MemoryManager: indexed %d raw files from %s.", n_raw, raw_dir)
     else:
         logger.info("MemoryManager: raw_dir does not exist yet (%s) — skipping seed.", raw_dir)
@@ -280,10 +308,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         project_root   = project_root,
         memory_manager = memory_manager,
     )
-    research_agent = ResearchAgent(
+    conversational_agent = ConversationalAgent(
         runtime        = runtime,
-        project_root   = project_root,
         memory_manager = memory_manager,
+        project_root   = project_root,
     )
 
     # -- Store resolved paths in state so endpoints can inject them ----------
@@ -297,14 +325,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     controller = ControllerAgent(
         runtime        = runtime,
-        agents         = [wiki_agent, research_agent],
+        agents         = [wiki_agent, conversational_agent],
         memory_manager = memory_manager,
     )
     _state.controller = controller
 
     logger.info(
         "ControllerAgent ready — agents: %s",
-        [wiki_agent.name, research_agent.name],
+        [wiki_agent.name, conversational_agent.name],
     )
 
     yield  # — application runs —
@@ -318,8 +346,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title       = "LORA — Local Reasoning Agent",
-    description = "Multi-agent research system with persistent SQLite memory.",
-    version     = "0.2.0",
+    description = "Multi-agent research system — WikiAgent + corpus-aware ConversationalAgent (RAG).",
+    version     = "0.4.0",
     lifespan    = lifespan,
 )
 
@@ -397,6 +425,26 @@ class MemoryStatsResponse(BaseModel):
     available:        bool   # False when MemoryManager is not initialised
 
 
+class FileEntry(BaseModel):
+    """Metadata for a single file in raw/ or wiki/."""
+    name:     str    # stem without extension
+    filename: str    # filename with extension, e.g. "my-doc.md"
+    path:     str    # absolute path — passed as context.raw_path on ingest
+    size:     int    # bytes
+    modified: str    # ISO-8601 UTC timestamp
+
+
+class FilesResponse(BaseModel):
+    """Response body for GET /files/raw and GET /files/wiki."""
+    files: list[FileEntry]
+
+
+class FileContentResponse(BaseModel):
+    """Response body for GET /files/content."""
+    path:    str
+    content: str
+
+
 # ---------------------------------------------------------------------------
 # Dependency helpers
 # ---------------------------------------------------------------------------
@@ -420,13 +468,13 @@ def _enrich_context(context: dict[str, Any]) -> dict[str, Any]:
     """
     defaults: dict[str, Any] = {}
 
-    if hasattr(_state, "wiki_dir") and _state.wiki_dir:
+    if _state.wiki_dir:
         defaults["wiki_dir"] = str(_state.wiki_dir)
-    if hasattr(_state, "raw_dir") and _state.raw_dir:
+    if _state.raw_dir:
         defaults["raw_dir"] = str(_state.raw_dir)
-    if hasattr(_state, "schema_path") and _state.schema_path:
+    if _state.schema_path:
         defaults["schema_path"] = str(_state.schema_path)
-    if hasattr(_state, "templates_dir") and _state.templates_dir:
+    if _state.templates_dir:
         defaults["templates_dir"] = str(_state.templates_dir)
     if _state.settings:
         defaults["auto_apply"] = _state.settings.auto_apply
@@ -520,13 +568,18 @@ async def get_health() -> HealthResponse:
     runtime = _require_runtime()
     raw: dict[str, Any] = await asyncio.to_thread(runtime.health_check)
 
+    # Embedding availability is now independent of the runtime backend —
+    # it comes from EmbeddingEngine (MLX-LM), not from oMLX's model list.
+    embedding_engine = _state.embedding_engine
+    embed_available  = embedding_engine is not None and embedding_engine.available
+
     return HealthResponse(
         healthy           = bool(raw.get("reachable") and raw.get("chat_model_found")),
         reachable         = bool(raw.get("reachable", False)),
         base_url          = str(raw.get("base_url", "")),
         models            = raw.get("models", []),
         chat_model_found  = bool(raw.get("chat_model_found", False)),
-        embed_model_found = bool(raw.get("embed_model_found") or False),
+        embed_model_found = embed_available,
         error             = raw.get("error"),
     )
 
@@ -581,6 +634,156 @@ async def get_memory_stats() -> MemoryStatsResponse:
         available      = True,
     )
 
+
+
+
+# ---------------------------------------------------------------------------
+# File management endpoints
+# ---------------------------------------------------------------------------
+
+def _file_entry(p: "Path") -> FileEntry:
+    """Build a FileEntry from a Path."""
+    stat = p.stat()
+    return FileEntry(
+        name     = p.stem,
+        filename = p.name,
+        path     = str(p.resolve()),
+        size     = stat.st_size,
+        modified = datetime.datetime.fromtimestamp(
+            stat.st_mtime, tz=datetime.timezone.utc
+        ).isoformat(),
+    )
+
+
+@app.get(
+    "/files/raw",
+    response_model = FilesResponse,
+    summary        = "List raw files",
+)
+async def get_files_raw() -> FilesResponse:
+    """Return metadata for every .md and .txt file in the raw/ directory."""
+    if _state.raw_dir is None:
+        raise HTTPException(status_code=503, detail="raw_dir not configured.")
+    raw_dir = _state.raw_dir
+    if not raw_dir.exists():
+        return FilesResponse(files=[])
+    files = [
+        _file_entry(p)
+        for p in sorted(raw_dir.iterdir())
+        if p.is_file() and p.suffix.lower() in {".md", ".txt"}
+    ]
+    return FilesResponse(files=files)
+
+
+@app.get(
+    "/files/wiki",
+    response_model = FilesResponse,
+    summary        = "List wiki pages",
+)
+async def get_files_wiki() -> FilesResponse:
+    """Return metadata for every .md file in the wiki/ directory."""
+    if _state.wiki_dir is None:
+        raise HTTPException(status_code=503, detail="wiki_dir not configured.")
+    wiki_dir = _state.wiki_dir
+    if not wiki_dir.exists():
+        return FilesResponse(files=[])
+    files = [
+        _file_entry(p)
+        for p in sorted(wiki_dir.iterdir())
+        if p.is_file() and p.suffix == ".md"
+    ]
+    return FilesResponse(files=files)
+
+
+@app.get(
+    "/files/content",
+    response_model = FileContentResponse,
+    summary        = "Read file content",
+)
+async def get_file_content(path: str) -> FileContentResponse:
+    """
+    Return the plain-text content of a file by absolute path.
+
+    Only paths inside raw_dir or wiki_dir are permitted — anything else
+    returns HTTP 403.
+    """
+    if _state.raw_dir is None or _state.wiki_dir is None:
+        raise HTTPException(status_code=503, detail="Directories not configured.")
+
+    target = Path(path).resolve()
+    allowed_roots = [
+        _state.raw_dir.resolve(),
+        _state.wiki_dir.resolve(),
+    ]
+    if not any(str(target).startswith(str(root)) for root in allowed_roots):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: path is outside permitted directories.",
+        )
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+
+    try:
+        content = await asyncio.to_thread(target.read_text, "utf-8")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read file: {exc}") from exc
+
+    return FileContentResponse(path=str(target), content=content)
+
+
+@app.post(
+    "/files/upload",
+    response_model = FileEntry,
+    summary        = "Upload a raw file",
+)
+async def post_file_upload(file: UploadFile = File(...)) -> FileEntry:
+    """
+    Accept a multipart file upload and save it to raw/.
+
+    Only .md and .txt files are accepted.  If a file with the same name
+    already exists it is overwritten.  Returns the FileEntry for the
+    saved file.
+    """
+    if _state.raw_dir is None:
+        raise HTTPException(status_code=503, detail="raw_dir not configured.")
+
+    filename = file.filename or "upload.md"
+    suffix   = Path(filename).suffix.lower()
+    if suffix not in {".md", ".txt"}:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Only .md and .txt files are accepted, got: {suffix}",
+        )
+
+    raw_dir = _state.raw_dir
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    dest = raw_dir / filename
+
+    try:
+        contents = await file.read()
+        await asyncio.to_thread(dest.write_bytes, contents)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {exc}") from exc
+    finally:
+        await file.close()
+
+    # Index the newly uploaded file immediately so ConversationalAgent can find it
+    # without waiting for the next server restart seed pass.
+    if _state.memory_manager is not None:
+        try:
+            await asyncio.to_thread(
+                _state.memory_manager.index_document,
+                dest,
+                "raw",
+                None,
+                False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "MemoryManager.index_document failed for upload %s: %s", filename, exc
+            )
+
+    return _file_entry(dest)
 
 # ---------------------------------------------------------------------------
 # SSE streaming helper
