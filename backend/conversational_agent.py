@@ -67,6 +67,8 @@ import logging
 import os
 from typing import Any
 
+from prompt_builder import PromptBuilder, RagSource
+
 logger = logging.getLogger(__name__)
 
 
@@ -86,42 +88,12 @@ _INGEST_KEYWORDS: frozenset[str] = frozenset({
 # Prompts
 # ---------------------------------------------------------------------------
 
-_DEFAULT_SYSTEM = """\
-You are LORA, a local research assistant with access to a structured wiki corpus.
-
-Your job is to answer the user's question accurately. Follow these rules:
-
-- Answer directly. Do not open with "Based on the context..." or similar.
-- Use the wiki context ONLY if it directly addresses the question being asked.
-  If the wiki context is about a different topic, ignore it entirely and answer
-  from your own knowledge.
-- When using the wiki, cite pages inline (e.g. "According to the Build Order page, …").
-- If the question is general knowledge unrelated to the LORA project, answer
-  from your own knowledge without referencing the wiki at all.
-- Never fabricate project-specific details not present in the context.
-- Be concise. Aim for 100–300 words unless the question clearly requires more.
-- Plain prose only. No JSON, no XML, no code blocks unless explicitly requested.
-"""
-
-# Injected before the user question when corpus results are available.
-_CONTEXT_BLOCK = """\
-## Wiki Context
-
-{entries}
----
-
-"""
-
-_CONTEXT_ENTRY = """\
-### {title}  ({doc_type})
-
-{snippet}
-"""
-
 # Characters of each document's content to include in the prompt.
 # 2000 chars × 4 docs ≈ 8000 chars of context — comfortable for
 # gemma-4-e4b-it-4bit alongside a system prompt.
 _MAX_SNIPPET_CHARS = 2000
+
+_PROMPT_BUILDER = PromptBuilder()
 
 
 # ---------------------------------------------------------------------------
@@ -193,12 +165,55 @@ class ConversationalAgent:
         max_tokens     = int(context.get("max_tokens",   1024))
         temperature    = float(context.get("temperature",  0.3))
         max_results    = int(context.get("max_results",   4))
-        system         = str(context.get("system", _DEFAULT_SYSTEM))
+        system         = str(context.get("system", PromptBuilder._SYSTEM))
 
         logger.info(
             "ConversationalAgent.run() — subtask=%s  chars=%d  max_results=%d",
             subtask.subtask_id, len(instruction), max_results,
         )
+
+        # -- Prebuilt prompt passthrough (Phase 4 controller integration) --------
+        # When the controller has pre-assembled a full 6-slot prompt via
+        # PromptBuilder, it passes it here. Skip internal RAG and prompt
+        # assembly entirely — use the prebuilt prompt directly.
+        prebuilt_prompt  = context.get("_prebuilt_prompt")
+        prebuilt_system  = context.get("_prebuilt_system")
+
+        if prebuilt_prompt is not None:
+            logger.debug(
+                "ConversationalAgent: using prebuilt prompt from controller "
+                "(chars=%d).", len(prebuilt_prompt),
+            )
+            try:
+                answer = self._runtime.infer(
+                    prompt      = prebuilt_prompt,
+                    system      = prebuilt_system or system,
+                    max_tokens  = max_tokens,
+                    temperature = temperature,
+                )
+            except Exception as exc:
+                logger.error(
+                    "ConversationalAgent: inference failed (prebuilt path) "
+                    "for subtask %s: %s", subtask.subtask_id, exc,
+                )
+                return AgentResult(
+                    subtask_id = subtask.subtask_id,
+                    agent_name = self.name,
+                    status     = TaskStatus.FAILED,
+                    output     = {},
+                    error      = f"Inference error: {exc}",
+                )
+            return AgentResult(
+                subtask_id = subtask.subtask_id,
+                agent_name = self.name,
+                status     = TaskStatus.COMPLETE,
+                output     = {
+                    "answer":   answer,
+                    "sources":  [],     # sources are in the prompt; not re-parsed here
+                    "grounded": bool(context.get("_routing", {}).get("fetch_rag")),
+                },
+            )
+        # -- End prebuilt prompt passthrough ------------------------------------
 
         # -- Step 2: Corpus retrieval (wiki-first) ---------------------------
         #
@@ -214,7 +229,6 @@ class ConversationalAgent:
         # "LORA Master Project Outline.md" (raw) are returned for the same
         # query, wasting context window space on identical material.
 
-        context_block = ""
         sources:  list[str] = []
         grounded: bool      = False
         results:  list[Any] = []
@@ -256,21 +270,9 @@ class ConversationalAgent:
                     )
 
                 if results:
-                    entries = []
                     for doc in results:
-                        title   = _path_to_title(str(doc.path))
-                        snippet = doc.content[:_MAX_SNIPPET_CHARS]
-                        if len(doc.content) > _MAX_SNIPPET_CHARS:
-                            snippet += "\n… [truncated]"
-                        entries.append(_CONTEXT_ENTRY.format(
-                            title    = title,
-                            doc_type = doc.doc_type,
-                            snippet  = snippet,
-                        ))
                         sources.append(str(doc.path))
-
-                    context_block = _CONTEXT_BLOCK.format(entries="\n".join(entries))
-                    grounded      = True
+                    grounded = True
                     logger.debug(
                         "Corpus: %d doc(s) injected — %s",
                         len(sources), [os.path.basename(s) for s in sources],
@@ -288,11 +290,16 @@ class ConversationalAgent:
                     "proceeding without context.", exc,
                 )
 
-        # -- Step 3: Assemble prompt -----------------------------------------
-        if context_block:
-            prompt = f"{context_block}## Question\n\n{instruction}"
-        else:
-            prompt = instruction
+        # -- Step 3: Assemble prompt via PromptBuilder -----------------------
+        rag_sources = (
+            [RagSource(path=str(doc.path), content=doc.content[:_MAX_SNIPPET_CHARS])
+             for doc in results]
+            if results else None
+        )
+        system, prompt = _PROMPT_BUILDER.build(
+            instruction  = instruction,
+            rag_snippets = rag_sources,
+        )
 
         # -- Step 4: Inference -----------------------------------------------
         try:

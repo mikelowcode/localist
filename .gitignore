@@ -1,34 +1,93 @@
+# -------------------------
 # Python
+# -------------------------
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.sqlite3
+*.db
+*.log
 
 # Virtual environments
 .venv/
 env/
 venv/
 
-# Node (if frontend exists)
+# -------------------------
+# Node / Frontend
+# -------------------------
 node_modules/
+lora-ui/node_modules/
+lora-ui/.svelte-kit/
+lora-ui/build/
+lora-ui/.vite/
 
-# ML models
+# -------------------------
+# ML models & embeddings
+# -------------------------
 backend/models/
 *.safetensors
 *.bin
+backend/embedding_cache/
+backend/embedding_engine_cache/
+backend/backfill_embeddings_output/
 
+# -------------------------
 # Hugging Face cache
+# -------------------------
 huggingface/
 hf_cache/
 .cache/
 
+# -------------------------
 # macOS junk
+# -------------------------
 .DS_Store
 
-# Logs
-*.log
-
+# -------------------------
 # Local runtime artifacts
+# -------------------------
 lora_memory.db
-backend/models/
+memory.db
+*.sqlite
+*.sqlite3
+
+# Persona and cognitive substrate
+backend/wiki/persona.md
+backend/wiki/raw/
+backend/wiki/tmp/
+backend/wiki_agent_output/
+
+# Episodic memory + logs
+backend/logs/
+backend/agents/**/logs/
+backend/episodic_extractor_output/
+backend/episodic_memory_cache/
+
+# Prompt builder scratch files
+backend/prompt_builder_cache/
+backend/prompt_debug/
+
+# -------------------------
+# Tests (keep definitions, ignore outputs)
+# -------------------------
+backend/tests/__pycache__/
+backend/tests/tmp/
+backend/tests/output/
+
+# -------------------------
+# Editor / IDE
+# -------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# -------------------------
+# Environment / Secrets
+# -------------------------
+.env
+.env.*
+*.pem
+*.key

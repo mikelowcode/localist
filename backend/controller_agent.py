@@ -40,7 +40,24 @@ if TYPE_CHECKING:
     # the dependency graph clean.
     from memory_manager import MemoryManager
 
+from planner import Planner as _RulePlanner
+from prompt_builder import PromptBuilder, Turn, EpisodeBullet, RagSource
+from memory_manager import (
+    EpisodicMemoryWriter,
+    EpisodicMemoryReader,
+    format_episodic_summary,
+    EpisodeRecord,
+)
+from episodic_extractor import (
+    process_explicit_signal,
+    process_implicit_extraction,
+)
+from tool_dispatcher import ToolDispatcher
+from prompt_builder import ToolResult as _ToolResult
+
 logger = logging.getLogger(__name__)
+
+_PROMPT_BUILDER = PromptBuilder()
 
 
 # ---------------------------------------------------------------------------
@@ -556,9 +573,9 @@ class ControllerAgent:
     ) -> None:
         self._runtime        = runtime
         self._agents         = {a.name: a for a in agents}
-        self._planner        = Planner(runtime)
+        self._planner        = _RulePlanner(runtime=runtime, memory_manager=memory_manager)
         self._synthesizer    = Synthesizer(runtime)
-        self._classifier     = IntentClassifier(runtime)
+        # IntentClassifier retired — routing is now handled by _RulePlanner
         self._memory_manager = memory_manager   # None → use ephemeral shim per request
 
         if not agents:
@@ -635,34 +652,326 @@ class ControllerAgent:
     # Internal execution pipeline
     # -----------------------------------------------------------------------
 
-    def _execute(self, task: Task, memory: _AnyMemory) -> ControllerResult:
+    def _execute_plan(
+        self,
+        task:   Task,
+        plan:   "RoutingPlan",
+        memory: _AnyMemory,
+    ) -> ControllerResult:
         """
-        Classify intent → route via Planner → Dispatch → return.
+        Execute the 7-step contract from §4.4 of LORA-Architecture.md.
 
-        query  → ConversationalAgent (corpus RAG, single inference call,
-                 short-circuits the Synthesizer)
-        ingest → WikiAgent via Planner → Synthesizer
+        Steps
+        -----
+        1. RoutingPlan already received from Planner (done in _execute).
+        2. If write_episode: run EpisodicMemoryWriter.
+        3. If tools_to_call: stub — logs tool names, does not execute.
+           Full tool dispatch arrives in Phase 6.
+        4. If fetch_rag: run MemoryManager.query_corpus().
+        5. If fetch_episodic: run EpisodicMemoryReader.by_recency().
+        6. Call PromptBuilder.build() with all collected content.
+        7. Pass prebuilt prompt to agent via SubTask.context["_prebuilt_prompt"].
+           Agent short-circuits its own prompt assembly when this key is present.
         """
+        db_path = getattr(self._memory_manager, "_db_path", None)
 
-        intent = self._classifier.classify(task.instruction)
-        logger.info("Intent=%s — routing through Planner pipeline.", intent)
+        # -- Step 2: Episodic write ------------------------------------------
+        if plan.write_episode and db_path is not None:
+            try:
+                extraction = process_explicit_signal(
+                    instruction     = task.instruction,
+                    runtime         = self._runtime,
+                    db_path         = db_path,
+                    task_id         = task.task_id,
+                    project_context = task.context.get("project_context", "general"),
+                )
+                if extraction is not None:
+                    logger.info(
+                        "_execute_plan: explicit episode written — "
+                        "type=%s confidence=%.2f subject=%r.",
+                        extraction.episode_type,
+                        extraction.confidence,
+                        extraction.subject,
+                    )
+                else:
+                    logger.debug(
+                        "_execute_plan: process_explicit_signal returned None "
+                        "(retraction, no signal, or model said NONE)."
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "_execute_plan: episodic write failed (%s) — continuing.", exc
+                )
 
-        agent_list = list(self._agents.values())
-        subtasks   = self._planner.plan(task, agent_list)
+        # -- Pre-step 3: Episodic relevance for compound P3 queries ------------
+        # The Planner's Priority 3 path short-circuits before Priority 5
+        # (episodic relevance). For queries that schedule tool calls we run the
+        # P5 check here so episodic context is fetched alongside tool results.
+        if plan.tools_to_call and not plan.fetch_episodic:
+            try:
+                _ep_raw = self._runtime.infer(
+                    system      = (
+                        "You are a routing classifier. "
+                        "Reply with a single word: yes or no."
+                    ),
+                    prompt      = (
+                        "Does this instruction relate to personal preferences, "
+                        "past corrections, project decisions, or workflow patterns?\n\n"
+                        f"Instruction: {task.instruction}\n\n"
+                        "Answer (yes or no):"
+                    ),
+                    max_tokens  = 10,
+                    temperature = 0.1,
+                )
+                if _ep_raw.strip().lower().startswith("yes"):
+                    plan.fetch_episodic = True
+                    logger.debug(
+                        "_execute_plan: pre-dispatch episodic check → yes; "
+                        "fetch_episodic updated."
+                    )
+            except Exception as _ep_exc:
+                logger.debug(
+                    "_execute_plan: pre-dispatch episodic check failed (%s).",
+                    _ep_exc,
+                )
 
-        if not subtasks:
-            return ControllerResult(
-                task_id = task.task_id,
-                status  = TaskStatus.FAILED,
-                answer  = "",
-                error   = "Planner could not construct a valid execution plan.",
+        # -- Step 3: Tool dispatch ------------------------------------------
+        dispatched_tool_results: list[_ToolResult] = []
+        if plan.tools_to_call:
+            try:
+                dispatcher = ToolDispatcher(
+                    runtime      = self._runtime,
+                    project_root = task.context.get("project_root"),
+                )
+                dispatched_tool_results = dispatcher.dispatch(
+                    tools_to_call = plan.tools_to_call,
+                    instruction   = task.instruction,
+                    context       = task.context,
+                )
+                logger.info(
+                    "_execute_plan: tool dispatch complete — "
+                    "tools=%s results=%d",
+                    plan.tools_to_call,
+                    len(dispatched_tool_results),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "_execute_plan: tool dispatch failed (%s) — "
+                    "continuing without tool results.", exc,
+                )
+
+        # -- Step 4: RAG fetch -----------------------------------------------
+        rag_sources: list[RagSource] = []
+        if plan.fetch_rag and self._memory_manager is not None:
+            try:
+                docs = self._memory_manager.query_corpus(
+                    task.instruction,
+                    max_results    = 3,
+                    use_embeddings = True,
+                )
+                rag_sources = [
+                    RagSource(path=str(doc.path), content=doc.content[:2000])
+                    for doc in docs
+                    if doc.relevance_score >= 0.4
+                ]
+                logger.info(
+                    "_execute_plan: RAG fetch complete — %d source(s).",
+                    len(rag_sources),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "_execute_plan: RAG fetch failed (%s) — continuing without context.", exc
+                )
+
+        # -- Step 4a: Persona fetch ------------------------------------------
+        persona_docs = self._memory_manager.query_corpus(
+            "LORA persona identity research assistant",
+            max_results    = 1,
+            use_embeddings = True,
+        ) if self._memory_manager is not None else []
+        if persona_docs:
+            persona_source = RagSource(
+                path    = str(persona_docs[0].path),
+                content = persona_docs[0].content[:1600],
+            )
+            rag_sources.insert(0, persona_source)
+            logger.debug(
+                "_execute_plan: persona source prepended — path=%s",
+                persona_source.path,
+            )
+        else:
+            logger.debug("_execute_plan: persona doc not found in corpus.")
+
+        # Deduplicate rag_sources by path — persona prepend and normal RAG fetch
+        # may both return the same document. Keep first occurrence (persona wins).
+        seen_paths: set[str] = set()
+        deduped: list[RagSource] = []
+        for rs in rag_sources:
+            if rs.path not in seen_paths:
+                seen_paths.add(rs.path)
+                deduped.append(rs)
+        rag_sources = deduped
+        logger.debug(
+            "_execute_plan: rag_sources after dedup — %d source(s).",
+            len(rag_sources),
+        )
+
+        # -- Step 5: Episodic retrieval --------------------------------------
+        episodic_bullets: list[EpisodeBullet] = []
+        if plan.fetch_episodic and db_path is not None:
+            try:
+                reader  = EpisodicMemoryReader(db_path=db_path)
+                records = reader.by_recency(
+                    project_context=task.context.get("project_context", "general")
+                )
+                summary = format_episodic_summary(records)
+                if summary:
+                    for record in records:
+                        if record.confidence >= 0.7 and record.status == "active":
+                            episodic_bullets.append(EpisodeBullet(
+                                content      = record.content,
+                                episode_type = record.episode_type,
+                                confidence   = record.confidence,
+                            ))
+                    self._planner.mark_episodic_injected()
+                    logger.info(
+                        "_execute_plan: episodic retrieval complete — %d bullet(s).",
+                        len(episodic_bullets),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "_execute_plan: episodic retrieval failed (%s) — continuing.", exc
+                )
+
+        # -- Step 6: PromptBuilder assembly ----------------------------------
+        working_turns: list[Turn] = []
+        try:
+            entries = memory.get_context_window(
+                task_id    = task.task_id,
+                limit      = 5,
+                max_tokens = 300,
+            )
+            working_turns = [
+                Turn(role=e["role"], content=e["content"])
+                for e in entries
+            ]
+        except Exception as exc:
+            logger.debug("_execute_plan: working memory fetch failed (%s).", exc)
+
+        system_prompt, user_prompt = _PROMPT_BUILDER.build(
+            instruction      = task.instruction,
+            working_memory   = working_turns            or None,
+            episodic_summary = episodic_bullets         or None,
+            rag_snippets     = rag_sources              or None,
+            tool_results     = [
+                r for r in dispatched_tool_results
+                if not r.result.startswith("ERROR:")
+                and not r.result.startswith("<")
+                and len(r.result.strip()) >= 5
+            ] or None,
+        )
+
+        logger.debug(
+            "_execute_plan: prompt assembled — "
+            "system_chars=%d  user_chars=%d  "
+            "working_turns=%d  episodic_bullets=%d  rag_sources=%d",
+            len(system_prompt), len(user_prompt),
+            len(working_turns), len(episodic_bullets), len(rag_sources),
+        )
+        logger.debug(
+            "_execute_plan: assembled system_prompt:\n%s",
+            system_prompt,
+        )
+        logger.debug(
+            "_execute_plan: assembled user_prompt:\n%s",
+            user_prompt,
+        )
+
+        # -- Step 7: Build SubTask with prebuilt prompt ----------------------
+        effective_agent_name = plan.agent
+        agent = self._agents.get(effective_agent_name)
+        if agent is None:
+            agent = self._agents.get("conversational_agent")
+            if agent is None:
+                return ControllerResult(
+                    task_id = task.task_id,
+                    status  = TaskStatus.FAILED,
+                    answer  = "",
+                    error   = (
+                        f"Planner requested '{plan.agent}' which is not registered "
+                        "and no conversational_agent fallback exists."
+                    ),
+                )
+            effective_agent_name = "conversational_agent"
+            logger.warning(
+                "_execute_plan: '%s' not registered; falling back to "
+                "conversational_agent.", plan.agent,
             )
 
-        results = self._dispatch(subtasks, memory, task.task_id)
+        subtask_context = {
+            **task.context,
+            "_prebuilt_prompt":  user_prompt,
+            "_prebuilt_system":  system_prompt,
+            "_routing": {
+                "fetch_rag":      plan.fetch_rag,
+                "fetch_episodic": plan.fetch_episodic,
+                "tools_to_call":  plan.tools_to_call,
+                "write_episode":  plan.write_episode,
+                "episode_type":   plan.episode_type,
+                "compound":       plan.compound,
+            },
+        }
 
-        # For query intent: ConversationalAgent returns a complete answer
-        # directly — no synthesis step needed.
-        if intent == "query" and len(results) == 1:
+        subtask = SubTask(
+            subtask_id  = f"{task.task_id}-0",
+            agent_name  = effective_agent_name,
+            instruction = task.instruction,
+            context     = subtask_context,
+        )
+
+        results = self._dispatch([subtask], memory, task.task_id)
+
+        # -- Post-response hook: implicit episodic extraction ----------------
+        # Run after every dispatch. Catches durable facts the user revealed
+        # without an explicit memory command. Skipped when:
+        #   - No MemoryManager (no db_path to write to)
+        #   - Agent failed (no useful response to extract from)
+        #   - write_episode was already True (explicit extraction already ran;
+        #     avoid double-writing the same turn)
+        if (
+            db_path is not None
+            and not plan.write_episode
+            and results
+            and results[0].status == TaskStatus.COMPLETE
+        ):
+            try:
+                agent_response = results[0].output.get("answer", "")
+                if agent_response:
+                    implicit = process_implicit_extraction(
+                        instruction     = task.instruction,
+                        response        = agent_response,
+                        runtime         = self._runtime,
+                        db_path         = db_path,
+                        task_id         = task.task_id,
+                        project_context = task.context.get(
+                            "project_context", "general"
+                        ),
+                    )
+                    if implicit is not None:
+                        logger.info(
+                            "_execute_plan: implicit episode written — "
+                            "type=%s confidence=%.2f subject=%r.",
+                            implicit.episode_type,
+                            implicit.confidence,
+                            implicit.subject,
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "_execute_plan: implicit extraction failed (%s) — "
+                    "continuing.", exc,
+                )
+
+        if effective_agent_name == "conversational_agent" and len(results) == 1:
             r = results[0]
             if r.status == TaskStatus.COMPLETE:
                 return ControllerResult(
@@ -671,14 +980,32 @@ class ControllerAgent:
                     answer   = r.output.get("answer", ""),
                     sources  = r.output.get("sources", []),
                     metadata = {
-                        "intent":   intent,
-                        "grounded": r.output.get("grounded", False),
-                        "agent":    r.agent_name,
+                        "agent":          effective_agent_name,
+                        "fetch_rag":      plan.fetch_rag,
+                        "fetch_episodic": plan.fetch_episodic,
+                        "grounded":       r.output.get("grounded", False),
                     },
                 )
 
-        # Ingest (and any failed query) → synthesize
         return self._synthesizer.synthesize(task, results, memory)
+
+    def _execute(self, task: Task, memory: _AnyMemory) -> ControllerResult:
+        """
+        Route via rule-based Planner → execute plan → return.
+        """
+        plan = self._planner.route(
+            instruction = task.instruction,
+            context     = task.context,
+        )
+
+        logger.info(
+            "Planner plan: agent=%s  fetch_rag=%s  fetch_episodic=%s  "
+            "tools=%s  write_episode=%s  compound=%s",
+            plan.agent, plan.fetch_rag, plan.fetch_episodic,
+            plan.tools_to_call, plan.write_episode, plan.compound,
+        )
+
+        return self._execute_plan(task, plan, memory)
 
     def _dispatch(
         self,

@@ -1,0 +1,237 @@
+"""
+Phase 7 integration tests — LORA full pipeline.
+
+Covers:
+  7.1  — Full conversational pipeline: corpus hit → fetch_rag=True → answer
+  7.1b — Direct answer path: Priority 6 fallback, no corpus match
+  7.3  — Working memory 300-token ceiling drops oldest turns
+  7.4  — Persona document always prepended first in RAG slot
+  7.6  — system_prompt and user_prompt logged at DEBUG after assembly
+
+Tests that require corpus queries use a real SQLite MemoryManager via
+tmp_path (matching the Phase 4 convention). Tests that need precise
+query_corpus control use a MagicMock memory manager. test_7_3 exercises
+PromptBuilder directly without ControllerAgent.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+from controller_agent import (
+    ControllerAgent,
+    TaskStatus,
+    AgentResult,
+    SubTask,
+)
+from memory_manager import MemoryManager
+from prompt_builder import PromptBuilder, Turn
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def db_path(tmp_path: Path) -> Path:
+    path = tmp_path / "test.db"
+    MemoryManager(db_path=path)   # initialise schema
+    return path
+
+
+@pytest.fixture()
+def mm(db_path: Path) -> MemoryManager:
+    return MemoryManager(db_path=db_path)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def make_runtime(infer_return: str = "Test answer.", embed_return=None):
+    rt = MagicMock()
+    rt.infer.return_value = infer_return
+    rt.embed.return_value = embed_return or ([0.0] * 768)
+    return rt
+
+
+def make_conv_agent(answer: str = "Test answer."):
+    """Conversational agent mock that captures the SubTask it receives."""
+    received: list[SubTask] = []
+
+    agent = MagicMock()
+    agent.name = "conversational_agent"
+    agent.can_handle.return_value = True
+
+    def run(subtask):
+        received.append(subtask)
+        return AgentResult(
+            subtask_id = subtask.subtask_id,
+            agent_name = "conversational_agent",
+            status     = TaskStatus.COMPLETE,
+            output     = {"answer": answer, "sources": [], "grounded": False},
+        )
+
+    agent.run.side_effect = run
+    agent._received = received
+    return agent
+
+
+@dataclass
+class MockDoc:
+    """Lightweight stand-in for MemoryManager DocumentResult."""
+    path:            str
+    content:         str
+    relevance_score: float
+    doc_type:        str = "wiki"
+    name:            str = "mock"
+
+
+# ---------------------------------------------------------------------------
+# TestFullPipeline
+# ---------------------------------------------------------------------------
+
+class TestFullPipeline:
+
+    def test_7_1_full_pipeline_conversational(self, mm, db_path):
+        """Full pipeline: corpus hit → P4 routing → fetch_rag=True → answer."""
+        # Jaccard("LORA research assistant", "LORA research assistant agentic local")
+        # = |{lora,research,assistant}| / |{lora,research,assistant,agentic,local}|
+        # = 3/5 = 0.60 >= 0.4 Planner threshold → P4 fires
+        mm.index_document(
+            path     = db_path.parent / "phase7_doc.md",
+            doc_type = "wiki",
+            content  = "LORA research assistant agentic local",
+        )
+
+        rt   = make_runtime(infer_return="Paris.")
+        conv = make_conv_agent(answer="Paris.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        result = ctrl.handle_task({"instruction": "LORA research assistant"})
+
+        assert result["status"] == "complete"
+        assert result["answer"] == "Paris."
+        routing = conv._received[0].context["_routing"]
+        assert routing["fetch_rag"] is True
+
+    def test_7_1_full_pipeline_direct_answer(self, mm):
+        """Priority 6 fallback: empty corpus → no RAG, no episodic."""
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent(answer="no")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        result = ctrl.handle_task({"instruction": "What is 2+2?"})
+
+        assert result["status"] == "complete"
+        routing = conv._received[0].context["_routing"]
+        assert routing["fetch_rag"]      is False
+        assert routing["fetch_episodic"] is False
+
+    def test_7_3_working_memory_ceiling(self):
+        """300-token ceiling drops oldest turns; Turn -8 must not survive."""
+        # 8 turns × ~176 chars formatted each = ~1408 chars > 1200-char ceiling.
+        # PromptBuilder drops Turn -8 then Turn -7 before the total fits.
+        turns = [
+            Turn(
+                role    = "user" if i % 2 == 0 else "assistant",
+                content = "word " * 32,   # 160 chars per turn
+            )
+            for i in range(8)
+        ]
+
+        total_content_chars = sum(len(t.content) for t in turns)
+        assert total_content_chars > 1200   # sanity: raw content already over ceiling
+
+        _, user_prompt = PromptBuilder().build(
+            instruction    = "Follow-up question.",
+            working_memory = turns,
+        )
+
+        assert "Turn -8" not in user_prompt
+        assert 0 < len(user_prompt.encode()) < 5000
+
+    def test_7_4_persona_prepended_to_rag_sources(self):
+        """Step 4a always inserts persona as the first RagSource in slot 5."""
+        persona_doc = MockDoc(
+            path            = "wiki/lora-persona.md",
+            content         = "LORA is a local-first research assistant.",
+            relevance_score = 0.9,
+        )
+        other_doc = MockDoc(
+            path            = "wiki/lora-build-order.md",
+            content         = "Build order content for LORA.",
+            relevance_score = 0.6,
+        )
+
+        def query_side_effect(query, **kwargs):
+            # Step 4a persona fetch: "LORA persona identity research assistant"
+            if "persona" in query.lower():
+                return [persona_doc]
+            # Planner P4 + Step 4 RAG fetch: any other instruction query
+            return [other_doc]
+
+        mm_mock = MagicMock()
+        mm_mock.db_path = None                          # disable episodic hooks
+        mm_mock.query_corpus.side_effect = query_side_effect
+        mm_mock.get_context_window.return_value = []
+
+        rt   = make_runtime(infer_return="Paris.")
+        conv = make_conv_agent(answer="Paris.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm_mock)
+
+        # "LORA research assistant" returns other_doc (score 0.6 >= 0.4) for
+        # the Planner's P4 query → fetch_rag=True, so slot 5 is populated.
+        ctrl.handle_task({"instruction": "LORA research assistant"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "Source: wiki/lora-persona.md" in prompt
+        # Persona header must appear before the other source header
+        assert prompt.index("lora-persona.md") < prompt.index("lora-build-order.md")
+
+    def test_7_4b_persona_not_duplicated(self, caplog):
+        """Persona doc appears exactly once in slot 5 when Step 4 and Step 4a both return it."""
+        persona_doc = MockDoc(
+            path            = "wiki/lora-persona.md",
+            content         = "# LORA Persona\nTest persona content.",
+            relevance_score = 0.9,
+        )
+
+        mm_mock = MagicMock()
+        mm_mock.db_path = None                          # disable episodic hooks
+        mm_mock.query_corpus.return_value = [persona_doc]
+        mm_mock.get_context_window.return_value = []
+
+        rt   = make_runtime(infer_return="I am LORA.")
+        conv = make_conv_agent(answer="I am LORA.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm_mock)
+
+        with caplog.at_level(logging.DEBUG, logger="controller_agent"):
+            result = ctrl.handle_task({"instruction": "LORA research assistant"})
+
+        assert result["status"] == "complete"
+        messages = [r.getMessage() for r in caplog.records]
+        user_prompt = next(
+            m.split("assembled user_prompt:\n", 1)[1]
+            for m in messages
+            if "assembled user_prompt:" in m
+        )
+        assert user_prompt.count("wiki/lora-persona.md") == 1
+
+    def test_7_6_prompt_logging_emitted(self, mm, caplog):
+        """assembled system_prompt and user_prompt are logged at DEBUG."""
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        with caplog.at_level(logging.DEBUG, logger="controller_agent"):
+            ctrl.handle_task({"instruction": "What is 2+2?"})
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("_execute_plan: assembled system_prompt:" in m for m in messages)
+        assert any("_execute_plan: assembled user_prompt:" in m for m in messages)

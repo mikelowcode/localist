@@ -104,6 +104,8 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
 
+from prompt_builder import PromptBuilder
+
 from controller_agent import (
     AgentResult,
     SubTask,
@@ -135,6 +137,8 @@ SYSTEM_PROMPT = (
     "valid XML document. You MUST NOT output prose, comments, explanations, or "
     "Markdown fences. Your entire response must be the XML block and nothing else."
 )
+
+_PROMPT_BUILDER = PromptBuilder()
 
 
 # ---------------------------------------------------------------------------
@@ -782,13 +786,18 @@ class WikiAgent:
                 )
             else:
                 try:
-                    user_prompt = build_user_prompt(
+                    raw_user_prompt = build_user_prompt(
                         schema_text  = schema_text,
                         templates    = templates,
                         wiki_context = wiki_context,
                         raw_filename = raw_path.name,
                         raw_content  = raw_content,
                     )
+                    _sys, user_prompt = _PROMPT_BUILDER.build(
+                        instruction = raw_user_prompt,
+                    )
+                    # _sys (PromptBuilder's generic identity prompt) is discarded —
+                    # WikiAgent must use SYSTEM_PROMPT (XML-only directive) here.
                 except Exception as exc:
                     return self._fail(subtask, f"Prompt build error: {exc}")
                 logger.debug(
