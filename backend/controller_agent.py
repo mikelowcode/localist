@@ -577,6 +577,7 @@ class ControllerAgent:
         self._synthesizer    = Synthesizer(runtime)
         # IntentClassifier retired — routing is now handled by _RulePlanner
         self._memory_manager = memory_manager   # None → use ephemeral shim per request
+        self._persona_cache: str | None = None
 
         if not agents:
             logger.warning("ControllerAgent initialized with no sub-agents.")
@@ -589,6 +590,41 @@ class ControllerAgent:
             logger.info(
                 "ControllerAgent: no MemoryManager supplied — using ephemeral memory per request."
             )
+
+    # -----------------------------------------------------------------------
+    # Private helpers
+    # -----------------------------------------------------------------------
+
+    def _load_persona(self) -> str | None:
+        """
+        Load the LORA persona document from the wiki corpus.
+        Result is cached in self._persona_cache after first successful load.
+        Returns None when MemoryManager is absent or corpus has no persona doc.
+        """
+        if self._persona_cache is not None:
+            return self._persona_cache
+        if self._memory_manager is None:
+            return None
+        try:
+            docs = self._memory_manager.query_corpus(
+                "LORA persona identity research assistant",
+                max_results    = 1,
+                use_embeddings = True,
+            )
+            if docs:
+                self._persona_cache = docs[0].content[:2000]
+                logger.debug(
+                    "_load_persona: persona loaded and cached — "
+                    "path=%s  chars=%d",
+                    docs[0].path,
+                    len(self._persona_cache),
+                )
+        except Exception as exc:
+            logger.warning(
+                "_load_persona: persona fetch failed (%s) — "
+                "proceeding without persona.", exc,
+            )
+        return self._persona_cache
 
     # -----------------------------------------------------------------------
     # Public API (called by FastAPI)
@@ -772,7 +808,8 @@ class ControllerAgent:
                 rag_sources = [
                     RagSource(path=str(doc.path), content=doc.content[:2000])
                     for doc in docs
-                    if doc.relevance_score >= 0.4
+                    if doc.relevance_score >= 0.55
+                    and not str(doc.path).endswith("lora-persona.md")
                 ]
                 logger.info(
                     "_execute_plan: RAG fetch complete — %d source(s).",
@@ -782,39 +819,6 @@ class ControllerAgent:
                 logger.warning(
                     "_execute_plan: RAG fetch failed (%s) — continuing without context.", exc
                 )
-
-        # -- Step 4a: Persona fetch ------------------------------------------
-        persona_docs = self._memory_manager.query_corpus(
-            "LORA persona identity research assistant",
-            max_results    = 1,
-            use_embeddings = True,
-        ) if self._memory_manager is not None else []
-        if persona_docs:
-            persona_source = RagSource(
-                path    = str(persona_docs[0].path),
-                content = persona_docs[0].content[:1600],
-            )
-            rag_sources.insert(0, persona_source)
-            logger.debug(
-                "_execute_plan: persona source prepended — path=%s",
-                persona_source.path,
-            )
-        else:
-            logger.debug("_execute_plan: persona doc not found in corpus.")
-
-        # Deduplicate rag_sources by path — persona prepend and normal RAG fetch
-        # may both return the same document. Keep first occurrence (persona wins).
-        seen_paths: set[str] = set()
-        deduped: list[RagSource] = []
-        for rs in rag_sources:
-            if rs.path not in seen_paths:
-                seen_paths.add(rs.path)
-                deduped.append(rs)
-        rag_sources = deduped
-        logger.debug(
-            "_execute_plan: rag_sources after dedup — %d source(s).",
-            len(rag_sources),
-        )
 
         # -- Step 5: Episodic retrieval --------------------------------------
         episodic_bullets: list[EpisodeBullet] = []
@@ -860,7 +864,7 @@ class ControllerAgent:
 
         system_prompt, user_prompt = _PROMPT_BUILDER.build(
             instruction      = task.instruction,
-            working_memory   = working_turns            or None,
+            persona          = self._load_persona(),
             episodic_summary = episodic_bullets         or None,
             rag_snippets     = rag_sources              or None,
             tool_results     = [
@@ -869,6 +873,7 @@ class ControllerAgent:
                 and not r.result.startswith("<")
                 and len(r.result.strip()) >= 5
             ] or None,
+            working_memory   = working_turns            or None,
         )
 
         logger.debug(

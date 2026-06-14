@@ -10,7 +10,7 @@ Covers:
          parent directory auto-creation
   6.4 — ControllerAgent wiring:
          [TOOL RESULTS] slot in prebuilt prompt when tool fires
-         Slot ordering: [USER] < [TOOL RESULTS]
+         Slot ordering: [TOOL RESULTS] < [INSTRUCTION]
          Token ceiling enforced (slot 6 ≤ 500 tokens)
          Tool dispatch failure → graceful absence of [TOOL RESULTS]
          Quality filter: ERROR/repr/short strings excluded from slot 6
@@ -383,7 +383,7 @@ class TestControllerToolIntegration:
 
         prompt = conv._received[0].context["_prebuilt_prompt"]
         if "[TOOL RESULTS]" in prompt:
-            assert prompt.index("[USER]") < prompt.index("[TOOL RESULTS]")
+            assert prompt.index("[TOOL RESULTS]") < prompt.index("[INSTRUCTION]")
 
     def test_tool_slot_ceiling_enforced(self, mm):
         """Slot 6 must not exceed 500 tokens (2000 chars) in the prompt."""
@@ -408,7 +408,7 @@ class TestControllerToolIntegration:
             start = prompt.index("[TOOL RESULTS]")
             # Find the next slot label after TOOL RESULTS (or end of string)
             next_slot = len(prompt)
-            for label in ["[USER]", "[WORKING MEMORY]",
+            for label in ["[INSTRUCTION]", "[WORKING MEMORY]",
                           "[EPISODIC MEMORY]", "[CONTEXT]"]:
                 pos = prompt.find(label, start + 1)
                 if pos != -1:

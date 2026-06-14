@@ -2,7 +2,7 @@
 LORA — PromptBuilder
 ====================
 Single point of prompt assembly for all LORA agents.
-Implements the 6-slot prompt contract defined in §3 of
+Implements the 7-slot prompt contract defined in §3 of
 LORA-Architecture.md. Every agent calls PromptBuilder.build();
 no agent assembles its own prompt string.
 
@@ -52,17 +52,26 @@ class ToolResult:
 
 class PromptBuilder:
     """
-    Assembles the canonical 6-slot prompt defined in §3 of
+    Assembles the canonical 7-slot prompt defined in §3 of
     LORA-Architecture.md.
 
     Slot layout
     -----------
-    Slot 1  [SYSTEM]         — identity; always present; 50-token hard ceiling
-    Slot 2  [USER]           — raw instruction; always present; uncapped
-    Slot 3  [WORKING MEMORY] — recent turns; always present; 300-token ceiling
-    Slot 4  [EPISODIC MEMORY]— durable facts; conditional; 150-token ceiling
-    Slot 5  [CONTEXT]        — RAG snippets; conditional; 400-token ceiling
-    Slot 6  [TOOL RESULTS]   — tool output; conditional; 500-token ceiling
+    SYSTEM MESSAGE
+      Slot 1a [identity]        — _SYSTEM constant; always present; ~50 tokens
+      Slot 1b [persona]         — wiki persona doc; injected when provided;
+                                  500-token ceiling; appended to system msg
+
+    USER MESSAGE (static-first ordering for KV-cache prefix reuse)
+      Slot 3  [EPISODIC MEMORY] — durable facts; conditional; 150-token ceiling
+      Slot 4  [CONTEXT]         — RAG snippets; conditional; 450-token ceiling
+      Slot 5  [TOOL RESULTS]    — tool output; conditional; 500-token ceiling
+      Slot 6  [WORKING MEMORY]  — recent turns; conditional; 300-token ceiling
+      Slot 7  [INSTRUCTION]     — raw user instruction; always present; uncapped
+
+    Slots are ordered most-stable-first so that the KV-cache prefix
+    is maximally reused across consecutive turns. [INSTRUCTION] is always
+    last because it changes on every turn.
 
     Token estimation: 1 token ≈ 4 characters (len(text) // 4).
     This is consistent with the convention used elsewhere in memory_manager.py.
@@ -70,8 +79,9 @@ class PromptBuilder:
     Returns
     -------
     build() → (system_prompt: str, user_prompt: str)
-        system_prompt : Slot 1 only. Pass as the `system=` argument to runtime.
-        user_prompt   : Slots 2–6 assembled in order, empty slots cleanly
+        system_prompt : Slot 1a + optional 1b. Pass as the `system=` argument
+                        to runtime.
+        user_prompt   : Slots 3–7 assembled in order, empty slots cleanly
                         omitted (no label, no whitespace placeholder).
 
     Invariants
@@ -79,11 +89,11 @@ class PromptBuilder:
     - Stateless. Safe to call from multiple threads concurrently.
     - Callers pass full content; PromptBuilder enforces all token ceilings.
     - Empty optional slots produce no output whatsoever — not even a newline.
-    - Slot 1 is a constant. It is never overridden by callers.
+    - Slot 1a is a constant. It is never overridden by callers.
     """
 
     # -----------------------------------------------------------------------
-    # Slot 1 — canonical system prompt (§3.2, Slot 1)
+    # Slot 1a — canonical system prompt (§3.2, Slot 1)
     # Ceiling: 50 tokens = 200 chars. This value is 174 chars / ~43 tokens.
     # -----------------------------------------------------------------------
     _SYSTEM: str = (
@@ -95,11 +105,12 @@ class PromptBuilder:
     # -----------------------------------------------------------------------
     # Token ceilings (in tokens; multiply by 4 for char equivalent)
     # -----------------------------------------------------------------------
-    _CEIL_SYSTEM:   int = 50    # hard; slot 1 is a constant so this is advisory
-    _CEIL_WORKING:  int = 300   # slot 3
-    _CEIL_EPISODIC: int = 150   # slot 4
-    _CEIL_RAG:      int = 450   # slot 5
-    _CEIL_TOOL:     int = 500   # slot 6
+    _CEIL_SYSTEM:   int = 50    # hard; slot 1a is a constant so this is advisory
+    _CEIL_PERSONA:  int = 500   # slot 1b; persona injected into system msg
+    _CEIL_EPISODIC: int = 150   # slot 3
+    _CEIL_RAG:      int = 450   # slot 4
+    _CEIL_TOOL:     int = 500   # slot 5
+    _CEIL_WORKING:  int = 300   # slot 6
 
     # -----------------------------------------------------------------------
     # Internal token helpers
@@ -126,77 +137,25 @@ class PromptBuilder:
     # Slot builders (private)
     # -----------------------------------------------------------------------
 
-    def _slot1_system(self) -> str:
-        """Return Slot 1: the canonical system prompt. Never changes."""
-        return self._SYSTEM
-
-    def _slot2_user(self, instruction: str) -> str:
+    def _slot1_system(self, persona: str | None = None) -> str:
         """
-        Return Slot 2: the raw user instruction.
+        Return Slot 1: system prompt, optionally with persona appended.
 
-        Format:
-            [USER]
-            {instruction}
+        When persona is None or empty, returns the identity constant only.
+        Otherwise appends the truncated persona (500-token ceiling) raw,
+        separated by a double newline — no label is added.
         """
-        return f"[USER]\n{instruction}"
+        if not persona:
+            return self._SYSTEM
+        truncated = self._truncate_to_tokens(persona, self._CEIL_PERSONA)
+        return self._SYSTEM + "\n\n" + truncated
 
-    def _slot3_working_memory(
-        self,
-        turns: list[Turn] | None,
-    ) -> str:
-        """
-        Return Slot 3: working memory block, or empty string if no turns.
-
-        Format:
-            [WORKING MEMORY]
-            Turn -N [role]: content
-            ...
-            Turn -1 [role]: content
-
-        Turns are listed chronologically (oldest surviving first, newest last).
-        The 300-token ceiling is enforced by dropping oldest turns first.
-        Each turn is formatted as a single line before ceiling enforcement.
-
-        Returns "" if turns is None or empty (slot is always labelled when
-        present, but entirely absent when there are no prior turns — the
-        architecture states the slot is 'always present' but 'may be empty
-        if no prior turns exist'. We emit the label only when there is
-        content to show, matching the 'clean omission' rule for the
-        label itself).
-        """
-        if not turns:
-            return ""
-
-        # Format all turns first
-        formatted: list[str] = []
-        for i, turn in enumerate(turns):
-            offset = -(len(turns) - i)   # -N … -1
-            if turn.role == "tool" and turn.label:
-                role_str = f"tool:{turn.label}"
-            else:
-                role_str = turn.role
-            formatted.append(f"Turn {offset} [{role_str}]: {turn.content}")
-
-        # Enforce 300-token ceiling: drop oldest until budget is met
-        max_chars = self._CEIL_WORKING * 4
-        while formatted:
-            total = sum(len(f) for f in formatted)
-            if total <= max_chars:
-                break
-            formatted.pop(0)
-
-        if not formatted:
-            return ""
-
-        body = "\n".join(formatted)
-        return f"[WORKING MEMORY]\n{body}"
-
-    def _slot4_episodic(
+    def _slot3_episodic(
         self,
         bullets: list[EpisodeBullet] | None,
     ) -> str:
         """
-        Return Slot 4: episodic memory block, or "" if None/empty.
+        Return Slot 3: episodic memory block, or "" if None/empty.
 
         Format:
             [EPISODIC MEMORY]
@@ -225,12 +184,12 @@ class PromptBuilder:
 
         return "\n".join(lines)
 
-    def _slot5_rag(
+    def _slot4_rag(
         self,
         sources: list[RagSource] | None,
     ) -> str:
         """
-        Return Slot 5: RAG context block, or "" if None/empty.
+        Return Slot 4: RAG context block, or "" if None/empty.
 
         Format:
             [CONTEXT]
@@ -240,7 +199,7 @@ class PromptBuilder:
             Source: {path}
             {content snippet}
 
-        The 400-token ceiling is enforced across all sources combined.
+        The 450-token ceiling is enforced across all sources combined.
         Each source's content is truncated at a sentence boundary when
         possible. Maximum 3 sources (callers should pre-rank; this method
         takes the first 3).
@@ -287,12 +246,12 @@ class PromptBuilder:
 
         return "\n\n".join(lines[:1] + lines[1:])
 
-    def _slot6_tools(
+    def _slot5_tools(
         self,
         tool_results: list[ToolResult] | None,
     ) -> str:
         """
-        Return Slot 6: tool results block, or "" if None/empty.
+        Return Slot 5: tool results block, or "" if None/empty.
 
         Format:
             [TOOL RESULTS]
@@ -331,6 +290,62 @@ class PromptBuilder:
 
         return "\n".join(lines)
 
+    def _slot6_working_memory(
+        self,
+        turns: list[Turn] | None,
+    ) -> str:
+        """
+        Return Slot 6: working memory block, or empty string if no turns.
+
+        Format:
+            [WORKING MEMORY]
+            Turn -N [role]: content
+            ...
+            Turn -1 [role]: content
+
+        Turns are listed chronologically (oldest surviving first, newest last).
+        The 300-token ceiling is enforced by dropping oldest turns first.
+        Each turn is formatted as a single line before ceiling enforcement.
+
+        Returns "" if turns is None or empty.
+        """
+        if not turns:
+            return ""
+
+        # Format all turns first
+        formatted: list[str] = []
+        for i, turn in enumerate(turns):
+            offset = -(len(turns) - i)   # -N … -1
+            if turn.role == "tool" and turn.label:
+                role_str = f"tool:{turn.label}"
+            else:
+                role_str = turn.role
+            formatted.append(f"Turn {offset} [{role_str}]: {turn.content}")
+
+        # Enforce 300-token ceiling: drop oldest until budget is met
+        max_chars = self._CEIL_WORKING * 4
+        while formatted:
+            total = sum(len(f) for f in formatted)
+            if total <= max_chars:
+                break
+            formatted.pop(0)
+
+        if not formatted:
+            return ""
+
+        body = "\n".join(formatted)
+        return f"[WORKING MEMORY]\n{body}"
+
+    def _slot7_instruction(self, instruction: str) -> str:
+        """
+        Return Slot 7: the raw user instruction. Always present; uncapped.
+
+        Format:
+            [INSTRUCTION]
+            {instruction}
+        """
+        return f"[INSTRUCTION]\n{instruction}"
+
     # -----------------------------------------------------------------------
     # Public API
     # -----------------------------------------------------------------------
@@ -338,50 +353,52 @@ class PromptBuilder:
     def build(
         self,
         instruction:      str,
-        working_memory:   list[Turn]          | None = None,
-        episodic_summary: list[EpisodeBullet] | None = None,
-        rag_snippets:     list[RagSource]     | None = None,
-        tool_results:     list[ToolResult]    | None = None,
+        persona:          str | None            = None,
+        episodic_summary: list[EpisodeBullet]   | None = None,
+        rag_snippets:     list[RagSource]        | None = None,
+        tool_results:     list[ToolResult]       | None = None,
+        working_memory:   list[Turn]             | None = None,
     ) -> tuple[str, str]:
         """
-        Assemble the canonical 6-slot prompt.
+        Assemble the canonical 7-slot prompt.
 
         Parameters
         ----------
         instruction :
-            The raw user instruction (Slot 2). Never transformed.
-        working_memory :
-            Recent conversation turns (Slot 3). Oldest dropped first when
-            the 300-token ceiling is exceeded. Pass None or [] to omit.
+            The raw user instruction (Slot 7). Never transformed.
+        persona :
+            Optional persona string (Slot 1b). Injected into the system
+            message when provided; 500-token ceiling enforced.
         episodic_summary :
-            Pre-sorted EpisodeBullet list (Slot 4). Caller is responsible
-            for priority ordering (format_episodic_summary handles this).
-            Pass None or [] to omit.
+            Pre-sorted EpisodeBullet list (Slot 3). Caller is responsible
+            for priority ordering. Pass None or [] to omit.
         rag_snippets :
-            Ranked RagSource list (Slot 5). At most 3 used. Pass None or
+            Ranked RagSource list (Slot 4). At most 3 used. Pass None or
             [] to omit.
         tool_results :
-            ToolResult list in dispatch order (Slot 6). Pass None or []
+            ToolResult list in dispatch order (Slot 5). Pass None or []
             to omit.
+        working_memory :
+            Recent conversation turns (Slot 6). Oldest dropped first when
+            the 300-token ceiling is exceeded. Pass None or [] to omit.
 
         Returns
         -------
         (system_prompt, user_prompt) : tuple[str, str]
-            system_prompt : Slot 1. Pass as `system=` to the runtime.
-            user_prompt   : Slots 2–6 joined with double newlines.
+            system_prompt : Slot 1a + optional 1b. Pass as `system=` to
+                            the runtime.
+            user_prompt   : Slots 3–7 joined with double newlines.
                             Empty slots are cleanly absent.
         """
-        system_prompt = self._slot1_system()
+        system_prompt = self._slot1_system(persona)
 
         slots = [
-            self._slot2_user(instruction),
-            self._slot3_working_memory(working_memory),
-            self._slot4_episodic(episodic_summary),
-            self._slot5_rag(rag_snippets),
-            self._slot6_tools(tool_results),
+            self._slot3_episodic(episodic_summary),
+            self._slot4_rag(rag_snippets),
+            self._slot5_tools(tool_results),
+            self._slot6_working_memory(working_memory),
+            self._slot7_instruction(instruction),
         ]
 
-        # Join only non-empty slots; never emit empty labels or blank sections
         user_prompt = "\n\n".join(s for s in slots if s)
-
         return system_prompt, user_prompt

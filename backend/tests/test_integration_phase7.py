@@ -5,7 +5,7 @@ Covers:
   7.1  — Full conversational pipeline: corpus hit → fetch_rag=True → answer
   7.1b — Direct answer path: Priority 6 fallback, no corpus match
   7.3  — Working memory 300-token ceiling drops oldest turns
-  7.4  — Persona document always prepended first in RAG slot
+  7.4  — Persona document injected into system prompt via _load_persona()
   7.6  — system_prompt and user_prompt logged at DEBUG after assembly
 
 Tests that require corpus queries use a real SQLite MemoryManager via
@@ -156,8 +156,8 @@ class TestFullPipeline:
         assert "Turn -8" not in user_prompt
         assert 0 < len(user_prompt.encode()) < 5000
 
-    def test_7_4_persona_prepended_to_rag_sources(self):
-        """Step 4a always inserts persona as the first RagSource in slot 5."""
+    def test_7_4_persona_injected_into_system_prompt(self):
+        """_load_persona() fetches the persona doc and injects it into system_prompt."""
         persona_doc = MockDoc(
             path            = "wiki/lora-persona.md",
             content         = "LORA is a local-first research assistant.",
@@ -170,7 +170,7 @@ class TestFullPipeline:
         )
 
         def query_side_effect(query, **kwargs):
-            # Step 4a persona fetch: "LORA persona identity research assistant"
+            # _load_persona fetch: "LORA persona identity research assistant"
             if "persona" in query.lower():
                 return [persona_doc]
             # Planner P4 + Step 4 RAG fetch: any other instruction query
@@ -186,16 +186,21 @@ class TestFullPipeline:
         ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm_mock)
 
         # "LORA research assistant" returns other_doc (score 0.6 >= 0.4) for
-        # the Planner's P4 query → fetch_rag=True, so slot 5 is populated.
+        # the Planner's P4 query → fetch_rag=True, so slot 4 is populated.
         ctrl.handle_task({"instruction": "LORA research assistant"})
 
-        prompt = conv._received[0].context["_prebuilt_prompt"]
-        assert "Source: wiki/lora-persona.md" in prompt
-        # Persona header must appear before the other source header
-        assert prompt.index("lora-persona.md") < prompt.index("lora-build-order.md")
+        system_prompt = conv._received[0].context["_prebuilt_system"]
+        user_prompt   = conv._received[0].context["_prebuilt_prompt"]
 
-    def test_7_4b_persona_not_duplicated(self, caplog):
-        """Persona doc appears exactly once in slot 5 when Step 4 and Step 4a both return it."""
+        # Persona content must appear in system_prompt, not as a RAG source
+        assert "LORA is a local-first research assistant." in system_prompt
+        assert "Source: wiki/lora-persona.md" not in user_prompt
+
+        # The normal RAG source still appears in the user prompt
+        assert "Source: wiki/lora-build-order.md" in user_prompt
+
+    def test_7_4b_persona_filtered_from_rag_slot(self, caplog):
+        """lora-persona.md is filtered from RAG results; it appears only in system_prompt."""
         persona_doc = MockDoc(
             path            = "wiki/lora-persona.md",
             content         = "# LORA Persona\nTest persona content.",
@@ -221,7 +226,12 @@ class TestFullPipeline:
             for m in messages
             if "assembled user_prompt:" in m
         )
-        assert user_prompt.count("wiki/lora-persona.md") == 1
+        # Persona doc must not appear in the user message (it's in system_prompt via _load_persona)
+        assert user_prompt.count("wiki/lora-persona.md") == 0
+
+        # Persona content is in the system prompt
+        system_prompt = conv._received[0].context["_prebuilt_system"]
+        assert "LORA Persona" in system_prompt
 
     def test_7_6_prompt_logging_emitted(self, mm, caplog):
         """assembled system_prompt and user_prompt are logged at DEBUG."""

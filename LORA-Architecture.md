@@ -206,26 +206,46 @@ ceilings all affect how Gemma 4B weights information under attention
 constraints. A poorly ordered prompt does not just look wrong — it produces
 worse answers.
 
-The ordering principle is: **identity before context, context before
-evidence.**
+The ordering principle is: **static before dynamic, stable before volatile.**
 
-- Slot 1 sets behavioral priors.
-- Slots 2–3 establish the immediate situation.
-- Slots 4–5 provide grounding.
-- Slot 6 provides the freshest, most specific evidence.
+All content that is invariant across turns is placed first, forming a stable
+prefix that inference backends can cache and reuse. All content that changes
+per-turn is placed last. This is a KV-cache architectural constraint, not a
+style preference: every backend that supports prefix caching (oMLX, MLX-LM,
+Foundry Local, vLLM, llama.cpp, TGI, TensorRT-LLM, ONNX Runtime) requires
+exact byte-identity from the start of the token sequence. A single character
+change anywhere in the prefix causes a complete cache miss for everything
+after it.
+
+Content stability ranking, most stable to least:
+
+| Rank | Content | Changes when |
+|---|---|---|
+| 1 | Identity constant | Never |
+| 2 | Persona | Wiki page updated |
+| 3 | Episodic memory | New episode written |
+| 4 | RAG snippets | Query topic changes |
+| 5 | Tool results | New tool call issued |
+| 6 | Working memory | Every turn |
+| 7 | Current instruction | Every turn (always last) |
 
 ### 3.2 Slot Definitions
 
-#### Slot 1 — System
+The prompt is assembled as two runtime arguments: a **system message**
+(passed as `system=` to the runtime client) and a **user message** (passed
+as the user turn). Slots 1a and 1b form the system message. Slots 3–7 form
+the user message in strict stability order.
 
-**Purpose:** Establishes who LORA is and how it reasons. This is the only
-slot that never changes at runtime.
+---
 
-**Token ceiling:** 50 tokens (hard limit)
+#### Slot 1a — Identity
+
+**Purpose:** Establishes who LORA is and how it reasons. The invariant
+anchor of every prompt. Never changes.
+
+**Token ceiling:** ~50 tokens (the canonical value is 43 tokens)
 
 **Content:** Identity name, core behavioral constraint, epistemic stance.
-No persona detail. Persona is loaded from the wiki via RAG and appears in
-slot 5.
 
 **Canonical value:**
 ```
@@ -235,61 +255,49 @@ certainty.
 ```
 
 **Rules:**
-- This slot is a constant. It is never modified at runtime.
-- Every token in this slot competes with slots 4–6. Keep it minimal.
-- Persona, style, and project-specific behavior belong in slot 5, not here.
+- This is a constant defined in `PromptBuilder._SYSTEM`. It is never
+  modified at runtime.
+- Keep it minimal. Every token here is cached unconditionally by all
+  backends — there is no cost to including it, but expanding it narrows
+  the headroom for dynamic slots.
 
 ---
 
-#### Slot 2 — User Message
+#### Slot 1b — Persona
 
-**Purpose:** The raw instruction from the current task.
+**Purpose:** LORA's voice, style, and project-specific behavioral context.
+Loaded once per session from `wiki/lora-persona.md` and appended to the
+system message after the identity constant.
 
-**Token ceiling:** Uncapped.
+**Token ceiling:** 500 tokens (hard limit). Truncated by `PromptBuilder`
+when the wiki page exceeds this budget.
 
-**Format:**
+**Format:** Appended to Slot 1a with a double newline separator. No label
+is added; the persona content is inserted raw:
+
 ```
-[USER]
-{instruction}
+You are LORA, a local research assistant. You reason carefully, cite your
+sources, and acknowledge when you don't know something. You do not simulate
+certainty.
+
+{persona content from wiki/lora-persona.md}
 ```
 
 **Rules:**
-- No transformation of the instruction.
-- If the instruction references a file path or prior result, those are
-  resolved before this slot is populated. The instruction itself is
-  never modified.
+- Loaded by `ControllerAgent._load_persona()`, which caches the result in
+  `self._persona_cache` after the first successful corpus query.
+- Passed to `PromptBuilder.build()` as the `persona=` keyword argument.
+- When persona is `None` or empty, the system message is Slot 1a only —
+  no separator, no placeholder.
+- WikiAgent's XML-only system prompt is a protected contract. WikiAgent
+  does not pass `persona=` and never receives Slot 1b. See §3.5.
+- The persona must remain byte-stable within a session. Re-querying the
+  corpus on every turn would break prefix caching. The cache is
+  invalidated only when WikiAgent writes a new persona page.
 
 ---
 
-#### Slot 3 — Working Memory
-
-**Purpose:** The immediate conversational context. What just happened.
-
-**Token ceiling:** 300 tokens (hard limit). Oldest turns are dropped first
-when the ceiling is exceeded.
-
-**Format:**
-```
-[WORKING MEMORY]
-Turn -2 [user]: {prior user message}
-Turn -2 [assistant]: {prior assistant response}
-Turn -1 [user]: {most recent prior user message}
-Turn -1 [assistant]: {most recent prior assistant response}
-```
-
-**Rules:**
-- Default window: last 3 turns. Maximum window: 5 turns.
-- Turns are listed in chronological order (oldest first, newest last).
-- Tool results from prior turns are included as
-  `[tool: {tool_name}] {truncated result}` entries, capped at 2–3 lines.
-- The 300-token ceiling is enforced by `MemoryManager.get_context_window()`
-  via a `max_tokens` parameter. Truncation drops oldest turns first, never
-  mid-turn.
-- This slot is always present. It may be empty if no prior turns exist.
-
----
-
-#### Slot 4 — Episodic Memory
+#### Slot 3 — Episodic Memory
 
 **Purpose:** Durable facts about the user, project, and preferences that
 are relevant to this specific request.
@@ -301,13 +309,16 @@ are relevant to this specific request.
 **Rules:**
 - This slot is **conditional**. It is omitted entirely when not relevant.
   No empty label, no placeholder.
-- Relevance is determined by the Planner. See §4.
+- Relevance is determined by the Planner (Priority 5). See §4.
 - When injected: 3–5 bullets, confidence ≥ 0.7, type-ordered per §2.7.
 - The `[EPISODIC MEMORY]` label and inline type annotations are mandatory.
+- Placed first in the user message because episodic content changes rarely
+  (only when a new episode is written), maximising the stable prefix shared
+  across consecutive turns.
 
 ---
 
-#### Slot 5 — RAG Snippets
+#### Slot 4 — RAG Snippets
 
 **Purpose:** Relevant content from the wiki corpus and document index.
 
@@ -326,15 +337,17 @@ Source: wiki/WikiAgent Architecture.md
 **Rules:**
 - This slot is **conditional**. Omitted entirely when corpus yields no
   results above threshold.
-- Maximum 3 sources.
-- Wiki sources are preferred over raw doc sources when both are available.
+- Maximum 3 sources. Wiki sources are preferred over raw doc sources.
 - Content is never truncated mid-sentence. If a passage exceeds the per-
   source budget, it is cut at the nearest sentence boundary.
 - The `[CONTEXT]` label is mandatory. Source paths are mandatory.
+- Placed after episodic memory because RAG results change per query topic
+  but are deterministic for the same query, giving partial prefix reuse on
+  follow-up questions about the same topic.
 
 ---
 
-#### Slot 6 — Tool Results
+#### Slot 5 — Tool Results
 
 **Purpose:** Fresh, request-specific evidence from tool calls made during
 this request's routing phase.
@@ -359,23 +372,82 @@ this request's routing phase.
 
 ---
 
+#### Slot 6 — Working Memory
+
+**Purpose:** The immediate conversational context. What just happened.
+
+**Token ceiling:** 300 tokens (hard limit). Oldest turns are dropped first
+when the ceiling is exceeded.
+
+**Format:**
+```
+[WORKING MEMORY]
+Turn -2 [user]: {prior user message}
+Turn -2 [assistant]: {prior assistant response}
+Turn -1 [user]: {most recent prior user message}
+Turn -1 [assistant]: {most recent prior assistant response}
+```
+
+**Rules:**
+- Default window: last 3 turns. Maximum window: 5 turns.
+- Turns are listed in chronological order (oldest first, newest last).
+- Tool results from prior turns are included as
+  `[tool: {tool_name}] {truncated result}` entries, capped at 2–3 lines.
+- The 300-token ceiling is enforced by `MemoryManager.get_context_window()`
+  via a `max_tokens` parameter. Truncation drops oldest turns first, never
+  mid-turn.
+- This slot is conditional. It is omitted when no prior turns exist.
+- Placed second-to-last because working memory changes every turn. Placing
+  it here rather than first means only the instruction (Slot 7) consistently
+  invalidates the cache prefix on every turn.
+
+---
+
+#### Slot 7 — Instruction
+
+**Purpose:** The raw instruction from the current turn.
+
+**Token ceiling:** Uncapped.
+
+**Format:**
+```
+[INSTRUCTION]
+{instruction}
+```
+
+**Rules:**
+- No transformation of the instruction.
+- Always the last slot in the user message. This is a KV-cache invariant:
+  the most volatile content must be at the end so that all stable content
+  above it can be prefix-cached.
+- If the instruction references a file path or prior result, those are
+  resolved before this slot is populated. The instruction text itself is
+  never modified.
+
+---
+
 ### 3.3 Aggregate Token Budget
 
-| Slot | Label | Ceiling | Presence |
-|---|---|---|---|
-| 1 — System | `[SYSTEM]` | 50 | Always |
-| 2 — User | `[USER]` | Uncapped | Always |
-| 3 — Working memory | `[WORKING MEMORY]` | 300 | Always |
-| 4 — Episodic memory | `[EPISODIC MEMORY]` | 150 | Conditional |
-| 5 — RAG snippets | `[CONTEXT]` | 450 | Conditional |
-| 6 — Tool results | `[TOOL RESULTS]` | 500 | Conditional |
-| **Worst-case total** | | **~1,500** | |
+| Slot | Label | Ceiling | Presence | Message |
+|---|---|---|---|---|
+| 1a — Identity | *(none)* | ~50 | Always | System |
+| 1b — Persona | *(none)* | 500 | Conditional | System |
+| 3 — Episodic memory | `[EPISODIC MEMORY]` | 150 | Conditional | User |
+| 4 — RAG snippets | `[CONTEXT]` | 450 | Conditional | User |
+| 5 — Tool results | `[TOOL RESULTS]` | 500 | Conditional | User |
+| 6 — Working memory | `[WORKING MEMORY]` | 300 | Conditional | User |
+| 7 — Instruction | `[INSTRUCTION]` | Uncapped | Always | User |
+| **Worst-case total** | | **~1,950** | | |
+
+Slot numbers 2 and the old Slot 2 label `[USER]` are retired. The gap
+between 1b and 3 is intentional: slot numbering reflects cognitive role
+and stability rank, not sequential position in the output string.
 
 Gemma 4B quantized has an effective context window of approximately 8,000
-tokens. The prompt contract consumes under 1,500 tokens in the worst case,
-leaving substantial headroom for model output and system overhead. A prompt
-contract that routinely approaches the context ceiling will silently degrade
-on long sessions. This budget prevents that.
+tokens. The prompt contract consumes under 2,000 tokens in the worst case
+(persona + all dynamic slots fully populated), leaving substantial headroom
+for model output. A prompt contract that routinely approaches the context
+ceiling will silently degrade on long sessions. This budget prevents that.
 
 ### 3.4 PromptBuilder Interface
 
@@ -411,22 +483,27 @@ class PromptBuilder:
     def build(
         self,
         instruction:      str,
-        working_memory:   list[Turn]          | None = None,
-        episodic_summary: list[EpisodeBullet] | None = None,
-        rag_snippets:     list[RagSource]     | None = None,
-        tool_results:     list[ToolResult]    | None = None,
+        persona:          str | None            = None,
+        episodic_summary: list[EpisodeBullet]   | None = None,
+        rag_snippets:     list[RagSource]        | None = None,
+        tool_results:     list[ToolResult]       | None = None,
+        working_memory:   list[Turn]             | None = None,
     ) -> tuple[str, str]:
         """
-        Assembles the canonical 6-slot prompt.
+        Assembles the canonical 7-slot prompt (static-first ordering).
 
         Returns
         -------
         (system_prompt, user_prompt)
-            system_prompt : Slot 1 only. Passed as the system argument
-                            to the runtime client.
-            user_prompt   : Slots 2–6, assembled in order, with empty
-                            slots omitted cleanly. Passed as the user
-                            argument to the runtime client.
+            system_prompt : Slots 1a + 1b. Passed as the system= argument
+                            to the runtime client. Byte-stable when persona
+                            is unchanged — maximises KV-cache prefix reuse
+                            across the system message.
+            user_prompt   : Slots 3–7, assembled in stability order (most
+                            stable first, instruction always last). Empty
+                            slots are omitted cleanly — no label, no
+                            whitespace. Passed as the user= argument to
+                            the runtime client.
         """
         ...
 ```
@@ -437,6 +514,18 @@ class PromptBuilder:
 - Empty optional slots produce no output — not an empty label, not
   whitespace, nothing.
 - The builder is stateless. It is safe to call concurrently.
+
+### 3.5 WikiAgent Prompt Exception
+
+WikiAgent's system prompt is a protected contract: a compact XML-only
+instruction block that must not be replaced by `PromptBuilder._SYSTEM` or
+extended with a persona. WikiAgent calls `PromptBuilder.build()` with
+`instruction=` only. The returned `system_prompt` is discarded; WikiAgent
+passes its own `SYSTEM_PROMPT` constant to `runtime.infer()` directly.
+
+This exception is intentional and permanent. The XML-only prompt is tuned
+to the ingest task. General identity or persona context would pollute the
+structured-output contract WikiAgent depends on.
 
 ---
 
@@ -551,10 +640,18 @@ class RoutingPlan:
 1. Receive `RoutingPlan` from Planner.
 2. If `write_episode`: run `EpisodicMemoryWriter`, wait for completion.
 3. If `tools_to_call`: dispatch tools in listed order, collect results.
-4. If `fetch_rag`: run `MemoryManager.query_corpus()`, collect snippets.
-5. If `fetch_episodic`: run episodic retrieval, collect bullets.
-6. Call `PromptBuilder.build()` with all collected content.
+4. If `fetch_rag`: run `MemoryManager.query_corpus()`, collect snippets for Slot 4.
+5. If `fetch_episodic`: run episodic retrieval, collect bullets for Slot 3.
+6. Call `PromptBuilder.build()` with all collected content; persona is loaded
+   from `_load_persona()` (cached) and passed as `persona=` for Slot 1b.
 7. Call `RoutingPlan.agent` with the assembled prompt.
+
+The persona fetch (formerly Step 4a) has been removed from the per-request
+execution path. Persona is now a session-level cached value loaded on first
+request by `_load_persona()` and injected into the system message via
+`PromptBuilder.build(persona=...)`. This eliminates one corpus query per
+turn and moves the persona from the volatile user message (old Slot 5) into
+the stable system message prefix (Slot 1b).
 
 The Planner never calls agents, never calls tools, and never touches the
 database. It is pure decision logic.
@@ -623,9 +720,9 @@ Even when Gemma 4B produces output on binary classification tasks, it may use ma
 The dependency chain is strict. Each item depends on all items above it.
 No item is begun until all items above it are complete and tested.
 
-> **Session progress** — Phases 1–7 complete as of this session.
-> Test suite: **180 tests, 0 failures** across 7 test files.
-> Files added/modified: `memory_manager.py` (extended), `prompt_builder.py` (extended),
+> **Session progress** — Phases 1–7 complete, plus KV-Cache Prompt Refactor.
+> Test suite: **184 tests, 0 failures** across 7 test files.
+> Files added/modified in Phases 1–7: `memory_manager.py` (extended), `prompt_builder.py` (extended),
 > `planner.py` (extended), `episodic_extractor.py` (extended), `tool_dispatcher.py`,
 > `controller_agent.py` (extended), `conversational_agent.py` (extended),
 > `wiki_agent.py` (extended), `wiki/lora-persona.md` (new),
@@ -640,8 +737,19 @@ No item is begun until all items above it are complete and tested.
 > - Episodic extraction bypasses `PromptBuilder` wrapper; uses direct prompt construction
 > - `max_tokens` raised to 200 on all extraction inference calls
 > - Priority 5 replaced with deterministic keyword check (Gemma 4B binary classification incompatibility)
-> - P4+P5 compound merge added to `route()` so corpus-relevant + episodically-relevant queries receive both slot 4 and slot 5
+> - P4+P5 compound merge added to `route()` so corpus-relevant + episodically-relevant queries receive both Slot 3 (episodic) and Slot 4 (RAG)
 > - Implicit extraction gated by `_has_implicit_signal()` deterministic check before any inference call
+>
+> **KV-Cache Prompt Refactor** — the following changes were made after Phase 7 to maximise
+> prefix-cache reuse across all inference backends. Reflected in §3:
+> - Slot ordering redesigned: static-first, volatile-last (identity → persona → episodic → RAG → tools → working memory → instruction)
+> - Persona moved from volatile user message (old Slot 5 RAG prepend) to stable system message (Slot 1b)
+> - `PromptBuilder.build()` gained `persona: str | None` parameter; `working_memory` moved to last
+> - `[USER]` label renamed `[INSTRUCTION]`; old Slot 2 retired; slots renumbered 3–7
+> - `ControllerAgent._load_persona()` added: loads and caches persona once per session
+> - Step 4a (per-request persona fetch + dedup) removed from `_execute_plan`
+> - `tests/test_prompt_builder.py` (new file): 4 persona/ordering tests
+> - 4 tests updated across `test_controller_phase4.py`, `test_tool_dispatcher_phase6.py`, `test_integration_phase7.py`
 
 ---
 
@@ -705,7 +813,7 @@ No item is begun until all items above it are complete and tested.
 - [x] **6.1** Define `ToolResult` dataclass and tool dispatcher interface
 - [x] **6.2** Implement `web_search` sub-agent (1–3 searches, structured results)
 - [x] **6.3** Implement local file tools (read, write, append)
-- [x] **6.4** Wire tool results into slot 6 via `PromptBuilder`
+- [x] **6.4** Wire tool results into Slot 5 via `PromptBuilder`
 - [x] **6.5** Integration tests: tool results appear in correct slot, token ceiling enforced
 
 ---
@@ -715,7 +823,7 @@ No item is begun until all items above it are complete and tested.
 - [x] **7.1** Full pipeline test: instruction → Planner → fetches → PromptBuilder → agent → response
 - [x] **7.2** Episodic extraction fires correctly on real conversations
 - [x] **7.3** Working memory window enforces 300-token ceiling across session
-- [x] **7.4** Persona loaded from wiki via RAG (slot 5) rather than hardcoded system prompt
+- [x] **7.4** Persona loaded from wiki via RAG and injected into system message as Slot 1b (moved from Slot 5 RAG during KV-cache refactor; see session progress note above)
 - [x] **7.5** All agents use `PromptBuilder.build()`. No agent assembles its own prompt string.
 - [x] **7.6** Prompt logging enabled: every inference call writes its assembled prompt to debug log
 

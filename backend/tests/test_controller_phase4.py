@@ -124,7 +124,7 @@ class TestDirectAnswerPath:
 
         subtask = conv._received[0]
         assert "_prebuilt_prompt" in subtask.context
-        assert "[USER]" in subtask.context["_prebuilt_prompt"]
+        assert "[INSTRUCTION]" in subtask.context["_prebuilt_prompt"]
 
     def test_routing_metadata_in_context(self, mm):
         rt   = make_runtime(infer_return="no")

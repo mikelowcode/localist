@@ -99,9 +99,11 @@ _MEMORY_KEYWORDS: frozenset[str] = frozenset({
 })
 
 # Priority 3 — web search trigger keywords
+# "current" was removed (too broad — matches "currently", valid non-news uses);
+# replaced with "current price" as a compound phrase to reduce false positives.
 _WEB_SEARCH_KEYWORDS: frozenset[str] = frozenset({
     "latest",
-    "current",
+    "current price",
     "today",
     "news",
     "recent",
@@ -111,13 +113,13 @@ _WEB_SEARCH_KEYWORDS: frozenset[str] = frozenset({
 _FILE_OP_KEYWORDS: frozenset[str] = frozenset({
     "read",
     "write",
-    "open",
+    "open the file",
     "save",
     "create a file",
 })
 
 # Relevance threshold for Priority 4 corpus scoring
-_CORPUS_SCORE_THRESHOLD: float = 0.4
+_CORPUS_SCORE_THRESHOLD: float = 0.55
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +150,10 @@ class Planner:
         Optional MemoryManager. Required for Priority 4 corpus scoring.
         When absent, Priority 4 is skipped (no corpus to query).
     """
+
+    # Class-level aliases so callers can access via instance (e.g. p._WEB_SEARCH_KEYWORDS)
+    _WEB_SEARCH_KEYWORDS: frozenset[str] = _WEB_SEARCH_KEYWORDS
+    _FILE_OP_KEYWORDS:    frozenset[str] = _FILE_OP_KEYWORDS
 
     def __init__(
         self,
@@ -210,7 +216,7 @@ class Planner:
             "raw_path" in context
             or any(kw in lowered for kw in _INGEST_KEYWORDS)
         )
-        has_web_search = any(kw in lowered for kw in _WEB_SEARCH_KEYWORDS)
+        has_web_search = bool(self._any_whole_word(_WEB_SEARCH_KEYWORDS, lowered))
 
         if has_ingest and has_web_search:
             logger.debug(
@@ -361,6 +367,23 @@ class Planner:
     # Priority 3 — Tool signal  (§4.2, Priority 3)
     # -----------------------------------------------------------------------
 
+    @staticmethod
+    def _any_whole_word(keywords: frozenset[str], text: str) -> str | None:
+        """
+        Return the first keyword from `keywords` that appears as a whole
+        word (or whole phrase) in `text`, or None if no match.
+
+        Multi-word keywords (e.g. "create a file") are matched as a literal
+        phrase with word boundaries on each end. Single-word keywords are
+        matched with \\b anchors. Matching is case-insensitive; callers
+        should pass already-lowercased text.
+        """
+        for kw in keywords:
+            pattern = r"\b" + re.escape(kw) + r"\b"
+            if re.search(pattern, text):
+                return kw
+        return None
+
     def _priority3_tool(self, lowered: str) -> RoutingPlan | None:
         """
         Match condition: web search keyword OR file operation keyword present
@@ -374,13 +397,19 @@ class Planner:
         """
         tools: list[str] = []
 
-        if any(kw in lowered for kw in _WEB_SEARCH_KEYWORDS):
+        ws_kw = self._any_whole_word(_WEB_SEARCH_KEYWORDS, lowered)
+        if ws_kw:
             tools.append("web_search")
-            logger.debug("Planner: Priority 3 — web_search signal detected.")
+            logger.debug(
+                "Planner: Priority 3 — web_search signal detected (%r).", ws_kw
+            )
 
-        if any(kw in lowered for kw in _FILE_OP_KEYWORDS):
+        fo_kw = self._any_whole_word(_FILE_OP_KEYWORDS, lowered)
+        if fo_kw:
             tools.append("file_op")
-            logger.debug("Planner: Priority 3 — file_op signal detected.")
+            logger.debug(
+                "Planner: Priority 3 — file_op signal detected (%r).", fo_kw
+            )
 
         if tools:
             return RoutingPlan(
