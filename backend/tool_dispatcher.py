@@ -14,7 +14,7 @@ file_op    : Read, write, or append to local files. All paths are
              resolved relative to project_root and sandboxed — no
              path traversal outside project_root is permitted.
 
-Reference: §6 of LORA-Architecture.md
+Reference: §6 of LOCALIST-Architecture.md
 """
 
 from __future__ import annotations
@@ -46,9 +46,9 @@ _WEB_SEARCH_FALLBACK_SYSTEM = (
 _LANGSEARCH_ENDPOINT: str = "https://api.langsearch.com/v1/web-search"
 _LANGSEARCH_COUNT: int = 3
 
-# LORA Fetcher service endpoint (standalone service on port 8002)
+# Localist Fetcher service endpoint (standalone service on port 8002)
 _FETCHER_EXTRACT_URL: str = os.environ.get(
-    "LORA_FETCHER_URL", "http://localhost:8002"
+    "LOCALIST_FETCHER_URL", "http://localhost:8002"
 ) + "/extract"
 
 

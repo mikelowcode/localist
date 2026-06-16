@@ -36,7 +36,7 @@ Settings integration
 --------------------
 Add one field to the Settings class in main.py:
 
-    runtime_backend: str = "foundry"   # override with LORA_RUNTIME_BACKEND
+    runtime_backend: str = "foundry"   # override with LOCALIST_RUNTIME_BACKEND
 
 All other settings fields (chat_model, embedding_model, foundry_url, …)
 remain as-is.  The factory reads only the fields relevant to the chosen
@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Backend registry
 # ---------------------------------------------------------------------------
-# Maps the backend string (from LORA_RUNTIME_BACKEND / Settings) to a
+# Maps the backend string (from LOCALIST_RUNTIME_BACKEND / Settings) to a
 # zero-argument factory callable that returns a configured client.
 #
 # Concrete client imports are deferred inside the factory functions so that

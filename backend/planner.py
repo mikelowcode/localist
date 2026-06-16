@@ -10,7 +10,7 @@ executes the plan.
 Inference is invoked in exactly one place: Priority 5 (episodic relevance).
 Priorities 1–4 and 6 are pure rule evaluations — no model calls.
 
-Reference: §4 of LORA-Architecture.md
+Reference: §4 of LOCALIST-Architecture.md
 """
 
 from __future__ import annotations
@@ -327,7 +327,7 @@ class Planner:
             return plan
 
         # Priority 4 — Corpus signal
-        plan = self._priority4_corpus(lowered)
+        plan = self._priority4_corpus(lowered, instruction)
         if plan is not None:
             # P4 matched — also run P5 to check episodic relevance.
             # If both match, merge into a compound plan so the controller
@@ -531,32 +531,66 @@ class Planner:
     # Priority 4 — Corpus signal  (§4.2, Priority 4)
     # -----------------------------------------------------------------------
 
-    def _priority4_corpus(self, lowered: str) -> RoutingPlan | None:
+    def _priority4_corpus(self, lowered: str, instruction: str) -> RoutingPlan | None:
         """
-        Match condition: instruction contains an explicit wiki/vault trigger
-        keyword.
+        Match condition (either sufficient):
+          A) instruction contains an explicit wiki/vault trigger keyword, OR
+          B) MemoryManager is available AND query_corpus() returns a top result
+             with relevance_score >= _CORPUS_SCORE_THRESHOLD.
 
-        Priority 4 no longer uses corpus scoring. RAG is only injected when
-        the user explicitly signals they want wiki content. This keeps routing
-        deterministic and stable as the corpus grows.
+        Path A keeps routing deterministic for explicit wiki requests.
+        Path B restores score-based RAG injection for natural-language corpus
+        queries that lack a trigger keyword (e.g. "summarize the LORA Master
+        Project Outline").
 
         Returns a RoutingPlan with fetch_rag=True, or None if no match.
         """
+        # Path A — explicit keyword trigger
         matched_kw = next(
             (kw for kw in _WIKI_QUERY_KEYWORDS if kw in lowered), None
         )
-        if matched_kw is None:
+        if matched_kw is not None:
+            logger.debug(
+                "Planner: Priority 4 matched via keyword (%r).", matched_kw
+            )
+            return RoutingPlan(
+                agent          = "conversational_agent",
+                fetch_episodic = True,
+                fetch_rag      = True,
+                compound       = False,
+            )
+
+        # Path B — corpus score threshold
+        if self._memory_manager is None:
+            logger.debug("Planner: Priority 4 Path B skipped — no MemoryManager.")
             return None
 
+        try:
+            results = self._memory_manager.query_corpus(
+                instruction, max_results=1
+            )
+        except Exception as exc:
+            logger.warning("Planner: Priority 4 corpus check failed: %s", exc)
+            return None
+
+        top_score = results[0].relevance_score if results else 0.0
+
+        if top_score >= _CORPUS_SCORE_THRESHOLD:
+            logger.debug(
+                "Planner: Priority 4 matched via corpus score (%.3f >= %.3f).",
+                top_score, _CORPUS_SCORE_THRESHOLD,
+            )
+            return RoutingPlan(
+                agent          = "conversational_agent",
+                fetch_episodic = False,
+                fetch_rag      = True,
+                compound       = False,
+            )
+
         logger.debug(
-            "Planner: Priority 4 matched (keyword=%r).", matched_kw
+            "Planner: Priority 4 — corpus miss (top_score=%.3f).", top_score
         )
-        return RoutingPlan(
-            agent          = "conversational_agent",
-            fetch_episodic = True,
-            fetch_rag      = True,
-            compound       = False,
-        )
+        return None
 
     # -----------------------------------------------------------------------
     # Priority 5 — Episodic relevance  (§4.2, §4.3)
@@ -578,16 +612,16 @@ class Planner:
         injected this session, all subsequent turns return fetch_episodic=True
         without keyword evaluation.
         """
-        # Cache check: session-level flag (preserved from original)
-        if self._episodic_injected:
+        # Cache check: session-level flag.
+        # When set, we skip the (previously: inference) call and go straight
+        # to keyword evaluation — but we do NOT return True unconditionally.
+        # A turn with no episodic keyword still returns None so P6 or P4 can
+        # handle it correctly.
+        _skip_inference = self._episodic_injected
+        if _skip_inference:
             logger.debug(
-                "Planner: Priority 5 — episodic already injected this "
-                "session; returning fetch_episodic=True."
-            )
-            return RoutingPlan(
-                agent          = "conversational_agent",
-                fetch_episodic = True,
-                fetch_rag      = False,
+                "Planner: Priority 5 — episodic_injected=True; "
+                "skipping inference, proceeding to keyword check."
             )
 
         # Deterministic keyword check

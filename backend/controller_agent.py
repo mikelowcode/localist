@@ -543,7 +543,7 @@ class IntentClassifier:
 
 class ControllerAgent:
     """
-    The executive function of the LORA system.
+    The executive function of the Localist Framework.
 
     FastAPI instantiates one ControllerAgent at startup and calls
     ``handle_task(task_dict)`` for every incoming request.
@@ -695,7 +695,7 @@ class ControllerAgent:
         memory: _AnyMemory,
     ) -> ControllerResult:
         """
-        Execute the 7-step contract from §4.4 of LORA-Architecture.md.
+        Execute the 7-step contract from §4.4 of LOCALIST-Architecture.md.
 
         Steps
         -----

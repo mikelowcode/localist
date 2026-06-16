@@ -1,6 +1,8 @@
-# LORA — Local Reasoning Agent
+# Localist Framework
 
-LORA is a local-first, agentic general assistant running entirely on macOS Apple Silicon. All inference and embeddings run on-device via oMLX — no cloud services are required during normal operation. The system maintains persistent memory across sessions, fetches and reads live web content, searches indexed documents, and routes every query through a deterministic priority engine before a single token of inference is spent.
+Localist Framework is a local-first, agentic general assistant running entirely on macOS Apple Silicon. The system maintains persistent memory across sessions, fetches and reads live web content, searches indexed documents, and routes every query through a deterministic priority engine before a single token of inference is spent.
+
+Localist is inference-engine-agnostic. It ships with oMLX support out of the box and is designed to support MLX-LM, Ollama, LM Studio, and other local runtimes.
 
 ---
 
@@ -9,7 +11,7 @@ LORA is a local-first, agentic general assistant running entirely on macOS Apple
 The frontend (SvelteKit) sends requests over HTTP to the main backend — a FastAPI application on port 8001. The backend's `ControllerAgent` receives each task, runs it through the `Planner` (a priority-ordered rule engine), and dispatches to the appropriate agent: `ConversationalAgent` for answers and `WikiAgent` for document ingestion. When a query requires live web content, `ToolDispatcher` calls the LangSearch API or posts to the fetcher microservice on port 8002, which fetches and extracts clean article text. All inference goes through `OMLXRuntimeClient`, which speaks the OpenAI-compatible HTTP API exposed by oMLX. Episodic memory and vector embeddings are stored in a SQLite database with WAL mode enabled and survive server restarts.
 
 ```
-SvelteKit UI  (lora-ui/)
+Localist UI  (lora-ui/)
      │  HTTP
      ▼
 FastAPI — port 8001  (backend/main.py)
@@ -35,7 +37,7 @@ ControllerAgent  →  Planner  →  RoutingPlan
 - macOS Apple Silicon
 - Python 3.13
 - oMLX running `gemma-4-e4b-it-4bit` on port 8000
-- Node.js (for the SvelteKit frontend)
+- Node.js (for Localist UI)
 
 ---
 
@@ -50,24 +52,20 @@ pip install -r requirements.txt
 
 ---
 
-## Running LORA
+## Running Localist
 
-Both services must be running. Open two terminal windows, both inside `backend/` with the virtual environment active.
-
-**Main backend (port 8001):**
+Use the **Localist CLI** launcher to start both services with a single command:
 
 ```bash
-cd backend
-source .venv/bin/activate
-uvicorn main:app --reload --host 127.0.0.1 --port 8001
+./start_localist.sh
 ```
 
-**Fetcher microservice (port 8002):**
+This starts the Localist backend on port 8001 and the fetcher microservice on port 8002, tails both logs to the terminal with `[backend]` and `[fetcher]` prefixes, and shuts both down cleanly on Ctrl+C.
+
+To stop both services from a separate terminal:
 
 ```bash
-cd backend
-source .venv/bin/activate
-python -m uvicorn fetcher.main:app --host 127.0.0.1 --port 8002 --reload
+./start_localist.sh --stop
 ```
 
 The fetcher is a standalone FastAPI service. It is only required if you intend to use the `url_fetch` tool (drop a URL into chat). The main backend degrades gracefully if the fetcher is unreachable.
@@ -80,14 +78,14 @@ Copy `backend/.env.example` to `backend/.env` and set values as needed. The only
 
 | Variable | Default | Description |
 |---|---|---|
-| `LORA_RUNTIME_BACKEND` | `omlx` | `omlx` or `foundry` |
-| `LORA_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, or `WARNING` |
-| `LORA_OMLX_URL` | `http://localhost:8000` | oMLX server URL |
+| `LOCALIST_RUNTIME_BACKEND` | `omlx` | `omlx` or `foundry` |
+| `LOCALIST_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, or `WARNING` |
+| `LOCALIST_OMLX_URL` | `http://localhost:8000` | oMLX server URL |
 | `LANGSEARCH_API_KEY` | *(none)* | LangSearch API key. Web search is disabled and falls back to an inference stub when absent. |
-| `LORA_FETCHER_URL` | `http://localhost:8002` | Fetcher microservice URL |
-| `LORA_EMBEDDING_ENGINE_ENABLED` | `true` | Enable local embedding engine for RAG |
-| `LORA_WIKI_DIR` | `./wiki` | Path to wiki document directory |
-| `LORA_RAW_DIR` | `./raw` | Path to raw documents directory |
+| `LOCALIST_FETCHER_URL` | `http://localhost:8002` | Fetcher microservice URL |
+| `LOCALIST_EMBEDDING_ENGINE_ENABLED` | `true` | Enable local embedding engine for RAG |
+| `LOCALIST_WIKI_DIR` | `./wiki` | Path to wiki document directory |
+| `LOCALIST_RAW_DIR` | `./raw` | Path to raw documents directory |
 
 ---
 
@@ -103,7 +101,7 @@ Every query passes through `Planner`, a deterministic rule engine with seven pri
 | P2 | Memory keyword (`remember`, `forget`, `prefer`) | `ConversationalAgent` + write episode |
 | P3 | Tool signal: web search keyword, URL present, file keyword | `ConversationalAgent` + tool call |
 | P3b | Factual question keyword + corpus score below threshold | `ConversationalAgent` + `web_search` |
-| P4 | Explicit vault keyword (`check the wiki`, `vault`, etc.) | `ConversationalAgent` + RAG fetch |
+| P4 | Explicit vault keyword (`check the wiki`, `vault`, etc.) **or** corpus score ≥ 0.55 | `ConversationalAgent` + RAG fetch |
 | P5 | Episodic relevance keyword (`my preference`, `last time`, etc.) | `ConversationalAgent` + episodic fetch |
 | P6 | Fallback | `ConversationalAgent`, direct answer |
 
@@ -119,7 +117,7 @@ Every query passes through `Planner`, a deterministic rule engine with seven pri
 
 ### Memory
 
-LORA maintains two memory stores in SQLite:
+Localist maintains two memory stores in SQLite:
 
 **Episodic memory** stores typed facts extracted from conversation — preferences, corrections, decisions, workflows, naming conventions, project facts, and task completions. Each episode has a subject, content, type, confidence score, and status. Supersession (updating rather than duplicating) is handled by matching on subject and type. Episodes are never hard-deleted; status transitions manage lifecycle.
 
@@ -141,14 +139,14 @@ The prompt builder assembles a fixed 7-slot layout optimized for KV-cache effici
 6. **Tool results** — output from `web_search`, `url_fetch`, `file_op`
 7. **Instruction** — the current user message
 
-Slots 1–2 are static across turns, maximizing KV-cache reuse. Measured cache efficiency on turn 2: 79.7%. Worst-case prompt (all slots populated): approximately 1,950 tokens against an 8,000-token context window.
+Slots 1–2 are static across turns, maximizing KV-cache reuse. Measured cache efficiency on turn 2: 79.7%. Worst-case prompt (all slots populated): approximately 2,300 tokens against an 8,000-token context window.
 
 ---
 
 ## Project Structure
 
 ```
-lora-app-demo/
+localist/
 ├── backend/
 │   ├── main.py                      # FastAPI app — HTTP entry point, port 8001
 │   ├── controller_agent.py          # Task orchestration, agent dispatch, episodic extraction trigger
@@ -161,7 +159,7 @@ lora-app-demo/
 │   ├── episodic_extractor.py        # Explicit and implicit episode extraction pipeline
 │   ├── embedding_engine.py          # Local mlx embedding engine (768-dim)
 │   ├── omlx_runtime_client.py       # oMLX HTTP transport (OpenAI-compatible)
-│   ├── runtime_factory.py           # Constructs the active runtime from LORA_RUNTIME_BACKEND
+│   ├── runtime_factory.py           # Constructs the active runtime from LOCALIST_RUNTIME_BACKEND
 │   ├── base_runtime_client.py       # BaseRuntimeClient protocol definition
 │   ├── fetcher/
 │   │   ├── main.py                  # Fetcher FastAPI app — port 8002
@@ -180,7 +178,7 @@ lora-app-demo/
 │   ├── lora_memory.db               # SQLite database (episodic + embeddings)
 │   ├── requirements.txt
 │   └── .env                         # Local configuration (not committed)
-└── lora-ui/                         # SvelteKit frontend
+└── lora-ui/                         # Localist UI
 ```
 
 ---
@@ -208,6 +206,6 @@ All tests use mocks for inference and SQLite; no oMLX server or live API keys ar
 
 ## Roadmap
 
-- **Startup script** — single command to launch oMLX, the main backend, and the fetcher in the correct order with health-check gating
-- **UI redesign** — the SvelteKit frontend is functional but minimal; planned rework for memory inspection, episode browsing, and tool result display
-- **macOS app packaging** — bundle as a native `.app` via PyInstaller + Tauri so LORA can run without a terminal
+- **Localist CLI** — ✅ `./start_localist.sh` launches both services; `--stop` kills them cleanly
+- **Localist UI redesign** — functional but minimal; planned rework for memory inspection, episode browsing, and tool result display
+- **macOS app packaging** — bundle as a native `.app` via PyInstaller + Tauri so Localist Framework can run without a terminal

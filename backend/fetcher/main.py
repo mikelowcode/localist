@@ -39,7 +39,7 @@ from fetcher.models import (
 # ── Logging ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
-    level  = os.environ.get("LORA_LOG_LEVEL", "INFO").upper(),
+    level  = os.environ.get("LOCALIST_LOG_LEVEL", "INFO").upper(),
     format = "%(asctime)s  %(levelname)-8s  %(name)-20s  %(message)s",
     datefmt = "%H:%M:%S",
 )
@@ -188,4 +188,4 @@ async def endpoint_api(req: ApiRequest):
 
 @app.get("/health")
 async def health():
-    return {"healthy": True, "service": "lora-fetcher", "port": 8002}
+    return {"healthy": True, "service": "localist-fetcher", "port": 8002}

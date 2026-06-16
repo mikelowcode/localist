@@ -22,7 +22,7 @@ Pipeline
    Explicit signals → confidence = 1.0
    Model-extracted  → confidence scored 0.6–0.9 by response heuristic.
 
-Reference: §2 and Phase 5 of LORA-Architecture.md
+Reference: §2 and Phase 5 of LOCALIST-Architecture.md
 """
 
 from __future__ import annotations

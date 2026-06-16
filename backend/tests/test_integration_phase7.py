@@ -161,7 +161,7 @@ class TestFullPipeline:
             relevance_score = 0.9,
         )
         other_doc = MockDoc(
-            path            = "wiki/lora-build-order.md",
+            path            = "wiki/localist-build-order.md",
             content         = "Build order content for LORA.",
             relevance_score = 0.6,
         )
@@ -193,7 +193,7 @@ class TestFullPipeline:
         assert "Source: wiki/lora-persona.md" not in user_prompt
 
         # The normal RAG source still appears in the user prompt
-        assert "Source: wiki/lora-build-order.md" in user_prompt
+        assert "Source: wiki/localist-build-order.md" in user_prompt
 
     def test_7_4b_persona_filtered_from_rag_slot(self, caplog):
         """lora-persona.md is filtered from RAG results; it appears only in system_prompt."""

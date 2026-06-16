@@ -18,10 +18,10 @@ venv/
 # Node / Frontend
 # -------------------------
 node_modules/
-lora-ui/node_modules/
-lora-ui/.svelte-kit/
-lora-ui/build/
-lora-ui/.vite/
+localist-ui/node_modules/
+localist-ui/.svelte-kit/
+localist-ui/build/
+localist-ui/.vite/
 
 # -------------------------
 # ML models & embeddings
@@ -48,7 +48,7 @@ hf_cache/
 # -------------------------
 # Local runtime artifacts
 # -------------------------
-lora_memory.db
+localist_memory.db
 memory.db
 *.sqlite
 *.sqlite3

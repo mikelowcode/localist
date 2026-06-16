@@ -1,9 +1,0 @@
-{
-	"/": [
-		"src/routes/+page.ts"
-	],
-	"/conversation": [],
-	"/files": [],
-	"/research": [],
-	"/settings": []
-}

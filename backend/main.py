@@ -71,23 +71,23 @@ Environment / configuration
 All tuneable values are in the ``Settings`` class (pydantic-settings).  They
 can be overridden via environment variables or a .env file:
 
-  LORA_RUNTIME_BACKEND             Runtime backend: "foundry" | "omlx" (default "foundry")
-  LORA_CHAT_MODEL                  Chat model ID (interpreted by the active backend)
-  LORA_FOUNDRY_URL                 Override auto-resolved Foundry base URL (foundry only)
-  LORA_OMLX_URL                    oMLX server base URL (omlx only, default http://localhost:8000)
-  LORA_LOG_LEVEL                   Root log level (default INFO)
-  LORA_WIKI_DIR                    Absolute path to the wiki directory
-  LORA_RAW_DIR                     Absolute path to the raw files directory
-  LORA_SCHEMA_PATH                 Absolute path to SCHEMA.md
-  LORA_TEMPLATES_DIR               Absolute path to the templates directory
-  LORA_AUTO_APPLY                  Whether WikiAgent writes to disk immediately (bool)
-  LORA_STREAM_TIMEOUT              Streaming timeout in seconds (float)
-  LORA_REQUEST_TIMEOUT             Non-streaming timeout in seconds (float)
-  LORA_MEMORY_DB                   Absolute path to the SQLite memory DB file.
-                                   Defaults to <project_root>/lora_memory.db
-  LORA_EMBEDDING_ENGINE_ENABLED    Load the standalone MLX-LM EmbeddingEngine at
-                                   startup (bool, default True).  Set False to run
-                                   in keyword-only mode without loading the model.
+  LOCALIST_RUNTIME_BACKEND             Runtime backend: "foundry" | "omlx" (default "foundry")
+  LOCALIST_CHAT_MODEL                  Chat model ID (interpreted by the active backend)
+  LOCALIST_FOUNDRY_URL                 Override auto-resolved Foundry base URL (foundry only)
+  LOCALIST_OMLX_URL                    oMLX server base URL (omlx only, default http://localhost:8000)
+  LOCALIST_LOG_LEVEL                   Root log level (default INFO)
+  LOCALIST_WIKI_DIR                    Absolute path to the wiki directory
+  LOCALIST_RAW_DIR                     Absolute path to the raw files directory
+  LOCALIST_SCHEMA_PATH                 Absolute path to SCHEMA.md
+  LOCALIST_TEMPLATES_DIR               Absolute path to the templates directory
+  LOCALIST_AUTO_APPLY                  Whether WikiAgent writes to disk immediately (bool)
+  LOCALIST_STREAM_TIMEOUT              Streaming timeout in seconds (float)
+  LOCALIST_REQUEST_TIMEOUT             Non-streaming timeout in seconds (float)
+  LOCALIST_MEMORY_DB                   Absolute path to the SQLite memory DB file.
+                                       Defaults to <project_root>/localist_memory.db
+  LOCALIST_EMBEDDING_ENGINE_ENABLED    Load the standalone MLX-LM EmbeddingEngine at
+                                       startup (bool, default True).  Set False to run
+                                       in keyword-only mode without loading the model.
 """
 
 from __future__ import annotations
@@ -128,10 +128,10 @@ from wiki_agent import WikiAgent
 
 class Settings(BaseSettings):
     """
-    All configuration for the LORA backend.
+    All configuration for the Localist Framework backend.
     Override any field via environment variable or .env file.
     """
-    model_config = SettingsConfigDict(env_prefix="LORA_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="LOCALIST_", env_file=".env", extra="ignore")
 
     # Runtime backend selection
     runtime_backend: str = "foundry"
@@ -157,7 +157,7 @@ class Settings(BaseSettings):
     templates_dir:   str | None = None
 
     # MemoryManager
-    memory_db:                str | None = None   # None → <project_root>/lora_memory.db
+    memory_db:                str | None = None   # None → <project_root>/localist_memory.db
 
     # EmbeddingEngine — standalone MLX-LM embedding, backend-agnostic.
     # Set False to skip model load and run MemoryManager in keyword-only mode.
@@ -251,7 +251,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     raw_dir       = Path(settings.raw_dir)       if settings.raw_dir       else project_root / "raw"
     schema_path   = Path(settings.schema_path)   if settings.schema_path   else project_root / "SCHEMA.md"
     templates_dir = Path(settings.templates_dir) if settings.templates_dir else project_root / "templates"
-    memory_db     = Path(settings.memory_db)     if settings.memory_db     else project_root / "lora_memory.db"
+    memory_db     = Path(settings.memory_db)     if settings.memory_db     else project_root / "localist_memory.db"
 
     # -- EmbeddingEngine (standalone MLX-LM, backend-agnostic) ---------------
     #

@@ -3,7 +3,7 @@ LORA — PromptBuilder
 ====================
 Single point of prompt assembly for all LORA agents.
 Implements the 7-slot prompt contract defined in §3 of
-LORA-Architecture.md. Every agent calls PromptBuilder.build();
+LOCALIST-Architecture.md. Every agent calls PromptBuilder.build();
 no agent assembles its own prompt string.
 
 This module has no dependencies on FastAPI, SQLite, or any runtime
@@ -53,7 +53,7 @@ class ToolResult:
 class PromptBuilder:
     """
     Assembles the canonical 7-slot prompt defined in §3 of
-    LORA-Architecture.md.
+    LOCALIST-Architecture.md.
 
     Slot layout
     -----------
@@ -108,7 +108,7 @@ class PromptBuilder:
     _CEIL_SYSTEM:   int = 50    # hard; slot 1a is a constant so this is advisory
     _CEIL_PERSONA:  int = 500   # slot 1b; persona injected into system msg
     _CEIL_EPISODIC: int = 150   # slot 3
-    _CEIL_RAG:      int = 450   # slot 4
+    _CEIL_RAG:      int = 800   # slot 4
     _CEIL_TOOL:     int = 500   # slot 5
     _CEIL_WORKING:  int = 300   # slot 6
 
@@ -230,9 +230,9 @@ class PromptBuilder:
                     truncated.rfind("?"),
                 )
                 if last_period > entry_budget // 2:
-                    content = truncated[: last_period + 1]
+                    content = truncated[: last_period + 1] + " … [truncated]"
                 else:
-                    content = truncated + "…"
+                    content = truncated + "… [truncated]"
 
             block  = f"{header}\n{content}"
             lines.append(block)

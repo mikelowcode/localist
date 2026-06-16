@@ -55,7 +55,7 @@ Content-Type: application/json
 {
   "instruction": "Ingest the raw file and create wiki pages.",
   "context": {
-    "raw_path": "/Users/michaelfilanc/Projects/lora-app-demo/backend/raw/LORA Master Project Outline.md",
+    "raw_path": "/Users/michaelfilanc/Projects/lora-app-demo/backend/raw/Localist Master Project Outline.md",
     "auto_apply": true
   }
 }

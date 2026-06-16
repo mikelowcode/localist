@@ -30,7 +30,7 @@ Architectural contract
 Database file location
 ----------------------
 Defaults to  <project_root>/lora_memory.db
-Override via the ``db_path`` constructor argument or the LORA_MEMORY_DB
+Override via the ``db_path`` constructor argument or the LOCALIST_MEMORY_DB
 environment variable (the latter is read by main.py's Settings class —
 add  memory_db: str | None = None  to Settings and pass it through).
 
@@ -1218,7 +1218,7 @@ class MemoryManager:
 # ---------------------------------------------------------------------------
 
 # Closed set of valid episode types. Adding a type is an architectural
-# decision — do not expand this set without updating LORA-Architecture.md.
+# decision — do not expand this set without updating LOCALIST-Architecture.md.
 VALID_EPISODE_TYPES: frozenset[str] = frozenset({
     "preference",
     "correction",
@@ -1490,7 +1490,7 @@ class EpisodicMemoryReader:
     Reads episodes from the `episodes` table in `lora_memory.db`.
 
     Implements the three retrieval modes defined in §2.6 of
-    LORA-Architecture.md:
+    LOCALIST-Architecture.md:
 
       Mode 1 — Exact subject match
         By subject string. Returns up to 5 active records ordered by
@@ -1743,7 +1743,7 @@ class EpisodicMemoryReader:
 
 
 # ---------------------------------------------------------------------------
-# Episodic summarization contract  (§2.7 of LORA-Architecture.md)
+# Episodic summarization contract  (§2.7 of LOCALIST-Architecture.md)
 # ---------------------------------------------------------------------------
 
 # Priority order for bullet ranking. Lower index = higher priority.
@@ -1774,7 +1774,7 @@ def format_episodic_summary(
 ) -> str:
     """
     Format a list of EpisodeRecords into the canonical episodic memory block
-    for prompt injection, as specified in §2.7 of LORA-Architecture.md.
+    for prompt injection, as specified in §2.7 of LOCALIST-Architecture.md.
 
     Contract rules enforced
     -----------------------
