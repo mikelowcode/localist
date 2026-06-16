@@ -19,6 +19,7 @@ Reference: §6 of LORA-Architecture.md
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -40,6 +41,15 @@ _WEB_SEARCH_FALLBACK_SYSTEM = (
     "factual bullet points summarising what a web search would likely find. "
     "Format each bullet as: • <fact>. No preamble. No URLs. Plain text only."
 )
+
+# LangSearch API endpoint and config
+_LANGSEARCH_ENDPOINT: str = "https://api.langsearch.com/v1/web-search"
+_LANGSEARCH_COUNT: int = 3
+
+# LORA Fetcher service endpoint (standalone service on port 8002)
+_FETCHER_EXTRACT_URL: str = os.environ.get(
+    "LORA_FETCHER_URL", "http://localhost:8002"
+) + "/extract"
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +122,8 @@ class ToolDispatcher:
                 results.extend(self._run_web_search(instruction, ctx))
             elif tool_name == "file_op":
                 results.append(self._run_file_op(instruction, ctx))
+            elif tool_name == "url_fetch":
+                results.append(self._run_url_fetch(instruction, ctx))
             else:
                 logger.warning(
                     "ToolDispatcher: unknown tool %r — skipping.", tool_name
@@ -171,38 +183,95 @@ class ToolDispatcher:
         return results
 
     def _execute_single_search(self, query: str) -> ToolResult:
-        """Run one web_search query. Never raises."""
-        try:
-            if hasattr(self._runtime, "web_search") and callable(
-                getattr(self._runtime, "web_search")
-            ):
-                logger.debug(
-                    "ToolDispatcher: web_search (real) query=%r.", query
-                )
-                raw = self._runtime.web_search(query)
-            else:
-                logger.debug(
-                    "ToolDispatcher: web_search (fallback infer) query=%r.",
-                    query,
-                )
+        """Run one web_search query via LangSearch API. Never raises."""
+        api_key = os.environ.get("LANGSEARCH_API_KEY", "")
+
+        if not api_key:
+            # Fallback: bounded inference call (dev/offline mode)
+            logger.warning(
+                "ToolDispatcher: LANGSEARCH_API_KEY not set — "
+                "falling back to inference stub for query=%r.", query,
+            )
+            try:
                 raw = self._runtime.infer(
                     system      = _WEB_SEARCH_FALLBACK_SYSTEM,
                     prompt      = f"Search query: {query}",
                     max_tokens  = 120,
                     temperature = 0.2,
                 )
+                return ToolResult(
+                    tool_name  = "web_search",
+                    parameters = f"query={query!r}",
+                    result     = str(raw).strip(),
+                )
+            except Exception as exc:
+                return ToolResult(
+                    tool_name  = "web_search",
+                    parameters = f"query={query!r}",
+                    result     = f"ERROR: fallback search failed — {exc}",
+                )
+
+        # Real LangSearch call
+        try:
+            import requests as _requests
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "query":     query,
+                "summary":   True,
+                "count":     _LANGSEARCH_COUNT,
+                "freshness": "noLimit",
+            }
+            resp = _requests.post(
+                _LANGSEARCH_ENDPOINT,
+                headers=headers,
+                json=payload,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            pages = (
+                data.get("data", {})
+                    .get("webPages", {})
+                    .get("value", [])
+            )
+
+            if not pages:
+                return ToolResult(
+                    tool_name  = "web_search",
+                    parameters = f"query={query!r}",
+                    result     = "No results found.",
+                )
+
+            lines: list[str] = []
+            for page in pages[:_LANGSEARCH_COUNT]:
+                name    = page.get("name", "").strip()
+                snippet = page.get("snippet", "").strip()
+                url     = page.get("displayUrl", page.get("url", "")).strip()
+                # Prefer summary over snippet when available
+                body    = page.get("summary") or snippet
+                # Truncate body to keep Slot 6 within budget
+                body    = body[:300].rsplit(" ", 1)[0] if len(body) > 300 else body
+                lines.append(f"• {name}\n  {body}\n  [{url}]")
+
+            result_text = "\n\n".join(lines)
             logger.info(
-                "ToolDispatcher: web_search complete for query=%r "
-                "result_chars=%d.", query, len(str(raw)),
+                "ToolDispatcher: LangSearch complete for query=%r "
+                "results=%d result_chars=%d.",
+                query, len(pages), len(result_text),
             )
             return ToolResult(
                 tool_name  = "web_search",
                 parameters = f"query={query!r}",
-                result     = str(raw).strip(),
+                result     = result_text,
             )
+
         except Exception as exc:
             logger.warning(
-                "ToolDispatcher: web_search failed for query=%r: %s",
+                "ToolDispatcher: LangSearch failed for query=%r: %s",
                 query, exc,
             )
             return ToolResult(
@@ -340,3 +409,85 @@ class ToolDispatcher:
             parameters = params_str,
             result     = f"OK: appended {len(content)} characters to {path.name}",
         )
+
+    # -----------------------------------------------------------------------
+    # 6.4 — url_fetch tool
+    # -----------------------------------------------------------------------
+
+    def _run_url_fetch(
+        self,
+        instruction: str,
+        context:     dict[str, Any],
+    ) -> ToolResult:
+        """
+        Fetch and extract a URL via the LORA Fetcher service (port 8002).
+
+        URL resolution order:
+          1. context["fetch_url"] — explicit URL
+          2. First URL-like pattern found in the instruction string
+
+        Returns a single ToolResult. Never raises.
+        """
+        import re
+        import requests as _requests
+
+        # Resolve URL
+        url: str = context.get("fetch_url", "")
+        if not url:
+            match = re.search(r"https?://[^\s\"'>]+", instruction)
+            url   = match.group(0) if match else ""
+
+        if not url:
+            logger.warning("ToolDispatcher: url_fetch — no URL found in instruction or context.")
+            return ToolResult(
+                tool_name  = "url_fetch",
+                parameters = "",
+                result     = "ERROR: no URL provided for url_fetch.",
+            )
+
+        logger.debug("ToolDispatcher: url_fetch → %s", url)
+
+        try:
+            resp = _requests.post(
+                _FETCHER_EXTRACT_URL,
+                json    = {"url": url},
+                timeout = 15,
+            )
+            data = resp.json()
+
+            if resp.status_code != 200:
+                error_msg = data.get("message", "unknown error")
+                return ToolResult(
+                    tool_name  = "url_fetch",
+                    parameters = f"url={url!r}",
+                    result     = f"ERROR: fetch failed — {error_msg}",
+                )
+
+            title = data.get("title", "")
+            text  = data.get("cleaned_text", "")
+            words = data.get("word_count", 0)
+
+            result_text = (
+                f"Title: {title}\n"
+                f"Source: {url}\n"
+                f"Words: {words}\n\n"
+                f"{text}"
+            )
+
+            logger.info(
+                "ToolDispatcher: url_fetch complete — url=%r  words=%d  chars=%d",
+                url, words, len(result_text),
+            )
+            return ToolResult(
+                tool_name  = "url_fetch",
+                parameters = f"url={url!r}",
+                result     = result_text,
+            )
+
+        except Exception as exc:
+            logger.warning("ToolDispatcher: url_fetch failed — %s", exc)
+            return ToolResult(
+                tool_name  = "url_fetch",
+                parameters = f"url={url!r}",
+                result     = f"ERROR: url_fetch failed — {exc}",
+            )

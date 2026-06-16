@@ -92,6 +92,9 @@ can be overridden via environment variables or a .env file:
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
 import datetime
 import json

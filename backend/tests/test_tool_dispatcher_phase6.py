@@ -139,14 +139,32 @@ class TestWebSearch:
         assert "oMLX" in results[0].result
         assert rt.infer.called
 
-    def test_real_web_search_method_used_when_available(self, tmp_root):
+    def test_langsearch_api_called_when_key_set(self, tmp_root):
         rt = MagicMock()
-        rt.web_search = MagicMock(return_value="Real result for oMLX.")
+        fake_response = MagicMock()
+        fake_response.json.return_value = {
+            "data": {
+                "webPages": {
+                    "value": [
+                        {
+                            "name": "oMLX Release",
+                            "snippet": "Latest oMLX release notes.",
+                            "displayUrl": "example.com/omlx",
+                            "summary": None,
+                        }
+                    ]
+                }
+            }
+        }
+        fake_response.raise_for_status = MagicMock()
         td = ToolDispatcher(runtime=rt, project_root=tmp_root)
 
-        results = td.dispatch(["web_search"], "latest oMLX release")
-        assert rt.web_search.called
-        assert "Real result" in results[0].result
+        with patch.dict("os.environ", {"LANGSEARCH_API_KEY": "test-key"}):
+            with patch("requests.post", return_value=fake_response) as mock_post:
+                results = td.dispatch(["web_search"], "latest oMLX release")
+
+        assert mock_post.called
+        assert "oMLX Release" in results[0].result
         assert not rt.infer.called
 
     def test_explicit_queries_from_context(self, tmp_root):
@@ -503,7 +521,7 @@ class TestControllerToolIntegration:
             runtime=rt, agents=[conv], memory_manager=mm
         )
         ctrl.handle_task({
-            "instruction": "read the notes file",
+            "instruction": "read the file notes.md",
             "context": {
                 "project_root":   str(tmp_path),
                 "file_op_action": "read",

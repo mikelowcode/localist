@@ -99,21 +99,18 @@ class MockDoc:
 class TestFullPipeline:
 
     def test_7_1_full_pipeline_conversational(self, mm, db_path):
-        """Full pipeline: corpus hit → P4 routing → fetch_rag=True → answer."""
-        # Jaccard("LORA research assistant", "LORA research assistant agentic local")
-        # = |{lora,research,assistant}| / |{lora,research,assistant,agentic,local}|
-        # = 3/5 = 0.60 >= 0.4 Planner threshold → P4 fires
+        """Full pipeline: explicit wiki keyword → P4 routing → fetch_rag=True → answer."""
         mm.index_document(
             path     = db_path.parent / "phase7_doc.md",
             doc_type = "wiki",
-            content  = "LORA research assistant agentic local",
+            content  = "check the wiki LORA research assistant agentic",
         )
 
         rt   = make_runtime(infer_return="Paris.")
         conv = make_conv_agent(answer="Paris.")
         ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
 
-        result = ctrl.handle_task({"instruction": "LORA research assistant"})
+        result = ctrl.handle_task({"instruction": "check the wiki for LORA research assistant"})
 
         assert result["status"] == "complete"
         assert result["answer"] == "Paris."
@@ -185,9 +182,8 @@ class TestFullPipeline:
         conv = make_conv_agent(answer="Paris.")
         ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm_mock)
 
-        # "LORA research assistant" returns other_doc (score 0.6 >= 0.4) for
-        # the Planner's P4 query → fetch_rag=True, so slot 4 is populated.
-        ctrl.handle_task({"instruction": "LORA research assistant"})
+        # Explicit wiki keyword → P4 fires → fetch_rag=True → slot 4 populated.
+        ctrl.handle_task({"instruction": "check the wiki for LORA research assistant"})
 
         system_prompt = conv._received[0].context["_prebuilt_system"]
         user_prompt   = conv._received[0].context["_prebuilt_prompt"]
@@ -217,7 +213,7 @@ class TestFullPipeline:
         ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm_mock)
 
         with caplog.at_level(logging.DEBUG, logger="controller_agent"):
-            result = ctrl.handle_task({"instruction": "LORA research assistant"})
+            result = ctrl.handle_task({"instruction": "check the wiki for LORA research assistant"})
 
         assert result["status"] == "complete"
         messages = [r.getMessage() for r in caplog.records]

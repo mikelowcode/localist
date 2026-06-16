@@ -1,232 +1,213 @@
 # LORA — Local Reasoning Agent
 
-A local-first, multi-agent research system. All inference runs on local hardware via Azure AI Foundry or oMLX. No external cloud APIs are called during normal operation.
-
----
-
-## Project structure
-
-```
-lora-app-demo/
-├── backend/
-│   ├── main.py                      # FastAPI app — HTTP boundary only
-│   ├── controller_agent.py          # Central coordinator (Planner, Synthesizer, MemoryManager)
-│   ├── base_runtime_client.py       # BaseRuntimeClient Protocol — shared interface for all backends
-│   ├── runtime_factory.py           # Constructs the active runtime from LORA_RUNTIME_BACKEND
-│   ├── foundry_runtime_client.py    # Azure AI Foundry transport (auto-resolves ephemeral port)
-│   ├── omlx_runtime_client.py       # oMLX transport (OpenAI-compatible local API)
-│   ├── wiki_agent.py                # Write path: raw file → structured wiki pages
-│   ├── research_agent.py            # Read path: question → iterative research report
-│   ├── SCHEMA.md                    # Wiki page schema (edit to match your corpus)
-│   ├── templates/                   # Page templates used by WikiAgent
-│   │   ├── system.md
-│   │   ├── concept.md
-│   │   └── research-note.md
-│   ├── wiki/                        # Generated wiki pages (starts empty)
-│   ├── raw/                         # Drop raw .md / .txt files here
-│   ├── logs/                        # Runtime log output
-│   ├── requirements.txt
-│   ├── .env.example                 # Copy to .env and fill in values
-│   └── api.http                     # REST Client test file (VSCode)
-└── .vscode/
-    ├── settings.json
-    ├── launch.json                  # Debug configurations
-    └── extensions.json
-```
-
----
-
-## Quickstart
-
-### 1. Prerequisites
-
-- Python 3.11+
-- [Azure AI Foundry](https://ai.azure.com/) installed locally **or** [oMLX](https://github.com/ml-explore/mlx-examples) running at `http://localhost:8000`
-- VSCode (recommended) with the extensions in `.vscode/extensions.json`
-
-### 2. Set up the Python environment
-
-```bash
-cd ~/Projects/lora-app-demo/backend
-python3 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-### 3. Configure
-
-```bash
-cp .env.example .env
-# Edit .env — key variables listed below
-```
-
-| Variable | Default | Description |
-|---|---|---|
-| `LORA_RUNTIME_BACKEND` | `foundry` | `foundry` or `omlx` |
-| `LORA_CHAT_MODEL` | `Phi-4-mini-instruct-generic-gpu:5` | Chat model ID (backend-specific) |
-| `LORA_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model ID (Foundry only) |
-| `LORA_FOUNDRY_URL` | *(auto-resolved)* | Override Foundry base URL |
-| `LORA_OMLX_URL` | `http://localhost:8000` | oMLX server base URL |
-| `LORA_WIKI_DIR` | `./wiki` | Absolute path to wiki directory |
-| `LORA_RAW_DIR` | `./raw` | Absolute path to raw files directory |
-| `LORA_AUTO_APPLY` | `false` | WikiAgent: write pages to disk immediately |
-| `LORA_LOG_LEVEL` | `INFO` | Root log level |
-
-### 4. Start your inference backend
-
-**Foundry:**
-```bash
-foundry service start
-```
-
-**oMLX:**
-```bash
-# Start your oMLX server — confirm it's live at http://localhost:8000/v1/models
-```
-
-### 5. Start the LORA backend
-
-```bash
-# From backend/ with .venv active:
-uvicorn main:app --reload --host 127.0.0.1 --port 8000
-```
-
-Or use the **"LORA: FastAPI (uvicorn)"** launch config in VSCode (`F5`).
-
-### 6. Test the API
-
-Open `backend/api.http` in VSCode and click **Send Request**, or use curl:
-
-```bash
-# Health check
-curl http://127.0.0.1:8000/health
-
-# Research task
-curl -X POST http://127.0.0.1:8000/task \
-  -H "Content-Type: application/json" \
-  -d '{
-    "instruction": "What do we know about attention mechanisms?",
-    "context": {"query": "attention mechanisms"}
-  }'
-
-# Wiki ingestion
-curl -X POST http://127.0.0.1:8000/task \
-  -H "Content-Type: application/json" \
-  -d '{
-    "instruction": "Ingest this raw file into the wiki.",
-    "context": {
-      "raw_path": "/abs/path/to/raw/paper.md",
-      "auto_apply": true
-    }
-  }'
-```
-
----
-
-## API reference
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Backend reachability + model availability |
-| `GET` | `/agents` | List registered agent names |
-| `POST` | `/task` | Submit a task (blocking, returns full result) |
-| `POST` | `/task/stream` | Submit a task, stream answer as SSE |
-
-### POST /task — request body
-
-```json
-{
-  "task_id": "optional-uuid",
-  "instruction": "Your research question or ingestion command.",
-  "context": {
-    "query":          "focused sub-question for ResearchAgent",
-    "raw_path":       "/abs/path/to/raw/file.md",
-    "auto_apply":     false,
-    "max_sources":    5,
-    "max_iterations": 3,
-    "use_embeddings": false
-  }
-}
-```
-
-### POST /task/stream — SSE event format
-
-```
-data: {"type": "status",  "message": "Planning task…"}
-data: {"type": "token",   "token": "The "}
-data: {"type": "token",   "token": "answer "}
-data: {"type": "sources", "sources": [...]}
-data: {"type": "done",    "task_id": "...", "status": "complete"}
-data: [DONE]
-```
-
-> **Note:** Streaming currently replays the completed answer word-by-word after the full pipeline finishes. True token-level streaming during synthesis is listed under [What still needs to be built](#what-still-needs-to-be-built).
+LORA is a local-first, agentic general assistant running entirely on macOS Apple Silicon. All inference and embeddings run on-device via oMLX — no cloud services are required during normal operation. The system maintains persistent memory across sessions, fetches and reads live web content, searches indexed documents, and routes every query through a deterministic priority engine before a single token of inference is spent.
 
 ---
 
 ## Architecture
 
+The frontend (SvelteKit) sends requests over HTTP to the main backend — a FastAPI application on port 8001. The backend's `ControllerAgent` receives each task, runs it through the `Planner` (a priority-ordered rule engine), and dispatches to the appropriate agent: `ConversationalAgent` for answers and `WikiAgent` for document ingestion. When a query requires live web content, `ToolDispatcher` calls the LangSearch API or posts to the fetcher microservice on port 8002, which fetches and extracts clean article text. All inference goes through `OMLXRuntimeClient`, which speaks the OpenAI-compatible HTTP API exposed by oMLX. Episodic memory and vector embeddings are stored in a SQLite database with WAL mode enabled and survive server restarts.
+
 ```
-Svelte UI  (not yet built)
-    │  HTTP / SSE
-    ▼
-FastAPI  (main.py)
-    │  task_dict
-    ▼
-ControllerAgent  (controller_agent.py)
-    │
-    ├── Planner  ──────────────────► RuntimeClient.infer()
-    │       │ [SubTask list]
-    │       ▼
-    ├── _dispatch()
-    │       ├──► WikiAgent        ──► RuntimeClient.infer()
-    │       └──► ResearchAgent    ──► RuntimeClient.infer() / embed()
-    │
-    └── Synthesizer ───────────────► RuntimeClient.infer()
-                                            │
-                               ┌────────────┴─────────────┐
-                               ▼                           ▼
-                    FoundryRuntimeClient        OMLXRuntimeClient
-                    (Azure AI Foundry)          (oMLX local API)
+SvelteKit UI  (lora-ui/)
+     │  HTTP
+     ▼
+FastAPI — port 8001  (backend/main.py)
+     │
+     ▼
+ControllerAgent  →  Planner  →  RoutingPlan
+     │
+     ├──► ConversationalAgent  →  PromptBuilder  →  OMLXRuntimeClient
+     │         │
+     │         ├── MemoryManager (SQLite episodic + RAG)
+     │         └── ToolDispatcher
+     │               ├── LangSearch API  (web_search)
+     │               ├── Fetcher — port 8002  (url_fetch)
+     │               └── FileSystem  (file_op)
+     │
+     └──► WikiAgent  →  OMLXRuntimeClient
 ```
 
-The `RuntimeFactory` selects the active backend at startup based on `LORA_RUNTIME_BACKEND`. All agents and the controller are typed against `BaseRuntimeClient` and are completely unaware of which backend is running.
+---
+
+## Prerequisites
+
+- macOS Apple Silicon
+- Python 3.13
+- oMLX running `gemma-4-e4b-it-4bit` on port 8000
+- Node.js (for the SvelteKit frontend)
 
 ---
 
-## Agent overview
+## Installation
 
-### WikiAgent (`wiki_agent.py`)
-
-The **write path**. Accepts a raw `.md` or `.txt` file and uses the model to produce structured wiki actions: new `RESEARCH_NOTE`, `CONCEPT`, or `SYSTEM` pages, and unified diffs for existing pages.
-
-- Set `auto_apply: true` in context to write immediately; leave `false` to review proposed actions first.
-- Page content is validated against `SCHEMA.md` and the templates in `templates/`.
-- Optionally appends a `JournalEntry` to a `.jsonl` file for audit trails.
-
-### ResearchAgent (`research_agent.py`)
-
-The **read path**. Accepts a research question and iteratively retrieves, reads, and synthesises information from the wiki and raw directories.
-
-- Decomposes queries into sub-queries, retrieves relevant documents by keyword overlap, and extracts discrete claims with source references.
-- Set `use_embeddings: true` to re-rank retrieved documents by embedding cosine similarity (requires an embedding model in your backend).
-- Returns a structured Markdown report with claims, sources, detected gaps, and sub-query provenance.
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
 ---
 
-## Adding a new runtime backend
+## Running LORA
 
-1. Write a class that satisfies `BaseRuntimeClient` (`base_runtime_client.py`) — implement `infer()`, `embed()`, and `infer_stream()`.
-2. Add a factory function and registry entry in `runtime_factory.py`.
-3. Add any new config fields to `Settings` in `main.py` and pass them through `create_runtime()`.
+Both services must be running. Open two terminal windows, both inside `backend/` with the virtual environment active.
 
-Nothing else in the stack changes.
+**Main backend (port 8001):**
+
+```bash
+cd backend
+source .venv/bin/activate
+uvicorn main:app --reload --host 127.0.0.1 --port 8001
+```
+
+**Fetcher microservice (port 8002):**
+
+```bash
+cd backend
+source .venv/bin/activate
+python -m uvicorn fetcher.main:app --host 127.0.0.1 --port 8002 --reload
+```
+
+The fetcher is a standalone FastAPI service. It is only required if you intend to use the `url_fetch` tool (drop a URL into chat). The main backend degrades gracefully if the fetcher is unreachable.
 
 ---
 
-## What still needs to be built
+## Configuration
 
-- **Svelte UI** — the frontend layer. The SSE event format and `/task`, `/health`, `/agents` endpoints are stable and ready to consume.
-- **True streaming synthesis** — currently the pipeline completes fully before tokens are replayed. Wire `infer_stream()` into the synthesis step so tokens arrive in real time.
-- **Persistent MemoryManager** — the current in-process list is evicted after 200 entries. Swap the storage backend for SQLite or a vector store without changing the `MemoryManager` interface.
-- **oMLX embedding support** — `OMLXRuntimeClient.embed()` raises `NotImplementedError` until an embedding model is confirmed available. Once one is loaded, set `LORA_EMBEDDING_MODEL` and enable `use_embeddings: true` in ResearchAgent calls.
+Copy `backend/.env.example` to `backend/.env` and set values as needed. The only required variable for full functionality is `LANGSEARCH_API_KEY`; all others have working defaults.
+
+| Variable | Default | Description |
+|---|---|---|
+| `LORA_RUNTIME_BACKEND` | `omlx` | `omlx` or `foundry` |
+| `LORA_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, or `WARNING` |
+| `LORA_OMLX_URL` | `http://localhost:8000` | oMLX server URL |
+| `LANGSEARCH_API_KEY` | *(none)* | LangSearch API key. Web search is disabled and falls back to an inference stub when absent. |
+| `LORA_FETCHER_URL` | `http://localhost:8002` | Fetcher microservice URL |
+| `LORA_EMBEDDING_ENGINE_ENABLED` | `true` | Enable local embedding engine for RAG |
+| `LORA_WIKI_DIR` | `./wiki` | Path to wiki document directory |
+| `LORA_RAW_DIR` | `./raw` | Path to raw documents directory |
+
+---
+
+## How It Works
+
+### Routing
+
+Every query passes through `Planner`, a deterministic rule engine with seven priority levels evaluated in order. No inference is used for routing decisions.
+
+| Priority | Trigger | Route |
+|---|---|---|
+| P1 | `raw_path` in context, or ingest keyword | `WikiAgent` |
+| P2 | Memory keyword (`remember`, `forget`, `prefer`) | `ConversationalAgent` + write episode |
+| P3 | Tool signal: web search keyword, URL present, file keyword | `ConversationalAgent` + tool call |
+| P3b | Factual question keyword + corpus score below threshold | `ConversationalAgent` + `web_search` |
+| P4 | Explicit vault keyword (`check the wiki`, `vault`, etc.) | `ConversationalAgent` + RAG fetch |
+| P5 | Episodic relevance keyword (`my preference`, `last time`, etc.) | `ConversationalAgent` + episodic fetch |
+| P6 | Fallback | `ConversationalAgent`, direct answer |
+
+### Tools
+
+**Web search** — fires automatically at P3b when the query looks factual and the local corpus has no strong hit. Calls LangSearch API, returns the top three results with titles, URLs, and truncated body text. Falls back to an inference stub when no API key is configured.
+
+**Page fetch** — triggered when a URL appears in the message or the user says "fetch this link", "summarize this URL", etc. Posts to the fetcher microservice, which downloads the page and uses `readability-lxml` to extract clean article text. Returns title, source URL, word count, and body text.
+
+**File operations** — sandboxed read, write, and append on local files. Triggered by explicit file-operation phrasing.
+
+**Wiki ingestion** — processes a raw document into structured wiki pages via `WikiAgent`. Triggered by `raw_path` in request context or ingestion keywords.
+
+### Memory
+
+LORA maintains two memory stores in SQLite:
+
+**Episodic memory** stores typed facts extracted from conversation — preferences, corrections, decisions, workflows, naming conventions, project facts, and task completions. Each episode has a subject, content, type, confidence score, and status. Supersession (updating rather than duplicating) is handled by matching on subject and type. Episodes are never hard-deleted; status transitions manage lifecycle.
+
+Extraction runs on two paths:
+- **Explicit**: the user says "remember that" or "my preference is" — the episode is stored immediately at confidence 1.0, subject derived from the normalized content string.
+- **Implicit**: after every response, the controller checks whether the exchange contains memorable content and extracts an episode at confidence 0.6–0.9 if so.
+
+**Corpus (RAG)** stores vector embeddings of wiki pages and ingested documents. `ConversationalAgent` queries the corpus when `fetch_rag=True` in the routing plan and injects matching passages into the prompt. Embeddings use `mlx-community/embeddinggemma-300m-4bit` (768-dimensional, local).
+
+### Prompt Layout
+
+The prompt builder assembles a fixed 7-slot layout optimized for KV-cache efficiency:
+
+1. **Identity** — static system role (never changes between turns)
+2. **Persona** — loaded from `wiki/lora-persona.md`, cached per session
+3. **Working memory** — recent conversation turns
+4. **Episodic memory** — retrieved episodes relevant to the current query
+5. **RAG / context** — retrieved corpus passages
+6. **Tool results** — output from `web_search`, `url_fetch`, `file_op`
+7. **Instruction** — the current user message
+
+Slots 1–2 are static across turns, maximizing KV-cache reuse. Measured cache efficiency on turn 2: 79.7%. Worst-case prompt (all slots populated): approximately 1,950 tokens against an 8,000-token context window.
+
+---
+
+## Project Structure
+
+```
+lora-app-demo/
+├── backend/
+│   ├── main.py                      # FastAPI app — HTTP entry point, port 8001
+│   ├── controller_agent.py          # Task orchestration, agent dispatch, episodic extraction trigger
+│   ├── planner.py                   # Deterministic routing rule engine (P1–P6)
+│   ├── conversational_agent.py      # Primary agent: prompt assembly, RAG, tool result injection
+│   ├── wiki_agent.py                # Document ingestion agent — raw file → structured wiki pages
+│   ├── prompt_builder.py            # 7-slot KV-cache-optimized prompt assembler
+│   ├── tool_dispatcher.py           # Executes web_search, url_fetch, file_op tool calls
+│   ├── memory_manager.py            # SQLite-backed episodic + RAG memory interface
+│   ├── episodic_extractor.py        # Explicit and implicit episode extraction pipeline
+│   ├── embedding_engine.py          # Local mlx embedding engine (768-dim)
+│   ├── omlx_runtime_client.py       # oMLX HTTP transport (OpenAI-compatible)
+│   ├── runtime_factory.py           # Constructs the active runtime from LORA_RUNTIME_BACKEND
+│   ├── base_runtime_client.py       # BaseRuntimeClient protocol definition
+│   ├── fetcher/
+│   │   ├── main.py                  # Fetcher FastAPI app — port 8002
+│   │   ├── client.py                # Async HTTP client (httpx)
+│   │   ├── extractor.py             # readability-lxml extraction pipeline
+│   │   └── models.py                # Pydantic v2 request/response models
+│   ├── wiki/
+│   │   ├── lora-persona.md          # LORA persona — loaded into slot 2 of every prompt
+│   │   └── *.md                     # Indexed wiki pages
+│   ├── tests/
+│   │   ├── test_planner_phase3.py   # Planner routing unit tests
+│   │   ├── test_controller_phase4.py # ControllerAgent integration tests
+│   │   ├── test_episodic_phase5.py  # Episodic memory extraction tests
+│   │   ├── test_tool_dispatcher_phase6.py  # ToolDispatcher unit tests
+│   │   └── test_integration_phase7.py      # Full pipeline integration tests
+│   ├── lora_memory.db               # SQLite database (episodic + embeddings)
+│   ├── requirements.txt
+│   └── .env                         # Local configuration (not committed)
+└── lora-ui/                         # SvelteKit frontend
+```
+
+---
+
+## Development
+
+Run the full test suite from `backend/` with the virtual environment active:
+
+```bash
+cd backend
+source .venv/bin/activate
+python -m pytest tests/ -v
+```
+
+Tests are organized by phase and cover each layer independently:
+- **Phase 3** (`test_planner_phase3.py`) — routing rule engine, all priority levels
+- **Phase 4** (`test_controller_phase4.py`) — controller dispatch, RAG injection, prompt assembly
+- **Phase 5** (`test_episodic_phase5.py`) — episodic extraction, supersession, confidence scoring
+- **Phase 6** (`test_tool_dispatcher_phase6.py`) — LangSearch integration, file ops, url_fetch
+- **Phase 7** (`test_integration_phase7.py`) — full pipeline from instruction to response
+
+All tests use mocks for inference and SQLite; no oMLX server or live API keys are required.
+
+---
+
+## Roadmap
+
+- **Startup script** — single command to launch oMLX, the main backend, and the fetcher in the correct order with health-check gating
+- **UI redesign** — the SvelteKit frontend is functional but minimal; planned rework for memory inspection, episode browsing, and tool result display
+- **macOS app packaging** — bundle as a native `.app` via PyInstaller + Tauri so LORA can run without a terminal

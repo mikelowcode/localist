@@ -88,25 +88,18 @@ class TestPlannerPriorities:
 
     def test_p3_file_op_keyword(self):
         p = Planner(runtime=make_runtime())
-        plan = p.route("read the config file", context={})
+        plan = p.route("read the file notes.md", context={})
         assert "file_op" in plan.tools_to_call
 
-    def test_p4_corpus_hit(self):
-        mm = MagicMock()
-        doc = MagicMock(); doc.relevance_score = 0.7
-        mm.query_corpus.return_value = [doc]
-        p = Planner(runtime=make_runtime(), memory_manager=mm)
-        plan = p.route("Tell me about the LORA memory system", context={})
+    def test_p4_explicit_wiki_keyword_fires(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("check the wiki for LORA memory system", context={})
         assert plan.fetch_rag      is True
-        assert plan.fetch_episodic is False
+        assert plan.fetch_episodic is True
 
-    def test_p4_corpus_miss_falls_through(self):
-        mm = MagicMock()
-        doc = MagicMock(); doc.relevance_score = 0.1
-        mm.query_corpus.return_value = [doc]
-        p = Planner(runtime=make_runtime(infer_return="no"),
-                    memory_manager=mm)
-        plan = p.route("What is the capital of France?", context={})
+    def test_p4_no_wiki_keyword_falls_through(self):
+        p = Planner(runtime=make_runtime(infer_return="no"))
+        plan = p.route("Tell me about the LORA memory system", context={})
         assert plan.fetch_rag is False
 
     def test_p5_yes_returns_episodic(self):

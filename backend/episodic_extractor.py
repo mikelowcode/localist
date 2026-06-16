@@ -548,7 +548,11 @@ def process_explicit_signal(
     if not content:
         return None
 
-    subject = instruction.strip()[:80]
+    # Derive subject from the already-normalized content string (same approach
+    # as process_implicit_extraction). content is already in "The user..."
+    # form from extract_content_from_instruction — no second model call needed.
+    # Falls back to the raw instruction if content is unexpectedly empty.
+    subject = (content[:80] if content else instruction.strip()[:80])
 
     writer.insert(
         episode_type    = signal.episode_type,

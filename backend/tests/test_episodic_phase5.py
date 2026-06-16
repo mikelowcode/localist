@@ -420,19 +420,17 @@ class TestProcessExplicitSignal:
         assert episodes[0]["confidence"] == 1.0
 
     def test_supersession_on_duplicate_subject(self, db_path):
-        rt = make_runtime(
-            infer_return="User prefers step-by-step instructions."
-        )
+        # Subject is derived from content (no extra model call), so supersession
+        # fires when both inserts produce the same subject from their content.
+        rt = make_runtime(infer_return="User prefers step-by-step instructions.")
         # First insert
         process_explicit_signal(
             instruction = "remember that I prefer step-by-step instructions",
             runtime     = rt,
             db_path     = db_path,
         )
-        # Second insert — same subject, same type → supersedes
-        rt2 = make_runtime(
-            infer_return="User prefers unified diffs over step-by-step."
-        )
+        # Second insert — same content → same subject → supersedes
+        rt2 = make_runtime(infer_return="User prefers step-by-step instructions.")
         process_explicit_signal(
             instruction = "remember that I prefer step-by-step instructions",
             runtime     = rt2,
@@ -560,7 +558,8 @@ class TestControllerWiring:
             "context":     {"project_context": "LORA"},
         })
 
-        # Only one infer call (explicit extraction); no second call for implicit
+        # One infer call for explicit extraction (content only — subject derived
+        # from content); no additional call for the suppressed implicit hook.
         assert rt.infer.call_count == 1
 
     def test_failed_agent_suppresses_implicit_hook(self, db_path):

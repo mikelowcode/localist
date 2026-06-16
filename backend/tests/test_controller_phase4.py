@@ -153,28 +153,22 @@ class TestDirectAnswerPath:
 # ---------------------------------------------------------------------------
 # Path 2 — RAG path (Priority 4)
 # ---------------------------------------------------------------------------
-#
-# Document content and instruction are chosen so Jaccard keyword overlap
-# scores 0.6 (above the 0.4 Planner threshold).
-# "LORA research assistant" vs "LORA research assistant agentic local":
-#   intersection={lora,research,assistant}=3  union=5  → 0.60
-# "LORA SQLite memory" vs "LORA SQLite memory episodic storage":
-#   intersection={lora,sqlite,memory}=3  union=5  → 0.60
+# P4 now fires on explicit wiki/vault trigger keywords, not corpus scoring.
 
 class TestRAGPath:
 
-    def test_fetch_rag_true_when_corpus_hits(self, mm, db_path):
+    def test_fetch_rag_true_when_wiki_keyword_present(self, mm, db_path):
         mm.index_document(
             path     = db_path.parent / "fake_wiki.md",
             doc_type = "wiki",
-            content  = "LORA research assistant agentic local",
+            content  = "check the wiki LORA research assistant agentic",
         )
 
         rt   = make_runtime(infer_return="no")
         conv = make_conv_agent("RAG answer.")
         ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
 
-        result = ctrl.handle_task({"instruction": "LORA research assistant"})
+        result = ctrl.handle_task({"instruction": "check the wiki for LORA research assistant"})
 
         assert result["status"] == "complete"
         routing = conv._received[0].context["_routing"]
@@ -184,14 +178,14 @@ class TestRAGPath:
         mm.index_document(
             path     = db_path.parent / "fake_wiki.md",
             doc_type = "wiki",
-            content  = "LORA SQLite memory episodic storage",
+            content  = "check the wiki LORA SQLite memory storage",
         )
 
         rt   = make_runtime(infer_return="no")
         conv = make_conv_agent()
         ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
 
-        ctrl.handle_task({"instruction": "LORA SQLite memory"})
+        ctrl.handle_task({"instruction": "check the wiki for LORA SQLite memory"})
 
         prompt = conv._received[0].context["_prebuilt_prompt"]
         assert "[CONTEXT]" in prompt

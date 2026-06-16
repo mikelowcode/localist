@@ -70,6 +70,14 @@ backend/prompt_builder_cache/
 backend/prompt_debug/
 
 # -------------------------
+# Fetcher microservice
+# -------------------------
+backend/fetcher/__pycache__/
+backend/fetcher/.cache/
+backend/fetcher/tmp/
+backend/fetcher/logs/
+
+# -------------------------
 # Tests (keep definitions, ignore outputs)
 # -------------------------
 backend/tests/__pycache__/

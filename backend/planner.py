@@ -99,19 +99,64 @@ _MEMORY_KEYWORDS: frozenset[str] = frozenset({
 })
 
 # Priority 3 — web search trigger keywords
-# "current" was removed (too broad — matches "currently", valid non-news uses);
-# replaced with "current price" as a compound phrase to reduce false positives.
+# Multi-word phrases carry no false-positive risk with _any_whole_word().
+# Single words ("today", "recent", "news") are protected by \b anchors.
 _WEB_SEARCH_KEYWORDS: frozenset[str] = frozenset({
     "latest",
     "current price",
+    "current version",
+    "current ceo",
+    "current status",
+    "current rate",
     "today",
     "news",
     "recent",
 })
 
+# Priority 3b — factual query keywords (trigger web search when corpus misses)
+_FACTUAL_QUERY_KEYWORDS: frozenset[str] = frozenset({
+    "when did",
+    "what year",
+    "who founded",
+    "who invented",
+    "who created",
+    "where was",
+    "how many",
+    "what is the",
+    "which company",
+    "who was the first",
+    "what was the first",
+})
+
+# Priority 4 — explicit wiki/vault query triggers
+_WIKI_QUERY_KEYWORDS: frozenset[str] = frozenset({
+    "check the wiki",
+    "search the wiki",
+    "what's in my vault",
+    "what is in my vault",
+    "look in the wiki",
+    "from the wiki",
+    "in the wiki",
+    "vault",
+})
+
+# Priority 3 — URL fetch trigger keywords (explicit only)
+_FETCH_KEYWORDS: frozenset[str] = frozenset({
+    "fetch this",
+    "fetch the url",
+    "fetch this url",
+    "read this link",
+    "read this url",
+    "open this link",
+    "summarize this url",
+    "summarize this link",
+    "extract this",
+})
+
 # Priority 3 — file operation trigger keywords
 _FILE_OP_KEYWORDS: frozenset[str] = frozenset({
-    "read",
+    "read the file",
+    "read file",
     "write",
     "open the file",
     "save",
@@ -276,8 +321,13 @@ class Planner:
         if plan is not None:
             return plan
 
+        # Priority 3b — Factual query + corpus miss
+        plan = self._priority3b_factual(instruction, lowered)
+        if plan is not None:
+            return plan
+
         # Priority 4 — Corpus signal
-        plan = self._priority4_corpus(instruction)
+        plan = self._priority4_corpus(lowered)
         if plan is not None:
             # P4 matched — also run P5 to check episodic relevance.
             # If both match, merge into a compound plan so the controller
@@ -411,6 +461,12 @@ class Planner:
                 "Planner: Priority 3 — file_op signal detected (%r).", fo_kw
             )
 
+        if self._any_whole_word(_FETCH_KEYWORDS, lowered) or re.search(
+            r"https?://", lowered
+        ):
+            tools.append("url_fetch")
+            logger.debug("Planner: Priority 3 — url_fetch signal detected.")
+
         if tools:
             return RoutingPlan(
                 agent          = "conversational_agent",
@@ -422,53 +478,85 @@ class Planner:
         return None
 
     # -----------------------------------------------------------------------
-    # Priority 4 — Corpus signal  (§4.2, Priority 4)
+    # Priority 3b — Factual query + corpus miss
     # -----------------------------------------------------------------------
 
-    def _priority4_corpus(self, instruction: str) -> RoutingPlan | None:
+    def _priority3b_factual(self, instruction: str, lowered: str) -> RoutingPlan | None:
         """
-        Match condition: MemoryManager.query_corpus() returns at least one
-        result with relevance_score >= _CORPUS_SCORE_THRESHOLD.
+        Match condition: instruction contains a factual query keyword AND
+        corpus query returns no result above _CORPUS_SCORE_THRESHOLD.
 
         When no MemoryManager is available, this priority is skipped entirely
-        (returns None) — no corpus to query.
+        (returns None) — corpus cannot be checked.
 
-        Returns a RoutingPlan with fetch_rag=True, or None if no match.
+        Returns a RoutingPlan with tools_to_call=["web_search"], or None.
         """
+        if not any(kw in lowered for kw in _FACTUAL_QUERY_KEYWORDS):
+            return None
+
         if self._memory_manager is None:
-            logger.debug(
-                "Planner: Priority 4 skipped (no MemoryManager available)."
-            )
+            logger.debug("Planner: Priority 3b skipped — no MemoryManager.")
             return None
 
         try:
             results = self._memory_manager.query_corpus(
-                instruction,
-                max_results    = 1,      # only need to know if any result clears the bar
-                use_embeddings = True,
+                instruction, max_results=1
             )
-            above_threshold = [
-                r for r in results
-                if r.relevance_score >= _CORPUS_SCORE_THRESHOLD
-            ]
-            if above_threshold:
-                logger.debug(
-                    "Planner: Priority 4 matched "
-                    "(top score=%.3f >= threshold=%.1f).",
-                    above_threshold[0].relevance_score,
-                    _CORPUS_SCORE_THRESHOLD,
-                )
-                return RoutingPlan(
-                    agent          = "conversational_agent",
-                    fetch_episodic = False,
-                    fetch_rag      = True,
-                )
         except Exception as exc:
-            logger.warning(
-                "Planner: Priority 4 corpus query failed (%s) — skipping.", exc
-            )
+            logger.warning("Planner: Priority 3b corpus check failed: %s", exc)
+            results = []
 
-        return None
+        top_score = results[0].relevance_score if results else 0.0
+
+        if top_score >= _CORPUS_SCORE_THRESHOLD:
+            logger.debug(
+                "Planner: Priority 3b — corpus hit (score=%.3f), "
+                "deferring to Priority 4.", top_score,
+            )
+            return None
+
+        logger.debug(
+            "Planner: Priority 3b matched — factual keyword, "
+            "corpus miss (score=%.3f), scheduling web_search.", top_score,
+        )
+        return RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = False,
+            tools_to_call  = ["web_search"],
+            compound       = True,
+        )
+
+    # -----------------------------------------------------------------------
+    # Priority 4 — Corpus signal  (§4.2, Priority 4)
+    # -----------------------------------------------------------------------
+
+    def _priority4_corpus(self, lowered: str) -> RoutingPlan | None:
+        """
+        Match condition: instruction contains an explicit wiki/vault trigger
+        keyword.
+
+        Priority 4 no longer uses corpus scoring. RAG is only injected when
+        the user explicitly signals they want wiki content. This keeps routing
+        deterministic and stable as the corpus grows.
+
+        Returns a RoutingPlan with fetch_rag=True, or None if no match.
+        """
+        matched_kw = next(
+            (kw for kw in _WIKI_QUERY_KEYWORDS if kw in lowered), None
+        )
+        if matched_kw is None:
+            return None
+
+        logger.debug(
+            "Planner: Priority 4 matched (keyword=%r).", matched_kw
+        )
+        return RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = True,
+            fetch_rag      = True,
+            compound       = False,
+        )
 
     # -----------------------------------------------------------------------
     # Priority 5 — Episodic relevance  (§4.2, §4.3)
@@ -511,6 +599,10 @@ class Planner:
             "workflow", "workflows",
             "last time", "previously", "before",
             "my project", "my setup", "my environment",
+            # Personal reference signals (unambiguous — always fetch episodic)
+            "my name", "do you remember", "who am i",
+            "what do you know about me", "my preference",
+            "what did i tell you", "what have i told you",
         })
 
         lowered = instruction.lower()
