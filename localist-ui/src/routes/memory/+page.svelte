@@ -1,13 +1,13 @@
 <script lang="ts">
-  import FileBrowser from '$lib/components/FileBrowser.svelte';
+  import EpisodesPanel from '$lib/components/EpisodesPanel.svelte';
 </script>
 
 <svelte:head>
-  <title>Files — Localist</title>
+  <title>Memory — Localist</title>
 </svelte:head>
 
 <div class="page-inner">
-  <FileBrowser />
+  <EpisodesPanel />
 </div>
 
 <style>

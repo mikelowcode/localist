@@ -3,7 +3,7 @@
 </script>
 
 <svelte:head>
-  <title>Research — LORA</title>
+  <title>Research — Localist</title>
 </svelte:head>
 
 <div class="page-inner">

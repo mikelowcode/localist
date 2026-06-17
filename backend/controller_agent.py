@@ -983,11 +983,20 @@ class ControllerAgent:
                     task_id  = task.task_id,
                     status   = TaskStatus.COMPLETE,
                     answer   = r.output.get("answer", ""),
-                    sources  = r.output.get("sources", []),
+                    sources  = [
+                        {
+                            "path": s,
+                            "type": "wiki" if "/wiki/" in s else "raw",
+                            "name": s.split("/")[-1].replace(".md", "").replace("-", " ").title(),
+                        }
+                        for s in r.output.get("sources", [])
+                    ],
                     metadata = {
                         "agent":          effective_agent_name,
+                        "priority":       plan.priority,
                         "fetch_rag":      plan.fetch_rag,
                         "fetch_episodic": plan.fetch_episodic,
+                        "tools_fired":    plan.tools_to_call,
                         "grounded":       r.output.get("grounded", False),
                     },
                 )

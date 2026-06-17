@@ -428,6 +428,28 @@ class MemoryStatsResponse(BaseModel):
     available:        bool   # False when MemoryManager is not initialised
 
 
+class EpisodeItem(BaseModel):
+    """A single episode record returned by GET /memory/episodes."""
+    id:              int
+    episode_type:    str
+    subject:         str
+    content:         str
+    confidence:      float
+    source:          str
+    task_id:         str | None = None
+    project_context: str | None = None
+    status:          str
+    created_at:      float
+    last_accessed:   float | None = None
+
+class EpisodesResponse(BaseModel):
+    """Response body for GET /memory/episodes."""
+    episodes: list[EpisodeItem]
+    total:    int
+    offset:   int
+    limit:    int
+
+
 class FileEntry(BaseModel):
     """Metadata for a single file in raw/ or wiki/."""
     name:     str    # stem without extension
@@ -638,6 +660,50 @@ async def get_memory_stats() -> MemoryStatsResponse:
     )
 
 
+
+
+@app.get(
+    "/memory/episodes",
+    response_model = EpisodesResponse,
+    summary        = "List stored episodes",
+)
+async def get_memory_episodes(
+    status:          str      = "active",
+    project_context: str | None = None,
+    episode_type:    str | None = None,
+    limit:           int      = 50,
+    offset:          int      = 0,
+) -> EpisodesResponse:
+    """
+    Return a paginated list of episodes from the episodic memory store.
+
+    Query parameters
+    ----------------
+    status          : "active" (default) | "retracted" | "all"
+    project_context : filter by project context string
+    episode_type    : filter by episode type
+    limit           : max results (default 50, max 200)
+    offset          : pagination offset (default 0)
+    """
+    mm = _state.memory_manager
+    if mm is None:
+        return EpisodesResponse(episodes=[], total=0, offset=offset, limit=limit)
+
+    rows: list[dict] = await asyncio.to_thread(
+        mm.list_episodes,
+        status          = status,
+        project_context = project_context,
+        episode_type    = episode_type,
+        limit           = limit,
+        offset          = offset,
+    )
+
+    return EpisodesResponse(
+        episodes = [EpisodeItem(**row) for row in rows],
+        total    = len(rows),
+        offset   = offset,
+        limit    = limit,
+    )
 
 
 # ---------------------------------------------------------------------------

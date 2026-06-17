@@ -1205,6 +1205,67 @@ class MemoryManager:
             "embeddings_pct": emb_pct,
         }
 
+    def list_episodes(
+        self,
+        status:          str = "active",
+        project_context: str | None = None,
+        episode_type:    str | None = None,
+        limit:           int = 100,
+        offset:          int = 0,
+    ) -> list[dict]:
+        """
+        Return a page of episodes as plain dicts for API serialisation.
+
+        Does NOT update last_accessed — this is a neutral UI read.
+        Results ordered by created_at DESC (newest first).
+
+        Parameters
+        ----------
+        status :
+            Filter by status column. "active" | "retracted" | "all".
+            "all" returns every status.
+        project_context :
+            Optional filter by project_context column.
+        episode_type :
+            Optional filter by episode_type column.
+        limit :
+            Max rows to return (capped at 200).
+        offset :
+            Row offset for pagination.
+        """
+        limit = min(limit, 200)
+        conditions = []
+        params: list = []
+
+        if status != "all":
+            conditions.append("status = ?")
+            params.append(status)
+        if project_context is not None:
+            conditions.append("project_context = ?")
+            params.append(project_context)
+        if episode_type is not None:
+            conditions.append("episode_type = ?")
+            params.append(episode_type)
+
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        sql = f"""
+            SELECT id, episode_type, subject, content, confidence,
+                   source, task_id, project_context, status,
+                   created_at, last_accessed
+            FROM episodes
+            {where}
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+
+        with sqlite3.connect(str(self._db_path), timeout=10.0) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            rows = conn.execute(sql, params).fetchall()
+
+        return [dict(row) for row in rows]
+
     def __repr__(self) -> str:
         return (
             f"MemoryManager("

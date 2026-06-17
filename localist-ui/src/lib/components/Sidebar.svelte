@@ -9,7 +9,7 @@
 
   const nav: NavItem[] = [
     { href: '/conversation', label: 'Conversation', icon: 'chat' },
-    { href: '/research',     label: 'Research',     icon: 'search' },
+    { href: '/memory',       label: 'Memory',       icon: 'memory' },
     { href: '/files',        label: 'Files',        icon: 'folder' },
     { href: '/settings',     label: 'Settings',     icon: 'settings' }
   ];
@@ -21,7 +21,7 @@
   <!-- Wordmark -->
   <div class="wordmark">
     <span class="wordmark-logo">L</span>
-    <span class="wordmark-text">LORA</span>
+    <span class="wordmark-text">LOCALIST</span>
   </div>
 
   <!-- Nav links -->
@@ -41,9 +41,13 @@
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
                 </svg>
-              {:else if item.icon === 'search'}
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-                  <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+              {:else if item.icon === 'memory'}
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+                     stroke="currentColor" stroke-width="1.75"
+                     stroke-linecap="round" stroke-linejoin="round">
+                  <ellipse cx="12" cy="5" rx="9" ry="3"/>
+                  <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
+                  <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
                 </svg>
               {:else if item.icon === 'folder'}
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
@@ -68,7 +72,7 @@
 
   <!-- Footer label -->
   <div class="sidebar-footer">
-    <span class="text-tertiary text-xs">v0.1.0</span>
+    <span class="text-tertiary text-xs">v0.2.0</span>
   </div>
 </aside>
 

@@ -37,7 +37,7 @@
 </script>
 
 <svelte:head>
-  <title>Settings — LORA</title>
+  <title>Settings — Localist</title>
 </svelte:head>
 
 <div class="settings-page">
@@ -199,7 +199,7 @@
       <dl class="about-list">
         <div class="about-row">
           <dt>System</dt>
-          <dd>LORA — Local Reasoning Agent</dd>
+          <dd>Localist Framework</dd>
         </div>
         <div class="about-row">
           <dt>UI Version</dt>

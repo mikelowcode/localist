@@ -73,6 +73,7 @@ class RoutingPlan:
     write_episode:  bool       = False
     episode_type:   str | None = None
     compound:       bool       = False
+    priority:       int        = 6
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +378,7 @@ class Planner:
                 agent          = "wiki_agent",
                 fetch_episodic = False,
                 fetch_rag      = False,
+                priority       = 1,
             )
         return None
 
@@ -410,6 +412,7 @@ class Planner:
                 write_episode  = True,
                 episode_type   = None,   # extracted by EpisodicMemoryWriter
                 compound       = True,   # write first, then respond
+                priority       = 2,
             )
         return None
 
@@ -474,6 +477,7 @@ class Planner:
                 fetch_rag      = False,
                 tools_to_call  = tools,
                 compound       = True,
+                priority       = 3,
             )
         return None
 
@@ -525,6 +529,7 @@ class Planner:
             fetch_rag      = False,
             tools_to_call  = ["web_search"],
             compound       = True,
+            priority       = 3,
         )
 
     # -----------------------------------------------------------------------
@@ -558,6 +563,7 @@ class Planner:
                 fetch_episodic = True,
                 fetch_rag      = True,
                 compound       = False,
+                priority       = 4,
             )
 
         # Path B — corpus score threshold
@@ -585,6 +591,7 @@ class Planner:
                 fetch_episodic = False,
                 fetch_rag      = True,
                 compound       = False,
+                priority       = 4,
             )
 
         logger.debug(
@@ -653,6 +660,7 @@ class Planner:
                 agent          = "conversational_agent",
                 fetch_episodic = True,
                 fetch_rag      = False,
+                priority       = 5,
             )
 
         logger.debug("Planner: Priority 5 — no episodic keyword matched.")
@@ -675,4 +683,5 @@ class Planner:
             agent          = "conversational_agent",
             fetch_episodic = False,
             fetch_rag      = False,
+            priority       = 6,
         )

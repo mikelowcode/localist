@@ -2,7 +2,7 @@
   /**
    * MarkdownRenderer.svelte
    *
-   * Lightweight Markdown renderer for LORA agent output.
+   * Lightweight Markdown renderer for Localist agent output.
    * Handles the exact subset the model produces — no third-party deps.
    *
    * Supported syntax:

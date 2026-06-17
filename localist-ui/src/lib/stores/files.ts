@@ -1,5 +1,5 @@
 /**
- * files.ts — LORA file management store
+ * files.ts — Localist file management store
  *
  * Owns all state and async operations for the /files page:
  *   rawFiles / wikiFiles   — listing state

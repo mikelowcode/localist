@@ -1,7 +1,7 @@
-# LORA — Canonical Architecture Specification
+# Localist Framework — Canonical Architecture Specification
 
 > **Status: Authoritative**
-> This document is the canonical reference for LORA's substrate architecture.
+> This document is the canonical reference for Localist Framework's substrate architecture.
 > No implementation begins until it is reflected here. No deviation from this
 > specification is made without updating this document first.
 
@@ -15,12 +15,13 @@
 4. [Planner Routing Model](#4-planner-routing-model)
 5. [Fetcher Service](#5-fetcher-service)
 6. [Build-Order Checklist](#6-build-order-checklist)
+7. [Localist UI](#7-localist-ui)
 
 ---
 
 ## 1. System Identity
 
-LORA is a **local-first, agentic general assistant**. Every architectural
+Localist Framework is a **local-first, agentic general assistant**. Every architectural
 decision is evaluated against five constraints:
 
 | Constraint | Meaning |
@@ -90,7 +91,7 @@ CREATE INDEX IF NOT EXISTS idx_episodes_project
 | `source` | TEXT | `"explicit"` for code-detected signals. `"model_extracted"` for inference-detected signals. |
 | `task_id` | TEXT | The `task_id` of the originating request. Nullable. |
 | `conversation_id` | TEXT | The originating conversation identifier. Nullable. |
-| `project_context` | TEXT | Scopes retrieval. e.g. `"LORA"`, `"general"`. Nullable defaults to `"general"`. |
+| `project_context` | TEXT | Scopes retrieval. e.g. `"localist"`, `"general"`. Nullable defaults to `"general"`. |
 | `status` | TEXT | `"active"` \| `"superseded"` \| `"retracted"`. See §2.5. |
 | `created_at` | REAL | Unix timestamp (from `time.time()`). |
 | `last_accessed` | REAL | Updated on every retrieval. Enables LRU decay. Nullable until first access. |
@@ -669,6 +670,7 @@ class RoutingPlan:
     write_episode:     bool           # True → EpisodicMemoryWriter runs first
     episode_type:      str | None     # type hint for extraction; None if not write
     compound:          bool           # True → multiple signal types detected
+    priority:          int            # 1–6; which priority rule matched (default 6)
 ```
 
 **Execution contract for `ControllerAgent.handle_task()`:**
@@ -684,6 +686,46 @@ class RoutingPlan:
 
 The Planner never calls agents, never calls tools, and never touches the
 database. It is pure decision logic.
+
+### 4.4a ControllerResult — API Response Schema
+
+`ControllerAgent.handle_task()` returns a `ControllerResult` dict that is
+serialised directly to the HTTP response by `main.py`.
+
+```python
+{
+    "task_id":  str,
+    "status":   "complete" | "failed",
+    "answer":   str,
+    "sources":  list[SourceItem],   # see below
+    "metadata": ResponseMetadata,   # see below
+    "error":    str | None,
+}
+```
+
+**`SourceItem`** — typed source reference:
+```python
+{
+    "path": str,              # absolute path on disk
+    "type": "wiki" | "raw",  # classified by path prefix
+    "name": str,              # human-readable title derived from filename
+}
+```
+
+**`ResponseMetadata`** — routing provenance:
+```python
+{
+    "agent":          str,         # agent that produced the answer
+    "priority":       int,         # 1–6; which Planner rule matched
+    "fetch_rag":      bool,        # True if RAG retrieval ran
+    "fetch_episodic": bool,        # True if episodic memory was injected
+    "tools_fired":    list[str],   # tool names that executed this turn
+    "grounded":       bool,        # True if any corpus context was injected
+}
+```
+
+This metadata is emitted in the SSE stream as the `"done"` event payload
+and consumed by Localist UI's provenance bar (see §7).
 
 ### 4.5 Compound Instruction Handling
 
@@ -824,7 +866,7 @@ Response: ApiResponse { url, status_code, content_type, data,
 ```
 
 **`GET /health`** — Service health check.
-Returns `{"healthy": true, "service": "lora-fetcher", "port": 8002}`.
+Returns `{"healthy": true, "service": "localist-fetcher", "port": 8002}`.
 
 ### 5.3 Error Handling
 
@@ -871,8 +913,9 @@ No item is begun until all items above it are complete and tested.
 
 > **Session progress** — Phases 1–7 complete, plus KV-Cache Prompt Refactor,
 > LangSearch integration, HTTP Fetcher service, Priority 4 rewrite,
-> Priority 3b, persona rewrite, and episodic memory bug fixes.
-> Test suite: **187 tests, 0 failures** across 7 test files.
+> Priority 3b, persona rewrite, episodic memory bug fixes, Localist rebrand,
+> and Localist UI overhaul (provenance bar, episodic memory panel, full rebrand).
+> Test suite: **184 tests, 0 failures** across 7 test files.
 >
 > **Files added/modified (all phases):**
 > `memory_manager.py`, `prompt_builder.py`, `planner.py`,
@@ -1033,4 +1076,80 @@ No item is begun until all items above it are complete and tested.
 
 ---
 
-*End of LORA Canonical Architecture Specification*
+---
+
+## 7. Localist UI
+
+### 7.1 Overview
+
+Localist UI is the SvelteKit frontend sub-product. It communicates with
+the Localist backend exclusively via the REST/SSE API on port 8001. All
+rendering is client-side; the backend has no knowledge of the UI.
+
+**Tech stack:** SvelteKit, TypeScript, IBM Plex Sans / IBM Plex Mono,
+CSS custom properties (no Tailwind, no component library).
+
+**Directory:** `localist-ui/` at the project root.
+
+**Dev server:** `npm run dev` from `localist-ui/` (port 5173).
+
+### 7.2 Routes
+
+| Route | Component | Purpose |
+|---|---|---|
+| `/conversation` | `ChatPanel.svelte` | Primary chat interface. Streams SSE responses. |
+| `/memory` | `EpisodesPanel.svelte` | Episodic memory browser. |
+| `/files` | FileBrowser | Raw and wiki file listing; file upload; wiki ingest trigger. |
+| `/settings` | Settings | Runtime status, version info. |
+
+### 7.3 Provenance Bar
+
+Every completed assistant turn renders a **provenance bar** between the
+response body and the source chips. It is driven by the `metadata` field
+in the SSE `"done"` event.
+
+**Chips rendered:**
+
+| Chip | Condition | Colour |
+|---|---|---|
+| `P1 · Direct` | `priority === 1` | Muted |
+| `P2 · Memory write` | `priority === 2` | Green |
+| `P3 · Web search` | `priority === 3` | Blue |
+| `P4 · Vault` | `priority === 4` | Purple |
+| `P5 · Episodic` | `priority === 5` | Amber |
+| `P6 · Inference` | `priority === 6` | Muted |
+| `⚙ {tool_name}` | each entry in `tools_fired` | Orange |
+| `◎ episodic` | `fetch_episodic === true` | Amber |
+| `◈ grounded` | `grounded === true` | Green |
+
+Source chips (wiki/raw type + human-readable name) are rendered below the
+provenance bar from the `sources` array.
+
+### 7.4 Episodic Memory Panel
+
+The `/memory` route renders `EpisodesPanel.svelte`, which calls
+`GET /api/memory/episodes` on mount and on manual refresh.
+
+**State management:** `localist-ui/src/lib/stores/episodes.ts`
+- `episodesStore` — writable store with episodes list, loading/error state,
+  pagination, and active type filter
+- `loadEpisodes(opts)` — fetches from `/api/memory/episodes` with optional
+  `episode_type`, `offset`, `limit` query params
+- `EPISODE_TYPES`, `TYPE_LABELS`, `TYPE_COLORS` — constants for the 7
+  canonical episode types
+
+**Episode card fields displayed:** type chip (colour-coded), subject,
+date, content, confidence percentage, project context, source.
+
+**Type filter bar:** All | Preference | Correction | Decision | Workflow |
+Fact | Relationship | Context
+
+### 7.5 API Proxy
+
+Localist UI proxies all `/api/*` requests to `http://localhost:8001` via
+the Vite dev server config. Production deployments should configure an
+equivalent reverse proxy. The `/api` prefix is stripped before forwarding.
+
+---
+
+*End of Localist Framework Canonical Architecture Specification*

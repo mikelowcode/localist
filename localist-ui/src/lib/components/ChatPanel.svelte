@@ -17,6 +17,7 @@
     status?: Task['status'];
     sources?: Task['sources'];
     status_message?: string;
+    metadata?: Task['metadata'];
   }
 
   let turns: Turn[] = [];
@@ -33,9 +34,10 @@
     if (idx >= 0) {
       turns[idx] = {
         ...turns[idx],
-        content: activeTask.answer,
-        status: activeTask.status,
-        sources: activeTask.sources,
+        content:        activeTask.answer,
+        status:         activeTask.status,
+        sources:        activeTask.sources,
+        metadata:       activeTask.metadata,
         status_message: activeTask.status_message
       };
       turns = turns; // trigger reactivity
@@ -67,6 +69,7 @@
             timestamp:      task.started_at + 1,  // +1ms ensures unique key
             status:         task.status,
             sources:        task.sources,
+            metadata:       task.metadata,
             status_message: task.status_message,
           },
         ];
@@ -157,7 +160,7 @@
           </svg>
         </div>
         <p class="empty-title">Start a conversation</p>
-        <p class="empty-sub">Ask a research question or give an instruction to the agent system.</p>
+        <p class="empty-sub">Ask LORA a question or give an instruction to get started.</p>
       </div>
     {:else}
       {#each turns as turn (turn.timestamp)}
@@ -183,6 +186,38 @@
                 />
               {:else if turn.status === 'planning'}
                 <span class="placeholder-pulse">···</span>
+              {/if}
+
+              {#if turn.status === 'complete' && turn.metadata}
+                {@const p = turn.metadata}
+                <div class="provenance-bar">
+                  <span class="prov-route">
+                    {#if p.priority === 1}
+                      <span class="prov-chip prov-direct">P1 · Direct</span>
+                    {:else if p.priority === 2}
+                      <span class="prov-chip prov-memory">P2 · Memory write</span>
+                    {:else if p.priority === 3}
+                      <span class="prov-chip prov-web">P3 · Web search</span>
+                    {:else if p.priority === 4}
+                      <span class="prov-chip prov-rag">P4 · Vault</span>
+                    {:else if p.priority === 5}
+                      <span class="prov-chip prov-episodic">P5 · Episodic</span>
+                    {:else}
+                      <span class="prov-chip prov-default">P6 · Inference</span>
+                    {/if}
+                  </span>
+                  {#if p.tools_fired && p.tools_fired.length > 0}
+                    {#each p.tools_fired as tool}
+                      <span class="prov-chip prov-tool">⚙ {tool}</span>
+                    {/each}
+                  {/if}
+                  {#if p.fetch_episodic}
+                    <span class="prov-chip prov-episodic-mem">◎ episodic</span>
+                  {/if}
+                  {#if p.grounded}
+                    <span class="prov-chip prov-grounded">◈ grounded</span>
+                  {/if}
+                </div>
               {/if}
 
               {#if turn.sources && turn.sources.length > 0 && turn.status === 'complete'}
@@ -222,7 +257,7 @@
         bind:value={instruction}
         on:keydown={handleKeydown}
         on:input={autoResizeTextarea}
-        placeholder="Ask a research question or give an instruction…"
+        placeholder="Ask LORA a question or give an instruction…"
         rows="1"
         disabled={$tasksStore.streaming || submitting}
         class="chat-input"
@@ -485,4 +520,33 @@
     border: 1px solid var(--border);
     color: var(--text-tertiary);
   }
+
+  .provenance-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-1);
+    margin-top: var(--sp-3);
+    padding-top: var(--sp-2);
+    border-top: 1px solid var(--border-soft);
+  }
+
+  .prov-chip {
+    font-size: 10px;
+    font-family: var(--font-mono);
+    padding: 2px 7px;
+    border-radius: 999px;
+    letter-spacing: 0.03em;
+    font-weight: 500;
+    border: 1px solid transparent;
+  }
+
+  .prov-direct   { background: var(--bg-active); color: var(--text-tertiary); border-color: var(--border); }
+  .prov-memory   { background: #1a2a1a;           color: #7ecf7e; border-color: #2d4a2d; }
+  .prov-web      { background: #1a1a2e;           color: #7ea8cf; border-color: #2d3a5a; }
+  .prov-rag      { background: #2a1a2e;           color: #b07ecf; border-color: #4a2d5a; }
+  .prov-episodic { background: #2a2218;           color: #cfb07e; border-color: #5a4a2d; }
+  .prov-default  { background: var(--bg-active); color: var(--text-tertiary); border-color: var(--border); }
+  .prov-tool     { background: #1e1e1e;           color: #cf9a7e; border-color: #4a3020; }
+  .prov-episodic-mem { background: #2a2218;       color: #cfb07e; border-color: #5a4a2d; }
+  .prov-grounded { background: #1a2a1a;           color: #7ecf7e; border-color: #2d4a2d; }
 </style>

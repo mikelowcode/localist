@@ -20,6 +20,14 @@ export interface Task {
   error?: string;
   started_at: number;
   completed_at?: number;
+  metadata?: {
+    priority?:       number;
+    fetch_rag?:      boolean;
+    fetch_episodic?: boolean;
+    tools_fired?:    string[];
+    agent?:          string;
+    grounded?:       boolean;
+  };
 }
 
 export interface TasksState {
@@ -173,11 +181,23 @@ function handleSSEEvent(task_id: string, event: Record<string, unknown>): void {
       break;
     }
     case 'done': {
-      patchTask(task_id, {
-        status: 'complete',
-        completed_at: Date.now()
+      tasksStore.update((s) => {
+        const t = s.tasks[task_id];
+        if (!t) return s;
+        return {
+          ...s,
+          streaming: false,
+          tasks: {
+            ...s.tasks,
+            [task_id]: {
+              ...t,
+              status:       (event.status as Task['status']) ?? 'complete',
+              metadata:     (event.metadata as Task['metadata']) ?? {},
+              completed_at: Date.now(),
+            },
+          },
+        };
       });
-      tasksStore.update((s) => ({ ...s, streaming: false }));
       break;
     }
     case 'error': {
