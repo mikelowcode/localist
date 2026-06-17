@@ -1,4 +1,4 @@
-# LORA backend dependencies
+# Localist Framework backend dependencies
 # Install with:  pip install -r requirements.txt
 
 # Web framework
@@ -14,3 +14,9 @@ requests>=2.31.0
 # Pydantic v2 (FastAPI pulls this in; pin for stability)
 pydantic>=2.7.0
 python-multipart==0.0.32
+
+# Fetcher service — HTML extraction
+lxml>=6.1.1
+readability-lxml>=0.8.4.1
+chardet>=7.4.3
+cssselect>=1.4.0
