@@ -914,7 +914,8 @@ No item is begun until all items above it are complete and tested.
 > **Session progress** — Phases 1–7 complete, plus KV-Cache Prompt Refactor,
 > LangSearch integration, HTTP Fetcher service, Priority 4 rewrite,
 > Priority 3b, persona rewrite, episodic memory bug fixes, Localist rebrand,
-> and Localist UI overhaul (provenance bar, episodic memory panel, full rebrand).
+> and Localist UI overhaul (provenance bar, episodic memory panel, full rebrand),
+> and Fetcher service restored (lxml, readability-lxml pinned in requirements.txt).
 > Test suite: **184 tests, 0 failures** across 7 test files.
 >
 > **Files added/modified (all phases):**
