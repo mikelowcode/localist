@@ -34,6 +34,11 @@ class EpisodeBullet:
 
 
 @dataclass
+class UserProfileFact:
+    content: str   # single fact line, already scored and selected by caller
+
+
+@dataclass
 class RagSource:
     path:    str
     content: str
@@ -107,7 +112,8 @@ class PromptBuilder:
     # -----------------------------------------------------------------------
     _CEIL_SYSTEM:   int = 50    # hard; slot 1a is a constant so this is advisory
     _CEIL_PERSONA:  int = 500   # slot 1b; persona injected into system msg
-    _CEIL_EPISODIC: int = 150   # slot 3
+    _CEIL_EPISODIC: int = 150   # slot 3a; episodic bullets
+    _CEIL_PROFILE:  int = 100   # slot 3b; user profile facts
     _CEIL_RAG:      int = 800   # slot 4
     _CEIL_TOOL:     int = 500   # slot 5
     _CEIL_WORKING:  int = 300   # slot 6
@@ -150,39 +156,61 @@ class PromptBuilder:
         truncated = self._truncate_to_tokens(persona, self._CEIL_PERSONA)
         return self._SYSTEM + "\n\n" + truncated
 
-    def _slot3_episodic(
+    def _slot3_combined(
         self,
-        bullets: list[EpisodeBullet] | None,
+        bullets:       list[EpisodeBullet] | None,
+        profile_facts: list[UserProfileFact] | None,
     ) -> str:
         """
-        Return Slot 3: episodic memory block, or "" if None/empty.
+        Return Slot 3: episodic memory block and/or user profile facts,
+        or "" if both are None/empty.
+
+        Two independent sub-budgets:
+          Episodic bullets : 150-token ceiling (unchanged)
+          User profile     : 100-token ceiling (new)
+
+        Each sub-block is omitted cleanly when empty.
+        Combined output is returned as a single string.
 
         Format:
             [EPISODIC MEMORY]
             - {content} ({episode_type}, {confidence:.1f})
 
-        The 150-token ceiling is enforced by dropping lowest-priority bullets
-        from the tail (callers should pre-sort by priority; this method
-        enforces the budget by truncating from the end).
+            [USER PROFILE]
+            - {fact line}
         """
-        if not bullets:
-            return ""
+        parts: list[str] = []
 
-        lines = ["[EPISODIC MEMORY]"]
-        max_chars = self._CEIL_EPISODIC * 4
+        # -- Episodic sub-block (150-token ceiling) ---------------------------
+        if bullets:
+            lines = ["[EPISODIC MEMORY]"]
+            for bullet in bullets:
+                line = (
+                    f"- {bullet.content} "
+                    f"({bullet.episode_type}, {bullet.confidence:.1f})"
+                )
+                candidate = "\n".join(lines + [line])
+                if self._estimate_tokens(candidate) > self._CEIL_EPISODIC:
+                    break
+                lines.append(line)
+            if len(lines) > 1:
+                parts.append("\n".join(lines))
 
-        for bullet in bullets:
-            line = f"- {bullet.content} ({bullet.episode_type}, {bullet.confidence:.1f})"
-            candidate = "\n".join(lines + [line])
-            if self._estimate_tokens(candidate) > self._CEIL_EPISODIC:
-                break    # budget exhausted; remaining bullets are dropped
-            lines.append(line)
+        # -- User profile sub-block (100-token ceiling) -----------------------
+        if profile_facts:
+            lines = ["[USER PROFILE]"]
+            max_chars = self._CEIL_PROFILE * 4
+            used_chars = len("[USER PROFILE]\n")
+            for fact in profile_facts:
+                line = f"- {fact.content}"
+                if used_chars + len(line) + 1 > max_chars:
+                    break
+                lines.append(line)
+                used_chars += len(line) + 1
+            if len(lines) > 1:
+                parts.append("\n".join(lines))
 
-        if len(lines) == 1:
-            # Only the label survived — no bullets fit; emit nothing
-            return ""
-
-        return "\n".join(lines)
+        return "\n\n".join(parts)
 
     def _slot4_rag(
         self,
@@ -353,11 +381,12 @@ class PromptBuilder:
     def build(
         self,
         instruction:      str,
-        persona:          str | None            = None,
-        episodic_summary: list[EpisodeBullet]   | None = None,
-        rag_snippets:     list[RagSource]        | None = None,
-        tool_results:     list[ToolResult]       | None = None,
-        working_memory:   list[Turn]             | None = None,
+        persona:          str | None              = None,
+        episodic_summary: list[EpisodeBullet]     | None = None,
+        profile_facts:    list[UserProfileFact]   | None = None,
+        rag_snippets:     list[RagSource]          | None = None,
+        tool_results:     list[ToolResult]         | None = None,
+        working_memory:   list[Turn]               | None = None,
     ) -> tuple[str, str]:
         """
         Assemble the canonical 7-slot prompt.
@@ -370,8 +399,12 @@ class PromptBuilder:
             Optional persona string (Slot 1b). Injected into the system
             message when provided; 500-token ceiling enforced.
         episodic_summary :
-            Pre-sorted EpisodeBullet list (Slot 3). Caller is responsible
+            Pre-sorted EpisodeBullet list (Slot 3a). Caller is responsible
             for priority ordering. Pass None or [] to omit.
+        profile_facts :
+            Pre-scored UserProfileFact list (Slot 3b). Caller is responsible
+            for relevance scoring and line selection. Pass None or [] to omit.
+            100-token sub-budget within Slot 3.
         rag_snippets :
             Ranked RagSource list (Slot 4). At most 3 used. Pass None or
             [] to omit.
@@ -388,12 +421,14 @@ class PromptBuilder:
             system_prompt : Slot 1a + optional 1b. Pass as `system=` to
                             the runtime.
             user_prompt   : Slots 3–7 joined with double newlines.
-                            Empty slots are cleanly absent.
+                            Empty slots are cleanly absent. Slot 3 includes
+                            an optional [USER PROFILE] sub-block (Slot 3b)
+                            when profile_facts are provided.
         """
         system_prompt = self._slot1_system(persona)
 
         slots = [
-            self._slot3_episodic(episodic_summary),
+            self._slot3_combined(episodic_summary, profile_facts),
             self._slot4_rag(rag_snippets),
             self._slot5_tools(tool_results),
             self._slot6_working_memory(working_memory),

@@ -41,12 +41,14 @@ if TYPE_CHECKING:
     from memory_manager import MemoryManager
 
 from planner import Planner as _RulePlanner
-from prompt_builder import PromptBuilder, Turn, EpisodeBullet, RagSource
+from pathlib import Path
+from prompt_builder import PromptBuilder, Turn, EpisodeBullet, RagSource, UserProfileFact
 from memory_manager import (
     EpisodicMemoryWriter,
     EpisodicMemoryReader,
     format_episodic_summary,
     EpisodeRecord,
+    _cosine_similarity,
 )
 from episodic_extractor import (
     process_explicit_signal,
@@ -579,6 +581,12 @@ class ControllerAgent:
         self._memory_manager = memory_manager   # None → use ephemeral shim per request
         self._persona_cache: str | None = None
 
+        # User profile cache — loaded once per process from
+        # wiki/users/michael.md, split into (line, embedding) pairs.
+        # Empty list until _load_user_profile() succeeds.
+        self._profile_lines:      list[str]        = []
+        self._profile_embeddings: list[list[float]] = []
+
         if not agents:
             logger.warning("ControllerAgent initialized with no sub-agents.")
 
@@ -608,16 +616,26 @@ class ControllerAgent:
         try:
             docs = self._memory_manager.query_corpus(
                 "LORA persona identity research assistant",
-                max_results    = 1,
+                max_results    = 3,
                 use_embeddings = True,
             )
-            if docs:
-                self._persona_cache = docs[0].content[:2000]
+            # Filter to the persona document by filename — never load a
+            # different wiki doc into the persona slot.
+            persona_doc = next(
+                (d for d in docs if "lora-persona" in str(d.path)), None
+            )
+            if persona_doc is not None:
+                self._persona_cache = persona_doc.content[:2000]
                 logger.debug(
                     "_load_persona: persona loaded and cached — "
                     "path=%s  chars=%d",
-                    docs[0].path,
+                    persona_doc.path,
                     len(self._persona_cache),
+                )
+            else:
+                logger.warning(
+                    "_load_persona: lora-persona not found in top-3 "
+                    "corpus results — proceeding without persona."
                 )
         except Exception as exc:
             logger.warning(
@@ -625,6 +643,121 @@ class ControllerAgent:
                 "proceeding without persona.", exc,
             )
         return self._persona_cache
+
+    def _load_user_profile(self) -> None:
+        """
+        Load wiki/users/michael.md and embed each fact line.
+
+        Splits the profile into non-empty, non-header lines (strips lines
+        starting with '#' and blank lines). Each line is embedded using
+        the runtime's embed() method and stored in parallel lists:
+          self._profile_lines      — raw fact strings
+          self._profile_embeddings — corresponding embedding vectors
+
+        Called once during the first request after startup (lazy init).
+        Results are cached for the process lifetime — the profile is a
+        session constant. Re-load requires a process restart.
+
+        Silently no-ops when:
+          - Profile file does not exist
+          - Runtime has no embed() method
+          - Any individual line fails to embed (that line is skipped)
+        """
+        if self._profile_lines:
+            return   # already loaded
+
+        profile_path = Path(__file__).parent / "wiki" / "users" / "michael.md"
+        if not profile_path.exists():
+            logger.warning("_load_user_profile: %s not found — skipping.", profile_path)
+            return
+
+        try:
+            raw = profile_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.warning("_load_user_profile: read failed (%s).", exc)
+            return
+
+        # Extract fact lines — skip headers (##) and blank lines
+        fact_lines = [
+            line.lstrip("- ").strip()
+            for line in raw.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+        if not fact_lines:
+            logger.warning("_load_user_profile: no fact lines found in profile.")
+            return
+
+        # Embed each line; skip lines that fail
+        loaded = 0
+        for line in fact_lines:
+            try:
+                vec = self._embed(line)
+                self._profile_lines.append(line)
+                self._profile_embeddings.append(vec)
+                loaded += 1
+            except Exception as exc:
+                logger.debug(
+                    "_load_user_profile: embed failed for line %r (%s) — skipping.",
+                    line[:40], exc,
+                )
+
+        logger.info(
+            "_load_user_profile: loaded %d/%d fact lines from %s.",
+            loaded, len(fact_lines), profile_path,
+        )
+
+    def _embed(self, text: str) -> list[float]:
+        """
+        Embed text using the MemoryManager's embed function.
+        Raises RuntimeError if no embed function is available.
+        """
+        fn = getattr(self._memory_manager, "_embed_fn", None)
+        if fn is None:
+            raise RuntimeError("No embed function available on MemoryManager.")
+        return fn(text)
+
+    def _score_profile_facts(
+        self,
+        instruction_embedding: list[float],
+        top_n:     int   = 5,
+        threshold: float = 0.45,
+    ) -> list[UserProfileFact]:
+        """
+        Score all cached profile fact lines against the instruction embedding.
+
+        Returns the top_n lines whose cosine similarity exceeds threshold,
+        ordered by score descending. Returns [] when:
+          - Profile is not loaded (_profile_lines is empty)
+          - instruction_embedding is empty
+          - No lines exceed threshold
+
+        Parameters
+        ----------
+        instruction_embedding :
+            Dense embedding of the current instruction. Caller is
+            responsible for generating this.
+        top_n :
+            Maximum facts to return. Default 5.
+        threshold :
+            Minimum cosine similarity. Default 0.45 — lower than the
+            0.55 RAG threshold because profile facts are short lines
+            whose embeddings are naturally less similar to full questions.
+        """
+        if not self._profile_lines or not instruction_embedding:
+            return []
+
+        scored: list[tuple[float, str]] = []
+        for line, vec in zip(self._profile_lines, self._profile_embeddings):
+            try:
+                sim = _cosine_similarity(instruction_embedding, vec)
+                if sim >= threshold:
+                    scored.append((sim, line))
+            except Exception:
+                continue
+
+        scored.sort(reverse=True)
+        return [UserProfileFact(content=line) for _, line in scored[:top_n]]
 
     # -----------------------------------------------------------------------
     # Public API (called by FastAPI)
@@ -808,7 +941,7 @@ class ControllerAgent:
                 rag_sources = [
                     RagSource(path=str(doc.path), content=doc.content[:2000])
                     for doc in docs
-                    if doc.relevance_score >= 0.55
+                    if (plan.force_rag or doc.relevance_score >= 0.55)
                     and not str(doc.path).endswith("lora-persona.md")
                 ]
                 logger.info(
@@ -847,6 +980,31 @@ class ControllerAgent:
                     "_execute_plan: episodic retrieval failed (%s) — continuing.", exc
                 )
 
+        # -- Step 5b: User profile injection ---------------------------------
+        profile_facts: list[UserProfileFact] = []
+        _should_inject_profile = (
+            plan.fetch_episodic          # P5 route
+            or plan.force_rag            # P4a identity route
+            or plan.fetch_rag            # P4 corpus route
+            or bool(episodic_bullets)    # episodic bullets fired
+        )
+        if _should_inject_profile:
+            try:
+                self._load_user_profile()
+                if self._profile_lines:
+                    instr_vec = self._embed(task.instruction)
+                    profile_facts = self._score_profile_facts(instr_vec)
+                    if profile_facts:
+                        logger.info(
+                            "_execute_plan: user profile injection — "
+                            "%d fact(s) selected.", len(profile_facts),
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "_execute_plan: user profile scoring failed (%s) — "
+                    "continuing without profile facts.", exc,
+                )
+
         # -- Step 6: PromptBuilder assembly ----------------------------------
         working_turns: list[Turn] = []
         try:
@@ -866,6 +1024,7 @@ class ControllerAgent:
             instruction      = task.instruction,
             persona          = self._load_persona(),
             episodic_summary = episodic_bullets         or None,
+            profile_facts    = profile_facts            or None,
             rag_snippets     = rag_sources              or None,
             tool_results     = [
                 r for r in dispatched_tool_results

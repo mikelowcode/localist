@@ -322,24 +322,41 @@ certainty.
   invalidated only when WikiAgent writes a new persona page.
 - `lora-persona.md` is filtered from RAG results — it is already in the
   system message and must not appear twice in Slot 4.
+- `_load_persona()` fetches top-3 corpus results and filters by
+  `"lora-persona" in str(d.path)` before accepting any document into
+  Slot 1b. If `lora-persona.md` is not in the top-3 results, persona
+  is absent for that session and a warning is logged.
 
 ---
 
-#### Slot 3 — Episodic Memory
+#### Slot 3 — Episodic Memory + User Profile
 
-**Purpose:** Durable facts about the user, project, and preferences that
-are relevant to this specific request.
+**Purpose:** Durable facts about the user, project, and preferences (Slot 3a —
+episodic bullets) and relevant lines from the user profile document (Slot 3b —
+user profile facts).
 
-**Token ceiling:** 150 tokens (hard limit)
+**Token ceiling:** 250 tokens total. Two independent sub-budgets enforced by
+`PromptBuilder._slot3_combined()`: 150 tokens for episodic bullets (Slot 3a),
+100 tokens for user profile facts (Slot 3b).
 
-**Format:** See §2.7 Summarization Contract.
+**Format:**
+```
+[EPISODIC MEMORY]
+- {content} ({episode_type}, {confidence:.1f})
+
+[USER PROFILE]
+- {fact line}
+```
 
 **Rules:**
-- This slot is **conditional**. It is omitted entirely when not relevant.
-  No empty label, no placeholder.
-- Relevance is determined by the Planner (Priority 5). See §4.
-- When injected: 3–5 bullets, confidence ≥ 0.7, type-ordered per §2.7.
-- The `[EPISODIC MEMORY]` label and inline type annotations are mandatory.
+- This slot is **conditional**. It is omitted entirely when both sub-blocks
+  are empty. No empty label, no placeholder.
+- Slot 3a (episodic): relevance determined by Priority 5. See §4.
+- Slot 3b (profile): injected on P4, P4a, P5 routes and any turn where
+  episodic bullets fire. See §3.6.
+- When episodic bullets injected: 3–5 bullets, confidence ≥ 0.7, type-ordered per §2.7.
+- Both `[EPISODIC MEMORY]` and `[USER PROFILE]` labels are mandatory when
+  their respective sub-block is present.
 - Placed first in the user message because episodic content changes rarely
   (only when a new episode is written), maximising the stable prefix shared
   across consecutive turns.
@@ -456,12 +473,13 @@ Turn -1 [assistant]: {most recent prior assistant response}
 |---|---|---|---|---|
 | 1a — Identity | *(none)* | ~50 | Always | System |
 | 1b — Persona | *(none)* | 500 | Conditional | System |
-| 3 — Episodic memory | `[EPISODIC MEMORY]` | 150 | Conditional | User |
+| 3a — Episodic memory | `[EPISODIC MEMORY]` | 150 | Conditional | User |
+| 3b — User profile | `[USER PROFILE]` | 100 | Conditional | User |
 | 4 — RAG snippets | `[CONTEXT]` | 800 | Conditional | User |
 | 5 — Tool results | `[TOOL RESULTS]` | 500 | Conditional | User |
 | 6 — Working memory | `[WORKING MEMORY]` | 300 | Conditional | User |
 | 7 — Instruction | `[INSTRUCTION]` | Uncapped | Always | User |
-| **Worst-case total** | | **~2,300** | | |
+| **Worst-case total** | | **~2,450** | | |
 
 Slot numbers 2 and the old Slot 2 label `[USER]` are retired. The gap
 between 1b and 3 is intentional: slot numbering reflects cognitive role
@@ -544,6 +562,53 @@ This exception is intentional and permanent.
 
 ---
 
+### 3.6 User Profile
+
+`ControllerAgent` maintains a per-session user profile sourced from
+`backend/wiki/users/michael.md`. This file is hand-authored (not produced
+by WikiAgent) and contains structured fact lines in five sections: Identity,
+Active Projects, Preferences, Working Patterns, and Decisions.
+
+Each section has a maximum of 5 lines to enforce minimalism and prevent
+prompt bloat. The ideal injection returns only the top relevant facts
+for the current instruction, not the entire profile.
+
+#### Embedding and scoring
+
+On first request after startup, `ControllerAgent._load_user_profile()`
+reads the file, strips section headers and blank lines, and embeds each
+remaining fact line using `ControllerAgent._embed()` — which delegates
+to `MemoryManager._embed_fn` (the EmbeddingEngine callable). Embeddings
+are stored in parallel lists (`_profile_lines`, `_profile_embeddings`)
+and cached for the session.
+
+Per-turn scoring: `_score_profile_facts(instruction_embedding, top_n=5,
+threshold=0.45)` computes cosine similarity between the instruction
+embedding and each cached fact embedding. Lines scoring ≥ 0.45 are
+returned as `UserProfileFact` objects, sorted by score descending,
+capped at 5.
+
+The 0.45 threshold is lower than the 0.55 RAG corpus threshold because
+profile fact lines are short and produce lower raw cosine similarity
+against full instruction embeddings even when semantically relevant.
+
+#### Injection trigger
+
+Profile facts are injected into Slot 3b on any turn where:
+- `plan.fetch_rag` is True (P4 and P4a routes)
+- `plan.fetch_episodic` is True (P5 routes)
+- Episodic bullets fired in the same turn
+
+P6 direct-answer turns do not inject profile facts.
+
+#### Update path
+
+Manual for now: edit `wiki/users/michael.md` directly and restart the
+backend to reload the cache. Automatic promotion from episodic memory
+is planned as part of the graph retrieval layer (future session).
+
+---
+
 ## 4. Planner Routing Model
 
 ### 4.1 Design Principles
@@ -604,6 +669,17 @@ All lower priorities are skipped.
 
 ---
 
+**PRIORITY 4a — IDENTITY TRIGGER**
+
+| | |
+|---|---|
+| **Condition** | Instruction contains any keyword from `_IDENTITY_KEYWORDS` (whole-phrase match via `_any_whole_word()`): `"who are you"`, `"what are you"`, `"tell me about yourself"`, `"what can you do"`, `"are you an ai"`, `"are you a bot"`, `"what is lora"`, `"who is lora"`, `"what is localist"`, `"are you made by google"`, `"are you chatgpt"`, `"are you gemma"`, `"introduce yourself"`. |
+| **Action** | Route to `conversational_agent`. Set `fetch_rag = True`, `force_rag = True`. `how-localist-works.md` is injected into Slot 4 regardless of embedding score. |
+| **Rationale** | Without this priority, identity questions fall to P6 (direct answer). Gemma 4B's RLHF fine-tuning then overrides the system prompt and produces "I'm a large language model made by Google." P4a forces RAG retrieval of `how-localist-works.md`, giving the model explicit first-person identity context. |
+| **Notes** | Fires before Priority 4 (explicit wiki/vault) so identity questions are never absorbed by general corpus routing. Does not set `fetch_episodic=True`. A trailing-content guard prevents false positives: if the matched keyword is followed by further meaningful words (e.g. `"what can you do with this file"`), the match is discarded. |
+
+---
+
 **PRIORITY 4 — CORPUS SIGNAL**
 
 | | |
@@ -632,6 +708,38 @@ All lower priorities are skipped.
 | **Condition** | None of the above triggered. |
 | **Action** | Route to `ConversationalAgent` with Slots 1–3 only (system + working memory + instruction). |
 | **Rationale** | General knowledge questions need no retrieval. The model answers from its own weights plus working memory. |
+
+---
+
+#### Priority 4a — Identity trigger
+
+**Match condition:** Instruction contains any keyword from
+`_IDENTITY_KEYWORDS` (whole-word match via `_any_whole_word()`).
+
+**Effect:** Routes to `conversational_agent` with `fetch_rag=True` and
+`force_rag=True`. The `force_rag` flag bypasses the `relevance_score >=
+0.55` threshold in the RAG filter, guaranteeing that `how-localist-works.md`
+is injected into Slot 4 regardless of embedding similarity score.
+
+**Purpose:** Prevents identity questions from falling to P6 (direct answer),
+where Gemma 4B's RLHF fine-tuning overrides the system prompt and produces
+"I'm a large language model made by Google." With `how-localist-works.md`
+in Slot 4, the model has explicit first-person identity context to draw from.
+
+**Keywords (`_IDENTITY_KEYWORDS`):**
+`"who are you"`, `"what are you"`, `"tell me about yourself"`,
+`"what can you do"`, `"are you an ai"`, `"are you a bot"`,
+`"what is lora"`, `"who is lora"`, `"what is localist"`,
+`"are you made by google"`, `"are you chatgpt"`, `"are you gemma"`,
+`"introduce yourself"`
+
+**Implementation notes:**
+- Uses `_any_whole_word()` for whole-phrase matching — prevents false
+  positives (e.g. `"what can you do with this file"` does not trigger).
+- Fires before Priority 4 (explicit wiki/vault) so identity questions
+  are never absorbed by general corpus routing.
+- Does not set `fetch_episodic=True` — identity questions do not require
+  episodic context.
 
 ---
 
@@ -670,6 +778,7 @@ class RoutingPlan:
     write_episode:     bool           # True → EpisodicMemoryWriter runs first
     episode_type:      str | None     # type hint for extraction; None if not write
     compound:          bool           # True → multiple signal types detected
+    force_rag:         bool           # True → bypass relevance_score >= 0.55 RAG threshold (set by P4a)
     priority:          int            # 1–6; which priority rule matched (default 6)
 ```
 
@@ -679,6 +788,9 @@ class RoutingPlan:
 2. If `write_episode`: run `EpisodicMemoryWriter`, wait for completion.
 3. If `tools_to_call`: dispatch tools in listed order, collect results.
 4. If `fetch_rag`: run `MemoryManager.query_corpus()`, collect snippets for Slot 4.
+   RAG results are filtered by `relevance_score >= 0.55` unless `plan.force_rag is True`,
+   in which case the threshold is bypassed and all returned documents are included (still
+   filtered for `lora-persona.md` exclusion). Maximum 3 sources regardless of `force_rag`.
 5. If `fetch_episodic`: run episodic retrieval, collect bullets for Slot 3.
 6. Call `PromptBuilder.build()` with all collected content; persona is loaded
    from `_load_persona()` (cached) and passed as `persona=` for Slot 1b.
@@ -1152,5 +1264,51 @@ the Vite dev server config. Production deployments should configure an
 equivalent reverse proxy. The `/api` prefix is stripped before forwarding.
 
 ---
+
+---
+
+### Session — 2026-06-18
+
+*Identity RAG fix (Item 1):*
+- `backend/raw/how-localist-works.md` authored (1,009 chars, under 1,600)
+  and ingested into wiki corpus as a research note.
+- `planner.py`: `_IDENTITY_KEYWORDS` frozenset (13 keywords) added;
+  `_priority4a_identity()` method added with `_any_whole_word()` matching
+  and trailing-content false-positive guard; wired into `route()` between
+  Priority 3b and Priority 4; `RoutingPlan.force_rag` field added.
+- `controller_agent.py`: `_load_persona()` path filter added — only
+  `lora-persona` path accepted into Slot 1b (top-3 fetch, path filter);
+  RAG filter updated to bypass score threshold when `plan.force_rag=True`.
+- Live verified: "Who are you?" → P4a matched → `lora-persona.md` in
+  Slot 1b (system_chars=403) → `how-localist-works.md` in Slot 4
+  (rag_sources=2) → LORA identifies correctly.
+- Test suite: 184 tests, 0 failures.
+
+*Known issue resolved:*
+- SQLite-persisted retrieval cache (`retrieval_cache` table, `valid` flag)
+  does not invalidate on direct `MemoryManager.index_document()` calls that
+  bypass the write path. Workaround: manual `UPDATE retrieval_cache SET
+  valid = 0`. Long-term fix: ensure all ingest paths go through the
+  canonical `/ingest` HTTP endpoint.
+
+*User profile continuity (Item 2 — partial):*
+- `backend/wiki/users/michael.md` authored: 5 sections (Identity,
+  Active Projects, Preferences, Working Patterns, Decisions), 20 fact
+  lines, no prose.
+- `prompt_builder.py`: `UserProfileFact` dataclass added; `_CEIL_PROFILE
+  = 100` added; `_slot3_episodic()` replaced by `_slot3_combined(bullets,
+  profile_facts)` with independent 150/100-token sub-budgets; `build()`
+  gains `profile_facts=` parameter (backwards-compatible).
+- `controller_agent.py`: `_embed()` helper delegates to
+  `MemoryManager._embed_fn`; `_load_user_profile()` lazy-loads and
+  embeds 20 fact lines at first request; `_score_profile_facts()` scores
+  via cosine similarity (threshold 0.45, top 5); Step 5b wired into
+  `_execute_plan()` firing on P4, P4a, P5, and episodic-bullet turns;
+  `profile_facts=` passed to `PromptBuilder.build()`.
+- Live verified: "What are my working patterns?" → P4 corpus route →
+  20/20 fact lines loaded → 5 working-pattern facts injected →
+  `[USER PROFILE]` block in assembled prompt → LORA answered correctly.
+- Graph retrieval layer (concept relationship reasoning) deferred to
+  next session as planned.
 
 *End of Localist Framework Canonical Architecture Specification*

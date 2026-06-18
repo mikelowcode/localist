@@ -11,7 +11,7 @@ Localist is inference-engine-agnostic. It ships with oMLX support out of the box
 The frontend (SvelteKit) sends requests over HTTP to the main backend — a FastAPI application on port 8001. The backend's `ControllerAgent` receives each task, runs it through the `Planner` (a priority-ordered rule engine), and dispatches to the appropriate agent: `ConversationalAgent` for answers and `WikiAgent` for document ingestion. When a query requires live web content, `ToolDispatcher` calls the LangSearch API or posts to the fetcher microservice on port 8002, which fetches and extracts clean article text. All inference goes through `OMLXRuntimeClient`, which speaks the OpenAI-compatible HTTP API exposed by oMLX. Episodic memory and vector embeddings are stored in a SQLite database with WAL mode enabled and survive server restarts.
 
 ```
-Localist UI  (lora-ui/)
+Localist UI  (localist-ui/)
      │  HTTP
      ▼
 FastAPI — port 8001  (backend/main.py)
@@ -101,6 +101,7 @@ Every query passes through `Planner`, a deterministic rule engine with seven pri
 | P2 | Memory keyword (`remember`, `forget`, `prefer`) | `ConversationalAgent` + write episode |
 | P3 | Tool signal: web search keyword, URL present, file keyword | `ConversationalAgent` + tool call |
 | P3b | Factual question keyword + corpus score below threshold | `ConversationalAgent` + `web_search` |
+| P4a | Identity keyword (`who are you`, `what are you`, `introduce yourself`, etc.) | `ConversationalAgent` + RAG fetch (force) |
 | P4 | Explicit vault keyword (`check the wiki`, `vault`, etc.) **or** corpus score ≥ 0.55 | `ConversationalAgent` + RAG fetch |
 | P5 | Episodic relevance keyword (`my preference`, `last time`, etc.) | `ConversationalAgent` + episodic fetch |
 | P6 | Fallback | `ConversationalAgent`, direct answer |
@@ -127,19 +128,23 @@ Extraction runs on two paths:
 
 **Corpus (RAG)** stores vector embeddings of wiki pages and ingested documents. `ConversationalAgent` queries the corpus when `fetch_rag=True` in the routing plan and injects matching passages into the prompt. Embeddings use `mlx-community/embeddinggemma-300m-4bit` (768-dimensional, local).
 
+**User profile** stores durable facts about the user in `wiki/users/michael.md` — identity, active projects, preferences, working patterns, and committed decisions. The profile is loaded once per session at first request, embedded line-by-line using `mlx-community/embeddinggemma-300m-4bit`, and cached for the process lifetime. On turns where the corpus or episodic memory is queried, the top relevant profile lines are scored against the current instruction (cosine similarity, threshold 0.45) and injected into the prompt as a `[USER PROFILE]` block. Only lines that score above the threshold are included — the full profile is never injected wholesale.
+
 ### Prompt Layout
 
 The prompt builder assembles a fixed 7-slot layout optimized for KV-cache efficiency:
 
 1. **Identity** — static system role (never changes between turns)
 2. **Persona** — loaded from `wiki/lora-persona.md`, cached per session
-3. **Working memory** — recent conversation turns
-4. **Episodic memory** — retrieved episodes relevant to the current query
-5. **RAG / context** — retrieved corpus passages
-6. **Tool results** — output from `web_search`, `url_fetch`, `file_op`
+3. **Episodic memory + User profile** — retrieved episodes and
+   relevance-scored user profile facts (two independent sub-budgets:
+   150 tokens episodic, 100 tokens profile)
+4. **RAG / context** — retrieved corpus passages
+5. **Tool results** — output from `web_search`, `url_fetch`, `file_op`
+6. **Working memory** — recent conversation turns
 7. **Instruction** — the current user message
 
-Slots 1–2 are static across turns, maximizing KV-cache reuse. Measured cache efficiency on turn 2: 79.7%. Worst-case prompt (all slots populated): approximately 2,300 tokens against an 8,000-token context window.
+Slots 1–2 are static across turns, maximizing KV-cache reuse. Measured cache efficiency on turn 2: 79.7%. Worst-case prompt (all slots populated): approximately 2,450 tokens against an 8,000-token context window.
 
 ---
 
@@ -167,7 +172,9 @@ localist/
 │   │   ├── extractor.py             # readability-lxml extraction pipeline
 │   │   └── models.py                # Pydantic v2 request/response models
 │   ├── wiki/
-│   │   ├── lora-persona.md          # LORA persona — loaded into slot 2 of every prompt
+│   │   ├── lora-persona.md          # LORA persona — loaded into Slot 1b of every prompt
+│   │   ├── users/
+│   │   │   └── michael.md           # User profile — line-level embeddings, Slot 3b injection
 │   │   └── *.md                     # Indexed wiki pages
 │   ├── tests/
 │   │   ├── test_planner_phase3.py   # Planner routing unit tests
@@ -206,6 +213,15 @@ All tests use mocks for inference and SQLite; no oMLX server or live API keys ar
 
 ## Roadmap
 
-- **Localist CLI** — ✅ `./start_localist.sh` launches both services; `--stop` kills them cleanly
-- **Localist UI redesign** — functional but minimal; planned rework for memory inspection, episode browsing, and tool result display
-- **macOS app packaging** — bundle as a native `.app` via PyInstaller + Tauri so Localist Framework can run without a terminal
+- **Localist CLI** — ✅ `./start_localist.sh` launches both services;
+  `--stop` kills them cleanly
+- **Identity continuity** — ✅ Priority 4a identity trigger; LORA
+  correctly identifies itself via `how-localist-works.md` RAG retrieval
+- **User profile** — ✅ `wiki/users/michael.md`; line-level embedding
+  and cosine-scored injection into Slot 3b
+- **Graph retrieval layer** — planned; concept relationship reasoning
+  via SQLite node/edge tables and hybrid graph + RAG retrieval
+- **Localist UI redesign** — functional but minimal; planned rework for
+  memory inspection, episode browsing, and tool result display
+- **macOS app packaging** — bundle as a native `.app` via PyInstaller +
+  Tauri so Localist Framework can run without a terminal
