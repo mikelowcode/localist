@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 from planner import Planner as _RulePlanner
 from pathlib import Path
-from prompt_builder import PromptBuilder, Turn, EpisodeBullet, RagSource, UserProfileFact
+from prompt_builder import PromptBuilder, Turn, EpisodeBullet, RagSource, UserProfileFact, GraphQueryResult, GraphLinkEntry, WorkingMemoryState
 from memory_manager import (
     EpisodicMemoryWriter,
     EpisodicMemoryReader,
@@ -53,9 +53,11 @@ from memory_manager import (
 from episodic_extractor import (
     process_explicit_signal,
     process_implicit_extraction,
+    process_working_state_update,
 )
 from tool_dispatcher import ToolDispatcher
 from prompt_builder import ToolResult as _ToolResult
+from wiki_doc import load_wiki_doc, parse_wiki_doc
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +191,22 @@ class RuntimeClient(Protocol):
     def embed(self, text: str) -> list[float]:
         """Return a dense embedding vector for the given text."""
         ...
+
+
+# ---------------------------------------------------------------------------
+# Memory key helper
+# ---------------------------------------------------------------------------
+
+def _memory_key(task: Task) -> str:
+    """
+    The key used to group conversation_log entries for working-memory
+    continuity. Prefers a client-supplied session_id (set once per page
+    load by the frontend) so multiple turns in one conversation share
+    working memory. Falls back to task.task_id for any caller that
+    doesn't supply session_id (e.g. the one-shot ingest path), matching
+    today's behavior for that path exactly.
+    """
+    return task.context.get("session_id") or task.task_id
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +451,7 @@ class Synthesizer:
             )
 
         # Both MemoryManager and _EphemeralMemory accept task_id as a kwarg.
-        context_str = memory.format_for_prompt(task_id=task.task_id)
+        context_str = memory.format_for_prompt(task_id=_memory_key(task))
         results_str = self._format_results(results)
 
         answer = self._runtime.infer(
@@ -625,7 +643,8 @@ class ControllerAgent:
                 (d for d in docs if "lora-persona" in str(d.path)), None
             )
             if persona_doc is not None:
-                self._persona_cache = persona_doc.content[:2000]
+                parsed = parse_wiki_doc(persona_doc.content)
+                self._persona_cache = parsed.body[:2000]
                 logger.debug(
                     "_load_persona: persona loaded and cached — "
                     "path=%s  chars=%d",
@@ -672,7 +691,7 @@ class ControllerAgent:
             return
 
         try:
-            raw = profile_path.read_text(encoding="utf-8")
+            parsed = load_wiki_doc(profile_path)
         except Exception as exc:
             logger.warning("_load_user_profile: read failed (%s).", exc)
             return
@@ -680,7 +699,7 @@ class ControllerAgent:
         # Extract fact lines — skip headers (##) and blank lines
         fact_lines = [
             line.lstrip("- ").strip()
-            for line in raw.splitlines()
+            for line in parsed.body.splitlines()
             if line.strip() and not line.strip().startswith("#")
         ]
 
@@ -791,11 +810,12 @@ class ControllerAgent:
 
         # Use the persistent manager if available; otherwise a fresh ephemeral shim.
         memory: _AnyMemory = self._memory_manager or _EphemeralMemory()
+        mem_key = _memory_key(task)
         memory.add(
             "user",
             task.instruction,
             metadata={"task_id": task.task_id},
-            task_id=task.task_id,
+            task_id=mem_key,
         )
 
         try:
@@ -832,17 +852,20 @@ class ControllerAgent:
 
         Steps
         -----
-        1. RoutingPlan already received from Planner (done in _execute).
-        2. If write_episode: run EpisodicMemoryWriter.
-        3. If tools_to_call: stub — logs tool names, does not execute.
-           Full tool dispatch arrives in Phase 6.
-        4. If fetch_rag: run MemoryManager.query_corpus().
-        5. If fetch_episodic: run EpisodicMemoryReader.by_recency().
-        6. Call PromptBuilder.build() with all collected content.
-        7. Pass prebuilt prompt to agent via SubTask.context["_prebuilt_prompt"].
-           Agent short-circuits its own prompt assembly when this key is present.
+        1.  RoutingPlan already received from Planner (done in _execute).
+        2.  If write_episode: run EpisodicMemoryWriter.
+        3.  If tools_to_call: stub — logs tool names, does not execute.
+            Full tool dispatch arrives in Phase 6.
+        4.  If fetch_rag: run MemoryManager.query_corpus().
+        5.  If fetch_episodic: run EpisodicMemoryReader.by_recency().
+        5c. If graph_query: fetch links via get_backlinks() / get_outgoing_links(),
+            convert to GraphQueryResult for PromptBuilder Slot 5b.
+        6.  Call PromptBuilder.build() with all collected content.
+        7.  Pass prebuilt prompt to agent via SubTask.context["_prebuilt_prompt"].
+            Agent short-circuits its own prompt assembly when this key is present.
         """
         db_path = getattr(self._memory_manager, "_db_path", None)
+        mem_key = _memory_key(task)
 
         # -- Step 2: Episodic write ------------------------------------------
         if plan.write_episode and db_path is not None:
@@ -937,9 +960,13 @@ class ControllerAgent:
                     task.instruction,
                     max_results    = 3,
                     use_embeddings = True,
+                    doc_type       = "wiki" if plan.force_rag else None,
                 )
                 rag_sources = [
-                    RagSource(path=str(doc.path), content=doc.content[:2000])
+                    RagSource(
+                        path    = str(doc.path),
+                        content = parse_wiki_doc(doc.content).body[:2000],
+                    )
                     for doc in docs
                     if (plan.force_rag or doc.relevance_score >= 0.55)
                     and not str(doc.path).endswith("lora-persona.md")
@@ -1005,11 +1032,81 @@ class ControllerAgent:
                     "continuing without profile facts.", exc,
                 )
 
+        # -- Step 5c: Graph query fetch ---------------------------------------
+        graph_result: GraphQueryResult | None = None
+        if plan.graph_query is not None and self._memory_manager is not None:
+            direction, node_id, resolved_stem = plan.graph_query
+            try:
+                if direction == "incoming":
+                    edges = self._memory_manager.get_backlinks(node_id)
+                else:  # "outgoing"
+                    edges = self._memory_manager.get_outgoing_links(node_id)
+
+                links = [
+                    GraphLinkEntry(
+                        name     = (
+                            # incoming: interesting side is the source page.
+                            # outgoing+resolved: interesting side is the target page.
+                            # outgoing+unresolved: no real target page; fall back to
+                            # link_text (the original [[...]] text) — NOT target_path,
+                            # which is the normalized stem-shaped string and loses
+                            # the original author casing.
+                            Path(edge.node_doc_path).stem
+                            if edge.node_doc_path is not None
+                            else edge.link_text
+                        ),
+                        resolved = edge.target_resolved,
+                    )
+                    for edge in edges
+                ]
+
+                graph_result = GraphQueryResult(
+                    direction = direction,
+                    page_name = resolved_stem,
+                    links     = links,
+                )
+                logger.info(
+                    "_execute_plan: graph query fetch complete — "
+                    "direction=%s page=%s edges=%d",
+                    direction, resolved_stem, len(links),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "_execute_plan: graph query fetch failed (%s) — "
+                    "continuing without graph result.", exc,
+                )
+
+        # -- Step 5d: Working state assembly (deterministic) ----------------
+        working_state: WorkingMemoryState | None = None
+        if plan.graph_query is None:
+            try:
+                active_artifacts = [s.path for s in rag_sources]
+                current_project = (
+                    task.context.get("project_context")
+                    if task.context.get("project_context") not in (None, "general")
+                    else None
+                )
+                if current_project or active_artifacts:
+                    working_state = WorkingMemoryState(
+                        current_project  = current_project,
+                        active_artifacts = active_artifacts,
+                    )
+                    logger.info(
+                        "_execute_plan: working state assembled — "
+                        "current_project=%r artifacts=%d",
+                        current_project, len(active_artifacts),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "_execute_plan: working state assembly failed (%s) — "
+                    "continuing without working state.", exc,
+                )
+
         # -- Step 6: PromptBuilder assembly ----------------------------------
         working_turns: list[Turn] = []
         try:
             entries = memory.get_context_window(
-                task_id    = task.task_id,
+                task_id    = mem_key,
                 limit      = 5,
                 max_tokens = 300,
             )
@@ -1032,15 +1129,19 @@ class ControllerAgent:
                 and not r.result.startswith("<")
                 and len(r.result.strip()) >= 5
             ] or None,
+            graph_result     = graph_result             or None,
+            working_state    = working_state,
             working_memory   = working_turns            or None,
         )
 
         logger.debug(
             "_execute_plan: prompt assembled — "
             "system_chars=%d  user_chars=%d  "
-            "working_turns=%d  episodic_bullets=%d  rag_sources=%d",
+            "working_turns=%d  episodic_bullets=%d  rag_sources=%d  "
+            "working_state_artifacts=%d",
             len(system_prompt), len(user_prompt),
             len(working_turns), len(episodic_bullets), len(rag_sources),
+            len(working_state.active_artifacts) if working_state is not None else 0,
         )
         logger.debug(
             "_execute_plan: assembled system_prompt:\n%s",
@@ -1083,6 +1184,7 @@ class ControllerAgent:
                 "write_episode":  plan.write_episode,
                 "episode_type":   plan.episode_type,
                 "compound":       plan.compound,
+                "graph_query":    plan.graph_query,
             },
         }
 
@@ -1093,7 +1195,7 @@ class ControllerAgent:
             context     = subtask_context,
         )
 
-        results = self._dispatch([subtask], memory, task.task_id)
+        results = self._dispatch([subtask], memory, mem_key)
 
         # -- Post-response hook: implicit episodic extraction ----------------
         # Run after every dispatch. Catches durable facts the user revealed
@@ -1132,6 +1234,27 @@ class ControllerAgent:
             except Exception as exc:
                 logger.warning(
                     "_execute_plan: implicit extraction failed (%s) — "
+                    "continuing.", exc,
+                )
+
+            # Working state update — separate try for independent error isolation.
+            # Runs regardless of plan.graph_query: P3c exclusivity guards Slot 6A
+            # *rendering* on the next turn, not whether working state is captured
+            # after a graph-query turn. The instruction/response pair from any
+            # route represents real conversational state worth persisting.
+            try:
+                ws_response = results[0].output.get("answer", "")
+                if ws_response:
+                    process_working_state_update(
+                        instruction = task.instruction,
+                        response    = ws_response,
+                        mem_key     = mem_key,
+                        runtime     = self._runtime,
+                        db_path     = db_path,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "_execute_plan: working state update failed (%s) — "
                     "continuing.", exc,
                 )
 

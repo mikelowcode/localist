@@ -99,3 +99,16 @@ backend/tests/output/
 .env.*
 *.pem
 *.key
+
+# ── Localist private runtime directories ──────────────────────────────
+# Wiki pages and raw documents contain personal data and are never
+# committed to the public repo. Maintain local copies only.
+backend/wiki/
+backend/raw/
+
+# SQLite database files (runtime artifacts, never committed)
+backend/*.db
+backend/localist_memory.db
+
+# Environment files (contain API keys)
+backend/.env

@@ -12,7 +12,7 @@ client. It is pure Python and safe to import anywhere in the backend.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +51,25 @@ class ToolResult:
     result:     str
 
 
+@dataclass
+class GraphLinkEntry:
+    name:     str    # resolved page's stem, or raw link_text if unresolved
+    resolved: bool   # True if this entry points to a real page
+
+
+@dataclass
+class GraphQueryResult:
+    direction: str                  # "incoming" | "outgoing"
+    page_name: str                  # display name of the resolved page
+    links:     list[GraphLinkEntry] # may be empty — zero results is valid
+
+
+@dataclass
+class WorkingMemoryState:
+    current_project:  str | None = None
+    active_artifacts: list[str]  = field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # PromptBuilder
 # ---------------------------------------------------------------------------
@@ -71,6 +90,11 @@ class PromptBuilder:
       Slot 3  [EPISODIC MEMORY] — durable facts; conditional; 150-token ceiling
       Slot 4  [CONTEXT]         — RAG snippets; conditional; 450-token ceiling
       Slot 5  [TOOL RESULTS]    — tool output; conditional; 500-token ceiling
+      Slot 5b [GRAPH RESULT]    — graph query result; emitted whenever a graph
+                                  query resolved, even with zero edges;
+                                  300-token ceiling
+      Slot 6A [WORKING STATE]   — structured working state; conditional;
+                                  100-token ceiling
       Slot 6  [WORKING MEMORY]  — recent turns; conditional; 300-token ceiling
       Slot 7  [INSTRUCTION]     — raw user instruction; always present; uncapped
 
@@ -86,8 +110,11 @@ class PromptBuilder:
     build() → (system_prompt: str, user_prompt: str)
         system_prompt : Slot 1a + optional 1b. Pass as the `system=` argument
                         to runtime.
-        user_prompt   : Slots 3–7 assembled in order, empty slots cleanly
-                        omitted (no label, no whitespace placeholder).
+        user_prompt   : Slots 3–7 assembled in order. Most empty slots are
+                        cleanly omitted (no label, no whitespace placeholder).
+                        Exception: Slot 5b ([GRAPH RESULT]) is always rendered
+                        when graph_result is not None, even with zero links —
+                        see _slot_graph() for the full contract.
 
     Invariants
     ----------
@@ -116,7 +143,9 @@ class PromptBuilder:
     _CEIL_PROFILE:  int = 100   # slot 3b; user profile facts
     _CEIL_RAG:      int = 800   # slot 4
     _CEIL_TOOL:     int = 500   # slot 5
-    _CEIL_WORKING:  int = 300   # slot 6
+    _CEIL_GRAPH:    int = 300   # slot 5b
+    _CEIL_WORKING_STATE: int = 100   # slot 6a
+    _CEIL_WORKING:       int = 300   # slot 6
 
     # -----------------------------------------------------------------------
     # Internal token helpers
@@ -318,6 +347,102 @@ class PromptBuilder:
 
         return "\n".join(lines)
 
+    def _slot_graph(self, graph_result: GraphQueryResult | None) -> str:
+        """
+        Return Slot 5b: graph query result, or "" if graph_result is None.
+
+        This slot does NOT follow the clean-omission rule of other slots.
+        When graph_result is not None the slot is always rendered — even when
+        graph_result.links is an empty list. Zero edges is a real, correct
+        answer that must be visible to the model. The only omission case is
+        graph_result=None, meaning no graph query was resolved this turn.
+
+        300-token ceiling enforced as a single post-render truncation.
+        """
+        if graph_result is None:
+            return ""
+
+        page  = graph_result.page_name
+        links = graph_result.links
+
+        if graph_result.direction == "incoming":
+            if not links:
+                content = f"No pages link to {page}."
+            else:
+                body    = "\n".join(f"- {e.name}" for e in links)
+                content = f"Pages linking to {page}:\n{body}"
+        else:  # outgoing
+            if not links:
+                content = f"{page} does not link to any other pages."
+            else:
+                resolved   = [e for e in links if e.resolved]
+                unresolved = [e for e in links if not e.resolved]
+                sections: list[str] = []
+                if resolved:
+                    res_body = "\n".join(f"- {e.name}" for e in resolved)
+                    sections.append(f"{page} links to:\n{res_body}")
+                if unresolved:
+                    header = (
+                        f"{page} also references a page that does not exist:"
+                        if resolved
+                        else f"{page} references a page that does not exist:"
+                    )
+                    unres_body = "\n".join(
+                        f'- "{e.name}" (no matching page found)'
+                        for e in unresolved
+                    )
+                    sections.append(f"{header}\n{unres_body}")
+                content = "\n\n".join(sections)
+
+        rendered = f"[GRAPH RESULT]\n{content}"
+        return self._truncate_to_tokens(rendered, self._CEIL_GRAPH)
+
+    def _slot6a_working_state(
+        self,
+        state: WorkingMemoryState | None,
+    ) -> str:
+        """
+        Return Slot 6A: structured working state, or "" if state is None/empty.
+
+        Clean-omission: returns "" when state is None or both current_project
+        is falsy and active_artifacts is empty — no label, no placeholder.
+
+        active_artifacts is truncated by dropping entries from the end until
+        the block fits within the 100-token ceiling. current_project is emitted
+        as-is (ceiling is soft for this single line).
+
+        Format:
+            [WORKING STATE]
+            current_project: {current_project}
+            active_artifacts: {artifact1}, {artifact2}, ...
+
+        Each line is only emitted when its field is non-empty/non-None.
+        """
+        if state is None:
+            return ""
+        if not state.current_project and not state.active_artifacts:
+            return ""
+
+        lines = ["[WORKING STATE]"]
+
+        if state.current_project:
+            lines.append(f"current_project: {state.current_project}")
+
+        if state.active_artifacts:
+            artifacts = list(state.active_artifacts)
+            while artifacts:
+                line = f"active_artifacts: {', '.join(artifacts)}"
+                candidate = "\n".join(lines + [line])
+                if self._estimate_tokens(candidate) <= self._CEIL_WORKING_STATE:
+                    lines.append(line)
+                    break
+                artifacts.pop()
+
+        if len(lines) == 1:
+            return ""
+
+        return "\n".join(lines)
+
     def _slot6_working_memory(
         self,
         turns: list[Turn] | None,
@@ -386,6 +511,8 @@ class PromptBuilder:
         profile_facts:    list[UserProfileFact]   | None = None,
         rag_snippets:     list[RagSource]          | None = None,
         tool_results:     list[ToolResult]         | None = None,
+        graph_result:     GraphQueryResult         | None = None,
+        working_state:    WorkingMemoryState       | None = None,
         working_memory:   list[Turn]               | None = None,
     ) -> tuple[str, str]:
         """
@@ -411,6 +538,14 @@ class PromptBuilder:
         tool_results :
             ToolResult list in dispatch order (Slot 5). Pass None or []
             to omit.
+        graph_result :
+            GraphQueryResult for the current turn (Slot 5b). When not None,
+            always rendered — even with zero links. Pass None to omit.
+        working_state :
+            Structured working state (Slot 6A). Deterministic; not inferred.
+            Rendered between tool-results and working-memory slots.
+            100-token ceiling; active_artifacts truncated from the end.
+            Pass None to omit (zero-impact on output when absent).
         working_memory :
             Recent conversation turns (Slot 6). Oldest dropped first when
             the 300-token ceiling is exceeded. Pass None or [] to omit.
@@ -423,7 +558,9 @@ class PromptBuilder:
             user_prompt   : Slots 3–7 joined with double newlines.
                             Empty slots are cleanly absent. Slot 3 includes
                             an optional [USER PROFILE] sub-block (Slot 3b)
-                            when profile_facts are provided.
+                            when profile_facts are provided. Slot 5b
+                            ([GRAPH RESULT]) is always rendered when
+                            graph_result is not None; see _slot_graph().
         """
         system_prompt = self._slot1_system(persona)
 
@@ -431,6 +568,8 @@ class PromptBuilder:
             self._slot3_combined(episodic_summary, profile_facts),
             self._slot4_rag(rag_snippets),
             self._slot5_tools(tool_results),
+            self._slot_graph(graph_result),
+            self._slot6a_working_state(working_state),
             self._slot6_working_memory(working_memory),
             self._slot7_instruction(instruction),
         ]

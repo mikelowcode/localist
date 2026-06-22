@@ -44,6 +44,13 @@ export const tasksStore = writable<TasksState>({
 
 const BASE = '/api';
 
+// Stable for the lifetime of this page load. Groups conversation_log
+// entries server-side so working memory persists across turns within
+// a session. Regenerated on full page reload (by design) rather than
+// persisted, so a fresh page load starts a fresh conversation from the
+// backend's perspective.
+const SESSION_ID = crypto.randomUUID();
+
 // ── Create a new task entry ──────────────────────────────────
 function createTask(task_id: string, instruction: string): Task {
   return {
@@ -88,7 +95,11 @@ export async function submitTask(
     tasks: { ...s.tasks, [task_id]: task }
   }));
 
-  const body = JSON.stringify({ task_id, instruction, context });
+  const body = JSON.stringify({
+    task_id,
+    instruction,
+    context: { session_id: SESSION_ID, ...context },
+  });
 
   try {
     const res = await fetch(`${BASE}/task/stream`, {

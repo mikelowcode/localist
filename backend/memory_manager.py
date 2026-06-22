@@ -145,7 +145,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION   = 2          # increment when schema changes require migration
+_SCHEMA_VERSION   = 5          # increment when schema changes require migration
 _EMBEDDING_DIM    = 768        # EmbeddingGemma-300M-4bit output dimension
 _EMBEDDING_FORMAT = ">768f"    # big-endian float32 × 768
 
@@ -242,6 +242,39 @@ class DocumentResult:
             "type":            self.doc_type,
             "relevance_score": round(self.relevance_score, 4),
         }
+
+
+class GraphEdgeResult:
+    """
+    A single graph_edges row, resolved for read-time consumption.
+
+    For outgoing queries, node_title/node_doc_path are None when
+    target_resolved is False (the edge points to a page that doesn't
+    exist). For incoming queries, target_resolved is always True by
+    construction and node_title/node_doc_path are always populated —
+    they describe the SOURCE side of the edge in that case (see
+    get_backlinks() docstring for why the field names stay fixed but the
+    populated side changes per query direction).
+    """
+
+    __slots__ = (
+        "link_text", "target_path", "target_resolved",
+        "node_title", "node_doc_path",
+    )
+
+    def __init__(
+        self,
+        link_text:       str,
+        target_path:     str,
+        target_resolved: bool,
+        node_title:      str | None,
+        node_doc_path:   str | None,
+    ) -> None:
+        self.link_text       = link_text
+        self.target_path     = target_path
+        self.target_resolved = target_resolved
+        self.node_title      = node_title
+        self.node_doc_path   = node_doc_path
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +419,42 @@ class MemoryManager:
                         ON episodes (subject, status);
                     CREATE INDEX IF NOT EXISTS idx_episodes_project
                         ON episodes (project_context, status);
+
+                    CREATE TABLE IF NOT EXISTS graph_nodes (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        doc_path        TEXT    NOT NULL UNIQUE,
+                        node_type       TEXT,
+                        title           TEXT,
+                        source_doc_path TEXT    NOT NULL,
+                        created_at      REAL    NOT NULL,
+                        updated_at      REAL    NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_graph_nodes_doc_path
+                        ON graph_nodes(doc_path);
+
+                    CREATE TABLE IF NOT EXISTS graph_edges (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source_node_id  INTEGER NOT NULL REFERENCES graph_nodes(id),
+                        target_path     TEXT    NOT NULL,
+                        target_node_id  INTEGER REFERENCES graph_nodes(id),
+                        target_resolved INTEGER NOT NULL DEFAULT 0,
+                        link_text       TEXT    NOT NULL,
+                        source_doc_path TEXT    NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_graph_edges_source
+                        ON graph_edges(source_node_id);
+                    CREATE INDEX IF NOT EXISTS idx_graph_edges_target_path
+                        ON graph_edges(target_path);
+                    CREATE INDEX IF NOT EXISTS idx_graph_edges_resolved
+                        ON graph_edges(target_resolved);
+
+                    CREATE TABLE IF NOT EXISTS working_state (
+                        mem_key                TEXT    PRIMARY KEY,
+                        current_focus          TEXT,
+                        open_loops_json        TEXT    NOT NULL DEFAULT '[]',
+                        recent_decisions_json  TEXT    NOT NULL DEFAULT '[]',
+                        updated_at             REAL    NOT NULL
+                    );
                 """)
 
                 # Ensure schema_version row exists.
@@ -441,6 +510,61 @@ class MemoryManager:
                 CREATE INDEX IF NOT EXISTS idx_episodes_project
                     ON episodes (project_context, status);
             """)
+
+        if from_version < 3:
+            logger.info("Applying migration v2→v3: creating graph_nodes and graph_edges tables.")
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS graph_nodes (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    doc_path        TEXT    NOT NULL UNIQUE,
+                    node_type       TEXT,
+                    title           TEXT,
+                    source_doc_path TEXT    NOT NULL,
+                    created_at      REAL    NOT NULL,
+                    updated_at      REAL    NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_graph_nodes_doc_path
+                    ON graph_nodes(doc_path);
+
+                CREATE TABLE IF NOT EXISTS graph_edges (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_node_id  INTEGER NOT NULL REFERENCES graph_nodes(id),
+                    target_path     TEXT    NOT NULL,
+                    target_node_id  INTEGER REFERENCES graph_nodes(id),
+                    target_resolved INTEGER NOT NULL DEFAULT 0,
+                    link_text       TEXT    NOT NULL,
+                    source_doc_path TEXT    NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_graph_edges_source
+                    ON graph_edges(source_node_id);
+                CREATE INDEX IF NOT EXISTS idx_graph_edges_target_path
+                    ON graph_edges(target_path);
+                CREATE INDEX IF NOT EXISTS idx_graph_edges_resolved
+                    ON graph_edges(target_resolved);
+            """)
+
+        if from_version < 4:
+            logger.info("Applying migration v3→v4: creating working_state table.")
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS working_state (
+                    mem_key                TEXT    PRIMARY KEY,
+                    current_focus          TEXT,
+                    open_loops_json        TEXT    NOT NULL DEFAULT '[]',
+                    recent_decisions_json  TEXT    NOT NULL DEFAULT '[]',
+                    turn_summaries_json    TEXT    NOT NULL DEFAULT '[]',
+                    updated_at             REAL    NOT NULL
+                );
+            """)
+
+        if from_version < 5:
+            logger.info("Applying migration v4→v5: dropping turn_summaries_json column.")
+            cols = {row[1] for row in conn.execute(
+                "PRAGMA table_info(working_state)"
+            ).fetchall()}
+            if "turn_summaries_json" in cols:
+                conn.executescript(
+                    "ALTER TABLE working_state DROP COLUMN turn_summaries_json;"
+                )
 
         conn.execute(
             "UPDATE schema_version SET version = ?", (_SCHEMA_VERSION,)
@@ -834,6 +958,263 @@ class MemoryManager:
                 logger.info("remove_document: removed %s.", path.name)
             finally:
                 conn.close()
+
+    # -----------------------------------------------------------------------
+    # Link graph  (build_graph.py API)
+    # -----------------------------------------------------------------------
+
+    def upsert_graph_node(
+        self,
+        doc_path:  Path | str,
+        node_type: str | None,
+        title:     str | None,
+    ) -> int:
+        """
+        Insert or update a graph_nodes row identified by doc_path.
+        Returns the row's id.
+
+        On insert:           created_at = updated_at = now.
+        On conflict (same doc_path already exists): node_type/title/updated_at
+        are overwritten; created_at is preserved from the original insert so
+        the first-seen timestamp is stable across rebuilds.
+        """
+        doc_path_str = str(Path(doc_path).resolve())
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO graph_nodes
+                        (doc_path, node_type, title, source_doc_path,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(doc_path) DO UPDATE SET
+                        node_type  = excluded.node_type,
+                        title      = excluded.title,
+                        updated_at = excluded.updated_at
+                    """,
+                    (doc_path_str, node_type, title, doc_path_str, now, now),
+                )
+                conn.commit()
+                row = conn.execute(
+                    "SELECT id FROM graph_nodes WHERE doc_path = ?",
+                    (doc_path_str,),
+                ).fetchone()
+                return row["id"]
+            finally:
+                conn.close()
+
+    def upsert_graph_edge(
+        self,
+        source_node_id:  int,
+        source_doc_path: Path | str,
+        target_path:     str,
+        target_node_id:  int | None,
+        target_resolved: bool,
+        link_text:       str,
+    ) -> None:
+        """
+        Insert or update a graph_edges row by the natural key
+        (source_doc_path, target_path).
+
+        On update, target_node_id / target_resolved / link_text are refreshed
+        so a previously-unresolved link can resolve on a later rebuild once
+        the target page exists.
+        """
+        source_doc_path_str = str(Path(source_doc_path).resolve())
+        with self._lock:
+            conn = self._connect()
+            try:
+                existing = conn.execute(
+                    """SELECT id FROM graph_edges
+                       WHERE source_doc_path = ? AND target_path = ?""",
+                    (source_doc_path_str, target_path),
+                ).fetchone()
+                if existing is not None:
+                    conn.execute(
+                        """UPDATE graph_edges
+                           SET source_node_id  = ?,
+                               target_node_id  = ?,
+                               target_resolved = ?,
+                               link_text       = ?
+                           WHERE source_doc_path = ? AND target_path = ?""",
+                        (source_node_id, target_node_id,
+                         1 if target_resolved else 0, link_text,
+                         source_doc_path_str, target_path),
+                    )
+                else:
+                    conn.execute(
+                        """INSERT INTO graph_edges
+                               (source_node_id, source_doc_path, target_path,
+                                target_node_id, target_resolved, link_text)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (source_node_id, source_doc_path_str, target_path,
+                         target_node_id, 1 if target_resolved else 0, link_text),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def clear_graph_for_doc(self, doc_path: Path | str) -> None:
+        """
+        Delete all graph_edges rows where source_doc_path == doc_path.
+
+        Intended for per-document partial rebuilds (e.g. a future WikiAgent
+        post-ingest hook). The full offline rebuild script uses
+        clear_graph_edges() instead.
+        """
+        doc_path_str = str(Path(doc_path).resolve())
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "DELETE FROM graph_edges WHERE source_doc_path = ?",
+                    (doc_path_str,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def clear_graph_edges(self) -> None:
+        """
+        Delete ALL graph_edges rows.
+
+        Used by the full-corpus rebuild script between the node-upsert pass
+        and the edge-upsert pass, so stale edges (from since-removed [[...]]
+        links) don't survive the rebuild. Does NOT delete graph_nodes rows.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("DELETE FROM graph_edges")
+                conn.commit()
+            finally:
+                conn.close()
+
+    def resolve_node_by_stem(self, stem: str) -> dict | None:
+        """
+        Look up a single graph_nodes row whose doc_path stem equals ``stem``.
+
+        Does exact-match only — caller is responsible for normalising the stem
+        before calling. Returns a dict with keys ``id``, ``doc_path``, ``title``
+        if exactly one row matches, else ``None`` (zero or multiple matches).
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT id, doc_path, title FROM graph_nodes"
+                ).fetchall()
+            finally:
+                conn.close()
+
+        matches = [
+            {"id": row["id"], "doc_path": row["doc_path"], "title": row["title"]}
+            for row in rows
+            if Path(row["doc_path"]).stem == stem
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def get_backlinks(self, node_id: int) -> list[GraphEdgeResult]:
+        """
+        Return all graph_edges rows where ``target_node_id`` equals ``node_id``.
+
+        For each edge, the source node's ``title`` and ``doc_path`` are fetched
+        and exposed as ``node_title``/``node_doc_path`` — the interesting "other
+        side" of a backlinks query is the source page, not the target.
+        ``target_resolved`` is always ``True`` for every row this method returns
+        (structural guarantee: an edge found by ``target_node_id = ?`` is, by
+        construction, always resolved).
+
+        Returns an empty list when no backlinks exist.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT e.link_text, e.target_path,
+                           n.title    AS node_title,
+                           n.doc_path AS node_doc_path
+                    FROM   graph_edges e
+                    JOIN   graph_nodes n ON n.id = e.source_node_id
+                    WHERE  e.target_node_id = ?
+                    """,
+                    (node_id,),
+                ).fetchall()
+            finally:
+                conn.close()
+
+        return [
+            GraphEdgeResult(
+                link_text       = row["link_text"],
+                target_path     = row["target_path"],
+                target_resolved = True,
+                node_title      = row["node_title"],
+                node_doc_path   = row["node_doc_path"],
+            )
+            for row in rows
+        ]
+
+    def get_outgoing_links(self, node_id: int) -> list[GraphEdgeResult]:
+        """
+        Return all graph_edges rows where ``source_node_id`` equals ``node_id``.
+
+        Includes both resolved and unresolved edges — unresolved edges (where the
+        target page does not yet exist in the graph) are never silently dropped.
+        For resolved edges, ``node_title``/``node_doc_path`` are populated from
+        the target node. For unresolved edges, both are ``None``.
+
+        Returns an empty list when no outgoing links exist.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT e.link_text, e.target_path, e.target_resolved,
+                           n.title    AS node_title,
+                           n.doc_path AS node_doc_path
+                    FROM   graph_edges e
+                    LEFT JOIN graph_nodes n ON n.id = e.target_node_id
+                    WHERE  e.source_node_id = ?
+                    """,
+                    (node_id,),
+                ).fetchall()
+            finally:
+                conn.close()
+
+        return [
+            GraphEdgeResult(
+                link_text       = row["link_text"],
+                target_path     = row["target_path"],
+                target_resolved = bool(row["target_resolved"]),
+                node_title      = row["node_title"],
+                node_doc_path   = row["node_doc_path"],
+            )
+            for row in rows
+        ]
+
+    def list_graph_node_stems(self) -> list[str]:
+        """
+        Return the stem of every ``doc_path`` currently stored in
+        ``graph_nodes``.
+
+        Used by Planner P3c to feed a candidate-stem list into
+        ``resolve_graph_target()`` without touching the filesystem.
+        Returns an empty list when the graph has not been built yet.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT doc_path FROM graph_nodes"
+                ).fetchall()
+            finally:
+                conn.close()
+
+        return [Path(row["doc_path"]).stem for row in rows]
 
     # -----------------------------------------------------------------------
     # Corpus retrieval  (ResearchAgent API)
@@ -1543,6 +1924,19 @@ class EpisodeRecord:
 
 
 # ---------------------------------------------------------------------------
+# WorkingStateRecord — return type for WorkingStateStore.get()
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WorkingStateRecord:
+    mem_key:          str
+    current_focus:    str | None
+    open_loops:       list[str]
+    recent_decisions: list[str]
+    updated_at:       float
+
+
+# ---------------------------------------------------------------------------
 # EpisodicMemoryReader
 # ---------------------------------------------------------------------------
 
@@ -1799,6 +2193,175 @@ class EpisodicMemoryReader:
                     len(records), query[:40],
                 )
                 return records
+            finally:
+                conn.close()
+
+
+# ---------------------------------------------------------------------------
+# WorkingStateStore — Slot 6A Tier 2 persistent storage
+# ---------------------------------------------------------------------------
+
+class WorkingStateStore:
+    """
+    Reads and writes the `working_state` table in `lora_memory.db`.
+
+    One row per mem_key (the same session-grouping key used by
+    conversation_log and get_context_window). Tier 2 fields only —
+    current_focus, open_loops, recent_decisions.
+    The two list fields are stored as JSON-encoded strings; this class
+    encodes/decodes at the boundary so callers always deal in Python lists.
+
+    Architecture notes
+    ------------------
+    - No persistent connection. Opens/closes per call (WAL concurrent reads).
+    - Threading lock acquired for all writes (upsert, clear). Reads are
+      lock-free — WAL mode permits concurrent readers.
+    - Same _connect() PRAGMA set as EpisodicMemoryWriter.
+    - This class is storage only. No inference, no controller wiring.
+
+    Parameters
+    ----------
+    db_path :
+        Path to the SQLite file. Must be the same file used by MemoryManager.
+    """
+
+    def __init__(self, db_path: Path | str) -> None:
+        self._db_path = Path(db_path)
+        self._lock    = threading.Lock()
+
+    # -----------------------------------------------------------------------
+    # Internal helpers
+    # -----------------------------------------------------------------------
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self._db_path), timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    # -----------------------------------------------------------------------
+    # Public API
+    # -----------------------------------------------------------------------
+
+    def get(self, mem_key: str) -> WorkingStateRecord | None:
+        """
+        Read the working state for a session.
+
+        Returns None when no row exists for mem_key — callers can
+        distinguish "never written" from "written but empty".
+
+        Parameters
+        ----------
+        mem_key :
+            Session-grouping key (same key used by conversation_log).
+
+        Returns
+        -------
+        WorkingStateRecord | None
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM working_state WHERE mem_key = ?", (mem_key,)
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if row is None:
+            return None
+
+        return WorkingStateRecord(
+            mem_key          = row["mem_key"],
+            current_focus    = row["current_focus"],
+            open_loops       = json.loads(row["open_loops_json"]),
+            recent_decisions = json.loads(row["recent_decisions_json"]),
+            updated_at       = row["updated_at"],
+        )
+
+    def upsert(
+        self,
+        mem_key:          str,
+        current_focus:    str | None,
+        open_loops:       list[str],
+        recent_decisions: list[str],
+    ) -> None:
+        """
+        Insert or update the working state for a session.
+
+        If a row already exists for mem_key, all fields are overwritten
+        (ON CONFLICT DO UPDATE). updated_at is always set to time.time().
+
+        Parameters
+        ----------
+        mem_key :
+            Session-grouping key.
+        current_focus :
+            Current task focus string, or None when unset.
+        open_loops :
+            List of unresolved topic strings.
+        recent_decisions :
+            List of recent decision strings.
+        """
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO working_state
+                        (mem_key, current_focus, open_loops_json,
+                         recent_decisions_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(mem_key) DO UPDATE SET
+                        current_focus         = excluded.current_focus,
+                        open_loops_json       = excluded.open_loops_json,
+                        recent_decisions_json = excluded.recent_decisions_json,
+                        updated_at            = excluded.updated_at
+                    """,
+                    (
+                        mem_key,
+                        current_focus,
+                        json.dumps(open_loops),
+                        json.dumps(recent_decisions),
+                        now,
+                    ),
+                )
+                conn.commit()
+                logger.info(
+                    "upsert: working_state written for mem_key=%r.", mem_key
+                )
+            finally:
+                conn.close()
+
+    def clear(self, mem_key: str) -> int:
+        """
+        Delete the working state row for a session.
+
+        Parameters
+        ----------
+        mem_key :
+            Session-grouping key to delete.
+
+        Returns
+        -------
+        int
+            Number of rows deleted (0 if no row existed for mem_key).
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                cursor = conn.execute(
+                    "DELETE FROM working_state WHERE mem_key = ?", (mem_key,)
+                )
+                count = cursor.rowcount
+                conn.commit()
+                logger.info(
+                    "clear: deleted %d working_state row(s) for mem_key=%r.",
+                    count, mem_key,
+                )
+                return count
             finally:
                 conn.close()
 

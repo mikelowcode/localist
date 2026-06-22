@@ -35,10 +35,14 @@ from episodic_extractor import (
     extract_implicit_episode,
     process_explicit_signal,
     process_implicit_extraction,
+    extract_working_state_update,
+    process_working_state_update,
     ExtractionSignal,
     ExtractionResult,
     _infer_type_from_content,
+    _MAX_BULLET_CHARS,
 )
+from memory_manager import WorkingStateStore, WorkingStateRecord
 from controller_agent import ControllerAgent, TaskStatus, AgentResult
 
 
@@ -597,3 +601,251 @@ class TestControllerWiring:
             "instruction": "remember that I prefer dark mode",
         })
         assert result["status"] == "complete"
+
+
+# ---------------------------------------------------------------------------
+# Working state update — extract_working_state_update / process_working_state_update
+# ---------------------------------------------------------------------------
+
+_WELL_FORMED_RESPONSE = (
+    "FOCUS: implementing Slot 6A working memory\n"
+    "OPEN_LOOPS: wire Tier 2 into controller, write integration tests\n"
+    "DECISIONS: use separate try/except blocks for error isolation"
+)
+
+
+class TestExtractWorkingStateUpdate:
+
+    # 1. Well-formed three-line response → correct parsing of all fields.
+    def test_wellformed_response_parses_all_fields(self):
+        rt = make_runtime(infer_return=_WELL_FORMED_RESPONSE)
+        result = extract_working_state_update(
+            instruction    = "How should we wire the working state hook?",
+            response       = "Use a separate try/except block.",
+            previous_state = None,
+            runtime        = rt,
+        )
+        assert result is not None
+        current_focus, open_loops, recent_decisions = result
+
+        assert current_focus    == "implementing Slot 6A working memory"
+        assert open_loops       == ["wire Tier 2 into controller", "write integration tests"]
+        assert recent_decisions == ["use separate try/except blocks for error isolation"]
+
+    # 2. Malformed response (missing label) → returns None.
+    def test_missing_label_returns_none(self):
+        rt = make_runtime(infer_return=(
+            "FOCUS: something\n"
+            "OPEN_LOOPS: none\n"
+            # DECISIONS label missing
+        ))
+        result = extract_working_state_update(
+            instruction="hi", response="hello", previous_state=None, runtime=rt
+        )
+        assert result is None
+
+    # 3. Completely garbage response → returns None.
+    def test_garbage_response_returns_none(self):
+        rt = make_runtime(infer_return="This is not the format at all.")
+        result = extract_working_state_update(
+            instruction="hi", response="hello", previous_state=None, runtime=rt
+        )
+        assert result is None
+
+    # 4. OPEN_LOOPS: NONE → empty list, not ["NONE"].
+    def test_open_loops_none_returns_empty_list(self):
+        rt = make_runtime(infer_return=(
+            "FOCUS: current task\n"
+            "OPEN_LOOPS: NONE\n"
+            "DECISIONS: NONE"
+        ))
+        result = extract_working_state_update(
+            instruction="hi", response="hello", previous_state=None, runtime=rt
+        )
+        assert result is not None
+        _, open_loops, _ = result
+        assert open_loops == []
+
+    # 5. Per-bullet truncation applied to an open_loop string > 80 chars.
+    def test_open_loop_truncated_at_80_chars(self):
+        long_item = "A" * 100   # 100 chars — exceeds _MAX_BULLET_CHARS (80)
+        rt = make_runtime(infer_return=(
+            f"FOCUS: current task\n"
+            f"OPEN_LOOPS: {long_item}\n"
+            f"DECISIONS: NONE"
+        ))
+        result = extract_working_state_update(
+            instruction="hi", response="hello", previous_state=None, runtime=rt
+        )
+        assert result is not None
+        _, open_loops, _ = result
+        assert len(open_loops) == 1
+        assert len(open_loops[0]) <= _MAX_BULLET_CHARS
+
+    # 6. Exactly three labels required — a 4th unexpected label still succeeds
+    #    (extra lines are silently ignored); missing any required label → None.
+    def test_exactly_three_labels_required(self):
+        # Extra label present but all three required labels present → succeeds
+        rt_extra = make_runtime(infer_return=(
+            "FOCUS: something\n"
+            "OPEN_LOOPS: NONE\n"
+            "DECISIONS: NONE\n"
+            "EXTRA: this line is ignored"
+        ))
+        result = extract_working_state_update(
+            instruction="hi", response="hello", previous_state=None, runtime=rt_extra
+        )
+        assert result is not None
+
+        # Missing FOCUS → fails closed
+        rt_no_focus = make_runtime(infer_return=(
+            "OPEN_LOOPS: NONE\n"
+            "DECISIONS: NONE"
+        ))
+        assert extract_working_state_update(
+            instruction="hi", response="hello", previous_state=None, runtime=rt_no_focus
+        ) is None
+
+        # Missing OPEN_LOOPS → fails closed
+        rt_no_loops = make_runtime(infer_return=(
+            "FOCUS: something\n"
+            "DECISIONS: NONE"
+        ))
+        assert extract_working_state_update(
+            instruction="hi", response="hello", previous_state=None, runtime=rt_no_loops
+        ) is None
+
+        # Missing DECISIONS → fails closed
+        rt_no_dec = make_runtime(infer_return=(
+            "FOCUS: something\n"
+            "OPEN_LOOPS: NONE"
+        ))
+        assert extract_working_state_update(
+            instruction="hi", response="hello", previous_state=None, runtime=rt_no_dec
+        ) is None
+
+
+class TestProcessWorkingStateUpdate:
+
+    @pytest.fixture()
+    def db_path(self, tmp_path: Path) -> Path:
+        path = tmp_path / "ws_test.db"
+        MemoryManager(db_path=path)
+        return path
+
+    # 6. FOCUS: NONE with a previous_state present → carry forward previous focus.
+    def test_focus_none_carries_forward_previous_focus(self, db_path):
+        store = WorkingStateStore(db_path=db_path)
+        store.upsert(
+            mem_key          = "sess-a",
+            current_focus    = "previous focus value",
+            open_loops       = [],
+            recent_decisions = [],
+        )
+
+        rt = make_runtime(infer_return=(
+            "FOCUS: NONE\n"
+            "OPEN_LOOPS: NONE\n"
+            "DECISIONS: NONE"
+        ))
+        result = process_working_state_update(
+            instruction = "What is 2+2?",
+            response    = "4.",
+            mem_key     = "sess-a",
+            runtime     = rt,
+            db_path     = db_path,
+        )
+        assert result is not None
+        assert result.current_focus == "previous focus value"
+
+    # 7. FOCUS: NONE with previous_state=None (first turn) → current_focus is None.
+    def test_focus_none_first_turn_yields_none_focus(self, db_path):
+        rt = make_runtime(infer_return=(
+            "FOCUS: NONE\n"
+            "OPEN_LOOPS: NONE\n"
+            "DECISIONS: NONE"
+        ))
+        result = process_working_state_update(
+            instruction = "Hello.",
+            response    = "Hi there.",
+            mem_key     = "sess-first",
+            runtime     = rt,
+            db_path     = db_path,
+        )
+        assert result is not None
+        assert result.current_focus is None
+        assert result.current_focus != "NONE"
+
+    # 8. Inference failure → process_working_state_update returns previous_state,
+    #    does not raise, does not call upsert() beyond what already exists.
+    def test_inference_failure_returns_previous_state_unchanged(self, db_path):
+        store = WorkingStateStore(db_path=db_path)
+        store.upsert(
+            mem_key          = "sess-b",
+            current_focus    = "stable focus",
+            open_loops       = ["existing loop"],
+            recent_decisions = [],
+        )
+
+        rt = MagicMock()
+        rt.infer.side_effect = RuntimeError("model offline")
+
+        result = process_working_state_update(
+            instruction = "Something.",
+            response    = "Something else.",
+            mem_key     = "sess-b",
+            runtime     = rt,
+            db_path     = db_path,
+        )
+        # Does not raise — returns previous state or None
+        # The stored row must be unchanged (no upsert called with bad data)
+        stored = store.get("sess-b")
+        assert stored is not None
+        assert stored.current_focus == "stable focus"
+        assert stored.open_loops    == ["existing loop"]
+
+    # 9. Integration — loop reconciliation: second turn closes a loop from the first.
+    def test_loop_reconciliation_across_two_turns(self, db_path):
+        """
+        First turn opens a loop; second turn's model response resolves it.
+        The resolved loop must be absent from the second result's open_loops.
+        This is the 'reconcile, not append' guarantee from the system prompt.
+        """
+        # Turn 1: model reports one open loop
+        rt1 = make_runtime(infer_return=(
+            "FOCUS: implementing working state\n"
+            "OPEN_LOOPS: write integration test for loop reconciliation\n"
+            "DECISIONS: NONE"
+        ))
+        process_working_state_update(
+            instruction = "How do we ensure loops are reconciled?",
+            response    = "The model must edit the list, not append.",
+            mem_key     = "sess-reconcile",
+            runtime     = rt1,
+            db_path     = db_path,
+        )
+
+        # Verify turn 1 stored the loop
+        stored_1 = WorkingStateStore(db_path=db_path).get("sess-reconcile")
+        assert stored_1 is not None
+        assert "write integration test for loop reconciliation" in stored_1.open_loops
+
+        # Turn 2: model reports the loop is resolved — not present in OPEN_LOOPS
+        rt2 = make_runtime(infer_return=(
+            "FOCUS: implementing working state\n"
+            "OPEN_LOOPS: NONE\n"
+            "DECISIONS: reconciliation test written"
+        ))
+        result_2 = process_working_state_update(
+            instruction = "I wrote the test.",
+            response    = "Great — the loop is now closed.",
+            mem_key     = "sess-reconcile",
+            runtime     = rt2,
+            db_path     = db_path,
+        )
+
+        # The previously open loop must be absent
+        assert result_2 is not None
+        assert "write integration test for loop reconciliation" not in result_2.open_loops
+        assert result_2.open_loops == []
+        assert result_2.recent_decisions == ["reconciliation test written"]

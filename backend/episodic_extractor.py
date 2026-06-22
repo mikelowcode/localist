@@ -32,7 +32,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from memory_manager import EpisodicMemoryWriter, VALID_EPISODE_TYPES
+from memory_manager import EpisodicMemoryWriter, WorkingStateStore, WorkingStateRecord, VALID_EPISODE_TYPES
 from prompt_builder import PromptBuilder
 
 logger = logging.getLogger(__name__)
@@ -106,6 +106,33 @@ _IMPLICIT_EXTRACTION_SYSTEM = (
     "If nothing durable was revealed, output the single word: NONE. "
     "No preamble. No explanation. One sentence or NONE."
 )
+
+# System prompt for the working-state update call (post-response hook, Slot 6A Tier 2).
+_WORKING_STATE_UPDATE_SYSTEM = (
+    "You are a session-state tracker for a local AI research assistant. "
+    "After each turn, you update three working-state fields based on the previous "
+    "state and the new turn (user instruction + assistant response).\n\n"
+    "Output exactly three lines in this exact order, with no preamble, no explanation:\n"
+    "FOCUS: <one short phrase summarising what the user is currently working on, "
+    "or NONE to keep the previous focus unchanged>\n"
+    "OPEN_LOOPS: <comma-separated short phrases for unresolved threads, "
+    "or NONE if nothing is currently open>\n"
+    "DECISIONS: <comma-separated short phrases for decisions made this turn, "
+    "or NONE if no new decisions were made>\n\n"
+    "Rules:\n"
+    "- FOCUS: NONE means 'carry the previous focus forward unchanged, do not clear it'. "
+    "Only emit a new focus phrase if this turn clearly shifts what the user is working on.\n"
+    "- OPEN_LOOPS: NONE means the list is empty. Reconcile against the previous open "
+    "loops: if a loop was closed or answered by this turn's response, remove it. "
+    "Do not blindly append; edit the list to reflect what is still unresolved.\n"
+    "- DECISIONS: NONE means no new decisions were made this turn. "
+    "Only capture clear explicit choices or commitments, not tentative suggestions.\n"
+    "- Never add preamble, explanation, or extra lines beyond the three."
+)
+
+# Per-bullet truncation ceiling for open_loops and recent_decisions entries.
+# Mirrors memory_manager._MAX_BULLET_CHARS (80 chars) — same 20-token convention.
+_MAX_BULLET_CHARS = 80
 
 
 # ---------------------------------------------------------------------------
@@ -657,3 +684,219 @@ def process_implicit_extraction(
         task_id         = task_id,
         project_context = project_context,
     )
+
+
+def extract_working_state_update(
+    instruction:    str,
+    response:       str,
+    previous_state: "WorkingStateRecord | None",
+    runtime:        Any,
+) -> "tuple[str | None, list[str], list[str]] | None":
+    """
+    Extract updated Slot 6A Tier 2 fields from a conversation turn.
+
+    Calls the model with the previous working state and the new turn, then
+    parses the mandatory three-line structured response.
+
+    Parameters
+    ----------
+    instruction :
+        The user's instruction for this turn.
+    response :
+        The agent's response for this turn.
+    previous_state :
+        The stored WorkingStateRecord for this session, or None on the
+        first turn. Used to provide reconciliation context to the model.
+    runtime :
+        RuntimeClient. Used for a single infer() call.
+
+    Returns
+    -------
+    (current_focus, open_loops, recent_decisions) or None
+        current_focus    : New focus phrase, or None meaning 'keep previous'.
+        open_loops       : List of open-loop strings (empty list = none open).
+        recent_decisions : List of decision strings (empty list = none).
+        Returns None when the model response fails to parse — caller must
+        keep the previous state unchanged (fail-closed contract).
+    """
+    # Serialize previous state for the model's reconciliation context.
+    if previous_state is not None:
+        prev_focus = previous_state.current_focus or "NONE"
+        prev_loops = ", ".join(previous_state.open_loops) or "NONE"
+        prev_decisions = ", ".join(previous_state.recent_decisions) or "NONE"
+    else:
+        prev_focus = "NONE"
+        prev_loops = "NONE"
+        prev_decisions = "NONE"
+
+    user_prompt = (
+        f"Previous working state:\n"
+        f"current_focus: {prev_focus}\n"
+        f"open_loops: {prev_loops}\n"
+        f"recent_decisions: {prev_decisions}\n\n"
+        f"New turn:\n"
+        f"User: {instruction}\n"
+        f"Assistant: {response}"
+    )
+
+    try:
+        raw = runtime.infer(
+            system      = _WORKING_STATE_UPDATE_SYSTEM,
+            prompt      = user_prompt,
+            max_tokens  = 200,
+            temperature = 0.0,
+        )
+    except Exception as exc:
+        logger.warning(
+            "extract_working_state_update: inference failed (%s).", exc
+        )
+        return None
+
+    # Parse the three-line structured response. All three labels must be present.
+    lines = [l.strip() for l in raw.strip().splitlines() if l.strip()]
+
+    focus_val      = None
+    open_loops_val = None
+    decisions_val  = None
+
+    for line in lines:
+        upper = line.upper()
+        if upper.startswith("FOCUS:"):
+            focus_val = line[len("FOCUS:"):].strip()
+        elif upper.startswith("OPEN_LOOPS:"):
+            open_loops_val = line[len("OPEN_LOOPS:"):].strip()
+        elif upper.startswith("DECISIONS:"):
+            decisions_val = line[len("DECISIONS:"):].strip()
+
+    if any(v is None for v in (focus_val, open_loops_val, decisions_val)):
+        logger.warning(
+            "extract_working_state_update: parse failed — "
+            "missing label(s) in response %r.", raw[:120],
+        )
+        return None
+
+    # Resolve FOCUS — NONE means "keep previous value"
+    current_focus: str | None = (
+        None if focus_val.upper() == "NONE" else focus_val
+    )
+
+    # Parse OPEN_LOOPS — NONE means empty list
+    if open_loops_val.upper() == "NONE":
+        open_loops: list[str] = []
+    else:
+        open_loops = [
+            s[:_MAX_BULLET_CHARS] for s in
+            [item.strip() for item in open_loops_val.split(",")]
+            if s.strip()
+        ]
+
+    # Parse DECISIONS — NONE means empty list
+    if decisions_val.upper() == "NONE":
+        recent_decisions: list[str] = []
+    else:
+        recent_decisions = [
+            s[:_MAX_BULLET_CHARS] for s in
+            [item.strip() for item in decisions_val.split(",")]
+            if s.strip()
+        ]
+
+    logger.debug(
+        "extract_working_state_update: parsed — "
+        "focus=%r loops=%d decisions=%d.",
+        current_focus, len(open_loops), len(recent_decisions),
+    )
+    return current_focus, open_loops, recent_decisions
+
+
+def process_working_state_update(
+    instruction: str,
+    response:    str,
+    mem_key:     str,
+    runtime:     Any,
+    db_path:     Any,   # Path
+) -> "WorkingStateRecord | None":
+    """
+    Full working-state update pipeline: read → extract → resolve → write → return.
+
+    1. Read previous state via WorkingStateStore.get(mem_key).
+    2. Call extract_working_state_update(). If None → log and return
+       previous_state unchanged without calling upsert() (fail-closed).
+    3. Resolve FOCUS: None from extraction means carry forward
+       previous_state.current_focus (or None when no previous state).
+    4. Call WorkingStateStore.upsert() with resolved fields.
+    5. Return the resulting WorkingStateRecord.
+
+    Never raises — wraps all logic in try/except; returns previous_state
+    (or None if no previous state) on any exception.
+
+    Parameters
+    ----------
+    instruction :
+        The user's instruction for this turn.
+    response :
+        The agent's response for this turn.
+    mem_key :
+        Session key (same key used by conversation_log / get_context_window).
+    runtime :
+        RuntimeClient for the extraction inference call.
+    db_path :
+        Path to lora_memory.db.
+
+    Returns
+    -------
+    WorkingStateRecord | None
+        The newly stored record, or the previous record unchanged on failure.
+    """
+    store = WorkingStateStore(db_path=db_path)
+
+    try:
+        previous_state = store.get(mem_key)
+
+        result = extract_working_state_update(
+            instruction    = instruction,
+            response       = response,
+            previous_state = previous_state,
+            runtime        = runtime,
+        )
+
+        if result is None:
+            logger.warning(
+                "process_working_state_update: extraction returned None "
+                "for mem_key=%r — keeping previous state.", mem_key,
+            )
+            return previous_state
+
+        extracted_focus, open_loops, recent_decisions = result
+
+        # Resolve FOCUS: None means "keep previous value"
+        if extracted_focus is None:
+            current_focus = (
+                previous_state.current_focus if previous_state is not None else None
+            )
+        else:
+            current_focus = extracted_focus
+
+        store.upsert(
+            mem_key          = mem_key,
+            current_focus    = current_focus,
+            open_loops       = open_loops,
+            recent_decisions = recent_decisions,
+        )
+
+        logger.info(
+            "process_working_state_update: working state written "
+            "for mem_key=%r focus=%r loops=%d.",
+            mem_key, current_focus, len(open_loops),
+        )
+
+        return store.get(mem_key)
+
+    except Exception as exc:
+        logger.warning(
+            "process_working_state_update: failed for mem_key=%r (%s) — "
+            "continuing.", mem_key, exc,
+        )
+        try:
+            return store.get(mem_key)
+        except Exception:
+            return None

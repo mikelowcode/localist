@@ -8,6 +8,7 @@ Covers:
   - Episodic write path: P2 → EpisodicMemoryWriter called
   - Episodic retrieval path: fetch_episodic=True → bullets in prompt
   - Prebuilt prompt passthrough: ConversationalAgent uses _prebuilt_prompt
+  - wiki_doc wiring: _load_persona / _load_user_profile frontmatter handling
   - Working memory: prior turns appear in slot 3
   - Routing metadata: _routing key present in SubTask context
   - Tool stub: tools_to_call logged but not executed
@@ -30,16 +31,21 @@ import pytest
 
 from controller_agent import (
     ControllerAgent,
+    Task,
     TaskStatus,
     AgentResult,
     SubTask,
+    _memory_key,
 )
 from memory_manager import (
     MemoryManager,
     EpisodicMemoryWriter,
     EpisodicMemoryReader,
+    GraphEdgeResult,
 )
-from prompt_builder import PromptBuilder
+from planner import RoutingPlan
+from prompt_builder import PromptBuilder, WorkingMemoryState
+from wiki_doc import load_wiki_doc, ParsedWikiDoc
 
 
 # ---------------------------------------------------------------------------
@@ -449,3 +455,689 @@ class TestPrebuiltPromptPassthrough:
         result = agent.run(subtask)
         assert result.status == TaskStatus.COMPLETE
         assert result.output["answer"] == "Normal answer."
+
+
+# ---------------------------------------------------------------------------
+# wiki_doc wiring — _load_persona() frontmatter handling
+# ---------------------------------------------------------------------------
+
+_LORA_PERSONA_CONTENT = (
+    "You are LORA, a local‑first thinking partner.\n"
+    "You speak clearly, directly, and in a natural conversational tone.\n"
+    "You use tools when they are needed and follow tool instructions precisely.\n"
+    "When you state facts, you cite where they came from."
+)
+
+
+def _mock_doc(path_str: str, content: str):
+    doc = MagicMock()
+    doc.path = Path(path_str)
+    doc.content = content
+    return doc
+
+
+class TestLoadPersonaWikiDoc:
+
+    def test_no_frontmatter_byte_identical(self):
+        """Zero-behavior-change: plain content → cache equals content[:2000] exactly."""
+        mm = MagicMock()
+        mm.query_corpus.return_value = [
+            _mock_doc("/wiki/lora-persona.md", _LORA_PERSONA_CONTENT)
+        ]
+
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        ctrl._load_persona()
+
+        assert ctrl._persona_cache == _LORA_PERSONA_CONTENT[:2000]
+
+    def test_frontmatter_stripped_body_only(self):
+        """Forward-looking: frontmatter lines are excluded; body text is present."""
+        content = (
+            "---\n"
+            "title: LORA Persona\n"
+            "type: system\n"
+            "created: 2026-06-01\n"
+            "---\n"
+            "\n"
+            "You are LORA, a local-first thinking partner.\n"
+            "You are helpful, concise, and precise.\n"
+        )
+        mm = MagicMock()
+        mm.query_corpus.return_value = [
+            _mock_doc("/wiki/lora-persona.md", content)
+        ]
+
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        ctrl._load_persona()
+
+        assert "title: LORA Persona" not in ctrl._persona_cache
+        assert "type: system" not in ctrl._persona_cache
+        assert "---" not in ctrl._persona_cache
+        assert "You are LORA" in ctrl._persona_cache
+        assert "You are helpful" in ctrl._persona_cache
+
+
+# ---------------------------------------------------------------------------
+# wiki_doc wiring — _load_user_profile() frontmatter handling
+# ---------------------------------------------------------------------------
+
+_PROFILE_CONTENT_NO_FM = (
+    "## About Michael\n"
+    "\n"
+    "- Name: Michael\n"
+    "- Role: Solo developer\n"
+    "\n"
+    "## Preferences\n"
+    "\n"
+    "- I prefer concise answers.\n"
+)
+
+
+class TestLoadUserProfileWikiDoc:
+
+    def _make_ctrl_with_embed(self):
+        mm = MagicMock()
+        mm._embed_fn = lambda _: [0.0] * 768
+        return ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+
+    def test_no_frontmatter_byte_identical(self, tmp_path: Path):
+        """Zero-behavior-change: no frontmatter → profile_lines identical to old logic."""
+        profile_file = tmp_path / "michael.md"
+        profile_file.write_text(_PROFILE_CONTENT_NO_FM, encoding="utf-8")
+
+        # Reproduce what the old logic (raw.splitlines()) would have produced
+        expected = [
+            line.lstrip("- ").strip()
+            for line in _PROFILE_CONTENT_NO_FM.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+        ctrl = self._make_ctrl_with_embed()
+        with patch("pathlib.Path.exists", return_value=True), \
+             patch("controller_agent.load_wiki_doc",
+                   side_effect=lambda _: load_wiki_doc(profile_file)):
+            ctrl._load_user_profile()
+
+        assert ctrl._profile_lines == expected
+
+    def test_frontmatter_excluded_from_profile_lines(self, tmp_path: Path):
+        """Forward-looking: frontmatter YAML lines are not ingested as fact lines."""
+        content = (
+            "---\n"
+            "title: Michael Profile\n"
+            "type: user-profile\n"
+            "created: 2026-06-01\n"
+            "---\n"
+            "\n"
+            "## About Michael\n"
+            "\n"
+            "- Name: Michael\n"
+            "- Role: Solo developer\n"
+        )
+        profile_file = tmp_path / "michael.md"
+        profile_file.write_text(content, encoding="utf-8")
+
+        ctrl = self._make_ctrl_with_embed()
+        with patch("pathlib.Path.exists", return_value=True), \
+             patch("controller_agent.load_wiki_doc",
+                   side_effect=lambda _: load_wiki_doc(profile_file)):
+            ctrl._load_user_profile()
+
+        lines = ctrl._profile_lines
+        assert not any("title:" in l for l in lines)
+        assert not any("type:" in l for l in lines)
+        assert not any("---" in l for l in lines)
+        assert "Name: Michael" in lines
+        assert "Role: Solo developer" in lines
+
+
+# ---------------------------------------------------------------------------
+# _memory_key() and session_id cross-turn working memory
+# ---------------------------------------------------------------------------
+
+class TestMemoryKey:
+
+    def test_prefers_session_id_when_present(self):
+        """session_id in context takes precedence over task_id."""
+        task = Task(task_id="xyz", instruction="hi", context={"session_id": "abc"})
+        assert _memory_key(task) == "abc"
+
+    def test_falls_back_to_task_id_when_absent(self):
+        """Callers without session_id (e.g. ingest path) keep today's behavior."""
+        task = Task(task_id="xyz", instruction="hi", context={})
+        assert _memory_key(task) == "xyz"
+
+    def test_same_session_id_shares_working_memory(self, db_path: Path):
+        """Two handle_task() calls with the same session_id accumulate in one log."""
+        mm   = MemoryManager(db_path=db_path)
+        rt   = make_runtime()
+        conv = make_conv_agent("Answer.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        ctrl.handle_task({
+            "task_id":     "task-1",
+            "instruction": "First question",
+            "context":     {"session_id": "test-session"},
+        })
+        ctrl.handle_task({
+            "task_id":     "task-2",
+            "instruction": "Second question",
+            "context":     {"session_id": "test-session"},
+        })
+
+        entries = mm.get_context_window(task_id="test-session", limit=20)
+        user_instructions = [e["content"] for e in entries if e["role"] == "user"]
+        assert "First question" in user_instructions
+        assert "Second question" in user_instructions
+
+    def test_different_task_ids_without_session_are_isolated(self, db_path: Path):
+        """Callers without session_id keep isolated per-request memory."""
+        mm   = MemoryManager(db_path=db_path)
+        rt   = make_runtime()
+        conv = make_conv_agent("Answer.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        ctrl.handle_task({
+            "task_id":     "task-a",
+            "instruction": "Question A",
+        })
+        ctrl.handle_task({
+            "task_id":     "task-b",
+            "instruction": "Question B",
+        })
+
+        entries_a = mm.get_context_window(task_id="task-a", limit=20)
+        entries_b = mm.get_context_window(task_id="task-b", limit=20)
+
+        contents_a = [e["content"] for e in entries_a]
+        contents_b = [e["content"] for e in entries_b]
+
+        assert "Question A" in contents_a
+        assert "Question B" not in contents_a
+        assert "Question B" in contents_b
+        assert "Question A" not in contents_b
+
+
+# ---------------------------------------------------------------------------
+# wiki_doc wiring — RAG source frontmatter stripping
+# ---------------------------------------------------------------------------
+
+# Shape of how-localist-works.md frontmatter — confirmed from real corpus.
+_RAG_WITH_FRONTMATTER = (
+    "---\n"
+    "title: Localist Agent Framework Manifest and Schema\n"
+    "type: research-note\n"
+    "query: Analyze how-localist-works.md\n"
+    "created: 2026-06-18\n"
+    "updated: 2026-06-18\n"
+    "---\n"
+    "\n"
+    "## Summary\n"
+    "\n"
+    "Localist is a local-first AI agent framework.\n"
+    "It runs entirely on-device with no cloud dependencies.\n"
+)
+
+_RAG_WITHOUT_FRONTMATTER = (
+    "## Overview\n"
+    "\n"
+    "This document has no frontmatter block at all.\n"
+    "All content is body text.\n"
+)
+
+
+def _make_rag_ctrl(docs: list) -> tuple:
+    """Return (ctrl, conv_agent) with query_corpus() returning *docs*."""
+    mm = MagicMock()
+    mm.query_corpus.return_value = docs
+    conv = make_conv_agent()
+    ctrl = ControllerAgent(runtime=make_runtime(), agents=[conv], memory_manager=mm)
+    return ctrl, conv
+
+
+class TestRagSourceFrontmatterStripping:
+
+    def test_frontmatter_stripped_from_rag_source(self):
+        """Frontmatter lines must not appear in the RagSource content passed to PromptBuilder."""
+        doc = _mock_doc("/wiki/how-localist-works.md", _RAG_WITH_FRONTMATTER)
+        doc.relevance_score = 0.9  # above threshold
+
+        ctrl, conv = _make_rag_ctrl([doc])
+        ctrl.handle_task({"instruction": "check the wiki for Localist framework"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "title: Localist Agent Framework" not in prompt
+        assert "type: research-note"              not in prompt
+        assert "query: Analyze how-localist-works" not in prompt
+        assert "created: 2026-06-18"              not in prompt
+        assert "---"                              not in prompt
+        # Body text must still be present
+        assert "Localist is a local-first AI agent framework" in prompt
+
+    def test_no_frontmatter_rag_source_unchanged(self):
+        """Zero-behavior-change: content without frontmatter is passed through unmodified."""
+        doc = _mock_doc("/wiki/plain-doc.md", _RAG_WITHOUT_FRONTMATTER)
+        doc.relevance_score = 0.9
+
+        ctrl, conv = _make_rag_ctrl([doc])
+        ctrl.handle_task({"instruction": "check the wiki for plain doc overview"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        # The full body text must appear in the prompt, character-for-character
+        assert "This document has no frontmatter block at all." in prompt
+        assert "All content is body text." in prompt
+
+    def test_rag_filter_and_exclusion_unaffected(self):
+        """Score filter and lora-persona.md exclusion must be unchanged after the fix."""
+        low_score_doc   = _mock_doc("/wiki/low-score.md", "low relevance content")
+        low_score_doc.relevance_score = 0.3   # below 0.55 threshold — must be excluded
+
+        persona_doc     = _mock_doc("/wiki/lora-persona.md", "persona content")
+        persona_doc.relevance_score = 0.9     # above threshold but excluded by path rule
+
+        good_doc        = _mock_doc("/wiki/good.md", "relevant body text about Localist")
+        good_doc.relevance_score = 0.9
+
+        ctrl, conv = _make_rag_ctrl([low_score_doc, persona_doc, good_doc])
+        ctrl.handle_task({"instruction": "check the wiki for Localist"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        # Only the good_doc should appear
+        assert "relevant body text about Localist" in prompt
+        assert "low relevance content"             not in prompt
+        assert "persona content"                   not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Graph query fetch — Step 5c wiring
+# ---------------------------------------------------------------------------
+
+class TestGraphQueryFetch:
+    """
+    Tests for _execute_plan() Step 5c: graph query fetch and Slot 5b rendering.
+
+    Tests 1-5 inject a specific RoutingPlan directly (bypassing real Planner
+    routing) via patch.object so the graph_query field can be set precisely.
+    Test 6 routes through the real Planner with a real MemoryManager to verify
+    the "pure/minimal" guarantee end-to-end.
+    """
+
+    def _make_graph_plan(self, direction: str, node_id: int, stem: str) -> RoutingPlan:
+        return RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = False,
+            force_rag      = False,
+            compound       = False,
+            priority       = 3,
+            graph_query    = (direction, node_id, stem),
+        )
+
+    # 1. Incoming, 2 edges — [GRAPH RESULT] appears with both source page stems
+    def test_incoming_populated(self):
+        mm_mock = MagicMock()
+        mm_mock.query_corpus.return_value = []
+        mm_mock.get_backlinks.return_value = [
+            GraphEdgeResult(
+                link_text       = "[[lora-persona]]",
+                target_path     = "lora-persona",
+                target_resolved = True,
+                node_title      = "How Localist Works",
+                node_doc_path   = "/wiki/how-localist-works.md",
+            ),
+            GraphEdgeResult(
+                link_text       = "[[lora-persona]]",
+                target_path     = "lora-persona",
+                target_resolved = True,
+                node_title      = "Localist Build Order",
+                node_doc_path   = "/wiki/localist-build-order.md",
+            ),
+        ]
+
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent("Incoming answer.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm_mock)
+        plan = self._make_graph_plan("incoming", 7, "lora-persona")
+
+        with patch.object(ctrl._planner, "route", return_value=plan):
+            ctrl.handle_task({"instruction": "what links to lora-persona"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[GRAPH RESULT]" in prompt
+        assert "Pages linking to lora-persona:" in prompt
+        assert "how-localist-works" in prompt
+        assert "localist-build-order" in prompt
+
+    # 2. Outgoing, mixed resolved+unresolved — confirms link_text used for
+    #    unresolved display (not target_path), catching the link_text-vs-
+    #    target_path bug described in the prompt spec.
+    def test_outgoing_mixed_link_text_vs_target_path(self):
+        mm_mock = MagicMock()
+        mm_mock.query_corpus.return_value = []
+        mm_mock.get_outgoing_links.return_value = [
+            GraphEdgeResult(
+                link_text       = "localist-master-project-outline",
+                target_path     = "localist-master-project-outline",
+                target_resolved = True,
+                node_title      = "Localist Master Project Outline",
+                node_doc_path   = "/wiki/localist-master-project-outline.md",
+            ),
+            GraphEdgeResult(
+                link_text       = "Localist Software Stack Overview",  # original casing
+                target_path     = "localist-software-stack-overview",  # normalized — must NOT appear
+                target_resolved = False,
+                node_title      = None,
+                node_doc_path   = None,
+            ),
+        ]
+
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent("Outgoing answer.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm_mock)
+        plan = self._make_graph_plan("outgoing", 3, "localist-build-order")
+
+        with patch.object(ctrl._planner, "route", return_value=plan):
+            ctrl.handle_task({"instruction": "what does localist-build-order link to"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[GRAPH RESULT]" in prompt
+        assert "localist-master-project-outline" in prompt
+        # Unresolved entry must show original link_text, not the normalized target_path
+        assert '"Localist Software Stack Overview"' in prompt
+        assert "localist-software-stack-overview" not in prompt
+
+    # 3. Zero edges — [GRAPH RESULT] still present (clean-omission exception)
+    def test_zero_edges_slot_still_emitted(self):
+        mm_mock = MagicMock()
+        mm_mock.query_corpus.return_value = []
+        mm_mock.get_backlinks.return_value = []
+
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent("No backlinks answer.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm_mock)
+        plan = self._make_graph_plan("incoming", 5, "lora-persona")
+
+        with patch.object(ctrl._planner, "route", return_value=plan):
+            ctrl.handle_task({"instruction": "what links to lora-persona"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[GRAPH RESULT]" in prompt
+        assert "No pages link to lora-persona." in prompt
+
+    # 4. Fetch failure — _execute_plan does not raise; [GRAPH RESULT] absent
+    def test_fetch_failure_degrades_gracefully(self):
+        mm_mock = MagicMock()
+        mm_mock.query_corpus.return_value = []
+        mm_mock.get_backlinks.side_effect = RuntimeError("SQLite locked")
+
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent("Degraded answer.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm_mock)
+        plan = self._make_graph_plan("incoming", 5, "lora-persona")
+
+        with patch.object(ctrl._planner, "route", return_value=plan):
+            # Must not raise
+            result = ctrl.handle_task({"instruction": "what links to lora-persona"})
+
+        assert result["status"] == "complete"
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[GRAPH RESULT]" not in prompt
+
+    # 5. Non-graph-query plan — get_backlinks/get_outgoing_links never called
+    def test_no_graph_query_no_edge_fetch(self):
+        mm_mock = MagicMock()
+        mm_mock.query_corpus.return_value = []
+
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent("Direct answer.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm_mock)
+
+        # "What is 2+2?" triggers no graph pattern → plan.graph_query is None
+        ctrl.handle_task({"instruction": "What is 2+2?"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[GRAPH RESULT]" not in prompt
+        mm_mock.get_backlinks.assert_not_called()
+        mm_mock.get_outgoing_links.assert_not_called()
+
+    # 6. Purity end-to-end: real Planner + real MemoryManager.
+    #    Episodic records and RAG docs exist in the DB and WOULD appear if
+    #    their fetch conditions fired. Verify they do not leak into the prompt.
+    def test_p3c_purity_no_rag_or_episodic_slots(self, tmp_path):
+        db_path = tmp_path / "purity.db"
+        mm = MemoryManager(db_path=db_path)
+
+        # Graph: "lora-persona" node + "how-localist-works" backlink source
+        lp_id  = mm.upsert_graph_node(
+            doc_path  = str(tmp_path / "lora-persona.md"),
+            node_type = "wiki",
+            title     = "LORA Persona",
+        )
+        src_id = mm.upsert_graph_node(
+            doc_path  = str(tmp_path / "how-localist-works.md"),
+            node_type = "wiki",
+            title     = "How Localist Works",
+        )
+        mm.upsert_graph_edge(
+            source_node_id  = src_id,
+            source_doc_path = str(tmp_path / "how-localist-works.md"),
+            target_path     = "lora-persona",
+            target_node_id  = lp_id,
+            target_resolved = True,
+            link_text       = "lora-persona",
+        )
+
+        # Episodic record (would appear in [EPISODIC MEMORY] if fetch_episodic fired)
+        writer = EpisodicMemoryWriter(db_path=db_path)
+        writer.insert(
+            episode_type    = "preference",
+            subject         = "output format",
+            content         = "PURITY_LEAK_EPISODIC: should not appear in prompt",
+            source          = "explicit",
+            confidence      = 1.0,
+            project_context = "general",
+        )
+
+        # RAG document (would appear in [CONTEXT] if fetch_rag fired)
+        mm.index_document(
+            path     = tmp_path / "background-doc.md",
+            doc_type = "wiki",
+            content  = "PURITY_LEAK_RAG localist persona links wiki architecture",
+        )
+
+        # Real Planner routes "what links to lora-persona" → P3c
+        rt   = make_runtime(infer_return="yes")  # "yes" would fire episodic if reached
+        conv = make_conv_agent("Graph answer.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        ctrl.handle_task({"instruction": "what links to lora-persona"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+
+        # Graph result must be present
+        assert "[GRAPH RESULT]" in prompt
+        assert "how-localist-works" in prompt
+
+        # No other context slots must leak — purity guarantee
+        assert "[CONTEXT]"       not in prompt
+        assert "[EPISODIC MEMORY]" not in prompt
+        assert "[USER PROFILE]"  not in prompt
+        assert "PURITY_LEAK_EPISODIC" not in prompt
+        assert "PURITY_LEAK_RAG"      not in prompt
+
+
+# ---------------------------------------------------------------------------
+# force_rag doc_type filtering — Open Item 7 fix
+#
+# When plan.force_rag=True (P4a identity route), query_corpus() must be
+# called with doc_type="wiki" so that raw/ source files cannot backfill
+# [CONTEXT] slots via the force_rag bypass.
+#
+# When plan.force_rag=False (normal P4 corpus route), query_corpus() must
+# be called with doc_type=None — raw/ files remain fully eligible.
+# ---------------------------------------------------------------------------
+
+class TestForceRagDocTypeFilter:
+    """
+    Lock in the conditional doc_type argument to query_corpus() introduced
+    by the raw/-in-RAG fix (force_rag path restricted to wiki docs only).
+
+    Each test injects a RoutingPlan directly via patch.object so the
+    force_rag flag can be set precisely without relying on Planner routing.
+    """
+
+    def _make_plan(self, *, force_rag: bool) -> RoutingPlan:
+        return RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = True,
+            force_rag      = force_rag,
+            priority       = 6,
+        )
+
+    def test_force_rag_true_calls_query_corpus_with_wiki_doc_type(self):
+        """When force_rag=True, Step 4's query_corpus() call must use doc_type='wiki'."""
+        mm = MagicMock()
+        mm.query_corpus.return_value = []
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[conv], memory_manager=mm)
+        plan = self._make_plan(force_rag=True)
+
+        with patch.object(ctrl._planner, "route", return_value=plan):
+            ctrl.handle_task({"instruction": "Who are you?"})
+
+        # call_args_list[0] is Step 4 (RAG fetch); later calls are _load_persona() etc.
+        assert mm.query_corpus.call_count >= 1
+        _, step4_kwargs = mm.query_corpus.call_args_list[0]
+        assert step4_kwargs.get("doc_type") == "wiki", (
+            f"Expected doc_type='wiki' when force_rag=True; got {step4_kwargs.get('doc_type')!r}"
+        )
+
+    def test_force_rag_false_calls_query_corpus_with_no_doc_type_filter(self):
+        """When force_rag=False, Step 4's query_corpus() call must use doc_type=None (no filter)."""
+        mm = MagicMock()
+        mm.query_corpus.return_value = []
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[conv], memory_manager=mm)
+        plan = self._make_plan(force_rag=False)
+
+        with patch.object(ctrl._planner, "route", return_value=plan):
+            ctrl.handle_task({"instruction": "check the wiki for Localist architecture"})
+
+        assert mm.query_corpus.call_count >= 1
+        _, step4_kwargs = mm.query_corpus.call_args_list[0]
+        assert step4_kwargs.get("doc_type") is None, (
+            f"Expected doc_type=None when force_rag=False; got {step4_kwargs.get('doc_type')!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step 5d — WorkingMemoryState (Slot 6A) wiring
+# ---------------------------------------------------------------------------
+
+class TestWorkingStateSlot6A:
+    """
+    Verifies Step 5d: WorkingMemoryState assembly and the P3c exclusivity guard.
+
+    Tests inject RoutingPlans directly via patch.object so the graph_query
+    field can be set precisely — matching the pattern used in TestGraphQueryFetch.
+    """
+
+    def _make_rag_plan(self, *, fetch_rag: bool = True, graph_query=None) -> RoutingPlan:
+        return RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = fetch_rag,
+            force_rag      = False,
+            priority       = 4,
+            graph_query    = graph_query,
+        )
+
+    # 1. Non-P3c route with RAG sources present → working_state constructed,
+    #    active_artifacts matches the RAG source paths exactly.
+    def test_non_p3c_with_rag_sources_builds_working_state(self):
+        doc = _mock_doc("/wiki/localist-arch.md", "Localist architecture content here.")
+        doc.relevance_score = 0.9
+
+        mm = MagicMock()
+        mm.query_corpus.return_value = [doc]
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[conv], memory_manager=mm)
+        plan = self._make_rag_plan(fetch_rag=True)
+
+        with patch.object(ctrl._planner, "route", return_value=plan):
+            ctrl.handle_task({"instruction": "check the wiki for Localist architecture"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[WORKING STATE]" in prompt
+        assert "active_artifacts:" in prompt
+        # Path must be the exact path from the RAG source
+        assert "/wiki/localist-arch.md" in prompt
+
+    # 2. Non-P3c route with no RAG sources and no usable current_project →
+    #    working_state stays None; no [WORKING STATE] block in prompt.
+    def test_non_p3c_no_rag_no_project_working_state_absent(self):
+        mm = MagicMock()
+        mm.query_corpus.return_value = []
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[conv], memory_manager=mm)
+        plan = self._make_rag_plan(fetch_rag=False)
+
+        with patch.object(ctrl._planner, "route", return_value=plan):
+            ctrl.handle_task({"instruction": "What is 2+2?"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[WORKING STATE]" not in prompt
+
+    # 3. P3c exclusivity guard: graph_query is not None with fetch_rag=True and
+    #    docs present in scope → working_state is NOT constructed regardless.
+    #    This is the regression test for the Phase C purity guarantee.
+    def test_p3c_graph_query_excludes_working_state(self):
+        doc = _mock_doc("/wiki/lora-persona.md", "Some persona content.")
+        doc.relevance_score = 0.9
+
+        mm = MagicMock()
+        mm.query_corpus.return_value = [doc]
+        mm.get_backlinks.return_value = []
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[conv], memory_manager=mm)
+
+        # Plan with both graph_query set AND fetch_rag=True — hypothetical scenario
+        # that exercises the guard directly, regardless of what the Planner produces.
+        plan = self._make_rag_plan(
+            fetch_rag    = True,
+            graph_query  = ("incoming", 5, "lora-persona"),
+        )
+
+        with patch.object(ctrl._planner, "route", return_value=plan):
+            ctrl.handle_task({"instruction": "what links to lora-persona"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[WORKING STATE]" not in prompt, (
+            "Slot 6A must not be constructed on P3c routes (graph_query is not None)"
+        )
+
+    # 4. Regression guard: existing RAG path behaviour is unchanged — answer,
+    #    sources, and [CONTEXT] slot are unaffected by the Step 5d addition.
+    def test_regression_rag_answer_and_sources_unchanged(self):
+        doc = _mock_doc("/wiki/localist-arch.md", "check the wiki Localist architecture content.")
+        doc.relevance_score = 0.9
+
+        mm = MagicMock()
+        mm.query_corpus.return_value = [doc]
+        conv = make_conv_agent("Architecture answer.")
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[conv], memory_manager=mm)
+        plan = self._make_rag_plan(fetch_rag=True)
+
+        with patch.object(ctrl._planner, "route", return_value=plan):
+            result = ctrl.handle_task(
+                {"instruction": "check the wiki for Localist architecture"}
+            )
+
+        # Core result unchanged
+        assert result["status"] == "complete"
+        assert result["answer"] == "Architecture answer."
+        # [CONTEXT] slot still present — RAG wiring unaffected
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[CONTEXT]" in prompt
+        assert "Localist architecture content" in prompt

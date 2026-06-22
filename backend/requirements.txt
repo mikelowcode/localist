@@ -15,6 +15,9 @@ requests>=2.31.0
 pydantic>=2.7.0
 python-multipart==0.0.32
 
+# Wiki document parsing (frontmatter + [[link]] extraction)
+PyYAML>=6.0
+
 # Fetcher service — HTML extraction
 lxml>=6.1.1
 readability-lxml>=0.8.4.1

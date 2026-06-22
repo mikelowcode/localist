@@ -69,6 +69,12 @@ class RoutingPlan:
         True → bypass relevance_score threshold in RAG filter.
         Set by priorities that guarantee document relevance via keyword
         match (e.g. Priority 4a identity trigger).
+    graph_query :
+        (direction, node_id, resolved_stem) when Priority 3c matched a
+        structural graph lookup; None otherwise. direction is "incoming"
+        or "outgoing". resolved_stem is carried alongside node_id so
+        downstream consumers skip a second MemoryManager round-trip just
+        to recover the display name.
     """
     agent:          str
     fetch_episodic: bool
@@ -79,6 +85,7 @@ class RoutingPlan:
     compound:       bool       = False
     force_rag:      bool       = False
     priority:       int        = 6
+    graph_query:    tuple[str, int, str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +200,145 @@ _CORPUS_SCORE_THRESHOLD: float = 0.55
 
 
 # ---------------------------------------------------------------------------
+# Graph-query extraction and name resolution  (P3c, Phase C Step 3a)
+#
+# extract_graph_query() and resolve_graph_target() are pure, stateless
+# functions with zero MemoryManager dependency. The caller (ControllerAgent /
+# route(), wired in Step 3b) injects the real stem list at call time.
+# ---------------------------------------------------------------------------
+
+# Pattern B — incoming backlink lead-phrases, sorted longest-first.
+# Longest-first ordering is load-bearing: a shorter phrase must not
+# shadow a longer, more specific one that is also a prefix of the
+# instruction (even if no collision exists in the current set, any
+# future addition could introduce one).
+_BACKLINK_LEAD_PHRASES: tuple[str, ...] = (
+    "show me backlinks for",
+    "what pages link to",
+    "backlinks for",
+    "what links to",
+    "what references",
+    "what mentions",
+)
+
+# Pattern C — outgoing lead-phrases, same longest-first principle.
+_OUTGOING_LEAD_PHRASES: tuple[str, ...] = (
+    "show outgoing links for",
+    "outgoing links for",
+    "what links from",
+    "links from",
+)
+
+# Token-overlap stopwords for Tier 2 name resolution.
+_GRAPH_STOPWORDS: frozenset[str] = frozenset({
+    "the", "a", "an", "of", "to", "in", "on", "for", "is", "are",
+    "and", "or", "page", "pages", "about", "that",
+})
+
+# Pattern A compiled regex (module-level, evaluated once at import time).
+_PATTERN_A_OUTGOING: re.Pattern[str] = re.compile(
+    r"what does (.+?) link to\??\.?$", re.IGNORECASE
+)
+
+
+def _normalize_graph_text(text: str) -> str:
+    # Identical to wiki_agent._validate_links() / build_graph._normalize():
+    # link_text.lower().replace(" ", "-").
+    # .strip() is added here because remainder may carry incidental leading/
+    # trailing whitespace that the write-time normalizer never sees (link_text
+    # there always comes pre-trimmed from XML parsing).
+    return text.lower().strip().replace(" ", "-")
+
+
+def extract_graph_query(instruction: str) -> tuple[str, str] | None:
+    """
+    Attempt to extract a (direction, remainder) pair from `instruction`
+    using three deterministic patterns. Returns None if no pattern matches.
+
+    direction : "incoming" | "outgoing"
+    remainder : whatever text follows/is captured by the matched
+                pattern — passed directly to resolve_graph_target()
+                with no further cleanup, even if empty.
+    """
+    instruction = instruction.strip()
+
+    # Pattern A is checked first because it is a regex anchored at both
+    # ends (re.match + $ anchor) and syntactically more specific than B/C's
+    # startswith checks. Checking it first avoids any ambiguity on inputs
+    # that match "what does X link to" — no B/C phrase can compete with that
+    # anchored form, but testing A before B/C makes the priority explicit.
+    m = _PATTERN_A_OUTGOING.match(instruction)
+    if m:
+        return ("outgoing", m.group(1).strip())
+
+    # Normalize for B and C: lowercase, strip surrounding whitespace, then
+    # strip trailing punctuation so "What links to X?" and "what links to X"
+    # reach the same startswith comparison.
+    normalized = instruction.strip().lower().rstrip("?.")
+
+    # Pattern B — incoming: longest-first ordering prevents a shorter phrase
+    # from matching before a longer, more specific one.
+    for phrase in _BACKLINK_LEAD_PHRASES:
+        if normalized.startswith(phrase):
+            return ("incoming", normalized[len(phrase):].strip())
+
+    # Pattern C — outgoing: same longest-first principle as Pattern B.
+    for phrase in _OUTGOING_LEAD_PHRASES:
+        if normalized.startswith(phrase):
+            return ("outgoing", normalized[len(phrase):].strip())
+
+    return None
+
+
+def resolve_graph_target(
+    remainder:       str,
+    candidate_stems: list[str],
+) -> str | None:
+    """
+    Resolve `remainder` (raw extracted text) against `candidate_stems`
+    (a list of existing page stems, e.g. ["how-localist-works",
+    "localist-build-order", ...]) using a three-tier deterministic
+    pipeline. Returns the single matching stem, or None if resolution
+    is ambiguous or finds no match (both cases are identical from the
+    caller's perspective — never distinguish "zero" from "multiple").
+    """
+    normalized = _normalize_graph_text(remainder)
+
+    # Tier 1 — symmetric substring match.
+    # Match if: normalized remainder is a substring of the stem, OR the
+    # stem is a substring of the normalized remainder (either direction).
+    tier1 = [
+        stem for stem in candidate_stems
+        if normalized in stem or stem in normalized
+    ]
+    if len(tier1) == 1:
+        return tier1[0]
+    if len(tier1) > 1:
+        # Multi-match: ambiguous. Never tiebreak — return None immediately.
+        return None
+    # Zero Tier 1 matches → fall through to Tier 2.
+
+    # Tier 2 — token-overlap fallback (only reached when Tier 1 found zero).
+    query_tokens = set(normalized.split("-")) - _GRAPH_STOPWORDS
+    if len(query_tokens) < 2:
+        # Too few meaningful tokens to score reliably; skip Tier 2 entirely
+        # and fall through to Tier 3 (return None). This is the "skipped,
+        # not scored" path — a low ratio is not the reason for the None here.
+        return None
+
+    # Asymmetric ratio: intersection / query-token count (NOT Jaccard).
+    # Rewards stems where most of the query's meaningful words are present;
+    # does not penalise stems for having more tokens than the query.
+    tier2 = [
+        stem for stem in candidate_stems
+        if len(query_tokens & set(stem.split("-"))) / len(query_tokens) >= 0.5
+    ]
+    if len(tier2) == 1:
+        return tier2[0]
+    return None  # zero or ambiguous — Tier 3 fallthrough (return None)
+
+
+# ---------------------------------------------------------------------------
 # Planner
 # ---------------------------------------------------------------------------
 
@@ -201,13 +347,16 @@ class Planner:
     Rule engine that produces a RoutingPlan from an instruction and context.
 
     Priority order (first match wins):
-      1. Ingest signal       — deterministic keyword/context check
-      2. Memory command      — deterministic keyword check
-      3. Tool signal         — deterministic keyword check
+      1.  Ingest signal      — deterministic keyword/context check
+      2.  Memory command     — deterministic keyword check
+      3c. Graph-query        — structural link lookup; wins over web_search
+                               but defers to file_op/url_fetch (inline guard)
+      3.  Tool signal        — deterministic keyword check
+      3b. Factual query      — keyword + corpus miss → web_search
       4a. Identity trigger   — deterministic keyword check (forces RAG)
-      4. Corpus signal       — deterministic score threshold check
-      5. Episodic relevance  — single bounded inference call (added in 3.3)
-      6. Direct answer       — fallback (added in 3.4)
+      4.  Corpus signal      — deterministic score threshold check
+      5.  Episodic relevance — single bounded inference call (added in 3.3)
+      6.  Direct answer      — fallback (added in 3.4)
 
     The Planner never calls agents, never writes to the database,
     and never assembles a prompt for the final answer.
@@ -339,6 +488,13 @@ class Planner:
 
         # Priority 2 — Explicit memory command
         plan = self._priority2_memory(lowered)
+        if plan is not None:
+            return plan
+
+        # Priority 3c — Graph-query (runs before P3 so a graph-query wins over a
+        # web_search-only P3 match; P3c's inline guard defers to P3 when
+        # file_op/url_fetch signals are present)
+        plan = self._priority3c_graph_query(instruction, lowered)
         if plan is not None:
             return plan
 
@@ -512,6 +668,113 @@ class Planner:
         return None
 
     # -----------------------------------------------------------------------
+    # Priority 3c — Graph-query  (structural link lookup)
+    # -----------------------------------------------------------------------
+
+    def _priority3c_graph_query(
+        self,
+        instruction: str,
+        lowered:     str,
+    ) -> RoutingPlan | None:
+        """
+        Priority 3c — Graph-query (structural "what links to X" /
+        "what does X link to" lookup).
+
+        Wins over web_search/P3b/P4a/P4 but loses to P1/P2 (handled by
+        route()'s call order, not here) and to P3's file_op/url_fetch
+        signals specifically (handled by the inline guard below — there is
+        no standalone pre-check method for those two signals; the module-
+        level note above _priority3_tool() explains the design rationale —
+        do NOT remove that comment when editing nearby code).
+
+        Returns None (deferring to normal priority evaluation) if:
+          - file_op or url_fetch keywords are present (inline guard), OR
+          - no MemoryManager is available, OR
+          - no extraction pattern matches the instruction, OR
+          - name resolution fails at all tiers (zero or ambiguous matches).
+
+        On success, returns a RoutingPlan with graph_query set and
+        fetch_rag/fetch_episodic/force_rag all False — graph-query turns
+        are deliberately pure/minimal, never combined with RAG or episodic
+        context (Phase C design).
+        """
+        # 1. Inline file_op/url_fetch guard.
+        #    Intentionally duplicates three lines from _priority3_tool() —
+        #    this duplication is deliberate (no standalone pre-check exists
+        #    for those two signals without modifying _priority3_tool()).
+        #    _WEB_SEARCH_KEYWORDS is NOT guarded here: P3c must win over a
+        #    web_search-only P3 match (hence its placement before P3 in route()).
+        if (
+            self._any_whole_word(_FILE_OP_KEYWORDS, lowered)
+            or self._any_whole_word(_FETCH_KEYWORDS, lowered)
+            or re.search(r"https?://", lowered)
+        ):
+            return None
+
+        # 2. MemoryManager availability check (same pattern as P3b/P4).
+        if self._memory_manager is None:
+            logger.debug("Planner: Priority 3c skipped — no MemoryManager.")
+            return None
+
+        # 3. Extraction.
+        extracted = extract_graph_query(instruction)
+        if extracted is None:
+            return None
+        direction, remainder = extracted
+
+        # 4. Fetch candidate stems from the live graph_nodes table.
+        try:
+            candidate_stems = self._memory_manager.list_graph_node_stems()
+        except Exception as exc:
+            logger.warning(
+                "Planner: Priority 3c — list_graph_node_stems failed: %s", exc
+            )
+            return None
+
+        # 5. Name resolution (three-tier deterministic pipeline).
+        resolved_stem = resolve_graph_target(remainder, candidate_stems)
+        if resolved_stem is None:
+            logger.debug(
+                "Planner: Priority 3c — name resolution failed for %r.", remainder
+            )
+            return None
+
+        # 6. Node id lookup.  Should always succeed since resolved_stem came
+        #    from the same graph_nodes table, but guard defensively in case of
+        #    a race between step 4 and step 6 in a concurrent-write scenario.
+        try:
+            node = self._memory_manager.resolve_node_by_stem(resolved_stem)
+        except Exception as exc:
+            logger.warning(
+                "Planner: Priority 3c — resolve_node_by_stem failed: %s", exc
+            )
+            return None
+
+        if node is None:
+            logger.warning(
+                "Planner: Priority 3c — resolve_node_by_stem returned None for "
+                "%r (race condition or DB inconsistency).", resolved_stem
+            )
+            return None
+
+        node_id = node["id"]
+        logger.debug(
+            "Planner: Priority 3c matched — direction=%r stem=%r node_id=%d.",
+            direction, resolved_stem, node_id,
+        )
+
+        # 7. Build the plan.
+        return RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = False,
+            force_rag      = False,
+            compound       = False,
+            priority       = 3,
+            graph_query    = (direction, node_id, resolved_stem),
+        )
+
+    # -----------------------------------------------------------------------
     # Priority 3b — Factual query + corpus miss
     # -----------------------------------------------------------------------
 
@@ -607,6 +870,7 @@ class Planner:
             fetch_rag      = True,
             force_rag      = True,
             compound       = False,
+            priority       = 4,
         )
 
     # -----------------------------------------------------------------------

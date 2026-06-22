@@ -105,6 +105,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel, Field
 
 from prompt_builder import PromptBuilder
+from wiki_doc import parse_wiki_doc
 
 from controller_agent import (
     AgentResult,
@@ -292,7 +293,7 @@ in what the raw file explicitly states.
 
 ### Mapped Pages
 
-- [[existing-page]] — reason this page is relevant.
+- [[localist-software-stack]] — use the page_name from EXISTING WIKI PAGES verbatim, not a paraphrase.
 
 ### Proposed New Pages
 
@@ -300,7 +301,7 @@ in what the raw file explicitly states.
 
 ## Related Pages
 
-- [[existing-page]]
+- [[localist-software-stack]]
 
 ## Revision History
 
@@ -355,6 +356,12 @@ Filename: {raw_filename}
 4. For existing wiki pages, propose minimal unified diffs only where necessary.
 5. Page names MUST be kebab-case (lowercase letters, digits, hyphens only).
 6. Use {today} as the date in all Revision History entries.
+7. Every [[...]] link target in "### Mapped Pages" and "## Related Pages"
+   MUST exactly match an existing page name from EXISTING WIKI PAGES above,
+   or a page_name you are proposing in this same response — not a
+   paraphrase, not a page title, not a longer or shorter description of
+   it. If you are not certain a page exists, propose it as a new page
+   instead of linking to a guessed name.
 {_EXAMPLE}
 OUTPUT RULES (read before generating):
 - Output ONLY the <actions> XML block. Nothing before it. Nothing after it.
@@ -409,6 +416,12 @@ The file "{raw_filename}" has been provided directly for processing.
 4. For existing wiki pages, propose minimal unified diffs only where necessary.
 5. Page names MUST be kebab-case (lowercase letters, digits, hyphens only).
 6. Use {today} as the date in all Revision History entries.
+7. Every [[...]] link target in "### Mapped Pages" and "## Related Pages"
+   MUST exactly match an existing page name from EXISTING WIKI PAGES above,
+   or a page_name you are proposing in this same response — not a
+   paraphrase, not a page title, not a longer or shorter description of
+   it. If you are not certain a page exists, propose it as a new page
+   instead of linking to a guessed name.
 {_EXAMPLE}
 OUTPUT RULES (read before generating):
 - Output ONLY the <actions> XML block. Nothing before it. Nothing after it.
@@ -495,7 +508,7 @@ def parse_model_xml(raw_output: str) -> Actions:
             entry = {
                 "page_name": (action.findtext("page_name") or "").strip(),
                 "page_type": (action.findtext("page_type") or "").strip(),
-                "content":   raw_content,
+                "content":   raw_content.strip(),
             }
             if not entry["page_name"] or not entry["page_type"]:
                 logger.warning(
@@ -602,6 +615,72 @@ def _parse_unified_hunks(diff_text: str) -> list[tuple[int, list[str]]]:
         hunks.append((current_start, current_lines))
 
     return hunks
+
+
+# ---------------------------------------------------------------------------
+# Link validation
+# ---------------------------------------------------------------------------
+
+_LINK_SCAN_HEADERS = ["### Mapped Pages", "## Related Pages"]
+
+
+def _validate_links(
+    actions: Actions,
+    wiki_pages: dict[str, str],
+) -> dict[str, list[str]]:
+    """
+    Scan each new_pages[i].content for [[...]] occurrences within the
+    Mapped Pages and Related Pages sections, and flag any whose target
+    does not match an existing wiki page or a page proposed in this same
+    response.
+
+    Returns a dict keyed by page_name, each value a list of unresolved
+    link targets found in that page's content. Pages with no unresolved
+    links are omitted from the dict (empty dict overall if none found).
+
+    Does not modify actions or any page content. Pure validation —
+    flagging only.
+
+    Normalization rule: link_text.lower().replace(" ", "-") — lowercase
+    plus space-to-hyphen only. Resolves case-only mismatches (e.g.
+    "Localist Master Project Outline" → "localist-master-project-outline")
+    but intentionally does NOT resolve word-count mismatches (e.g.
+    "Localist Software Stack Overview" ≠ "localist-software-stack").
+    This rule must stay consistent with Phase B's graph builder (Prompt 5).
+    """
+    valid_targets = set(wiki_pages.keys()) | {p.page_name for p in actions.new_pages}
+    unresolved: dict[str, list[str]] = {}
+
+    for page in actions.new_pages:
+        parsed = parse_wiki_doc(page.content)
+        in_scope_links: list = []
+
+        for header in _LINK_SCAN_HEADERS:
+            idx = parsed.body.find(header)
+            if idx == -1:
+                continue
+            line_end = parsed.body.find("\n", idx)
+            if line_end == -1:
+                continue  # header is last line, no content follows
+            section_start = line_end + 1
+            rest = parsed.body[section_start:]
+            # Section ends at the next line beginning with '#' (any heading level)
+            m = re.search(r"^#", rest, re.MULTILINE)
+            section_end = section_start + m.start() if m else len(parsed.body)
+            section_text = parsed.body[section_start:section_end]
+            # Use parse_wiki_doc for link extraction — no second [[...]] regex
+            in_scope_links.extend(parse_wiki_doc(section_text).links)
+
+        page_unresolved = [
+            link.link_text.lower().replace(" ", "-")
+            for link in in_scope_links
+            if link.link_text.lower().replace(" ", "-") not in valid_targets
+        ]
+
+        if page_unresolved:
+            unresolved[page.page_name] = page_unresolved
+
+    return unresolved
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +899,17 @@ class WikiAgent:
         except ValueError as exc:
             return self._fail(subtask, f"XML parse error: {exc}")
 
+        # -- 6b. Validate [[...]] link targets --------------------------------
+
+        unresolved_links = _validate_links(actions, wiki_pages)
+        if unresolved_links:
+            for page_name, targets in unresolved_links.items():
+                for target in targets:
+                    logger.warning(
+                        "[%s] Unresolved link in '%s': [[%s]]",
+                        self.name, page_name, target,
+                    )
+
         # -- 7. Optionally journal the result --------------------------------
 
         if journal_path is not None:
@@ -868,11 +958,12 @@ class WikiAgent:
         # -- 10. Build and return AgentResult --------------------------------
 
         output: dict[str, Any] = {
-            "new_pages":       [p.model_dump() for p in actions.new_pages],
-            "diffs":           [d.model_dump() for d in actions.diffs],
-            "applied":         applied,
-            "raw_filename":    raw_path.name,
-            "wiki_page_count": len(wiki_pages),
+            "new_pages":        [p.model_dump() for p in actions.new_pages],
+            "diffs":            [d.model_dump() for d in actions.diffs],
+            "applied":          applied,
+            "raw_filename":     raw_path.name,
+            "wiki_page_count":  len(wiki_pages),
+            "unresolved_links": unresolved_links,
         }
 
         if auto_apply:

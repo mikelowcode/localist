@@ -426,7 +426,7 @@ class TestControllerToolIntegration:
             start = prompt.index("[TOOL RESULTS]")
             # Find the next slot label after TOOL RESULTS (or end of string)
             next_slot = len(prompt)
-            for label in ["[INSTRUCTION]", "[WORKING MEMORY]",
+            for label in ["[INSTRUCTION]", "[WORKING MEMORY]", "[WORKING STATE]",
                           "[EPISODIC MEMORY]", "[CONTEXT]"]:
                 pos = prompt.find(label, start + 1)
                 if pos != -1:

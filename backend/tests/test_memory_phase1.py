@@ -23,6 +23,9 @@ from memory_manager import (
     EpisodicMemoryWriter,
     EpisodicMemoryReader,
     EpisodeRecord,
+    GraphEdgeResult,
+    WorkingStateRecord,
+    WorkingStateStore,
     format_episodic_summary,
     VALID_EPISODE_TYPES,
 )
@@ -495,3 +498,548 @@ class TestGetContextWindowMaxTokens:
             mm.add(role="user", content="A" * 10, task_id=task)
         result = mm.get_context_window(task_id=task, limit=3)
         assert len(result) == 3
+
+
+# ---------------------------------------------------------------------------
+# TestGraphSchema — v2→v3 migration: graph_nodes and graph_edges tables
+# ---------------------------------------------------------------------------
+
+def _create_v2_db(path: Path) -> None:
+    """Create a v2-schema SQLite database (no graph tables) for migration tests."""
+    conn = sqlite3.connect(str(path))
+    conn.executescript("""
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (2);
+        CREATE TABLE conversation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            meta_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL
+        );
+        CREATE TABLE document_index (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            path TEXT NOT NULL UNIQUE,
+            doc_type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            token_set TEXT NOT NULL DEFAULT '',
+            embedding BLOB DEFAULT NULL,
+            content_hash TEXT NOT NULL DEFAULT '',
+            indexed_at REAL NOT NULL
+        );
+        CREATE TABLE retrieval_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            query_hash TEXT NOT NULL UNIQUE,
+            top_n INTEGER NOT NULL,
+            result_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            valid INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE episodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_type TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            content TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 1.0,
+            source TEXT NOT NULL,
+            task_id TEXT,
+            conversation_id TEXT,
+            project_context TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at REAL NOT NULL,
+            last_accessed REAL,
+            embedding BLOB
+        );
+    """)
+    conn.close()
+
+
+class TestGraphSchema:
+
+    # Test 1 — Fresh database has both graph tables and all four indexes.
+    def test_fresh_db_has_graph_tables_and_indexes(self, tmp_path):
+        path = tmp_path / "test.db"
+        MemoryManager(db_path=path)
+
+        conn = sqlite3.connect(str(path))
+        tables  = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        indexes = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()}
+        conn.close()
+
+        assert "graph_nodes" in tables
+        assert "graph_edges" in tables
+        assert "idx_graph_nodes_doc_path"    in indexes
+        assert "idx_graph_edges_source"      in indexes
+        assert "idx_graph_edges_target_path" in indexes
+        assert "idx_graph_edges_resolved"    in indexes
+
+    # Test 2 — Fresh database schema_version is current (_SCHEMA_VERSION = 5).
+    def test_fresh_db_schema_version_is_current(self, tmp_path):
+        path = tmp_path / "test.db"
+        MemoryManager(db_path=path)
+
+        conn = sqlite3.connect(str(path))
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        conn.close()
+
+        assert version == 5
+
+    # Test 3 — v2 database opens cleanly and exits with current schema version + graph tables.
+    def test_v2_migration_creates_graph_tables(self, tmp_path):
+        path = tmp_path / "test.db"
+        _create_v2_db(path)
+
+        # Precondition: truly a v2 database with no graph tables.
+        conn = sqlite3.connect(str(path))
+        version_before = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        tables_before  = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        conn.close()
+        assert version_before == 2
+        assert "graph_nodes" not in tables_before
+        assert "graph_edges" not in tables_before
+
+        # Open with MemoryManager → triggers _migrate(from_version=2).
+        MemoryManager(db_path=path)
+
+        conn = sqlite3.connect(str(path))
+        version_after = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        tables_after  = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        conn.close()
+
+        assert version_after == 5
+        assert "graph_nodes" in tables_after
+        assert "graph_edges" in tables_after
+
+    # Test 4 — FK constraint on source_node_id is actively enforced.
+    def test_graph_edges_fk_enforced(self, tmp_path):
+        path = tmp_path / "test.db"
+        MemoryManager(db_path=path)
+
+        # Replicate MemoryManager._connect() pragma so FK enforcement is active.
+        conn = sqlite3.connect(str(path))
+        conn.execute("PRAGMA foreign_keys=ON")
+
+        now = time.time()
+        conn.execute(
+            "INSERT INTO graph_nodes (doc_path, source_doc_path, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?)",
+            ("/wiki/anchor.md", "/wiki/anchor.md", now, now),
+        )
+        conn.commit()
+
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO graph_edges"
+                " (source_node_id, target_path, target_resolved, link_text, source_doc_path)"
+                " VALUES (99999, 'ghost-page', 0, 'Ghost Page', '/wiki/anchor.md')",
+            )
+            conn.commit()
+
+        conn.close()
+
+    # Test 5 — target_node_id is nullable; target_resolved defaults to 0.
+    def test_graph_edges_nullable_and_defaults(self, tmp_path):
+        path = tmp_path / "test.db"
+        MemoryManager(db_path=path)
+
+        conn = sqlite3.connect(str(path))
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+
+        now = time.time()
+        cursor = conn.execute(
+            "INSERT INTO graph_nodes (doc_path, source_doc_path, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?)",
+            ("/wiki/source.md", "/wiki/source.md", now, now),
+        )
+        node_id = cursor.lastrowid
+        conn.commit()
+
+        # Omit target_node_id and target_resolved — only mandatory columns supplied.
+        conn.execute(
+            "INSERT INTO graph_edges (source_node_id, target_path, link_text, source_doc_path)"
+            " VALUES (?, ?, ?, ?)",
+            (node_id, "unresolved-page", "Unresolved Page", "/wiki/source.md"),
+        )
+        conn.commit()
+
+        row = conn.execute(
+            "SELECT * FROM graph_edges WHERE source_node_id = ?", (node_id,)
+        ).fetchone()
+        conn.close()
+
+        assert row["target_node_id"] is None
+        assert row["target_resolved"] == 0
+
+    # Test 6 — Episodes writer still works correctly after v3 schema is in place.
+    def test_existing_episodes_unaffected_by_v3(self, tmp_path):
+        path = tmp_path / "test.db"
+        MemoryManager(db_path=path)     # initialises v3 schema
+        writer = EpisodicMemoryWriter(db_path=path)
+
+        ep_id = writer.insert(
+            episode_type="preference",
+            subject="v3-canary",
+            content="Episodes still work in v3 schema.",
+            source="explicit",
+            confidence=1.0,
+        )
+        assert ep_id > 0
+
+        row = _row(path, ep_id)
+        assert row["content"] == "Episodes still work in v3 schema."
+        assert row["status"]  == "active"
+
+
+# ---------------------------------------------------------------------------
+# TestGraphReadMethods — resolve_node_by_stem, get_backlinks, get_outgoing_links
+# ---------------------------------------------------------------------------
+
+class TestGraphReadMethods:
+
+    # --- resolve_node_by_stem ---
+
+    def test_resolve_node_by_stem_found(self, tmp_path):
+        path = tmp_path / "test.db"
+        mm = MemoryManager(db_path=path)
+        doc = tmp_path / "localist-software-stack.md"
+        mm.upsert_graph_node(doc, node_type="wiki", title="Localist Software Stack")
+
+        result = mm.resolve_node_by_stem("localist-software-stack")
+
+        assert result is not None
+        assert result["title"] == "Localist Software Stack"
+        assert Path(result["doc_path"]).stem == "localist-software-stack"
+        assert isinstance(result["id"], int)
+
+    def test_resolve_node_by_stem_not_found(self, tmp_path):
+        path = tmp_path / "test.db"
+        mm = MemoryManager(db_path=path)
+        mm.upsert_graph_node(tmp_path / "existing-page.md", node_type="wiki", title="Existing")
+
+        result = mm.resolve_node_by_stem("nonexistent-page")
+
+        assert result is None
+
+    # --- get_backlinks ---
+
+    def test_get_backlinks_two_sources(self, tmp_path):
+        path = tmp_path / "test.db"
+        mm = MemoryManager(db_path=path)
+
+        target_id  = mm.upsert_graph_node(tmp_path / "target.md",  node_type="wiki", title="Target Page")
+        source1_id = mm.upsert_graph_node(tmp_path / "source1.md", node_type="wiki", title="Source Page 1")
+        source2_id = mm.upsert_graph_node(tmp_path / "source2.md", node_type="wiki", title="Source Page 2")
+
+        mm.upsert_graph_edge(
+            source_node_id=source1_id, source_doc_path=tmp_path / "source1.md",
+            target_path="target", target_node_id=target_id, target_resolved=True,
+            link_text="Target Page",
+        )
+        mm.upsert_graph_edge(
+            source_node_id=source2_id, source_doc_path=tmp_path / "source2.md",
+            target_path="target", target_node_id=target_id, target_resolved=True,
+            link_text="Target",
+        )
+
+        backlinks = mm.get_backlinks(target_id)
+
+        assert len(backlinks) == 2
+        assert all(isinstance(r, GraphEdgeResult) for r in backlinks)
+        assert all(r.target_resolved is True for r in backlinks)
+        assert all(r.node_doc_path is not None for r in backlinks)
+        assert {r.node_title for r in backlinks} == {"Source Page 1", "Source Page 2"}
+
+    def test_get_backlinks_empty(self, tmp_path):
+        path = tmp_path / "test.db"
+        mm = MemoryManager(db_path=path)
+        node_id = mm.upsert_graph_node(tmp_path / "isolated.md", node_type="wiki", title="Isolated")
+
+        result = mm.get_backlinks(node_id)
+
+        assert result == []
+
+    # --- get_outgoing_links ---
+
+    def test_get_outgoing_links_resolved_and_unresolved(self, tmp_path):
+        path = tmp_path / "test.db"
+        mm = MemoryManager(db_path=path)
+
+        source_id = mm.upsert_graph_node(tmp_path / "source.md", node_type="wiki", title="Source Page")
+        target_id = mm.upsert_graph_node(tmp_path / "target.md", node_type="wiki", title="Target Page")
+
+        mm.upsert_graph_edge(
+            source_node_id=source_id, source_doc_path=tmp_path / "source.md",
+            target_path="target", target_node_id=target_id, target_resolved=True,
+            link_text="Target Page",
+        )
+        mm.upsert_graph_edge(
+            source_node_id=source_id, source_doc_path=tmp_path / "source.md",
+            target_path="ghost-page", target_node_id=None, target_resolved=False,
+            link_text="Ghost Page",
+        )
+
+        links = mm.get_outgoing_links(source_id)
+
+        assert len(links) == 2
+        assert all(isinstance(l, GraphEdgeResult) for l in links)
+
+        resolved   = next(l for l in links if l.target_resolved)
+        unresolved = next(l for l in links if not l.target_resolved)
+
+        assert resolved.node_title    == "Target Page"
+        assert resolved.node_doc_path is not None
+        assert unresolved.node_title    is None
+        assert unresolved.node_doc_path is None
+
+    def test_get_outgoing_links_empty(self, tmp_path):
+        path = tmp_path / "test.db"
+        mm = MemoryManager(db_path=path)
+        node_id = mm.upsert_graph_node(tmp_path / "leaf.md", node_type="wiki", title="Leaf Node")
+
+        result = mm.get_outgoing_links(node_id)
+
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# _create_v3_db — helper for WorkingStateStore migration test
+# ---------------------------------------------------------------------------
+
+def _create_v3_db(path: Path) -> None:
+    """Create a v3-schema SQLite database (no working_state table) for migration tests."""
+    conn = sqlite3.connect(str(path))
+    conn.executescript("""
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (3);
+        CREATE TABLE conversation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            meta_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL
+        );
+        CREATE TABLE document_index (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            path TEXT NOT NULL UNIQUE,
+            doc_type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            token_set TEXT NOT NULL DEFAULT '',
+            embedding BLOB DEFAULT NULL,
+            content_hash TEXT NOT NULL DEFAULT '',
+            indexed_at REAL NOT NULL
+        );
+        CREATE TABLE retrieval_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            query_hash TEXT NOT NULL UNIQUE,
+            top_n INTEGER NOT NULL,
+            result_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            valid INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE episodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_type TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            content TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 1.0,
+            source TEXT NOT NULL,
+            task_id TEXT,
+            conversation_id TEXT,
+            project_context TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at REAL NOT NULL,
+            last_accessed REAL,
+            embedding BLOB
+        );
+        CREATE TABLE graph_nodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_path TEXT NOT NULL UNIQUE,
+            node_type TEXT,
+            title TEXT,
+            source_doc_path TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE graph_edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_node_id INTEGER NOT NULL REFERENCES graph_nodes(id),
+            target_path TEXT NOT NULL,
+            target_node_id INTEGER REFERENCES graph_nodes(id),
+            target_resolved INTEGER NOT NULL DEFAULT 0,
+            link_text TEXT NOT NULL,
+            source_doc_path TEXT NOT NULL
+        );
+    """)
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# TestWorkingStateStore — Slot 6A Tier 2 storage
+# ---------------------------------------------------------------------------
+
+class TestWorkingStateStore:
+
+    @pytest.fixture()
+    def db_path(self, tmp_path: Path) -> Path:
+        path = tmp_path / "wss_test.db"
+        MemoryManager(db_path=path)   # initialises schema v4
+        return path
+
+    @pytest.fixture()
+    def store(self, db_path: Path) -> WorkingStateStore:
+        return WorkingStateStore(db_path=db_path)
+
+    # 1. get() on a mem_key with no row → returns None.
+    def test_get_nonexistent_returns_none(self, store):
+        result = store.get("session-does-not-exist")
+        assert result is None
+
+    # 2. upsert() then get() → round-trips all fields correctly,
+    #    including empty lists and a None current_focus.
+    def test_upsert_get_roundtrip_all_fields(self, store):
+        store.upsert(
+            mem_key          = "session-abc",
+            current_focus    = "implementing Slot 6A",
+            open_loops       = ["need to wire controller", "test ceiling"],
+            recent_decisions = ["use deterministic tier only"],
+        )
+        record = store.get("session-abc")
+
+        assert record is not None
+        assert isinstance(record, WorkingStateRecord)
+        assert record.mem_key          == "session-abc"
+        assert record.current_focus    == "implementing Slot 6A"
+        assert record.open_loops       == ["need to wire controller", "test ceiling"]
+        assert record.recent_decisions == ["use deterministic tier only"]
+        assert isinstance(record.updated_at, float)
+        assert record.updated_at > 0
+
+    # 2b. Empty lists and None current_focus round-trip correctly.
+    def test_upsert_get_roundtrip_empty_state(self, store):
+        store.upsert(
+            mem_key          = "session-empty",
+            current_focus    = None,
+            open_loops       = [],
+            recent_decisions = [],
+        )
+        record = store.get("session-empty")
+
+        assert record is not None
+        assert record.current_focus    is None
+        assert record.open_loops       == []
+        assert record.recent_decisions == []
+
+    # 3. upsert() called twice on the same mem_key → second call overwrites
+    #    (ON CONFLICT DO UPDATE); exactly one row exists for that mem_key.
+    def test_upsert_twice_overwrites_not_duplicates(self, store, db_path):
+        store.upsert(
+            mem_key          = "session-xyz",
+            current_focus    = "first focus",
+            open_loops       = ["loop A"],
+            recent_decisions = [],
+        )
+        store.upsert(
+            mem_key          = "session-xyz",
+            current_focus    = "second focus",
+            open_loops       = ["loop A", "loop B"],
+            recent_decisions = ["decision one"],
+        )
+
+        # Exactly one row in the DB for this mem_key.
+        conn = sqlite3.connect(str(db_path))
+        count = conn.execute(
+            "SELECT COUNT(*) FROM working_state WHERE mem_key = ?", ("session-xyz",)
+        ).fetchone()[0]
+        conn.close()
+        assert count == 1
+
+        # get() returns the second upsert's values.
+        record = store.get("session-xyz")
+        assert record.current_focus    == "second focus"
+        assert record.open_loops       == ["loop A", "loop B"]
+        assert record.recent_decisions == ["decision one"]
+
+    # 4. clear() removes the row; get() afterward returns None.
+    def test_clear_removes_row(self, store):
+        store.upsert(
+            mem_key          = "session-to-clear",
+            current_focus    = "will be deleted",
+            open_loops       = [],
+            recent_decisions = [],
+        )
+        assert store.get("session-to-clear") is not None
+
+        deleted = store.clear("session-to-clear")
+        assert deleted == 1
+        assert store.get("session-to-clear") is None
+
+    # 5. clear() on a nonexistent mem_key returns 0 and doesn't raise.
+    def test_clear_nonexistent_returns_zero(self, store):
+        result = store.clear("session-never-existed")
+        assert result == 0
+
+    # 6. Fresh-install path: brand-new MemoryManager creates the working_state table
+    #    without turn_summaries_json and at the current schema version.
+    def test_fresh_install_has_working_state_table(self, tmp_path):
+        path = tmp_path / "fresh.db"
+        MemoryManager(db_path=path)
+
+        conn = sqlite3.connect(str(path))
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(working_state)"
+        ).fetchall()}
+        conn.close()
+
+        assert "working_state" in tables
+        assert version == 5
+        assert "turn_summaries_json" not in cols
+
+    # 7. Migration path: v3 database (no working_state) gains the table and
+    #    schema_version bumps to 5 when opened by MemoryManager.
+    def test_v3_migration_creates_working_state(self, tmp_path):
+        path = tmp_path / "migrate.db"
+        _create_v3_db(path)
+
+        # Precondition: truly v3, no working_state.
+        conn = sqlite3.connect(str(path))
+        version_before = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        tables_before  = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        conn.close()
+        assert version_before == 3
+        assert "working_state" not in tables_before
+
+        # Open with MemoryManager → triggers _migrate(from_version=3) → v3→v4→v5.
+        MemoryManager(db_path=path)
+
+        conn = sqlite3.connect(str(path))
+        version_after = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        tables_after  = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        cols_after = {r[1] for r in conn.execute(
+            "PRAGMA table_info(working_state)"
+        ).fetchall()}
+        conn.close()
+
+        assert version_after == 5
+        assert "working_state" in tables_after
+        assert "turn_summaries_json" not in cols_after
