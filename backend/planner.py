@@ -218,6 +218,15 @@ _SEARCH_NEGATIVE_FILTER: frozenset[str] = frozenset({
     "why did you search",
     "did you search",
     "what tool did you use",
+    # 2026-06-26: identity/capability questions confirmed as false positives via
+    # diagnostics/score_lookup_request_templates.py — these utterances cross the
+    # lookup_request 0.60 gate due to syntactic (not semantic) similarity with the
+    # four question-form templates added 2026-06-25 ("can you look up", etc.).
+    "who are you",
+    "what are you",
+    "what can you do",
+    "what can you help with",
+    "what do you do",
 })
 
 # Relevance threshold for Priority 4 corpus scoring

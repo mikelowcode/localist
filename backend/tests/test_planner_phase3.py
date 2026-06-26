@@ -1020,3 +1020,87 @@ class TestEmbedFnWiringSmoke:
         agent = make_agent("conversational_agent")
         ctrl = ControllerAgent(runtime=rt, agents=[agent])
         assert ctrl._planner._embed_fn is None
+
+
+# ---------------------------------------------------------------------------
+# 2026-06-26: identity/capability negative-filter entries
+# (confirmed false positives via diagnostics/score_lookup_request_templates.py)
+# ---------------------------------------------------------------------------
+
+class TestIdentityCapabilityNegativeFilter:
+    """
+    Five identity/capability phrases added to _SEARCH_NEGATIVE_FILTER on
+    2026-06-26 after live diagnostic confirmed they cross the lookup_request
+    0.60 gate via syntactic similarity with the four 2026-06-25 question-form
+    templates ("can you look up", etc.).
+
+    Tests 1–5: _semantic_search_intent returns None for each exact phrase.
+    Test 6:    _priority3_tool returns None for "Who are you?" end-to-end.
+    Test 7:    Non-regression — original 2026-06-25 incident utterances still
+               fire the gate (negative filter does not intercept them).
+    """
+
+    def _make_planner_with_embed(self) -> "Planner":
+        """Return a Planner with a stub embed_fn so _semantic_search_intent is reachable."""
+        fixed_vec = _unit_vector(8)
+        spy = MagicMock(return_value=fixed_vec)
+        p = Planner(runtime=make_runtime(), embed_fn=spy)
+        spy.reset_mock()
+        return p
+
+    def test_who_are_you_filtered(self):
+        """'who are you' is caught by negative filter → _semantic_search_intent returns None."""
+        p = self._make_planner_with_embed()
+        assert p._semantic_search_intent("who are you") is None
+
+    def test_what_are_you_filtered(self):
+        """'what are you' is caught by negative filter → _semantic_search_intent returns None."""
+        p = self._make_planner_with_embed()
+        assert p._semantic_search_intent("what are you") is None
+
+    def test_what_can_you_do_filtered(self):
+        """'what can you do' is caught by negative filter → _semantic_search_intent returns None."""
+        p = self._make_planner_with_embed()
+        assert p._semantic_search_intent("what can you do") is None
+
+    def test_what_can_you_help_with_filtered(self):
+        """'what can you help with' is caught by negative filter → _semantic_search_intent returns None."""
+        p = self._make_planner_with_embed()
+        assert p._semantic_search_intent("what can you help with") is None
+
+    def test_what_do_you_do_filtered(self):
+        """'what do you do' is caught by negative filter → _semantic_search_intent returns None."""
+        p = self._make_planner_with_embed()
+        assert p._semantic_search_intent("what do you do") is None
+
+    def test_priority3_tool_returns_none_for_who_are_you(self):
+        """
+        End-to-end: _priority3_tool("who are you?") returns None (no tools scheduled).
+        Verifies the observed false-positive behavior is now blocked at the
+        _priority3_tool level, not just the helper.
+        """
+        p = self._make_planner_with_embed()
+        result = p._priority3_tool("who are you?")
+        assert result is None
+
+    def test_original_lookup_incident_utterances_still_fire_gate(self):
+        """
+        Non-regression: the 2026-06-25 incident's utterance family
+        ("Can you look up ...") is NOT intercepted by the new negative-filter
+        entries and still fires the semantic gate when scores are above threshold.
+
+        Uses _planner_with_mocked_semantic to inject a score of 0.62 on
+        lookup_request (above the 0.60 gate), exactly as measured for those
+        live utterances post-update-B. Confirms gate_fired=True is preserved.
+        """
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.10,
+            "lookup_request":         0.62,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool(
+            "can you look up apple's price hike for the macbook neo and ipad?"
+        )
+        assert result is not None, "Gate should fire for a real lookup-request utterance"
+        assert "web_search" in result.tools_to_call

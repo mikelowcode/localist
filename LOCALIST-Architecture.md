@@ -2869,17 +2869,24 @@ response instead of a grounded one. Under the old ladder, P4a's `force_rag` bypa
 have included `how-localist-works.md` regardless of score. This is the one real, narrow
 behavioral change caused by removing P4a — recorded plainly.
 
-*Two open follow-ups, explicitly undecided:*
-1. Whether the `lookup_request` 0.65 threshold should be revisited given this newly observed
+*Two open follow-ups, explicitly undecided at the time of this entry:*
+1. Whether the `lookup_request` 0.60 threshold should be revisited given this newly observed
    false-positive instance against identity-shaped queries — a change to the semantic
    classifier, not to the routing ladder. Cross-reference §10.4 Open Item 3.
 2. Whether the 0.547-vs-0.55 near-miss on `"What is Localist?"` warrants action (e.g.
    lowering the P4 Path B threshold, or a targeted corpus boost for that document) or is an
    acceptable cost of the restored, un-padded routing design.
-Neither has been decided; both are recorded here as observations, not committed next steps.
+Neither had been decided at the time of this entry.
 
-*Status:* CLOSED. The removal is complete and live-verified. The two follow-ups above are
-separately open and unscheduled.
+*Follow-up 1 update (2026-06-26):* Resolved via `_SEARCH_NEGATIVE_FILTER` expansion rather
+than threshold adjustment. Five identity/capability phrases ("who are you", "what are you",
+"what can you do", "what can you help with", "what do you do") added to the negative filter,
+blocking the false-positive collision before the embedding call. The 0.60 threshold was not
+changed. See §10.4 Open Item 3 — Update 2026-06-26 for the full fix record.
+
+*Follow-up 2* remains open and unscheduled.
+
+*Status:* CLOSED. The removal is complete and live-verified.
 
 ---
 
@@ -3264,7 +3271,7 @@ have produced a worse fix in either direction.
 **Per-group cosine similarity against four canonical template groups, using the EmbeddingGemma
 model already resident in the process.** `_SEARCH_INTENT_TEMPLATES` defines four named groups —
 `explicit_search_action`, `lookup_request`, `knowledge_request_open`, `freshness_request` — with
-17 template strings total (5+5+4+3). At startup, `Planner.__init__()` embeds all 17 using the
+21 template strings total (5+9+4+3; `lookup_request` expanded from 5 to 9 on 2026-06-25 — see §10.4 Open Item 3 update). At startup, `Planner.__init__()` embeds all 21 using the
 same EmbeddingGemma model (`mlx-community/embeddinggemma-300m-4bit`, 768-dimensional) that
 `EmbeddingEngine` already uses for corpus retrieval. The `embed_fn` callable is threaded into
 `Planner` as a new optional constructor parameter (`embed_fn: Callable[[str], list[float]] | None
@@ -3292,7 +3299,7 @@ threshold. In the live diagnostic evaluation, `knowledge_request_open` won the a
 adversarial negative test cases — demonstrating how frequently this scenario arises in practice.
 
 **Only two of the four groups gate routing; the other two are informational only.** `_SEMANTIC_GATE_THRESHOLDS`
-contains exactly two entries: `explicit_search_action` (≥ 0.68) and `lookup_request` (≥ 0.65).
+contains exactly two entries: `explicit_search_action` (≥ 0.68) and `lookup_request` (≥ 0.60; original value was 0.65, lowered 2026-06-25 — see §10.4 Open Item 3 update).
 `knowledge_request_open` and `freshness_request` are computed and logged on every turn but are
 excluded from gating. The evidence for `knowledge_request_open`: a live diagnostic pass found
 that "Explain this code to me." scored 0.795 on that group — higher than 5 of the 10 real
@@ -3305,21 +3312,25 @@ in the computation pipeline and are emitted to the debug log; neither may gate `
 without a separate evaluation pass. See §10.4, Open Item 1.
 
 **Thresholds were derived from live-backend diagnostics, not tuned to fit any incident utterance.**
-The values 0.68 (`explicit_search_action`) and 0.65 (`lookup_request`) were determined from a
+The values 0.68 (`explicit_search_action`) and 0.65 (`lookup_request`, original) were determined from a
 structured evaluation pass run before the gating logic was written: 10 positive search-intent
 paraphrases, 7 adversarial negatives, and 1 negative-filter case (18 utterances total) submitted
 against the live EmbeddingGemma model. The second incident instruction ("Why don't you do a web
 search for APC...") was not used to tune these numbers — it scored 0.638, fell below the 0.68
 threshold, and was fixed at the literal-keyword layer specifically to avoid post-hoc threshold
-adjustment for one known utterance.
+adjustment for one known utterance. `lookup_request` was subsequently lowered from 0.65 to 0.60
+on 2026-06-25 after confirmed live false negatives (see §10.4 Open Item 3 update).
 
 **A negative filter short-circuits before the embedding call.** `_SEARCH_NEGATIVE_FILTER` is a
-frozenset of 9 phrases identifying meta-instructions that reference the conversation itself or
-the search tool — "did you search", "what tool did you use", "search my previous messages", and
-similar — rather than requesting a world-facing search. When any of these phrases appears in the
-lowered instruction, `_semantic_search_intent()` returns `None` immediately without invoking
-`embed_fn`. Verified live: "Did you search for that already?" triggered the filter and produced
-no embedding call.
+frozenset of 14 phrases (9 original + 5 added 2026-06-26) identifying meta-instructions that
+reference the conversation itself or the search tool — "did you search", "what tool did you use",
+"search my previous messages", and similar — rather than requesting a world-facing search, plus
+five identity/capability phrases ("who are you", "what are you", "what can you do",
+"what can you help with", "what do you do") added after a confirmed false-positive collision with
+the four 2026-06-25 `lookup_request` templates (see §10.4 Open Item 3 update). When any of these
+phrases appears in the lowered instruction, `_semantic_search_intent()` returns `None` immediately
+without invoking `embed_fn`. Verified live: "Did you search for that already?" triggered the
+filter and produced no embedding call.
 
 **"web search" and "do a search" added to `_WEB_SEARCH_KEYWORDS`.** The second incident gap was
 closed by adding these two phrases to the existing `_WEB_SEARCH_KEYWORDS` frozenset, matched via
@@ -3353,7 +3364,8 @@ credit for the model's behavior here lies with prompt wording (e.g. the behavior
 
 **Turn 2 — "Go ahead and look up APC (Auto Prefix Cache)."** This is a live, unscripted
 paraphrase — not identical to any string in the diagnostic dataset and not identical to the
-original incident's exact wording. `lookup_request` scored 0.740, clearing the 0.65 threshold.
+original incident's exact wording. `lookup_request` scored 0.740, clearing the 0.65 threshold
+(the threshold was subsequently lowered to 0.60 on 2026-06-25; 0.740 clears both values).
 `tools_to_call = ['web_search']`. LangSearch returned three real, correctly-disambiguated results
 identifying APC as automatic prefix caching in LLM inference serving — including an arXiv paper
 and a Chinese-language vLLM technical article independently confirming the same expansion. These
@@ -3378,10 +3390,93 @@ string. Sharing a single computed embedding across both call sites was scoped an
 deferred pending real latency data on the 16 GB development machine. Revisit only if profiling
 shows the cost matters in practice; do not optimize without measurement.
 
-**Open Item 3 — Threshold sample size.** 0.68 and 0.65 are derived from a single diagnostic
-pass: 10 positive paraphrases and 7 adversarial negatives. Treat as shippable-but-not-fully-validated.
-Revisit if live false positives (gate fires when no search was intended) or false negatives (gate
-misses a clear search instruction) are observed.
+**Open Item 3 — Threshold sample size.** 0.68 (`explicit_search_action`) and 0.65 (`lookup_request`,
+original) are derived from a single diagnostic pass: 10 positive paraphrases and 7 adversarial
+negatives. Treat as shippable-but-not-fully-validated. Revisit if live false positives (gate fires
+when no search was intended) or false negatives (gate misses a clear search instruction) are
+observed.
+
+**Open Item 3 — Update 2026-06-25 (false negatives; `lookup_request` template expansion +
+threshold lowering).** Three live "Can you look up [topic]?" utterances — "Can you look up
+Apple's price hike for the MacBook Neo and iPad?", "Can you look up Microsoft's next-generation
+in-house AI models?", "Can you look up their next-generation in-house Microsoft AI models?" —
+each scored below the 0.65 gate (0.593, 0.598, 0.598) despite being unambiguous lookup
+requests, because the original five `lookup_request` templates were all bare imperatives ("look
+up this", "look that up", etc.) and did not cover the "Can/Could you + look up/look into +
+[specific object]" question-form frame. Two fixes applied:
+
+- **Template expansion (update A):** Four new templates added to `lookup_request` — "can you
+  look up", "can you look that up for me", "could you look up", "can you look into this for me".
+  Total expanded from 5 to 9. Post-addition, the same three utterances scored 0.608, 0.621, and
+  0.617 respectively — real, consistent improvement (+0.015 to +0.023) but still below the 0.65
+  gate.
+- **Threshold lowering (update B):** `lookup_request` threshold lowered from 0.65 to 0.60. The
+  remaining 0.03–0.04 gap was consistent enough across all three utterances to satisfy the Open
+  Item 3 "live false negatives observed" revisit criterion; template coverage alone could not close
+  it. `explicit_search_action` (0.68) deliberately not changed. Known accepted risk: the original
+  18-utterance diagnostic pass did not retain per-utterance scores for `lookup_request`'s
+  adversarial negatives, so the margin to the new 0.60 line was unknown; any live false positive
+  on `lookup_request` was named as the trigger to re-examine.
+
+Six tests added to `TestPriority3SemanticGating` in `test_planner_phase3.py` covering the new
+templates, unchanged original templates, updated threshold values, and boundary behavior at both
+sides of the new 0.60 line.
+
+**Open Item 3 — Update 2026-06-26 (false positives; `_SEARCH_NEGATIVE_FILTER` expansion).**
+The accepted risk named in update B materialized. The named trigger was observed: after P4a
+(`_priority4a_identity()`) was removed from the routing ladder (see §8.8 Open Item 12), live
+verification showed "Who are you?" routing to priority=3 with `lookup_request=0.631 (≥ 0.60)`,
+`web_search` dispatched — a wasted search call on a pure identity question. Two further
+identity/capability utterances ("What can you do?", `lookup_request=0.666`) shared the same
+false-positive pattern.
+
+*Root-cause trace:*
+
+- `_FACTUAL_QUERY_KEYWORDS` was ruled out as the mechanism: structurally unreachable on this
+  routing path (P3b evaluates after P3, and `_FACTUAL_QUERY_KEYWORDS` phrases do not appear
+  in these utterances lexically).
+- Two diagnostic scripts (`diagnostics/score_lookup_request_templates.py`) isolated the
+  mechanism to the four 2026-06-25-added question-form templates specifically: "can you look
+  up", "can you look that up for me", "could you look up", "can you look into this for me".
+  These share a modal-auxiliary question frame ("what/who + are/can/do + you") with the
+  identity/capability utterances, producing syntactic (not semantic) similarity. The original
+  five bare-imperative `lookup_request` templates never crossed 0.60 for any of the three
+  tested utterances.
+- Per-template breakdown confirmed: for "Who are you?", scores 0.630 / 0.604 (two new
+  templates above gate), 0.588 / 0.588 (other two new templates), ≤ 0.522 (all five
+  originals). For "What are you?", four new templates all above gate (0.603–0.660). For
+  "What can you do?", four new templates above gate (0.652–0.672).
+
+*Fix:* Five phrases added to `_SEARCH_NEGATIVE_FILTER` — "who are you", "what are you",
+"what can you do", "what can you help with", "what do you do" — blocking the embedding call
+entirely before it reaches the gating logic. Selected over template-rewording or per-template
+thresholds as the narrowest reversible option: each phrase is a literal substring match,
+independently removable, with no impact on the gate logic itself.
+
+*Verification chain:*
+
+1. **Unit tests (+7):** `TestIdentityCapabilityNegativeFilter` in `test_planner_phase3.py` —
+   five tests confirming `_semantic_search_intent()` returns `None` for each phrase; one
+   confirming `_priority3_tool("who are you?")` returns `None` end-to-end; one non-regression
+   test confirming the 2026-06-25 incident utterances still fire the gate (lookup_request=0.62
+   mocked, `web_search` in tools_to_call).
+2. **Dedicated live-verification prompt:** Real `EmbeddingEngine`, real `Planner.__init__()`
+   with real `_template_embeddings`. Group A (5 identity/capability phrases): all five filter
+   fired, `_semantic_search_intent` returned `None`, `tools_to_call = []`. Group B (3 original
+   incident utterances): filter not fired, scores 0.6077 / 0.6172 / 0.6208 (≥ 0.60, matching
+   the §8.8 OI12 record to within rounding), `web_search` dispatched in all three cases.
+3. **Unprompted real-traffic confirmation:** Two organic turns the same session independently
+   triggered the filter correctly — not from a targeted test.
+
+*What remains open:*
+
+- The general negative-side margin of the 0.60 threshold remains unverified for the full
+  adversarial set; this update patched five specific observed collisions reactively, not
+  systematically. Any new live false positive on `lookup_request` remains the trigger to
+  re-examine the threshold or the template set.
+- Identity-adjacent siblings ("what's your name", "are you an AI", "what model are you")
+  were raised and explicitly deferred; their scores have not been tested. Not blocked, but
+  not covered.
 
 **Open Item 4 — Live near-miss on `explicit_search_action` threshold, compound
 instruction (2026-06-23).** A live, unscripted turn — "Look up karpathy llm
@@ -3419,18 +3514,23 @@ observed scoring in the 0.60–0.68 band for `explicit_search_action`.
 
 ### 10.5 Test Suite
 
-Final state: **339 tests, 0 failures** across all test files (verified against the live test
-suite as of 2026-06-22).
+Current state: **425 tests, 0 failures** across all test files (verified fresh 2026-06-26).
 
-The classifier was built across four sequential slots, all in `backend/tests/test_planner_phase3.py`:
+The classifier was built across four sequential slots (all in `backend/tests/test_planner_phase3.py`),
+then extended in two later sessions:
 
-| Slot | Purpose | Before | After | Net |
+| Slot / Session | Purpose | Before | After | Net |
 |---|---|---|---|---|
-| Diagnostic 1 | `_semantic_search_intent()` scaffold; `embed_fn` wiring; logging only, no routing change | 318 | 329 | +11 |
-| Diagnostic 2 | Expand return type to `(best_group, best_score, all_scores)`; per-group score logging | 329 | 331 | +2 |
-| Fix 1 | Live gating via `_SEMANTIC_GATE_THRESHOLDS`; first routing change in `_priority3_tool()` | 331 | 336 | +5 |
-| Fix 2 | "web search" and "do a search" added to `_WEB_SEARCH_KEYWORDS` | 336 | 339 | +3 |
-| **Total** | | **318** | **339** | **+21** |
+| Diagnostic 1 (2026-06-22) | `_semantic_search_intent()` scaffold; `embed_fn` wiring; logging only, no routing change | 318 | 329 | +11 |
+| Diagnostic 2 (2026-06-22) | Expand return type to `(best_group, best_score, all_scores)`; per-group score logging | 329 | 331 | +2 |
+| Fix 1 (2026-06-22) | Live gating via `_SEMANTIC_GATE_THRESHOLDS`; first routing change in `_priority3_tool()` | 331 | 336 | +5 |
+| Fix 2 (2026-06-22) | "web search" and "do a search" added to `_WEB_SEARCH_KEYWORDS` | 336 | 339 | +3 |
+| OI 3 update A+B (2026-06-25) | `lookup_request` template expansion (5→9) and threshold lowering (0.65→0.60); 6 new tests in `TestPriority3SemanticGating` | 339 | 345 | +6 |
+| P4a removal (2026-06-26) | `_priority4a_identity()` / `force_rag` removed; −3 deleted, +16 added across `test_planner_phase3.py` and `test_controller_phase4.py` — see §8.8 OI 12 for full breakdown | 405* | 418 | +13 |
+| OI 3 update 2026-06-26 | `_SEARCH_NEGATIVE_FILTER` identity/capability additions; `TestIdentityCapabilityNegativeFilter` in `test_planner_phase3.py` | 418 | 425 | +7 |
+| **Total** | | **318** | **425** | **+107** |
+
+\* The P4a-removal row uses 405 as its before-count because that was the confirmed baseline at the start of that session. The gap between 345 (OI 3 update A+B) and 405 reflects tests added across unrelated sessions (§8, §9, and other §8.8 close-outs) not tracked in this table.
 
 Fix 1's net of +5 reflects 7 new tests in `TestPriority3SemanticGating` minus 2 tests removed
 from its predecessor class `TestPriority3ToolUnaffectedBySemantic`, whose premise — "semantic
