@@ -101,7 +101,6 @@ Every query passes through `Planner`, a deterministic rule engine with seven pri
 | P2 | Memory keyword (`remember`, `forget`, `prefer`) | `ConversationalAgent` + write episode |
 | P3 | Tool signal: web search keyword, URL present, file keyword | `ConversationalAgent` + tool call |
 | P3b | Factual question keyword + corpus score below threshold | `ConversationalAgent` + `web_search` |
-| P4a | Identity keyword (`who are you`, `what are you`, `introduce yourself`, etc.) | `ConversationalAgent` + RAG fetch (force) |
 | P4 | Explicit vault keyword (`check the wiki`, `vault`, etc.) **or** corpus score ≥ 0.55 | `ConversationalAgent` + RAG fetch |
 | P5 | Episodic relevance keyword (`my preference`, `last time`, etc.) | `ConversationalAgent` + episodic fetch |
 | P6 | Fallback | `ConversationalAgent`, direct answer |
@@ -215,8 +214,9 @@ All tests use mocks for inference and SQLite; no oMLX server or live API keys ar
 
 - **Localist CLI** — ✅ `./start_localist.sh` launches both services;
   `--stop` kills them cleanly
-- **Identity continuity** — ✅ Priority 4a identity trigger; LORA
-  correctly identifies itself via `how-localist-works.md` RAG retrieval
+- **Identity continuity** — ✅ LORA correctly identifies itself; identity
+  questions route via P3 semantic gate or P6 direct answer backed by
+  `lora-persona.md`
 - **User profile** — ✅ `wiki/users/michael.md`; line-level embedding
   and cosine-scored injection into Slot 3b
 - **Graph retrieval layer** — planned; concept relationship reasoning

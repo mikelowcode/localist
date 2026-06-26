@@ -150,15 +150,72 @@ class TestPlannerPriorities:
         assert plan.write_episode  is False
         assert plan.compound       is False
 
-    def test_p4a_identity_returns_priority_4(self):
-        """P4a must set priority=4 — not inherit the default 6 used by P6."""
+
+# ---------------------------------------------------------------------------
+# Post-P4a-removal: former identity phrasings now route to P6
+# ---------------------------------------------------------------------------
+#
+# Discovery run (2026-06-26): all 13 former _IDENTITY_KEYWORDS phrasings
+# resolve to priority=6 (P6 direct-answer fallback) with no MemoryManager.
+# P4 Path B is skipped because there is no corpus to score against; if a
+# corpus were present with a sufficiently high-scoring document, some of
+# these might reach P4. The assertions below lock in the P6 outcome for
+# the no-corpus case, which is the clean-room unit-test baseline.
+
+class TestFormerP4aIdentityPhrasingsRouteToPSix:
+
+    def _check(self, phrase: str) -> None:
         p = Planner(runtime=make_runtime(infer_return="no"))
-        for instruction in ("Who are you?", "What is Localist?", "What can you do?"):
-            plan = p.route(instruction, context={})
-            assert plan.force_rag is True, f"P4a did not fire for {instruction!r}"
-            assert plan.priority == 4, (
-                f"Expected priority=4 for {instruction!r}; got priority={plan.priority}"
-            )
+        plan = p.route(phrase, context={})
+        assert plan.priority == 6, (
+            f"Expected priority=6 for {phrase!r}; got priority={plan.priority}"
+        )
+        assert plan.fetch_rag is False, (
+            f"Expected fetch_rag=False for {phrase!r}; got {plan.fetch_rag}"
+        )
+        assert plan.fetch_episodic is False, (
+            f"Expected fetch_episodic=False for {phrase!r}; got {plan.fetch_episodic}"
+        )
+        assert plan.agent == "conversational_agent"
+
+    def test_who_are_you(self):
+        self._check("who are you")
+
+    def test_what_are_you(self):
+        self._check("what are you")
+
+    def test_tell_me_about_yourself(self):
+        self._check("tell me about yourself")
+
+    def test_what_can_you_do(self):
+        self._check("what can you do")
+
+    def test_are_you_an_ai(self):
+        self._check("are you an ai")
+
+    def test_are_you_a_bot(self):
+        self._check("are you a bot")
+
+    def test_what_is_lora(self):
+        self._check("what is lora")
+
+    def test_who_is_lora(self):
+        self._check("who is lora")
+
+    def test_what_is_localist(self):
+        self._check("what is localist")
+
+    def test_are_you_made_by_google(self):
+        self._check("are you made by google")
+
+    def test_are_you_chatgpt(self):
+        self._check("are you chatgpt")
+
+    def test_are_you_gemma(self):
+        self._check("are you gemma")
+
+    def test_introduce_yourself(self):
+        self._check("introduce yourself")
 
 
 # ---------------------------------------------------------------------------

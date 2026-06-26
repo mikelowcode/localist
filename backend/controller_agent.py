@@ -961,7 +961,6 @@ class ControllerAgent:
                     task.instruction,
                     max_results    = 3,
                     use_embeddings = True,
-                    doc_type       = "wiki" if plan.force_rag else None,
                 )
                 rag_sources = [
                     RagSource(
@@ -969,7 +968,7 @@ class ControllerAgent:
                         content = parse_wiki_doc(doc.content).body[:2000],
                     )
                     for doc in docs
-                    if (plan.force_rag or doc.relevance_score >= 0.55)
+                    if doc.relevance_score >= 0.55
                     and not str(doc.path).endswith("lora-persona.md")
                 ]
                 logger.info(
@@ -1012,7 +1011,6 @@ class ControllerAgent:
         profile_facts: list[UserProfileFact] = []
         _should_inject_profile = (
             plan.fetch_episodic          # P5 route
-            or plan.force_rag            # P4a identity route
             or plan.fetch_rag            # P4 corpus route
             or bool(episodic_bullets)    # episodic bullets fired
         )

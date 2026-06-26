@@ -113,6 +113,9 @@ backend/localist_memory.db
 # Environment files (contain API keys)
 backend/.env
 
+# Compiled Python cache
+backend/__pycache__/
+
 # Sessions Log
 
 sessions-log.md

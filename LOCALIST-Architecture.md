@@ -359,7 +359,7 @@ user profile facts).
 - This slot is **conditional**. It is omitted entirely when both sub-blocks
   are empty. No empty label, no placeholder.
 - Slot 3a (episodic): relevance determined by Priority 5. See §4.
-- Slot 3b (profile): injected on P4, P4a, P5 routes and any turn where
+- Slot 3b (profile): injected on P4, P5 routes and any turn where
   episodic bullets fire. See §3.6.
 - When episodic bullets injected: 3–5 bullets, confidence ≥ 0.7, type-ordered per §2.7.
 - Both `[EPISODIC MEMORY]` and `[USER PROFILE]` labels are mandatory when
@@ -465,7 +465,7 @@ When zero edges exist, the content is a single declarative sentence:
   (RAG), or Slot 5 (tool results). This guarantee is not enforced by
   `PromptBuilder` — it falls out of the `RoutingPlan` produced by
   `planner._priority3c_graph_query()`, which sets `fetch_rag=False`,
-  `fetch_episodic=False`, `force_rag=False`, and `tools_to_call=[]`.
+  `fetch_episodic=False`, and `tools_to_call=[]`.
   `PromptBuilder` itself has no exclusivity guard.
 - Ceiling enforced as a single post-render truncation via `_truncate_to_tokens()`.
 - Conditional: omitted entirely (no label, no whitespace) when `graph_result is None`.
@@ -503,7 +503,7 @@ Each line is emitted only when its field is non-empty/non-None.
   project-name source is available at this context key.
 - `active_artifacts` — `[s.path for s in rag_sources]`: the filesystem paths of
   RAG documents retrieved during the same turn. Non-empty only on turns where
-  RAG retrieval ran (P4, P4a, P5 routes).
+  RAG retrieval ran (P4, P5 routes).
 
 **Tier 2 fields (model-assisted — updating, not yet rendering):**
 Three fields — `current_focus`, `open_loops`, `recent_decisions` — are updated
@@ -713,7 +713,7 @@ against full instruction embeddings even when semantically relevant.
 #### Injection trigger
 
 Profile facts are injected into Slot 3b on any turn where:
-- `plan.fetch_rag` is True (P4 and P4a routes)
+- `plan.fetch_rag` is True (P4 route)
 - `plan.fetch_episodic` is True (P5 routes)
 - Episodic bullets fired in the same turn
 
@@ -739,7 +739,7 @@ varies by routing path:
 | Routing path | First user slot |
 |---|---|
 | P6 (direct answer) | `[WORKING MEMORY]` (if non-empty), else `[INSTRUCTION]` |
-| P4 / P4a (RAG) | `[USER PROFILE]` or `[EPISODIC MEMORY]` (if either fires), else `[CONTEXT]` |
+| P4 (RAG) | `[USER PROFILE]` or `[EPISODIC MEMORY]` (if either fires), else `[CONTEXT]` |
 | P5 (episodic) | `[EPISODIC MEMORY]` |
 
 A P6 turn followed by a P4 turn produces a different first byte in the user message.
@@ -1350,17 +1350,6 @@ All lower priorities are skipped.
 
 ---
 
-**PRIORITY 4a — IDENTITY TRIGGER**
-
-| | |
-|---|---|
-| **Condition** | Instruction contains any keyword from `_IDENTITY_KEYWORDS` (whole-phrase match via `_any_whole_word()`): `"who are you"`, `"what are you"`, `"tell me about yourself"`, `"what can you do"`, `"are you an ai"`, `"are you a bot"`, `"what is lora"`, `"who is lora"`, `"what is localist"`, `"are you made by google"`, `"are you chatgpt"`, `"are you gemma"`, `"introduce yourself"`. |
-| **Action** | Route to `conversational_agent`. Set `fetch_rag = True`, `force_rag = True`. `how-localist-works.md` is injected into Slot 4 regardless of embedding score. |
-| **Rationale** | Without this priority, identity questions fall to P6 (direct answer). Gemma 4B's RLHF fine-tuning then overrides the system prompt and produces "I'm a large language model made by Google." P4a forces RAG retrieval of `how-localist-works.md`, giving the model explicit first-person identity context. |
-| **Notes** | Fires before Priority 4 (explicit wiki/vault) so identity questions are never absorbed by general corpus routing. Does not set `fetch_episodic=True`. A trailing-content guard prevents false positives: if the matched keyword is followed by further meaningful words (e.g. `"what can you do with this file"`), the match is discarded. |
-
----
-
 **PRIORITY 4 — CORPUS SIGNAL**
 
 | | |
@@ -1392,35 +1381,7 @@ All lower priorities are skipped.
 
 ---
 
-#### Priority 4a — Identity trigger
-
-**Match condition:** Instruction contains any keyword from
-`_IDENTITY_KEYWORDS` (whole-word match via `_any_whole_word()`).
-
-**Effect:** Routes to `conversational_agent` with `fetch_rag=True` and
-`force_rag=True`. The `force_rag` flag bypasses the `relevance_score >=
-0.55` threshold in the RAG filter, guaranteeing that `how-localist-works.md`
-is injected into Slot 4 regardless of embedding similarity score.
-
-**Purpose:** Prevents identity questions from falling to P6 (direct answer),
-where Gemma 4B's RLHF fine-tuning overrides the system prompt and produces
-"I'm a large language model made by Google." With `how-localist-works.md`
-in Slot 4, the model has explicit first-person identity context to draw from.
-
-**Keywords (`_IDENTITY_KEYWORDS`):**
-`"who are you"`, `"what are you"`, `"tell me about yourself"`,
-`"what can you do"`, `"are you an ai"`, `"are you a bot"`,
-`"what is lora"`, `"who is lora"`, `"what is localist"`,
-`"are you made by google"`, `"are you chatgpt"`, `"are you gemma"`,
-`"introduce yourself"`
-
-**Implementation notes:**
-- Uses `_any_whole_word()` for whole-phrase matching — prevents false
-  positives (e.g. `"what can you do with this file"` does not trigger).
-- Fires before Priority 4 (explicit wiki/vault) so identity questions
-  are never absorbed by general corpus routing.
-- Does not set `fetch_episodic=True` — identity questions do not require
-  episodic context.
+*Note: Priority 4a (`_priority4a_identity()`) was removed on 2026-06-26. Identity-style questions now fall through to P4 Path B (corpus scoring, threshold ≥ 0.55) or P6 (direct answer fallback) depending on corpus score. See Open Item 12 (§8.8) for the full removal record.*
 
 ---
 
@@ -1459,7 +1420,6 @@ class RoutingPlan:
     write_episode:     bool           # True → EpisodicMemoryWriter runs first
     episode_type:      str | None     # type hint for extraction; None if not write
     compound:          bool           # True → multiple signal types detected
-    force_rag:         bool           # True → bypass relevance_score >= 0.55 RAG threshold (set by P4a)
     priority:          int            # 1–6; which priority rule matched (default 6)
 ```
 
@@ -1469,9 +1429,8 @@ class RoutingPlan:
 2. If `write_episode`: run `EpisodicMemoryWriter`, wait for completion.
 3. If `tools_to_call`: dispatch tools in listed order, collect results.
 4. If `fetch_rag`: run `MemoryManager.query_corpus()`, collect snippets for Slot 4.
-   RAG results are filtered by `relevance_score >= 0.55` unless `plan.force_rag is True`,
-   in which case the threshold is bypassed and all returned documents are included (still
-   filtered for `lora-persona.md` exclusion). Maximum 3 sources regardless of `force_rag`.
+   RAG results are filtered by `relevance_score >= 0.55` unconditionally (still filtered
+   for `lora-persona.md` exclusion). Maximum 3 sources.
 5. If `fetch_episodic`: run episodic retrieval, collect bullets for Slot 3.
 6. Call `PromptBuilder.build()` with all collected content; persona is loaded
    from `_load_persona()` (cached) and passed as `persona=` for Slot 1b.
@@ -2036,7 +1995,7 @@ equivalent reverse proxy. The `/api` prefix is stripped before forwarding.
   `PromptBuilder.build()`'s new `graph_result` parameter. The "pure/minimal"
   guarantee (graph-query turns never combine with RAG/episodic/profile context)
   requires no extra guard code — it falls out for free because P3c's `RoutingPlan`
-  already sets `fetch_rag`/`fetch_episodic`/`force_rag` to `False` and
+  already sets `fetch_rag`/`fetch_episodic` to `False` and
   `tools_to_call` to `[]`; confirmed end-to-end with a dedicated leak-marker test.
 - `build_graph.py` — fixed: the `__main__` block previously called `MemoryManager()`
   with no path argument, which resolved to `MemoryManager`'s bare default
@@ -2529,6 +2488,8 @@ correction.
 *Test suite:* 288 → 289 (+1: `test_p4a_identity_returns_priority_4` in
 `tests/test_planner_phase3.py`, class `TestPlannerPriorities`), 0 failures.
 
+*Note: P4a, and the `force_rag` mechanism these three Open Items (8, 9, 10) describe, were removed entirely on 2026-06-26 — see Open Item 12 below.*
+
 **Open Item 11 — Fabricated tool-call syntax in generation output. OPEN, mechanism unknown,
 2026-06-22.**
 
@@ -2829,6 +2790,96 @@ returned answer is the fallback message and `grounded=False`/`sources=[]` for th
 **Status: Open Item 11's user-facing impact closed (2026-06-25); mechanism remains open and
 unexplained.** Both halves of the two-prompt plan (gate calibration; generation-time backstop) are
 implemented and verified to the extent each could be.
+
+---
+
+**Open Item 12 — Removal of Priority 4a (`_priority4a_identity()`). CLOSED 2026-06-26.**
+
+*Motivation:* Michael's view was that P4a was unnecessary scope creep once `lora-persona.md`
+was rebuilt past 500 tokens, and that the original "I am Gemma 4" incident that P4a was
+built to address was most likely caused by the persona document being too short to provide
+adequate grounding — not by any structural gap in the priority ladder. This causal claim is
+recorded as Michael's stated hypothesis, not as confirmed root cause; the original incident
+was deliberately not re-diagnosed as part of this removal.
+
+*Structural removal:*
+
+- **`backend/planner.py`**: Deleted `_priority4a_identity()` method and its section header
+  (~50 lines), its call site in `route()` (4 lines), the `_IDENTITY_KEYWORDS` frozenset (13
+  phrases), `force_rag: bool = False` from `RoutingPlan`, and `force_rag`-related text from
+  docstrings. Also updated `_priority3c_graph_query()`'s RoutingPlan construction (removed
+  `force_rag=False`) and its docstring.
+- **`backend/controller_agent.py`**: Three `force_rag` consumers simplified:
+  `doc_type = "wiki" if plan.force_rag else None` kwarg dropped entirely from the Step 4
+  `query_corpus()` call (now defaults to `None`); `if (plan.force_rag or doc.relevance_score
+  >= 0.55)` filter reduced to `if doc.relevance_score >= 0.55` (threshold now unconditional);
+  `or plan.force_rag  # P4a identity route` removed from `_should_inject_profile`.
+- **Confirmed zero remaining functional references:** `grep -rn "force_rag" backend/` returns
+  zero results outside of test docstrings describing the removed behavior.
+
+*Tests removed (3):* `test_p4a_identity_returns_priority_4` (`test_planner_phase3.py`
+`TestPlannerPriorities`) and both tests in `TestForceRagDocTypeFilter`
+(`test_controller_phase4.py`). All three asserted behavior of code that no longer exists;
+all were deleted, not adapted. Two incidental fixture fixes were also required and made
+(`force_rag=False` removed from two `_make_*_plan()` helpers in `test_controller_phase4.py`
+that would have raised `TypeError` post-removal) — not counted in the deletion total.
+
+*Tests added (16):* 13 in new class `TestFormerP4aIdentityPhrasingsRouteToPSix`
+(`test_planner_phase3.py`) — one per former `_IDENTITY_KEYWORDS` phrase, asserting the
+discovered routing outcome (not assumed). Plus one confirming `doc_type` is absent from
+the Step 4 `query_corpus()` call (`TestQueryCorpusNeverReceivesDocType`), one confirming
+the relevance threshold is unconditionally enforced (`TestRelevanceThresholdUnconditional`,
+doc at score 0.40 excluded with no bypass), and one confirming `RoutingPlan(force_rag=True)`
+now raises `TypeError` (`TestRoutingPlanNoForceRagField`).
+
+*Test suite delta:* 405 (baseline) → 402 (3 tests deleted) → 418 (16 tests added), 0 failures.
+
+*Live-verification findings:*
+
+Unit tests (no `embed_fn`, no `MemoryManager`): all 13 former identity phrasings resolved
+to `priority=6`, `fetch_rag=False`, `fetch_episodic=False`, `agent=conversational_agent`.
+P4 Path B is skipped without MemoryManager; P3 semantic gate does not fire without
+`embed_fn`. All 13 phrases reach P6 in the unit-test baseline.
+
+Live backend (real `embed_fn` present): three spot-checked queries showed a divergence from
+the unit-test baseline:
+- `"What is Localist?"` → priority=6. Corpus top_score=0.547 (below 0.55 threshold; P4
+  miss). Semantic gate: best=knowledge_request_open(0.598), gate_fired=False. Received a
+  hedging response ("I don't have live search results for that — here's what I know from
+  training..."). `how-localist-works.md` was NOT in `[CONTEXT]`.
+- `"Who are you?"` → priority=3. Semantic gate: lookup_request=0.631 (≥ 0.60 threshold),
+  gate_fired=True. `web_search` dispatched. Response correctly identified as LORA.
+- `"What can you do?"` → priority=3. Semantic gate: lookup_request=0.666 (≥ 0.60 threshold),
+  gate_fired=True. `web_search` dispatched. Response correctly identified as LORA.
+
+*Interpretation of the P3 routing result:* this is NOT a regression caused by this removal.
+`route()`'s evaluation order has always run Priority 3 before Priority 4a — confirmed
+directly by reading `route()`'s call order in `planner.py` (P3c → P3 → P3b → P4 → P5 →
+P6, with P4a never having existed between P3b and P4 from the routing engine's perspective
+once removed). Any phrasing that clears P3's semantic gate would have been caught by P3
+regardless of P4a's presence, because P4a never had the opportunity to evaluate those turns
+in the old ladder. What this live test surfaced is a pre-existing condition of the semantic
+search-intent classifier — cross-reference §10.4 Open Item 3 (thresholds derived from only
+18 diagnostic utterances, explicitly flagged for revisiting "if live false-positive signals
+are observed"). This session's result is now one such observed instance.
+
+*One finding directly attributable to this removal:* `"What is Localist?"` reached P6 and
+missed the corpus threshold narrowly (top_score=0.547 vs. 0.55 cutoff), receiving a hedging
+response instead of a grounded one. Under the old ladder, P4a's `force_rag` bypass would
+have included `how-localist-works.md` regardless of score. This is the one real, narrow
+behavioral change caused by removing P4a — recorded plainly.
+
+*Two open follow-ups, explicitly undecided:*
+1. Whether the `lookup_request` 0.65 threshold should be revisited given this newly observed
+   false-positive instance against identity-shaped queries — a change to the semantic
+   classifier, not to the routing ladder. Cross-reference §10.4 Open Item 3.
+2. Whether the 0.547-vs-0.55 near-miss on `"What is Localist?"` warrants action (e.g.
+   lowering the P4 Path B threshold, or a targeted corpus boost for that document) or is an
+   acceptable cost of the restored, un-padded routing design.
+Neither has been decided; both are recorded here as observations, not committed next steps.
+
+*Status:* CLOSED. The removal is complete and live-verified. The two follow-ups above are
+separately open and unscheduled.
 
 ---
 

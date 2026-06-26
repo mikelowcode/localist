@@ -767,7 +767,6 @@ class TestGraphQueryFetch:
             agent          = "conversational_agent",
             fetch_episodic = False,
             fetch_rag      = False,
-            force_rag      = False,
             compound       = False,
             priority       = 3,
             graph_query    = (direction, node_id, stem),
@@ -966,70 +965,6 @@ class TestGraphQueryFetch:
         assert "PURITY_LEAK_RAG"      not in prompt
 
 
-# ---------------------------------------------------------------------------
-# force_rag doc_type filtering — Open Item 7 fix
-#
-# When plan.force_rag=True (P4a identity route), query_corpus() must be
-# called with doc_type="wiki" so that raw/ source files cannot backfill
-# [CONTEXT] slots via the force_rag bypass.
-#
-# When plan.force_rag=False (normal P4 corpus route), query_corpus() must
-# be called with doc_type=None — raw/ files remain fully eligible.
-# ---------------------------------------------------------------------------
-
-class TestForceRagDocTypeFilter:
-    """
-    Lock in the conditional doc_type argument to query_corpus() introduced
-    by the raw/-in-RAG fix (force_rag path restricted to wiki docs only).
-
-    Each test injects a RoutingPlan directly via patch.object so the
-    force_rag flag can be set precisely without relying on Planner routing.
-    """
-
-    def _make_plan(self, *, force_rag: bool) -> RoutingPlan:
-        return RoutingPlan(
-            agent          = "conversational_agent",
-            fetch_episodic = False,
-            fetch_rag      = True,
-            force_rag      = force_rag,
-            priority       = 6,
-        )
-
-    def test_force_rag_true_calls_query_corpus_with_wiki_doc_type(self):
-        """When force_rag=True, Step 4's query_corpus() call must use doc_type='wiki'."""
-        mm = MagicMock()
-        mm.query_corpus.return_value = []
-        conv = make_conv_agent()
-        ctrl = ControllerAgent(runtime=make_runtime(), agents=[conv], memory_manager=mm)
-        plan = self._make_plan(force_rag=True)
-
-        with patch.object(ctrl._planner, "route", return_value=plan):
-            ctrl.handle_task({"instruction": "Who are you?"})
-
-        # call_args_list[0] is Step 4 (RAG fetch); later calls are _load_persona() etc.
-        assert mm.query_corpus.call_count >= 1
-        _, step4_kwargs = mm.query_corpus.call_args_list[0]
-        assert step4_kwargs.get("doc_type") == "wiki", (
-            f"Expected doc_type='wiki' when force_rag=True; got {step4_kwargs.get('doc_type')!r}"
-        )
-
-    def test_force_rag_false_calls_query_corpus_with_no_doc_type_filter(self):
-        """When force_rag=False, Step 4's query_corpus() call must use doc_type=None (no filter)."""
-        mm = MagicMock()
-        mm.query_corpus.return_value = []
-        conv = make_conv_agent()
-        ctrl = ControllerAgent(runtime=make_runtime(), agents=[conv], memory_manager=mm)
-        plan = self._make_plan(force_rag=False)
-
-        with patch.object(ctrl._planner, "route", return_value=plan):
-            ctrl.handle_task({"instruction": "check the wiki for Localist architecture"})
-
-        assert mm.query_corpus.call_count >= 1
-        _, step4_kwargs = mm.query_corpus.call_args_list[0]
-        assert step4_kwargs.get("doc_type") is None, (
-            f"Expected doc_type=None when force_rag=False; got {step4_kwargs.get('doc_type')!r}"
-        )
-
 
 # ---------------------------------------------------------------------------
 # Step 5d — WorkingMemoryState (Slot 6A) wiring
@@ -1048,7 +983,6 @@ class TestWorkingStateSlot6A:
             agent          = "conversational_agent",
             fetch_episodic = False,
             fetch_rag      = fetch_rag,
-            force_rag      = False,
             priority       = 4,
             graph_query    = graph_query,
         )
@@ -1141,3 +1075,101 @@ class TestWorkingStateSlot6A:
         prompt = conv._received[0].context["_prebuilt_prompt"]
         assert "[CONTEXT]" in prompt
         assert "Localist architecture content" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Post-P4a removal: query_corpus always called without doc_type (Part 4B)
+# ---------------------------------------------------------------------------
+
+class TestQueryCorpusNeverReceivesDocType:
+    """
+    After removing force_rag, Step 4's query_corpus() call must never pass
+    doc_type — the kwarg was dropped entirely (not set to None explicitly),
+    so it should be absent from call_kwargs.
+
+    Any plan with fetch_rag=True exercises this code path.
+    """
+
+    def test_step4_query_corpus_has_no_doc_type_kwarg(self):
+        """Step 4 query_corpus() must not pass doc_type under any plan."""
+        mm = MagicMock()
+        mm.query_corpus.return_value = []
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[conv], memory_manager=mm)
+
+        plan = RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = True,
+            priority       = 4,
+        )
+
+        with patch.object(ctrl._planner, "route", return_value=plan):
+            ctrl.handle_task({"instruction": "check the wiki for Localist"})
+
+        assert mm.query_corpus.call_count >= 1
+        _, step4_kwargs = mm.query_corpus.call_args_list[0]
+        assert "doc_type" not in step4_kwargs, (
+            f"doc_type must not be passed to query_corpus after force_rag removal; "
+            f"got doc_type={step4_kwargs.get('doc_type')!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Post-P4a removal: relevance threshold is now unconditional (Part 4C)
+# ---------------------------------------------------------------------------
+
+class TestRelevanceThresholdUnconditional:
+    """
+    Under the old code, force_rag=True bypassed the 0.55 relevance_score
+    threshold so documents below it were included in rag_sources.  After
+    removing force_rag, the threshold is unconditional: a low-scoring document
+    must always be excluded regardless of plan contents.
+    """
+
+    def test_low_score_doc_excluded_no_bypass(self):
+        """A doc with relevance_score < 0.55 must not appear in the prompt."""
+        low_doc = _mock_doc("/wiki/low-relevance.md", "Some low-relevance content.")
+        low_doc.relevance_score = 0.40   # below 0.55 — would have been included by force_rag
+
+        mm = MagicMock()
+        mm.query_corpus.return_value = [low_doc]
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[conv], memory_manager=mm)
+
+        plan = RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = True,
+            priority       = 4,
+        )
+
+        with patch.object(ctrl._planner, "route", return_value=plan):
+            ctrl.handle_task({"instruction": "check the wiki for LORA"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "Some low-relevance content." not in prompt, (
+            "Low-score document must be excluded: threshold is now unconditional"
+        )
+        assert "[CONTEXT]" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# RoutingPlan no longer accepts force_rag keyword argument (Part 4D)
+# ---------------------------------------------------------------------------
+
+class TestRoutingPlanNoForceRagField:
+    """
+    Confirm force_rag was genuinely removed from the RoutingPlan dataclass,
+    not merely left unused.  Passing force_rag=True must raise TypeError.
+    """
+
+    def test_force_rag_kwarg_raises_type_error(self):
+        import pytest
+        with pytest.raises(TypeError):
+            RoutingPlan(
+                agent          = "conversational_agent",
+                fetch_episodic = False,
+                fetch_rag      = False,
+                force_rag      = True,   # no longer a field — must raise
+            )

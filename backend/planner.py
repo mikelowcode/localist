@@ -65,10 +65,6 @@ class RoutingPlan:
     compound :
         True → multiple signal types detected; ControllerAgent sequences
         execution in priority order.
-    force_rag :
-        True → bypass relevance_score threshold in RAG filter.
-        Set by priorities that guarantee document relevance via keyword
-        match (e.g. Priority 4a identity trigger).
     graph_query :
         (direction, node_id, resolved_stem) when Priority 3c matched a
         structural graph lookup; None otherwise. direction is "incoming"
@@ -83,7 +79,6 @@ class RoutingPlan:
     write_episode:  bool       = False
     episode_type:   str | None = None
     compound:       bool       = False
-    force_rag:      bool       = False
     priority:       int        = 6
     graph_query:    tuple[str, int, str] | None = None
 
@@ -153,25 +148,6 @@ _WIKI_QUERY_KEYWORDS: frozenset[str] = frozenset({
     "from the wiki",
     "in the wiki",
     "vault",
-})
-
-# Priority 4a — identity trigger keywords
-# Matched before Priority 4 (explicit wiki/vault) so identity questions
-# never fall to P6. Forces fetch_rag=True to retrieve how-localist-works.md.
-_IDENTITY_KEYWORDS: frozenset[str] = frozenset({
-    "who are you",
-    "what are you",
-    "tell me about yourself",
-    "what can you do",
-    "are you an ai",
-    "are you a bot",
-    "what is lora",
-    "who is lora",
-    "what is localist",
-    "are you made by google",
-    "are you chatgpt",
-    "are you gemma",
-    "introduce yourself",
 })
 
 # Priority 3 — URL fetch trigger keywords (explicit only)
@@ -443,7 +419,6 @@ class Planner:
                                but defers to file_op/url_fetch (inline guard)
       3.  Tool signal        — deterministic keyword check
       3b. Factual query      — keyword + corpus miss → web_search
-      4a. Identity trigger   — deterministic keyword check (forces RAG)
       4.  Corpus signal      — deterministic score threshold check
       5.  Episodic relevance — single bounded inference call (added in 3.3)
       6.  Direct answer      — fallback (added in 3.4)
@@ -619,11 +594,6 @@ class Planner:
 
         # Priority 3b — Factual query + corpus miss
         plan = self._priority3b_factual(instruction, lowered)
-        if plan is not None:
-            return plan
-
-        # Priority 4a — Identity trigger
-        plan = self._priority4a_identity(lowered)
         if plan is not None:
             return plan
 
@@ -875,9 +845,8 @@ class Planner:
           - name resolution fails at all tiers (zero or ambiguous matches).
 
         On success, returns a RoutingPlan with graph_query set and
-        fetch_rag/fetch_episodic/force_rag all False — graph-query turns
-        are deliberately pure/minimal, never combined with RAG or episodic
-        context (Phase C design).
+        fetch_rag/fetch_episodic all False — graph-query turns are deliberately
+        pure/minimal, never combined with RAG or episodic context (Phase C design).
         """
         # 1. Inline file_op/url_fetch guard.
         #    Intentionally duplicates three lines from _priority3_tool() —
@@ -949,7 +918,6 @@ class Planner:
             agent          = "conversational_agent",
             fetch_episodic = False,
             fetch_rag      = False,
-            force_rag      = False,
             compound       = False,
             priority       = 3,
             graph_query    = (direction, node_id, resolved_stem),
@@ -1004,54 +972,6 @@ class Planner:
             tools_to_call  = ["web_search"],
             compound       = True,
             priority       = 3,
-        )
-
-    # -----------------------------------------------------------------------
-    # Priority 4a — Identity trigger  (§4.2, Priority 4a)
-    # -----------------------------------------------------------------------
-
-    def _priority4a_identity(self, lowered: str) -> RoutingPlan | None:
-        """
-        Match condition: instruction contains an identity trigger keyword.
-
-        Fires before Priority 4 (explicit wiki/vault) so that identity
-        questions are never routed to P6 (direct answer). Forces fetch_rag=True
-        so how-localist-works.md is retrieved from the corpus and injected into
-        Slot 4, giving Gemma 4B the context it needs to answer correctly.
-
-        Uses _any_whole_word() for whole-phrase matching — prevents false
-        positives (e.g. "what can you do with this file" should NOT trigger).
-
-        Returns a RoutingPlan with fetch_rag=True, or None if no match.
-        """
-        matched_kw = self._any_whole_word(_IDENTITY_KEYWORDS, lowered)
-        if matched_kw is None:
-            return None
-
-        # Guard against false positives where the identity phrase is just a
-        # prefix (e.g. "what can you do with this file"). Strip the matched
-        # keyword from the instruction; if meaningful words remain, the
-        # instruction is a task request, not an identity question.
-        remaining = re.sub(
-            r"\b" + re.escape(matched_kw) + r"\b", "", lowered, count=1
-        ).strip().strip("?!.,")
-        if remaining:
-            logger.debug(
-                "Planner: Priority 4a skipped — keyword %r followed by %r.",
-                matched_kw, remaining,
-            )
-            return None
-
-        logger.debug(
-            "Planner: Priority 4a matched (keyword=%r).", matched_kw
-        )
-        return RoutingPlan(
-            agent          = "conversational_agent",
-            fetch_episodic = False,
-            fetch_rag      = True,
-            force_rag      = True,
-            compound       = False,
-            priority       = 4,
         )
 
     # -----------------------------------------------------------------------
