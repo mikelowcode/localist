@@ -28,6 +28,7 @@ from memory_manager import (
     WorkingStateStore,
     format_episodic_summary,
     VALID_EPISODE_TYPES,
+    _query_hash,
 )
 
 
@@ -78,6 +79,28 @@ def _all_rows(db_path: Path) -> list[sqlite3.Row]:
     rows = conn.execute("SELECT * FROM episodes ORDER BY id").fetchall()
     conn.close()
     return rows
+
+
+# ---------------------------------------------------------------------------
+# _query_hash — cache key includes doc_type (fix for retrieval_cache collision)
+# ---------------------------------------------------------------------------
+
+class TestQueryHash:
+    """_query_hash must produce distinct keys for different doc_type values."""
+
+    def test_none_vs_wiki_differ(self):
+        h_none = _query_hash("Who are you?", 3, None)
+        h_wiki = _query_hash("Who are you?", 3, "wiki")
+        assert h_none != h_wiki
+
+    def test_wiki_vs_raw_differ(self):
+        h_wiki = _query_hash("Who are you?", 3, "wiki")
+        h_raw  = _query_hash("Who are you?", 3, "raw")
+        assert h_wiki != h_raw
+
+    def test_same_inputs_stable(self):
+        assert _query_hash("q", 5, "wiki") == _query_hash("q", 5, "wiki")
+        assert _query_hash("q", 5, None)   == _query_hash("q", 5, None)
 
 
 # ---------------------------------------------------------------------------

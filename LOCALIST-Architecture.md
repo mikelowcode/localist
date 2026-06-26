@@ -18,6 +18,7 @@
 7. [Localist UI](#7-localist-ui)
 8. [Graph Retrieval Layer](#8-graph-retrieval-layer)
 9. [Slot 6A — Structured Working State](#9-slot-6a--structured-working-state)
+10. [Semantic Search-Intent Classifier](#10-semantic-search-intent-classifier)
 
 ---
 
@@ -820,6 +821,473 @@ The stable-prefix/dynamic-suffix contract locked in §3.7a is the groundwork for
 
 This is explicitly a forward-looking architectural bet, not a fix for a currently-observed metric. No current backend in this codebase can produce a user-message cache hit; this is expected and accepted (§3.7) and should not be treated as a regression in future live-testing sessions.
 
+*Flagged 2026-06-23: live `/admin/api/cache/probe` evidence in §3.7c below directly contradicts the "no current backend... can produce a user-message cache hit" claim above. §3.7 and this paragraph are NOT yet edited to reflect this — that edit is deliberately deferred to a future session per standing discipline (lock the finding, decide on action items, then update the doc). Treat the claim above as superseded-but-not-yet-corrected in the prose until that edit happens.*
+
+---
+
+### 3.7c Open Item — Live Cache-Mechanism Findings and Candidate Follow-Up Actions (2026-06-23)
+
+**Status: forward-looking open item. Findings below are confirmed via live source-reading and a live probe call. The four candidate actions are NOT yet decided, scoped, or scheduled — this section exists to preserve the option space before the next session picks a subset to act on.**
+
+#### Confirmed mechanism (supersedes §3.7's session-continuity framing)
+
+Source-read directly from the installed oMLX package
+(`/opt/homebrew/Cellar/omlx/0.4.2/libexec/lib/python3.11/site-packages/omlx/`)
+and confirmed live via `POST /admin/api/cache/probe`:
+
+- oMLX's prefix cache is **role-blind and session-blind**. It hashes fixed-size
+  token-ID blocks (`compute_block_hash`, `paged_cache.py:78–119`) chained from a
+  fixed root seed (`b"omlx-root"`) — it has no concept of "session," "history,"
+  or "system vs. user message." §3.7's premise that caching requires the
+  *client* to assert continuity (a session ID, a growing `messages` array) is
+  incorrect. A client sending one isolated system+user pair per HTTP call —
+  exactly what `OMLXRuntimeClient.infer()` does — can and does produce real
+  cache hits on identical leading token blocks across separate, unrelated
+  calls, with no client-side change required.
+- Block size for the currently-loaded model is **512 tokens**, not the
+  256-token default documented in `scheduler.py:904` —
+  `_align_block_size_with_rotating_window()` overrides this at load time for
+  Gemma 4's rotating-window attention. Confirmed live via probe response
+  (`block_size: 512`), not assumed from source alone.
+- Live probe data (two real Localist-shaped prompts, ~780–800 tokens each,
+  system prompt + `[TOOL RESULTS]` + `[WORKING MEMORY]` held byte-identical,
+  only `[INSTRUCTION]` varying): both prompts produced exactly 2 blocks. Block
+  0 (tokens 0–511) was cached (`ssd_disk`) for both, confirmed already-warmed
+  from a prior 20-call diagnostic run. Block 1 (the remaining ~270–280 tokens)
+  was cold for both. Partial trailing blocks are never stored by
+  `store_cache` — block 1 is **unconditionally** cold regardless of content,
+  not cold because the instruction text differed. At current prompt lengths,
+  instruction-content divergence has **zero effect** on cache behavior, since
+  the only token range it could affect never gets cached in the first place.
+- `blocks_ssd_hot: 0` on both probes — the cached block was sitting in the SSD
+  cold tier, not the in-memory hot tier, at probe time (server/model had been
+  reloaded since the diagnostic run). A real inference call right now would
+  pay one SSD read for block 0 rather than a RAM hit.
+- The endpoint is `POST /admin/api/cache/probe`, not `/admin/probe_cache` as
+  an earlier investigation guessed from release notes alone — corrected here
+  for any future session that wants to re-run this check. Response is
+  aggregate counts only (`total_tokens`, `block_size`, `total_blocks`,
+  `blocks_ssd_hot`, `blocks_ssd_disk`, `blocks_cold`, `ssd_hit_tokens`,
+  `cold_tokens`) — no per-block detail.
+- **Three structurally distinct system messages compete for block 0, with
+  zero cross-sharing, confirmed by direct source read (2026-06-23).** The
+  warm-up fixture's system message (Lever 3, below), the main
+  conversational call's per-turn system message (persona + `PromptBuilder`
+  slots), and `_WORKING_STATE_UPDATE_SYSTEM` (the fixed constant used by
+  `extract_working_state_update()`'s post-response Tier 2 call) are three
+  different byte sequences from token 0. Since the cache is content-hashed
+  with no session or role awareness, none of these three call types can
+  ever produce a block-0 cache hit against either of the other two — they
+  are three separate, mutually non-overlapping cache lineages, not one
+  cache being destabilized by another. This was identified live: a
+  production session showed `blocks_cold` accumulating tokens turn over
+  turn with `blocks_ssd_hot` frozen at its single post-warm-up value (512
+  tokens cached out of 6,019 total prefill tokens after several turns —
+  8.5% efficiency, down from 25% after the first conversational call). An
+  embedding-call interference theory was proposed and **disproven by direct
+  source read**: `EmbeddingEngine` (in `embedding_engine.py`) runs entirely
+  in-process via `mlx_embeddings`, makes no HTTP call to oMLX at all, and
+  the module's own docstring states "OMLXRuntimeClient.embed() is NOT
+  called anywhere for corpus embeddings" — there is no code path by which
+  an embedding call touches oMLX's cache. The three-system-message finding
+  is the better-supported explanation, confirmed by reading
+  `_WORKING_STATE_UPDATE_SYSTEM`'s literal content against the other two
+  system messages, not yet confirmed by a live diagnostic isolating each
+  lineage's contribution independently. **Not yet actioned** — see Lever 3
+  update below and the live working-state-update outcome diagnostic
+  currently in progress (§10.4-adjacent; not yet a numbered open item as
+  of this update).
+
+#### Candidate follow-up actions (Lever 3 now implemented and confirmed; 1, 2, 4 remain option space)
+
+**Lever 1 — Grow the persona to widen the structurally-cacheable portion of
+block 0.** The system message currently occupies only ~159 of block 0's 512
+tokens; the remainder is dynamic-suffix content that happens to fit in block
+0 only by coincidence of current prompt length. Growing persona content
+toward the existing 500-token/2000-char ceiling (already sanctioned by
+§3.7a, ~381 tokens of headroom) would increase the *guaranteed*-stable
+portion of block 0, making cache reliability less sensitive to small changes
+in dynamic-suffix length. Cheap; no routing or slot-order change required.
+
+*Added context (2026-06-23, post-Lever-3 verification): the oMLX dashboard's
+own Serving Stats reports 58.4% cache efficiency (512 of 877 total prefill
+tokens cached) for the warm-up fixture's prompt shape in isolation — this is
+the real per-call baseline Lever 1 would be improving on. The ceiling on
+efficiency for any single prompt of this approximate length is structural:
+block 1 (the trailing partial block) is unconditionally uncacheable
+regardless of what Lever 1 does to block 0's composition. Separately, in a
+real multi-turn session, overall efficiency falls well below even this
+58.4% figure (observed: 8.5% after several turns) — see the new
+three-system-message finding above. Lever 1 addresses block 0's *internal*
+reliability for a single call shape; it does not address the
+multi-lineage problem.*
+
+**Lever 2 — Reconsider whether dynamic-suffix ordering has real cache payoff
+at longer prompt lengths.** §3.7a currently states the dynamic-suffix slot
+order (episodic → profile → RAG → tool results → working memory →
+instruction) "reflects conceptual layering... not cache eligibility." That
+statement was correct under the old (incorrect) session-continuity model. If
+real multi-turn sessions push prompts past ~1024 tokens (a third block),
+placing the most-stable dynamic slots (episodic, profile) immediately after
+the system message could make a second block cacheable on turns where that
+content doesn't change — but this is conditional on real session data
+showing episodic/profile content is actually stable enough turn-to-turn, not
+just stable within one frozen diagnostic fixture. Needs a live diagnostic
+before any slot-order change; not assumed to pay off.
+
+**Lever 3 — Pre-warm block 0 at startup. IMPLEMENTED AND CONFIRMED
+(2026-06-23).** Implemented as `run_cache_warmup()` in `backend/warmup.py`,
+hooked into `main.py`'s `lifespan()` immediately after
+`_state.controller = controller` and before the "ControllerAgent ready" log
+line. A single best-effort `runtime.infer()` call, built via the real
+`PromptBuilder.build()` against a dedicated fixture
+(`templates/warmup_fixture.md`, parsed by `parse_warmup_fixture()`), runs
+once per backend process boot. Fails open: any failure (oMLX unreachable,
+fixture missing/malformed, prompt assembly error) is logged as a warning
+and startup proceeds normally with no warm cache, never raising and never
+delaying server readiness beyond the warm-up call's own duration.
+
+Design decision, locked during implementation: success is defined as block 0
+reaching *any* cache-resident tier (disk or hot), not specifically the hot
+tier. Disk-resident-but-not-yet-hot is an acceptable end state, since
+disk→hot promotion was separately confirmed (see below) to be cheap and
+synchronous whenever it happens. The hook issues exactly one call — no
+polling, no retry, no second call to force hot-tier promotion.
+
+Verification chain (all live, against the real running system, in order):
+1. Initial probe-tool diagnostic (this section's "Confirmed mechanism"
+   findings above) established the baseline mechanism and predicted Lever
+   3's effect.
+2. A zero-delay follow-up diagnostic confirmed disk→hot promotion is
+   **synchronous, complete before `infer()` returns** (visible at a
+   measured 2.3 µs post-call probe latency) — resolving an open question
+   from the first Lever-3-shaped diagnostic about whether promotion was
+   async. (The reverse direction — cold→disk write timing — was not
+   resolved and remains genuinely untested; see "Still open" below.)
+3. Implementation (`warmup.py` + `warmup_fixture.md` + `main.py` hook),
+   352/352 tests passing, 0 regressions from the pre-implementation
+   342-test baseline.
+4. Fixture content reviewed directly for realism (concrete wiki-search and
+   note-fetch tool outputs, a substantive six-turn research conversation) —
+   judged qualitatively realistic, not a synthetic placeholder.
+5. Fixture's real token/block shape confirmed against the actual tokenizer
+   and probe endpoint: 877 tokens, 2 blocks, block 0 = tokens 0–511 —
+   structurally identical in composition to the original diagnostic
+   prompts despite being meaningfully longer in content. No 3-block
+   overflow; no shape mismatch with production traffic's expected block 0.
+6. Live verification against a real `start_localist.sh` boot (oMLX
+   pre-confirmed reachable via health check; model not yet loaded —
+   `loaded_count: 0` — so this run also exercised cold model load, not
+   cache promotion alone): startup logs showed
+   `Cache warm-up complete — block 0 promoted to cache-resident tier
+   (8874 ms)`, followed immediately by `ControllerAgent ready` and
+   `Application startup complete`, confirming hook ordering is correct —
+   it runs and completes before the server accepts any request. A
+   post-boot probe (preceded only by passive health-check polls, no real
+   chat requests) showed: `total_tokens: 877`, `total_blocks: 2`,
+   `blocks_ssd_hot: 1`, `blocks_cold: 1` (the unconditionally-cold tail,
+   as expected), `ssd_hit_tokens: 512`. Cross-checked independently via
+   the oMLX dashboard's Serving Stats panel (a separate UI/instrumentation
+   path from the `/admin/api/cache/probe` endpoint): Total Prefill Tokens
+   877, Cached Tokens 512 — exact agreement with the probe figures via a
+   wholly independent measurement surface.
+
+**Verdict: confirmed, with a real limitation surfaced after live
+deployment.** A single warm-up call at backend boot reliably promotes
+block 0 to a cache-resident tier before any real user request, with
+negligible added risk (fail-open, single call, no production dependency on
+the diagnostic-only probe endpoint) — this part of the original prediction
+holds exactly as tested. **What was not anticipated:** in real multi-turn
+production use, the warm-up's cache-resident block 0 is never hit again,
+because neither the main conversational call nor the Tier 2 working-state
+call shares a byte-identical system message with the warm-up fixture (see
+the three-system-message finding above). The hook does exactly what it was
+built and tested to do; it does not, by itself, improve steady-state
+multi-turn cache efficiency, which depends on a separate question (whether
+any of the three call types can be made to share a leading block) not
+addressed by this implementation.
+
+**One nuance for future reference:** the 8874 ms warm-up duration observed
+in live verification includes cold *model load* time (the model was not
+resident in oMLX at all before this test — `loaded_count: 0`), not warm-up
+prefill time alone. On a boot where oMLX already has the model loaded (e.g.
+if the backend restarts more often than oMLX does), the warm-up call's
+duration would be substantially lower — this number should not be read as
+the steady-state cost of the hook.
+
+**Still open, not resolved by this work:**
+- Cold→disk write timing (the original ambiguity from the first
+  Lever-3-shaped diagnostic) was never directly tested — every subsequent
+  run either found disk already populated or jumped straight from cold to
+  hot in a way that didn't isolate the write step. Low practical urgency
+  now, since disk→hot promotion is confirmed cheap regardless of how long
+  the write itself takes, but it remains a genuine gap in the mechanism
+  picture, not a closed question.
+- The oMLX dashboard displays an idle-unload countdown for the loaded model
+  (observed: "idle 4m 54s / ~10m 6s left" before eviction in one session,
+  and separately "idle 13m 59s / ~1m 1s left" in another). If this is a
+  real eviction policy and not just a display artifact, it has direct
+  bearing on Lever 3: a long-idle Localist session could see oMLX unload
+  the model entirely, after which the *next* real request — not the
+  warm-up hook, which only runs once at backend boot — would pay the full
+  cold-load cost again. Unscoped and unconfirmed; flagging only so it
+  isn't lost.
+- The dashboard's separate "Runtime Cache Observability" panel reports a
+  distinct "Memory: _ MB / 2.0 GB · N entries" figure (observed values
+  varying across sessions: 28 MB/1 entry shortly after one boot, 392
+  MB/14 entries after a multi-turn session reached 8.5% efficiency). This
+  appears to be a different cache-accounting surface from the
+  `blocks_ssd_hot`/`blocks_ssd_disk` block-tier model documented above —
+  its relationship to block-level tier state, and whether "entries" tracks
+  per-cache-lineage state (which would make 14 entries plausibly
+  correspond to the three-system-message finding's competing lineages,
+  accumulating over turns), is not understood and was not investigated.
+  Noted as an unexplained observation, not folded into the confirmed
+  mechanism above.
+- **New, highest-priority follow-up:** whether any of Levers 1/2/4, or a
+  new fifth option (making the Tier 2 working-state call and/or the main
+  conversational call share a byte-identical leading system message with
+  each other or with the warm-up fixture), would address the real
+  multi-turn efficiency problem the three-system-message finding
+  describes. Not scoped. A live diagnostic logging pass on
+  `extract_working_state_update()`'s outcomes (separate from cache
+  mechanics — see working-state-update Tier 2 pre-gate work) is in
+  progress as of this update and may independently reduce one of the
+  three competing lineages if its outcome leads to gating that call on
+  some turns.
+
+**Highest-priority follow-up — IMPLEMENTED 2026-06-23 (same day as
+diagnosis): all three calls now share a byte-identical leading prefix.**
+
+Implemented via a new `_build_wsu_system(persona)` in `episodic_extractor.py`,
+which constructs the Tier 2 system message as
+`PromptBuilder._slot1_system(persona) + "\n\n" + _WSU_TASK_INSTRUCTIONS`
+(the renamed, content-unchanged former `_WORKING_STATE_UPDATE_SYSTEM`).
+`extract_working_state_update()` and `process_working_state_update()` each
+gained a `persona: str | None = None` parameter, threaded from
+`controller_agent.py`'s existing `self._load_persona()` call at the Tier 2
+call site (~line 1249) — reusing the already-cached persona load from the
+same turn's main-call construction, not a second corpus query. Lever 1
+(persona growth) was folded into this same fix, since a shared prefix only
+has practical cache value if it's long enough to cover a meaningful portion
+of block 0: `lora-persona.md` was grown from ~476 chars (~119 tokens) to
+1,951 chars (~487 tokens) — real, previously-authored content (an earlier
+draft of the persona, trimmed back down to fit the existing 500-token
+`_CEIL_PERSONA` ceiling) rather than invented padding. `_SYSTEM` (160 chars)
++ this persona lands at ~528 tokens combined — 16 tokens past the 512-token
+block-0 boundary, meaning block 0 is now covered entirely by content
+genuinely shared across all three call sites, with a small uncontested
+margin into block 1.
+
+*What's confirmed, and at what strength of evidence:*
+- **Confirmed by test, with the real on-disk persona file (not a
+  placeholder string):** `_build_wsu_system(actual_persona)` produces output
+  whose leading bytes are identical, string-for-string, to
+  `PromptBuilder()._slot1_system(actual_persona)` — proven via a dedicated
+  test that reads `wiki/lora-persona.md` from disk, parses it through the
+  same `parse_wiki_doc().body[:2000]` path `_load_persona()` itself uses,
+  and asserts both the byte-identical prefix and the exact suffix shape
+  (`"\n\n" + _WSU_TASK_INSTRUCTIONS`, nothing duplicated or mangled at the
+  seam). This is real, code-level proof that the *construction* is correct.
+- **Not yet confirmed live:** whether this construction-level fix actually
+  changes `blocks_ssd_hot` / cache-efficiency behavior in a real multi-turn
+  session — i.e., whether the original 8.5%-efficiency finding improves.
+  The byte-identical-prefix test proves the prompts *would* hash to the
+  same lineage; it does not, by itself, re-run the live diagnostic that
+  measured the original problem. That re-verification (re-running the same
+  kind of multi-turn session and re-probing `/admin/api/cache/probe` or the
+  oMLX dashboard's Serving Stats) has not yet been done as of this writing
+  and is the natural next step before this item can be marked fully closed
+  rather than "implemented and unit-verified."
+- **A separate, narrower gap worth naming:** `lora-persona.md`'s on-disk
+  edit required re-indexing into `document_index` for `_load_persona()`
+  (which reads via `query_corpus()` from the DB, never from disk directly)
+  to actually serve the new content — this was done via direct SQL update
+  against `localist_memory.db` (content, token_set, and content_hash
+  refreshed; existing embedding preserved rather than recomputed, since the
+  identity/persona document is not typically retrieved via semantic
+  similarity). The stray, unreferenced `lora_memory.db` was also updated in
+  the same operation — outside the stated scope of the request that
+  prompted it. Harmless given that file's confirmed unreferenced status,
+  but logged explicitly per the project's standing discipline of not
+  letting out-of-scope side-effects pass without comment, however benign.
+
+**Lever 4 — Treat the trailing partial block's unconditional coldness as a
+budget signal, not a defect to fix.** Since the trailing partial block is
+*always* cold regardless of content or ordering, there may be limited ROI in
+optimizing slot order within it. The more relevant move may be ensuring
+expensive-to-recompute content (long RAG snippets, long tool results) lands
+in the cacheable leading block(s) wherever possible, while accepting that
+cheap, naturally-volatile content (the instruction itself) is what gets
+recomputed every time regardless of ordering.
+
+**Explicitly NOT recommended, regardless of which levers are pursued:**
+artificially padding prompts to force a block boundary purely to improve a
+cache-efficiency number — this trades a real, certain prefill cost for an
+uncertain caching benefit with no evidence of net positive ROI.
+
+**Current state (updated 2026-06-23):** Lever 3 is implemented, tested, and
+live-verified as doing exactly what it was built to do — but live
+multi-turn deployment surfaced that the original four-lever framing did not
+anticipate the real driver of steady-state cache efficiency: three
+structurally distinct system messages in rotation, none sharing a leading
+block with any other. This is now the most important open question in this
+section, ahead of Levers 1, 2, and 4 as originally scoped. Levers 1, 2, and
+4 remain undecided option space, unchanged from the original framing, and
+none has been scoped into a Claude Code prompt.
+
+---
+
+### 3.7c Update — Live Re-Verification of the Shared-Prefix Fix: Negative (2026-06-24)
+
+The "not yet confirmed live" item flagged in the implementation writeup above has now
+been tested directly, in a real multi-turn session, with a real `/admin/api/cache/probe`
+cross-check. The result is negative — documented here in full so it is not mistaken for
+"still pending" in any future session.
+
+1. **Persona content and combined system-message length independently re-confirmed,
+   byte-exact, from three separate sources this session:** `cat`'d directly from
+   `wiki/lora-persona.md` (1,951 chars, matching the implementation record above exactly);
+   reconstructing `_SYSTEM + "\n\n" + persona` from this disk content produces exactly
+   **2,113 characters**, matching both a real live backend log's own `system_chars=2113`
+   debug field (from a `13:19:04` conversational turn this session) and an independently
+   built `/admin/api/cache/probe` payload. All three agree exactly — there is no remaining
+   doubt about what the real per-turn system message currently contains, nor any doubt that
+   the construction described above is what's actually running in production right now.
+
+2. **Two real conversational turns ran with this exact 2,113-character / 525-token system
+   message** (confirmed via live backend log `_execute_plan: assembled system_prompt:`
+   dumps, identical text on both turns), the model already warm for the second of the two
+   (no cold-load confound).
+
+3. **`POST /admin/api/cache/probe`, run immediately after, against this exact payload,
+   twice in direct succession:** identical result both times —
+
+   ```
+   total_tokens: 525, block_size: 512, total_blocks: 2,
+   blocks_ssd_hot: 0, blocks_ssd_disk: 0, blocks_cold: 2,
+   ssd_hit_tokens: 0, cold_tokens: 525
+   ```
+
+   Fully cold, both blocks, both calls. Not the "block 0 hit, block 1 cold" pattern the fix
+   was designed to produce for this lineage.
+
+4. **Probe self-write ruled out as a confound:** sending identical content to the probe
+   twice in a row with no real inference call in between also showed fully cold both times
+   — consistent with the endpoint's own documented behavior (a hash-and-check walk against
+   existing cache state, not a prefill) and confirming the probe itself never writes to
+   cache. The two real conversational turns were the only events in this test capable of
+   writing cache state for this content; neither produced a hit on the immediately-following
+   probe.
+
+5. **Aggregate dashboard efficiency climbed from 23.8% → 30.3%** over the same live session
+   window (session-scoped, cleared beforehand; cached tokens 1,536 → 3,072, both exact
+   multiples of the 512-token block size) — a real, positive trend, but uninformative about
+   *which* of the three competing system-message lineages produced it, since the figure
+   aggregates all prefill traffic without attribution. Fully consistent with this
+   persona-bearing lineage getting zero hits while some other lineage (most plausibly the
+   warm-up fixture re-hitting itself) accounts for the entire observed gain.
+
+**Verdict: the fix remains correctly implemented at the construction level (re-confirmed
+independently this session) but is NOT producing the cache benefit it was designed to
+produce, based on direct live evidence rather than absence of evidence.** This should be
+read as a genuine negative result going forward, not as "still awaiting verification."
+
+**Root cause is not yet diagnosed; per standing project discipline, no fix should be
+proposed before it is.** Candidate explanations, none yet investigated:
+- The two turns observed may not have been the first time this content was ever sent —
+  if the most recent model reload (confirmed to have happened earlier in this session)
+  invalidated prior cache state, these two turns would both be "after invalidation, before
+  re-caching," not proof the content has never cached. Not ruled out.
+- Whether `OMLXRuntimeClient.infer_stream()`'s real streaming call path triggers the same
+  `store_cache` behavior as the warm-up hook's non-streaming `infer()` call has not been
+  directly checked — Lever 3's cache-writing behavior is confirmed only for the non-streaming
+  path. If streaming and non-streaming calls are handled differently by oMLX's own caching
+  logic, this would be a previously-unconsidered mechanism gap.
+- Whether oMLX's block-hash chaining has any dependency beyond the system message's own
+  token range (e.g. generation parameters such as `temperature`/`max_tokens`) is speculative
+  and not source-confirmed, but not yet ruled out either.
+
+**Next step (not yet started):** a direct source read of oMLX's `store_cache` call path
+(same installed-package directory used for the original 2026-06-23 mechanism read), followed
+by a targeted live test isolating streaming vs. non-streaming calls against identical content.
+
+---
+
+### 3.7c Update — Dashboard Observation, Sustained High Efficiency Across Restarts (2026-06-25)
+
+A new aggregate data point, recorded as supporting evidence for this open investigation — **not**
+a probe-confirmed finding, and explicitly not given the same evidentiary weight as the byte-level
+verification above. Per this project's "verify the mechanism, not just the correlation" discipline,
+this is logged as a dashboard reading pending live-probe confirmation, not as a resolved result.
+
+**Correction, added immediately after this entry was first written:** this session was run on
+**oMLX v0.4.4**, confirmed completed before this session began and consistent as a single binary for
+the session's entire duration — not a mid-session change, and not a variable that differs between
+the dashboard observation below and the rest of this session's work. Every prior entry in this §3.7c
+thread — the original 2026-06-23 mechanism finding, the 2026-06-24 negative-result probe, and the
+source-code read citing `/opt/homebrew/Cellar/omlx/0.4.2/...` — was conducted against v0.4.2, on
+separate earlier sessions. The confound is at the boundary between this session and that prior work,
+not within this session. The upgrade was not staged as a planned, controlled variable for this
+investigation; it is logged here as a confound identified after this entry was first drafted, not as
+a deliberate variable the analysis below was designed to isolate. **The "why is this notable"
+analysis below was originally written assuming same-binary continuity with the 2026-06-24 probe —
+that assumption is false.** The analysis is left in place rather than deleted, because the question
+it raises (does sustained high efficiency survive restart/standby) is still a real question — but
+every conclusion below must now be read as "possibly a v0.4.2 mechanism finding, possibly simply how
+v0.4.4 behaves," with no way to distinguish those from a dashboard reading alone.
+
+**Observation:** during this session's live testing (the Open Item 11 reproduction and gate-
+calibration/backstop verification work, recorded above), the oMLX Serving Stats dashboard reported,
+for `gemma-4-e4b-it-4bit`, all-time/session figures of: 41,236 total prefill tokens, 26,112 cached
+tokens, **63.3% cache efficiency**. Reported as sustained — i.e., not reset to near-zero — despite
+the Localist Runtime being restarted and the model going idle/into standby multiple times over the
+course of the session.
+
+**Why this is notable relative to the existing negative result — now qualified by the version
+confound above:** the 2026-06-24 update found fully cold probe results (`blocks_ssd_hot: 0,
+cold_tokens: 525`) for two real, identically-worded conversational turns on **v0.4.2**, against a
+dashboard efficiency climbing only modestly (23.8% → 30.3%) over that session — and explicitly
+concluded that modest aggregate gain was uninformative and likely attributable to a different
+lineage entirely (the warm-up fixture self-hitting). 63.3%, persisting across multiple
+restart/standby cycles, is a substantially larger and more durable figure than anything previously
+recorded for this investigation — but it was recorded on **v0.4.4**, a different binary, so it
+cannot be directly compared to the 23.8%/30.3%/cold-probe figures as if they were the same system
+at two points in time. If this dashboard number reflects real, mechanism-confirmed cache reuse,
+restart/standby persistence would be new information not covered by either candidate explanation
+already on file (model reload invalidating cache state; streaming vs. non-streaming `store_cache`
+differences) — but it would be new information about **v0.4.4 specifically**, not necessarily a
+correction to what was found on v0.4.2.
+
+**What this does NOT establish, stated plainly — now a longer list given the version confound:**
+this is one dashboard reading, not a live `/admin/api/cache/probe` call against known, byte-confirmed
+content, and not attributed to any specific lineage (system message vs. user message vs. some other
+prefill source). It carries the same aggregation problem the 2026-06-24 entry already named — the
+figure sums all prefill traffic without distinguishing which calls, paths, or content produced the
+hits. It does not, on its own, overturn the 2026-06-24 negative result for the specific
+persona-bearing system-message lineage that result was about — both because of the aggregation
+problem and now because of the version difference, either of which independently breaks any direct
+comparison. It also does not establish that v0.4.2's documented cold-probe behavior would reproduce
+or fail to reproduce on v0.4.4; that is now an open, distinct question this entry cannot answer.
+
+**Status: logged as supporting evidence, investigation remains open — now with an added
+prerequisite.** This raises the priority of the next step already named above (direct source read
+of `store_cache`, followed by a targeted live test isolating streaming vs. non-streaming calls) —
+the restart/standby persistence detail is a new and specific enough observation that it may be worth
+probing directly rather than waiting for it to recur. **However, given the v0.4.2 → v0.4.4 version
+confound identified above, that source read must now target the v0.4.4 installed package path, not
+the v0.4.2 path cited in the original 2026-06-23 finding (`/opt/homebrew/Cellar/omlx/0.4.2/...`) —
+the two versions' `store_cache` implementations cannot be assumed identical without checking.** Not
+yet investigated as of this entry; no mechanism claim is made for either version.
+
+---
+
+*(Reminder, unchanged from before: §3.7 and §3.7b's "no current backend...
+can produce a user-message cache hit" line is still flagged inline as
+superseded but not yet corrected — see line 824 of the current doc. That
+edit remains a deliberately separate, unbundled task and was not addressed
+in this update.)*
+
 ---
 
 ## 4. Planner Routing Model
@@ -1525,54 +1993,6 @@ equivalent reverse proxy. The `/api` prefix is stripped before forwarding.
 
 ---
 
----
-
-### Session — 2026-06-18
-
-*Identity RAG fix (Item 1):*
-- `backend/raw/how-localist-works.md` authored (1,009 chars, under 1,600)
-  and ingested into wiki corpus as a research note.
-- `planner.py`: `_IDENTITY_KEYWORDS` frozenset (13 keywords) added;
-  `_priority4a_identity()` method added with `_any_whole_word()` matching
-  and trailing-content false-positive guard; wired into `route()` between
-  Priority 3b and Priority 4; `RoutingPlan.force_rag` field added.
-- `controller_agent.py`: `_load_persona()` path filter added — only
-  `lora-persona` path accepted into Slot 1b (top-3 fetch, path filter);
-  RAG filter updated to bypass score threshold when `plan.force_rag=True`.
-- Live verified: "Who are you?" → P4a matched → `lora-persona.md` in
-  Slot 1b (system_chars=403) → `how-localist-works.md` in Slot 4
-  (rag_sources=2) → LORA identifies correctly.
-- Test suite: 184 tests, 0 failures.
-
-*Known issue resolved:*
-- SQLite-persisted retrieval cache (`retrieval_cache` table, `valid` flag)
-  does not invalidate on direct `MemoryManager.index_document()` calls that
-  bypass the write path. Workaround: manual `UPDATE retrieval_cache SET
-  valid = 0`. Long-term fix: ensure all ingest paths go through the
-  canonical `/ingest` HTTP endpoint.
-
-*User profile continuity (Item 2 — partial):*
-- `backend/wiki/users/michael.md` authored: 5 sections (Identity,
-  Active Projects, Preferences, Working Patterns, Decisions), 20 fact
-  lines, no prose.
-- `prompt_builder.py`: `UserProfileFact` dataclass added; `_CEIL_PROFILE
-  = 100` added; `_slot3_episodic()` replaced by `_slot3_combined(bullets,
-  profile_facts)` with independent 150/100-token sub-budgets; `build()`
-  gains `profile_facts=` parameter (backwards-compatible).
-- `controller_agent.py`: `_embed()` helper delegates to
-  `MemoryManager._embed_fn`; `_load_user_profile()` lazy-loads and
-  embeds 20 fact lines at first request; `_score_profile_facts()` scores
-  via cosine similarity (threshold 0.45, top 5); Step 5b wired into
-  `_execute_plan()` firing on P4, P4a, P5, and episodic-bullet turns;
-  `profile_facts=` passed to `PromptBuilder.build()`.
-- Live verified: "What are my working patterns?" → P4 corpus route →
-  20/20 fact lines loaded → 5 working-pattern facts injected →
-  `[USER PROFILE]` block in assembled prompt → LORA answered correctly.
-- Graph retrieval layer (concept relationship reasoning) deferred to
-  next session as planned.
-
----
-
 ## 8. Graph Retrieval Layer
 
 ### 8.1 Scope
@@ -1963,22 +2383,117 @@ applied only when `force_rag=True`.
 `TestForceRagDocTypeFilter`: `test_force_rag_true_calls_query_corpus_with_wiki_doc_type` and
 `test_force_rag_false_calls_query_corpus_with_no_doc_type_filter`), 0 failures.
 
-**Open Item 9 — Empty `[CONTEXT]` on identity-route queries. OPEN, deferred as of 2026-06-21.**
+**Open Item 9 — Empty `[CONTEXT]` on identity-route queries. CLOSED 2026-06-22.**
 
-*Observed in the same live-verification pass as Open Item 8's fix:* for two of the three
-identity-route reproduction queries (`"Who are you?"` and `"What can you do?"`),
-`query_corpus(doc_type="wiki")` returned only `lora-persona.md` as a relevant wiki candidate —
-which is then excluded by the existing persona-exclusion guard
-(`not str(doc.path).endswith("lora-persona.md")`). The net result: `[CONTEXT]` is empty for these
-identity questions post-fix, rather than backfilled with irrelevant `raw/` material as before.
+*Originally:* observed in the same live-verification pass as Open Item 8's fix (2026-06-21) — for
+two of the three identity-route reproduction queries (`"Who are you?"` and `"What can you do?"`),
+`query_corpus(doc_type="wiki")` returned only `lora-persona.md` as a relevant wiki candidate, which
+the existing persona-exclusion guard then removed, leaving `[CONTEXT]` empty. Logged as open, no
+fix direction decided, pending a live-tested diagnostic pass across more identity-phrasing variants.
 
-Strictly better than the prior bug — no incorrect material is supplied. But it means some identity
-questions currently get no RAG grounding at all. This gap was pre-existing but obscured by the
-`raw/` backfill. Not a regression introduced by the Open Item 8 fix.
+*Diagnostic pass (2026-06-22):* all 13 `_IDENTITY_KEYWORDS` phrasings from `planner.py` were run
+through a read-only probe against the live backend, capturing each query's full top-3
+`query_corpus(doc_type="wiki")` result set plus a direct cosine-similarity score against
+`lora-persona.md` specifically (independent of whether persona made the top-3). Result: 11 of 13
+phrasings returned populated `[CONTEXT]` (1–2 survivors after persona exclusion); the same two
+phrasings from the original observation (`"Who are you?"`, `"What can you do?"`) remained empty.
+Persona similarity for the two empty cases (0.490, 0.484) was solidly mid-range, ruling out
+"persona's score is unusually dominant" as the mechanism — both cases returned only one document
+in their top-3 entirely, with that document being `lora-persona.md`.
 
-*No decision made on a fix direction.* Not scoped further in this session; flagged for a future
-session consistent with this project's standard discipline for under-specified findings — gather
-more occurrences and evaluate scope before treating as a fix-ready item.
+*Two candidate mechanisms were proposed and disproven before the actual root cause was found —
+preserved here deliberately, not smoothed over, per this project's standing discipline of stating
+plainly when an informal description turns out wrong on fresh investigation:*
+
+1. *Keyword-Jaccard bottleneck (disproven).* Hypothesis: `query_corpus()`'s two-stage pipeline
+   (rank all docs by keyword Jaccard overlap, re-rank the top `2×max_results` by cosine) was
+   producing a shrunken candidate pool for these two low-keyword-overlap phrasings. Direct
+   inspection of `query_corpus()` disproved this: `pool = scored[:max_results*2]` and
+   `top = scored[:max_results]` are unconditional slices with no internal threshold, dedupe, or
+   early-exit — the function's own logic guarantees exactly `max_results` results whenever at
+   least that many documents of the requested `doc_type` exist, regardless of score values. A
+   live corpus-size check (`document_count(doc_type="wiki")` = 6) confirmed the corpus itself
+   was never the constraint either.
+2. *Relative-path cache drift (disproven).* A first live trace of the two failing queries showed
+   `_check_cache()` returning a hit, with a cached payload whose paths appeared to be short
+   filenames (`lora-persona.md`) rather than the absolute paths `document_index` currently stores
+   — suggesting a path-format migration had silently broken cache hydration. A second, deeper
+   trace disproved this directly: the short filenames were a display artifact of the trace
+   script itself (printing `Path(e["path"]).name` instead of the full stored path); the underlying
+   cache payload always contained correct, matching absolute paths. `git log` confirmed
+   `index_document()` has used `Path(path).resolve()` since the very first commit that introduced
+   `MemoryManager` — there was never a relative-path era for this table.
+
+*Actual root cause:* `_query_hash(query, top_n)` in `memory_manager.py` hashed only the query
+string and `max_results` — `doc_type` was never part of the cache key. `query_corpus()` calls this
+hash with the same `query`/`max_results` regardless of `doc_type`, so a `retrieval_cache` entry
+written for one `doc_type` (e.g. `None`, wiki+raw combined) could be served as a hit for a later
+call with a different `doc_type` (e.g. `"wiki"`). `_hydrate_cache_result()` then filters the
+already-hydrated cached docs down to the requested `doc_type` *after* retrieval, silently dropping
+any cached docs of the wrong type. Both originally-failing queries had real, valid (`valid=1`)
+cache entries written for `doc_type=None` at an earlier point — `"Who are you?"` on 2026-06-18,
+`"What can you do?"` on 2026-06-21 — each containing 3 absolute paths (a mix of `wiki/` and `raw/`
+docs). On a `doc_type="wiki"` call, only the single `wiki/` doc in each cached payload survived
+the post-hoc filter, and that doc was `lora-persona.md` in both cases — which the persona-exclusion
+guard then removed, yielding empty `[CONTEXT]`. This is not specific to P4a or to identity
+questions: any caller of `query_corpus()` that varies `doc_type` across calls sharing the same
+query text and `max_results` is exposed to the same collision. It happened to surface through the
+P4a route because P4a is the only caller that forces `doc_type="wiki"` on text that other routes
+or earlier sessions may have queried with `doc_type=None`.
+
+*Fix:* `_query_hash()`'s signature extended to `_query_hash(query: str, top_n: int, doc_type: str
+| None)`, with `doc_type` folded into the hashed string. Its one call site, inside `query_corpus()`,
+updated to pass `doc_type` through. No other method (`_write_cache`, `_check_cache`,
+`_hydrate_cache_result`) required modification — `_write_cache` already accepted a pre-computed
+hash string and `_check_cache`/`_hydrate_cache_result` are agnostic to how the hash was derived.
+No schema change — `doc_type` enters the hash input only, not a stored column. Existing cache rows
+computed under the old 2-field hash become unreachable under the new 3-field key and are left in
+place rather than purged; this is harmless and intentional — a fresh 3-field-keyed cache miss now
+falls through correctly to a real keyword+embedding re-rank for any query previously polluted by a
+cross-`doc_type` collision.
+
+*Separately found, separately fixed (not folded into this root cause, by deliberate choice — see
+§10's precedent for treating co-occurring failure shapes independently):* `backfill_embeddings.py`
+writes directly to `document_index.embedding` via its own raw `sqlite3.Connection`, bypassing
+`MemoryManager` and never calling `_invalidate_cache()`. A single `UPDATE retrieval_cache SET
+valid = 0` was added once after the script's embedding-update loop completes (not per-row),
+matching the script's existing raw-SQL pattern rather than refactoring it to construct a
+`MemoryManager`.
+
+*Live-verified, in stages, against three different conditions before the real one was confirmed —
+preserved here as a worked example of the project's "verify the mechanism, not just a
+symptom-correlation" discipline, the second such pattern this arc surfaced after mount-staleness:*
+
+1. A first re-run returned 3 docs for both queries — but against a freshly-reindexed, *empty*
+   database using the keyword-only fallback path (no embed model loaded), which is a different
+   code branch than the one that produced the original bug. Confirmed the fix's mechanism in
+   isolation; did not confirm it against the original failure's actual conditions.
+2. A second re-run, intended to use the real database, was discovered to have connected to
+   `lora_memory.db` — a known stray, empty, unreferenced database left over from an earlier
+   wrong-target `build_graph.py` run (see §8, Validation-Run Results) — rather than the real
+   production database. This was caught before being accepted as evidence, the same discipline
+   applied to source-file mount staleness now applied to database-file ambiguity.
+3. A corrected final run confirmed, from source (`main.py` → `backend/.env`'s
+   `LOCALIST_MEMORY_DB` setting → resolved working-directory path), the real database path
+   (`backend/localist_memory.db`); confirmed the original two stale `retrieval_cache` rows
+   (same `query_hash`, same `created_at` timestamps as originally traced) were still present and
+   still `valid=1` in that real database; computed both the old 2-field hash and the new 3-field
+   hash for both queries side by side, showing them to be different values (non-collision
+   demonstrated directly, not inferred); and re-ran both queries with the real `EmbeddingEngine`
+   against the real database, returning 3 documents each at cosine-similarity-range scores
+   (0.39–0.49, as opposed to the 0.0–0.05 range a keyword-only fallback would produce — confirmed
+   explicitly to rule out a repeat of stage 1's branch ambiguity).
+
+*Known, accepted gap:* verification in stage 3 constructed a standalone `MemoryManager` pointed at
+the confirmed real database and real `embed_fn`, rather than exercising the actual running FastAPI
+backend end-to-end through its HTTP endpoint — the backend was not running at verification time.
+`controller_agent.py`'s P4a branch is a thin wrapper around the identical `query_corpus()` call
+shape that was tested, so divergence risk is low, but this was not a full HTTP-level confirmation
+and is recorded as such rather than overstated.
+
+*Test suite:* 339 → 342 (+3 tests in `tests/test_memory_phase1.py`, class `TestQueryHash`:
+hash differs for `doc_type=None` vs `"wiki"`, differs for `"wiki"` vs `"raw"`, and is stable for
+identical inputs), 0 failures.
 
 **Open Item 10 — `_priority4a_identity()` missing `priority` field. CLOSED 2026-06-21.**
 
@@ -2014,266 +2529,306 @@ correction.
 *Test suite:* 288 → 289 (+1: `test_p4a_identity_returns_priority_4` in
 `tests/test_planner_phase3.py`, class `TestPlannerPriorities`), 0 failures.
 
----
+**Open Item 11 — Fabricated tool-call syntax in generation output. OPEN, mechanism unknown,
+2026-06-22.**
 
-### Session — 2026-06-19
-
-*Graph Retrieval Layer Phase A/B:*
-- `wiki_doc.py` created: `parse_wiki_doc()` / `load_wiki_doc()` returns `ParsedWikiDoc(frontmatter, body, links)` as frozen dataclasses; PyYAML parses ISO dates as `datetime.date` objects (PyYAML 6.0 behavior, empirically confirmed); 12 tests in `tests/test_wiki_doc.py` using verbatim real corpus fixtures. `PyYAML>=6.0` added to `requirements.txt`.
-- `controller_agent.py` updated: `_load_persona()` strips frontmatter before truncating persona body; `_load_user_profile()` calls `load_wiki_doc()` and operates on body lines only. Both verified zero-behavior-change for current files. 4 tests added to `tests/test_controller_phase4.py`; profile test isolation fix applied (patch `pathlib.Path.exists` + `controller_agent.load_wiki_doc`).
-- `wiki_agent.py` updated: `_validate_links()` added — section-scoped (`### Mapped Pages` H3, `## Related Pages` H2); normalization `link_text.lower().replace(" ", "-")`; wired between `parse_model_xml()` and journaling; unresolved links in `AgentResult.output["unresolved_links"]`; content never modified. 8 tests in `tests/test_wiki_agent.py` (new file); `_FakeRuntime` protocol-shaped fake established as convention for `WikiAgent.run()` tests to prevent `hasattr(rt, "infer_with_file")` false positives from `MagicMock`.
-- `memory_manager.py` updated: `graph_nodes` and `graph_edges` tables added as v2→v3 migration (`_SCHEMA_VERSION = 3`); four new public methods: `upsert_graph_node()` (INSERT ... ON CONFLICT DO UPDATE, returns id), `upsert_graph_edge()` (SELECT + UPDATE-or-INSERT by natural key), `clear_graph_for_doc()` (per-document edge clear), `clear_graph_edges()` (whole-corpus edge clear). 6 new tests in `TestGraphSchema` in `tests/test_memory_phase1.py`.
-- `build_graph.py` created: offline two-pass builder; normalization rule byte-for-byte identical to `_validate_links()`; same-page-same-target duplicate `[[...]]` links collapse to one edge row per unique `(source_doc_path, target_path)` pair (graph counts relationships, not link-mention occurrences); `doc_path` uses absolute resolved paths matching `document_index.path` convention; 10 tests in `tests/test_build_graph.py` (new file).
-- Validation run (real corpus, 2026-06-19): 5 nodes, 11 edges, 8 resolved, 3 unresolved. See §8.7.
-- Test suite: **224 tests, 0 failures** across 9 test files.
-
----
-
-### Session — 2026-06-19 (Live Testing, Evening)
-
-*Live verification of fixes from earlier session:*
-- **Persona/profile frontmatter stripping** (`_load_persona()`, `_load_user_profile()`): confirmed correct — system_chars stable at 403; no stray YAML visible in assembled prompt.
-- **RAG frontmatter stripping** (`parse_wiki_doc(doc.content).body[:2000]` in Step 4 of `_execute_plan()`): confirmed correct — RAG source content begins at body text, not YAML block.
-- **Cross-turn working memory (`session_id`)**: confirmed correct — second turn's `[WORKING MEMORY]` slot contains first turn's instruction and assistant response; memory persists across turns within the same page load.
-
-*New finding (recorded, not evaluated):*
-- `query_corpus()` is surfacing content from `raw/` as a RAG source alongside wiki pages. Observed in live session but not investigated or acted on. Flagged for evaluation in a future session — may indicate the document index includes `raw/` files without the distinction that `build_graph.py` enforces (wiki-only nodes).
-
-*Confirmed not a bug:*
-- LLM response appearing to cut off mid-sentence in one live turn was model/sampling behavior, not a streaming or PromptBuilder truncation defect. Response resumed correctly on the next token sample. No code change warranted.
-
-*Prefix stability (§3.7):*
-- Zero KV-cache hits confirmed across two independent live data points (T1→T2, T2→T3). Root cause documented in §3.7. Named as highest-priority item for the next session.
-
-*Test suite:* **231 tests, 0 failures** across 9 test files (7 new tests added this session: 3 RAG frontmatter + 4 session_id/working-memory).
-
----
-
-### Session — 2026-06-20
-
-*Prefix-stability investigation closed as a documentation/framing correction:*
-- Root cause identified: `OMLXRuntimeClient.infer_stream()` sends one system message + one user message per HTTP call with no message-history accumulation and no session identifier — verified by reading `omlx_runtime_client.py` directly. Zero user-turn cache hits is an expected structural property of this contract, not a slot-ordering defect.
-- No code changes required. `PromptBuilder.build()`'s existing slot order already matches the dynamic-suffix ordering this finding converged on.
-- Stable-prefix / dynamic-suffix contract formalized in §3.7a: system message (Slot 1a + 1b) = stable prefix; user message (Slots 3a–7) = dynamic suffix; terms added to §3.1 as canonical vocabulary.
-- §3.7 retitled and reframed as a resolved finding. "Design direction" options preserved as historical record, marked superseded.
-- APC future direction noted in §3.7b (unscheduled, direction statement only).
-- Slot-order regression test added: `test_pb_e_build_enforces_dynamic_suffix_slot_order` and `test_pb_f_slot3_profile_only_precedes_context` in `tests/test_prompt_builder.py`; both reference §3.7a in their docstrings.
-- Persona-minimalism constraint superseded: `lora-persona.md` may now grow as plain undifferentiated prose (no internal section headers) to absorb durable static-rules content, up to the existing 500-token hard ceiling. No ceiling change made. Current actual size ~241 chars / ~60 tokens (~12% of cap).
-- §3.2 Slot 1b updated: stale five-section structure description replaced with accurate plain-prose description; new growth-allowance rule added to Rules list.
-- Test suite: **233 tests, 0 failures** across 9 test files (2 new tests added this session).
-
-*WikiAgent prompt tightening — Rule 7 (same session, later prompt):*
-- Rule 7 added to both `build_user_prompt()` and `build_slim_prompt()` in `wiki_agent.py`: `[[...]]` link targets in `### Mapped Pages` and `## Related Pages` must match an existing or self-proposed `page_name` verbatim — not a paraphrase, not a title, not a longer or shorter description. `_EXAMPLE` placeholder updated from `existing-page` to `localist-software-stack` with reason text illustrating the verbatim constraint. No change to `_validate_links()` normalization or scope (locked per §8.4).
-- 3 new tests in `tests/test_wiki_agent.py`: Rule 7 present in both prompt functions with identical wording; Rules 1–6 text unchanged. Test suite: **236 tests, 0 failures**.
-- §8.6 cross-reference note added (this session) orienting future readers to Rule 7 as the write-time companion to `_validate_links()`.
-- §8.8 Open Item 1 (WikiAgent prompt wording) is now implemented and can be considered closed.
-
-*Documentation refresh — persona figures (same session, latest prompt):*
-- Persona token-count figures updated throughout the doc to reflect the post-rewrite size: **~476 chars / ~119 tokens (~24% of the 500-token cap)**. The earlier session-log reference "~241 chars / ~60 tokens (~12% of cap)" remains in this entry as a historical record of the size at that point in the session.
-- §3.7 `system_chars = 403` (2026-06-19 live-session record) annotated inline to clarify it predates the persona rewrite; current estimate (~159 tokens / ~636 chars) noted alongside without altering the recorded value.
-- §3.2 Slot 1b persona-structure description updated: sentence count corrected from four to five; size figures updated to match actual file.
-- No code files modified.
-
----
-
-### Session — 2026-06-20 (Phase C: Graph Retrieval Layer)
-
-*Five-prompt Phase C build sequence:*
-- **Prompt 1 (MemoryManager graph read methods):** `resolve_node_by_stem()`,
-  `get_backlinks()`, `get_outgoing_links()`, `GraphEdgeResult`. `list_graph_node_stems()`
-  was not in the original scope — the gap was found during Prompt 4 (Planner P3c wiring);
-  the implementation lives here because it is a `MemoryManager` method. Test suite:
-  236 → 242 (+6 tests).
-- **Prompt 2 (PromptBuilder graph slot):** `GraphQueryResult`/`GraphLinkEntry` input
-  dataclasses (deliberately decoupled from `memory_manager.GraphEdgeResult` to preserve
-  `prompt_builder.py`'s pure-Python constraint); `_slot_graph()` method; `_CEIL_GRAPH = 300`
-  ceiling; `graph_result=` parameter wired into `build()`. Test suite: 242 → 251 (+9 tests).
-- **Prompt 3 (Planner extraction + name resolution):** `extract_graph_query()` and
-  `resolve_graph_target()` standalone functions (`TestGraphQueryExtraction` and
-  `TestGraphNameResolution` classes in `tests/test_planner_phase3.py`). Scope strictly limited
-  to the two parsing/resolution helpers — no `route()` changes, no `RoutingPlan` changes, no
-  `MemoryManager` calls. Test suite: 251 → 266 (+15 tests).
-- **Prompt 4 (Planner P3c wiring):** `RoutingPlan.graph_query` field;
-  `_priority3c_graph_query()` method; P3c inserted in `route()` before P3; and
-  `list_graph_node_stems()` added to `MemoryManager` (gap found in this prompt — no existing
-  method listed all node stems). Test suite: 266 → 273 (+7 tests).
-- **Prompt 5 (ControllerAgent wiring):** Step 5c in `_execute_plan()` — fetches edges when
-  `plan.graph_query` is set, converts `GraphEdgeResult` → `GraphLinkEntry`/`GraphQueryResult`,
-  passes to `PromptBuilder.build()`. `link_text` (not `target_path`) used as display name for
-  unresolved targets to preserve original author casing. Pure/minimal guarantee confirmed by
-  a dedicated leak-marker test. Test suite: 273 → 279 (+6 tests). Zero failures throughout.
-
-*Two discrepancies found and resolved against the locked design during implementation:*
-- **No `page_name` field in `graph_nodes`.** The design assumed a `page_name` column for name
-  resolution. Actual schema (§8.3) has no such field. Resolution is stem-based via
-  `Path(doc_path).stem`. Prompted the addition of `list_graph_node_stems()` — no pre-existing
-  method listed all stems for the candidate list passed to `resolve_graph_target()`.
-- **P3c-before-P3 ordering.** The design required graph-query to win over a web_search-only
-  P3 match. This is only satisfiable if P3c runs before `_priority3_tool()` — if P3c ran
-  after, a web_search-only match would already have caused `route()` to return. See §8.1
-  ordering-correction note. Locked in by `test_p3c_beats_web_search_p3` in
-  `tests/test_planner_phase3.py`.
-
-*Live-testing arc:*
-- `"What links to localist-build-order?"` failed on first live test. Root cause:
-  `graph_nodes`/`graph_edges` were empty — `build_graph.py` had never been run against the
-  live backend database. Not a code bug; the Planner correctly logged "name resolution failed"
-  because the candidate stem list was empty.
-- After running `build_graph.py`, P3c still failed. The actual bug: the `__main__` block called
-  `MemoryManager()` with no path, defaulting to `lora_memory.db`, while the live backend uses
-  `localist_memory.db` (per `main.py:254`). The script reported success but silently populated
-  the wrong file.
-- Fixed by hardcoding `_BACKEND_DIR / "localist_memory.db"` in the `__main__` block. After
-  re-running: 5 nodes, 11 edges, 8 resolved, 3 unresolved — matching §8.7 exactly.
-  `Planner.route("What links to localist-build-order?")` returned
-  `graph_query=('incoming', 2, 'localist-build-order')` against the correct database,
-  confirming end-to-end P3c resolution.
-
-*`wiki/users/michael.md` exclusion confirmed:* `build_graph.py`'s non-recursive
-`wiki_dir.iterdir()` walk correctly excludes subdirectory entries, including
-`wiki/users/michael.md`. This is correct behavior by design. Resolves a question raised
-but left open during the Planner prompt's report.
-
-*Stray `lora_memory.db`:* Created by the first wrongly-targeted `build_graph.py` run.
-Contains graph data only (no `document_index` content); not referenced by any code path.
-Left in place; safe to delete in a future cleanup session.
-
-*Test suite:* **279 tests, 0 failures** across 10 test files. No new test files; all
-Phase C tests added to existing files.
-
-*One open item carried forward (see §8.8, Item 7):* the `build_graph.py` manual-trigger
-gap that allowed the production database to remain empty until manual testing caught it.
-Item 6 (RAG frontmatter regression) was closed in the 2026-06-21 session — see that
-session-log entry below.
-
----
-
-### Session — 2026-06-21
-
-*Open Item 6 closed — RAG frontmatter regression root-caused and fixed:*
-
-**Diagnostic phase (read-only):** A fresh diagnostic pass confirmed the root cause was
-not in `controller_agent.py` Step 4 (already correct), not in `memory_manager.py`'s
-retrieval cache (stores scores/paths only; content re-fetched fresh from `document_index`
-on every cache hit), and not in `prompt_builder.py`'s `_slot4_rag()` (renders
-`RagSource.content` as-is, no re-fetch). Static scan of all six `wiki/` files on disk
-plus the six `document_index` rows in the live `localist_memory.db` revealed the actual
-defect: four model-generated docs (`how-localist-works.md`, `localist-build-order.md`,
-`localist-master-project-outline.md`, `localist-software-stack.md`) each have a leading
-blank line (`'\n'`) as line 0, with the `---` frontmatter fence on line 1. This was
-confirmed by `repr()` inspection of the raw bytes — no BOM, no `\r\n` mismatch, no
-missing closing fence; simply a stray blank line prepended by Gemma before writing.
-
-**Root-cause trace:** `parse_model_xml()` in `wiki_agent.py` assigns
-`entry["content"] = raw_content` without `.strip()`. `page_name` and `page_type` are
-stripped two lines above; `content` is not. Gemma's XML output places a newline
-immediately after the opening `<content>` tag in practice (the few-shot `_EXAMPLE`
-template does not demonstrate one). That `\n` is never stripped anywhere downstream —
-not in `_shield_content_blocks()`, not in `parse_model_xml()`, not in
-`write_text_file()`. It becomes line 0 on disk. `parse_wiki_doc()` evaluates only
-`lines[0].rstrip("\r\n") == "---"`; when line 0 is blank, the frontmatter branch is
-never entered, `frontmatter = {}` and `body = content` (full file including the YAML
-block) are returned silently. The Step 4 call site `parse_wiki_doc(doc.content).body[:2000]`
-executes correctly; the body it receives is already the full file, so the frontmatter
-passes through to `RagSource.content` and into `[CONTEXT]`. The 2026-06-19 fix was real
-and correctly placed — it was defeated by write-time malformation it could not detect.
-
-**Fix:**
-- Write-time: `.strip()` added to `raw_content` in `parse_model_xml()` before
-  `entry["content"]` assignment, covering both the `__CONTENT_N__` placeholder path (the
-  normal model-output path) and the direct-`findtext` path identically.
-- Read-time: `parse_wiki_doc()` in `wiki_doc.py` hardened with `fence_idx` detection
-  tolerating exactly one leading blank line before the opening `---` fence. The condition
-  is bounded (`len(lines) >= 2 and lines[0].rstrip("\r\n") == "" and lines[1].rstrip("\r\n") == "---"`)
-  — not unbounded stripping, to avoid masking deeper structural problems. The existing
-  no-closing-fence fallback (`frontmatter = {}`, `body = content`) is preserved exactly.
-  No re-indexing required: `parse_wiki_doc()` runs at read time in Step 4; `index_document()`
-  stores raw file content and calls no parser. Confirmed by re-reading both `index_document()`
-  and the Step 4 call site fresh.
-
-**Follow-up confirmation pass (same session, after fix landed):** Verified that the two
-new tests covering the no-fence-found fallback and the standard-fence-at-line-0 case use
-generic inline fixture strings rather than the real `lora-persona.md` or
-`wiki/users/michael.md` content. Closed the gap with a direct disk-read check: both files
-confirmed `body == content` exactly (`frontmatter == {}`, no truncation, no mutation,
-`fence_idx = None` for both — `lora-persona.md` starts with `"You are LORA…"`,
-`users/michael.md` starts with `"## Identity"`). The persona-cache call site in
-`_load_persona()` confirmed unaffected — `parse_wiki_doc()` returns full file body
-unchanged for a no-fence document, identical pre/post-fix.
-
-**Live verification:** `MemoryManager.query_corpus("localist build order phases development
-roadmap")` against live `localist_memory.db` (keyword-only, `use_embeddings=False`)
-returned three previously-affected docs; all produced clean `[CONTEXT]` bodies starting
-at `## Summary` with no YAML block. Actual excerpt for `localist-build-order`:
+*Originally:* a single live turn produced a fabricated tool-call string as the model's entire
+visible output, in place of a synthesized answer. Instruction: `"Do a web search then tell when
+Microsoft's first formal investment in OpenAI was?"`. Backend logs confirmed routing, LangSearch
+dispatch, and prompt assembly all completed correctly — `[TOOL RESULTS]` in the assembled user
+prompt contained three real search results before generation. The model's raw completion was:
 
 ```
-## Summary
-
-This document outlines the nine-phase development roadmap for the Localist project...
+<|toolcall>call:websearch{query: "when was microsoft's first formal investment in openai"}<tool_call|>
 ```
 
-**Test suite:** 279 → 286 (+7 tests, 0 failures). New tests: 4 in `test_wiki_doc.py`
-(leading-blank-parses-frontmatter, leading-blank-body-clean,
-leading-blank-no-close-fence-fallback-unchanged, standard-fence-at-line-zero-unaffected);
-3 in `test_wiki_agent.py` (strips-leading-newline, strips-trailing-whitespace,
-strips-trailing-only). All 286 tests pass.
+This tag matches no real format used anywhere in this codebase. `OMLXRuntimeClient.infer()`'s
+chat-completions payload contains no `tools` or `tool_choice` field at all — confirmed by direct
+inspection of `omlx_runtime_client.py` — so there is no real tool-calling contract for the model
+to be honoring or malforming. The string was invented by the model, most likely reflecting
+tool-call-shaped patterns present in its training data despite this harness never exposing that
+capability.
 
-*Open Item 7 remains open.* No code change was made to `build_graph.py` or its trigger
-path in this session.
+*Diagnostic (read-only, same day):* a standalone script (`diagnostics/diag_toolcall_fabrication.py`)
+reconstructed the exact system prompt, `[TOOL RESULTS]` block, and `[WORKING MEMORY]` block from
+the incident's backend log as a fixed fixture, varying only the final `[INSTRUCTION]` line across
+4 phrasing variants — including the original instruction verbatim (Variant A) — at 5 repeat runs
+each (20 total live `OMLXRuntimeClient.infer()` calls, `temperature=0.30`, `max_tokens=1024`,
+matching the incident's real call parameters). Variants tested: (A) original exact phrasing, (B)
+search reframed as already-done ("Based on the search results..."), (C) no mention of search at
+all, (D) explicit statement that search already happened.
 
----
+*Result:* 0/20 fabrications. Every run across all four variants correctly treated `[TOOL RESULTS]`
+as already-resolved search content and produced a grounded (if sometimes hedged/inconclusive)
+answer rather than fabricating a tool-call string. This closes the original phrasing hypothesis —
+the literal instruction "do a web search" is not, on its own, a reliable trigger — but does not
+explain the original incident, which did occur once, live, under what appears to be the same
+prompt shape.
 
-### Session — 2026-06-21 (`raw/`-in-RAG fix, Open Items 8–9)
+*Mechanism: unknown.* The diagnostic fixture is a faithful reconstruction of what the backend log
+*displayed*, but is not a guaranteed faithful reconstruction of full live session state at the
+exact moment of the incident — e.g. the true stored `[WORKING MEMORY]` turn content (persisted via
+`MemoryManager.get_context_window()`) could in principle diverge from what a finite log excerpt
+showed, and that possibility has not been ruled out. No diagnostic has yet tested temperatures
+other than 0.30, run counts beyond 20 per variant, or working-memory content other than the one
+fixture pulled from the original log excerpt.
 
-*`raw/`-in-RAG finding reproduced, root-caused, and fixed (see §8.8, Open Item 8):*
+*Status:* not reproduced; not root-caused; no fix direction proposed or evaluated. Logged as a
+single confirmed live occurrence with unknown recurrence rate. Per this project's standard
+discipline for under-specified findings, this should not be treated as fix-ready until either (a)
+it recurs and a fuller live state capture is available, or (b) a wider diagnostic sweep (higher
+run count, varied temperature, varied working-memory content) establishes a non-zero reproduction
+rate. A passive detection guard in `conversational_agent.py` (flagging this output pattern at
+generation time and logging the full real prompt that produced it) has been suggested as a future
+non-fix instrumentation step, not yet scheduled or implemented.
 
-**Reproduction:** The inline observation from the 2026-06-19 evening session was reproduced
-live. Three P4a identity-route queries (`"What is Localist?"`, `"Who are you?"`, `"What can you
-do?"`) each confirmed `raw/` files reaching `[CONTEXT]`, always via the `force_rag=True` bypass
-set by Priority 4a. No `raw/` result in any test cleared the 0.55 threshold on its own merit
-(scores 0.0070–0.4206). Worst case — `"Who are you?"`: `lora-persona.md` scored highest (0.5023)
-but was excluded by the persona-exclusion guard, leaving both remaining `[CONTEXT]` slots filled
-by `raw/how-localist-works.md` (0.4206) and `raw/Localist Master Project Outline.md` (0.4166).
+*Cross-reference (2026-06-23):* §9.5 Open Item 4 confirms, via live diagnostic, a structurally
+different but topically related issue on a different call (`extract_working_state_update()`,
+`max_tokens=200`) — the model emits a `reasoning_content` delta stream that consumes the full
+token budget before any parseable output reaches `content`. This is **not** offered as an
+explanation for this item's fabricated tool-call string, which occurred on the main conversational
+call (`max_tokens=1024`) under different parameters and remains independently unreproduced and
+unexplained. Noted only because both findings involve this model/serving setup producing unexpected
+output shaped around its own internal process, on calls this codebase's parsers were not written
+expecting. Do not treat Open Item 4 as having root-caused this item.
 
-**Root cause:** `controller_agent.py` Step 4's `query_corpus()` call passed no `doc_type` filter,
-so `wiki` and `raw` documents competed in a single ranked pool. Because `plan.force_rag=True`
-bypasses the 0.55 threshold entirely, any `raw/` file landing in the top 3 was automatically
-included with no quality floor.
+*Second live occurrence, 2026-06-24, 12:34 — different trigger shape, real backend log captured
+directly (not reconstructed from a screenshot/chat excerpt).* Instruction:
+`"What do you know about LangSmith Engine?"`. Unlike the original incident, **no tool fired**:
+Priority 3's semantic gate scored `knowledge_request_open` highest (0.643) with `gate_fired=False`,
+so the plan carried `tools=[]`. The conversational call (`temp=0.30, max_tokens=1024,
+prompt_chars=610`, full `[TOOL RESULTS]` block absent from the prompt — there was none to include)
+returned, as the model's entire visible answer:
 
-**Fix:** `doc_type="wiki" if plan.force_rag else None` added to the `query_corpus()` call in Step
-4. Restricts the candidate pool at the source for the identity-route path; no second filter pass
-after the fact. No changes to `memory_manager.py` — `query_corpus()`'s existing `doc_type`
-parameter already supported this. `raw/` files remain fully eligible for the normal non-identity
-routing path, unchanged.
+```
+<|tool_call>call:web_search{query:<|"|>LangSmith Engine<|"|>}<tool_call|>
+```
 
-**Live verification post-fix:** Same three reproduction queries re-run — no `doc_type='raw'`
-document appeared in any. Normal RAG path confirmed unaffected: a sample non-identity query
-(`"local first agent framework oMLX Python SQLite multi-agent reasoning pipeline"`) returned three
-`raw/` docs in its top-5 `query_corpus(doc_type=None)` results, confirming the filter is additive
-and does not disturb the base ranking.
+This is the **inverse trigger condition** from the original incident, not a repeat of it. The
+2026-06-22 case fabricated a tool-call string *after* a real `web_search` had already run and
+real results were sitting in `[TOOL RESULTS]` — fabrication there meant ignoring grounded content
+already provided. This 2026-06-24 case fabricated the *same shaped* string when **no tool was ever
+offered or dispatched for that turn** — `tools=[]` — on a topic outside the model's training
+knowledge. Read naturally, this looks less like a malformed reaction to tool output already present
+and more like the model attempting to request a tool call that this harness simply does not expose
+(`OMLXRuntimeClient.infer()`'s payload has no `tools`/`tool_choice` field, confirmed previously and
+still true). Both incidents share the same malformed delimiter pattern (`<|tool_call...` /
+`...<tool_call|>`, never a real matched tag pair in any format this codebase uses), which is itself
+notable — two independent live incidents, twelve days apart, different trigger shapes, producing
+near-identical syntactically-broken tool-call tokens suggests the *string itself* is something
+the base model reaches for, rather than something assembled fresh from prompt content each time.
+This is offered as an observation, not a confirmed mechanism.
 
-**Test suite:** 286 → 288 (+2 tests in `test_controller_phase4.py`,
-`TestForceRagDocTypeFilter`), 0 failures.
+*New finding not present in the original incident: propagation into a second, independent call.*
+The fabricated string was stored verbatim as that turn's answer in `[WORKING MEMORY]`
+(`Turn -2 [agent]: {'answer': '\n<|tool_call>call:web_search{query:<|"|>LangSmith Engine<|"|>}<tool_call|>', ...}`).
+The Tier 2 working-state-update call for that same turn — a separate `infer_stream()` call,
+`temp=0.00`, prompt built from this same contaminated working-memory content — returned a near-
+identical string (`'\n<|tool_call>call:web_search{query:<|"|>LangSmith Engine<|"|>}<tool_call|><eos>'`),
+and `extract_working_state_update()` correctly logged this as `PARSE_FAILURE` (`missing label(s)`)
+rather than silently accepting it — the existing parse-failure guard from Open Item 4's diagnostic
+work did its job here. This establishes that a fabrication in the main conversational answer can
+**propagate into a second, structurally unrelated call** simply by virtue of being stored as normal
+turn history and later re-read as context — a blast-radius fact, not a root-cause fact. It does not
+mean Open Item 11 and Open Item 4 share a mechanism (they remain logged separately, per the
+cross-reference above); it means Open Item 11's failure mode, once it occurs, is not necessarily
+contained to the single turn it occurs on.
 
-*New deferred finding opened (see §8.8, Open Item 9):* With `doc_type="wiki"` applied on the
-identity route, two of the three reproduction queries (`"Who are you?"`, `"What can you do?"`)
-returned only `lora-persona.md` from `query_corpus()`, which the persona-exclusion guard then
-removes — leaving `[CONTEXT]` empty. Strictly better than the prior bug; no incorrect material
-supplied. The gap was pre-existing but obscured by the `raw/` backfill. No fix direction decided;
-logged as Open Item 9.
+*Adjacent, unverified observation — not part of this finding, logged separately so it isn't lost:*
+the same live chat session reportedly included a model-generated remark about oMLX cache state
+("cache is building with each turn"). No `/admin/api/cache/probe` call or dashboard read appears
+anywhere in the captured backend log for this session, so this claim cannot be checked against
+real cache telemetry from the evidence in hand. Flagged because, if accurate as a description of
+what the model said, it would be a third instance of the same class of behavior as this item and
+Open Item 4 — the model narrating something about its own serving/runtime internals that it has no
+actual introspection path to — but on a different surface (plain conversational prose instead of
+malformed tool-call tokens) and with no raw evidence yet captured. Not logged as its own Open Item
+pending an actual occurrence with backend log coverage.
 
-*`_priority4a_identity()` priority-field bug identified and fixed (see §8.8, Open Item 10):*
-The same live-reproduction run that produced Open Items 8 and 9 also revealed that the three
-reproduction queries all returned `priority=6` in the `RoutingPlan`, despite P4a correctly firing.
-Root cause: `_priority4a_identity()` never sets `priority=` in its `RoutingPlan(...)` construction,
-so the field silently inherits `RoutingPlan.priority`'s default of `6` — the same value used by
-`_priority6_direct()`. All other `_priorityN_*` methods set this field explicitly; P4a was the
-sole outlier. Impact: metadata-only — `plan.priority` feeds only `ControllerResult.metadata`, with
-no bearing on routing control flow or behavior. Fix: `priority = 4` added to the P4a
-`RoutingPlan(...)` construction. All three reproduction queries now report `priority=4`; `force_rag`
-and `agent` unchanged. Test suite: 288 → 289 (+1 test), 0 failures.
+*Status (updated 2026-06-24):* now two confirmed live occurrences, not one — still not root-caused,
+still no fix direction proposed or evaluated, recurrence rate still unknown (n=2 live, against
+indeterminate live turn volume). The original diagnostic's 0/20 isolation result is **not**
+contradicted by this new incident, since the new incident's prompt shape (`tools=[]`, no
+`[TOOL RESULTS]` block) was never one of the four variants tested — the diagnostic sweep covered
+only the "tool already ran" trigger shape. A natural next diagnostic step (not yet scheduled) would
+extend `diag_toolcall_fabrication.py` with a fifth variant matching this incident's actual shape:
+no tool dispatched, `[TOOL RESULTS]` absent, topic outside training knowledge, `temp=0.30`. Two data
+points with different trigger shapes still does not license a unified mechanism claim — it licenses
+widening the diagnostic, which remains the next concrete step if this is picked up before it
+recurs again.
 
-*Open Items 7 remains open.* No further code changes this session.
+*Third, fourth, and fifth live occurrences, 2026-06-25 — deliberate live reproduction attempt,
+three turns, real backend logs, isolating priming vs. instruction phrasing as candidate variables.*
+Following the 2026-06-24 update's open question (what trigger shape actually produces this), three
+live turns were run specifically to test whether fabrication requires priming from an immediately
+preceding real tool-dispatch turn, or is driven by something else.
+
+**Turn 1 ("Test A"), 10:49 — priming present, turn lands on Priority 6, `[TOOL RESULTS]` absent.**
+Instruction: `"Can you look up Apples price hike for the MacBook Neo and iPad?"`. Preceded in the
+same session by a real `tools=['web_search']` turn (`"What's the latest Apple News?"`) with results
+delivered normally. On the test turn: `lookup_request` scored 0.593 (`gate_fired=False`); Priority 4
+missed (`top_score=0.424`); Priority 5 no match; **Priority 6 — direct answer fallback**, `tools=[]`.
+Assembled user prompt contained only `[WORKING MEMORY]` + `[INSTRUCTION]` — no `[TOOL RESULTS]`, no
+`[CONTEXT]`. Model's entire output:
+
+```
+<|toolcall>call:web search{queries:[<|"|>Apple price hike MacBook Neo iPad<|"|>,<|"|>MacBook Neo price change<|"|>,<|"|>iPad price increase<|"|>]}<toolcall|>
+```
+
+**Turn 2 ("Test B"), 11:11 — priming present, turn lands on Priority 4 (corpus), `[TOOL RESULTS]`
+absent but `[CONTEXT]`/`[USER PROFILE]`/`[WORKING STATE]` all present and populated, topic-mismatched.**
+Instruction: `"Can you look up their next-generation in-house Microsoft AI models?"`, following a real
+`tools=['web_search']` turn (`"What's the latest Microsoft news?"`) in the same session. `lookup_request`
+scored 0.598 (`gate_fired=False`); **Priority 4 matched via corpus score (0.582 ≥ 0.550)** — `tools=[]`,
+`fetch_rag=True`. The RAG hit pulled two Localist-architecture wiki docs (`localist-master-project-
+outline.md`, `localist-software-stack.md`) that have no topical relevance to Microsoft's AI models —
+matched on shared technical vocabulary ("AI models," embeddings) rather than subject. `prompt_chars=4874`,
+including real prior-turn search results in `[WORKING MEMORY]`. Chat-pane tag: `P4 · Vault ◈ grounded`.
+Model's entire output:
+
+```
+<|toolcall>call:websearch{query: "next-generation in-house Microsoft AI models Build 2026"}<tool_call|>
+```
+
+**Turn 3 ("B1"), 11:17 — no priming (fresh task, no preceding turn in working memory at all), turn
+lands on Priority 4 (corpus), same topic-mismatch shape as Test B.** Instruction: `"Can you look up
+Microsoft's next-generation in-house AI models?"` — first and only turn in this task; `Turn -1` is the
+sole `[WORKING MEMORY]` entry, no prior agent response, fresh `mem_key`. `lookup_request` scored 0.598
+(`gate_fired=False`); Priority 4 matched via corpus score (0.584 ≥ 0.550) — `tools=[]`, `fetch_rag=True`,
+pulling the same two irrelevant Localist-architecture docs. `prompt_chars=3883`. Chat-pane tag: `P4 ·
+Vault ◈ grounded`. Model's entire output:
+
+```
+<|toolcall>call:websearch{query:<|"|>Microsoft next-generation in-house AI models<|"|>}<tool_call|>
+```
+
+*Interpretation.* Turn 3 (B1) is the decisive result: it reproduces fabrication with **no priming
+turn at all**, ruling out "immediately preceded by a real tool-dispatch turn" as a necessary
+condition — Test A had priming with an empty downstream prompt, Test B had priming with a populated
+(but topically irrelevant) downstream prompt, and B1 had neither priming nor relevant context, yet
+produced the same failure. The one factor constant across all three of today's reproductions, the
+2026-06-22 original incident, and the 2026-06-24 second incident is **`tools=[]` on the turn that
+produced the fabrication** — no exception across five live occurrences to date. The three 2026-06-25
+turns additionally share an instruction phrased with an explicit "look up" verb, and a `lookup_request`
+semantic score consistently in a narrow 0.593–0.598 band — below the 0.65 gate threshold but well
+above a clean miss — across all three, despite three different downstream routing outcomes (Priority
+6 empty fallback; Priority 4 RAG hit with irrelevant content; Priority 4 RAG hit with irrelevant
+content and no priming). This is read as suggestive that "look up"-phrased instructions landing on a
+`tools=[]` turn are a stronger candidate trigger than priming, tool-result-emptiness, or RAG-content
+relevance individually — each of which varied across the three turns while the outcome did not.
+
+*This remains a hypothesis, not a confirmed mechanism.* Promoted here from "candidate" to "leading
+hypothesis" on the strength of three converging live data points plus one clean disconfirmation
+(B1 against the priming theory), per this project's standard for distinguishing hypothesis-consistent-
+evidence from confirmed mechanism. Not yet tested: (a) whether the "look up" phrasing is doing real
+work versus any instruction landing on `tools=[]`-with-lookup-shaped-semantic-score regardless of
+literal verb choice — the originally-proposed B2 variant (priming held constant, non-"look up"
+phrasing) was not run this session and remains a natural next check if this is revisited; (b) whether
+the 0.59–0.60 score band itself is load-bearing (a near-miss specifically) versus any `lookup_request`
+score below 0.65; (c) whether the system prompt's "Your Tools" section framing — "Web search fires
+automatically on factual queries" — is contributing by setting an expectation the model then
+"completes" via fabricated syntax when that automatic firing doesn't happen on a given turn; this is
+plausible given the consistent malformed-but-tool-call-shaped string across all five occurrences, but
+untested.
+
+*Status (updated 2026-06-25, superseded later same day — see the generation-time backstop and gate
+threshold entries cross-referenced below):* five confirmed live occurrences total (2026-06-22 ×1,
+2026-06-24 ×1, 2026-06-25 ×3). Reproduction rate within today's deliberate three-turn attempt: 3/3.
+Leading hypothesis: instructions using explicit lookup/search phrasing, landing on a turn where
+`tools=[]` regardless of cause (Priority 6 fallback or a Priority 4 RAG hit that doesn't satisfy the
+lookup intent), reliably produce fabricated tool-call syntax as the entire model output. Still not
+root-caused at the mechanism level (why the model reaches for this specific malformed string remains
+unexplained — see the cross-session observation above that the same broken delimiter pattern recurs
+across unrelated trigger shapes). A two-part fix was implemented and live-verified later the same
+day: see "Gate-Calibration Fix" and "Generation-Time Backstop" entries immediately below.
+
+**Gate-Calibration Fix (Prompt 1), 2026-06-25.** `_SEARCH_INTENT_TEMPLATES["lookup_request"]` in
+`planner.py` was missing coverage for the "Can/Could you + look up/look into + [specific object]"
+question-form frame that all three of today's reproductions used — the existing five templates were
+all bare imperatives with a vague pronoun object. Four templates were added (`"can you look up"`,
+`"can you look that up for me"`, `"could you look up"`, `"can you look into this for me"`), with
+`_SEMANTIC_GATE_THRESHOLDS` deliberately left unchanged at first, on the reasoning that this looked
+like a paraphrase-coverage gap rather than a miscalibration. Live re-verification of the three
+original utterances showed real but insufficient movement: 0.593→0.608, 0.598→0.617, 0.598→0.621 —
+all three remained below the 0.65 threshold, and two of three still fabricated on re-test (the third
+hit a stale query-cache from an earlier same-day run, not a new confound).
+
+Given this evidence — three consistent live measurements, each landing 0.029–0.042 short of
+threshold — and per §10.4 Open Item 3's own stated revisit criterion ("revisit if live false
+negatives are observed," now satisfied), `_SEMANTIC_GATE_THRESHOLDS["lookup_request"]` was lowered
+from 0.65 to 0.60 (`explicit_search_action` at 0.68 left untouched). **Known, named risk:** the
+original 18-utterance diagnostic's per-utterance scores for `lookup_request`'s 7 adversarial
+negatives are not available in this document or in any retained diagnostic output, so the new
+threshold's negative-side margin is unverified. This is an accepted risk consistent with this
+project's existing "shippable-but-not-fully-validated" posture for these thresholds; the named
+mitigation is that any live false positive on `lookup_request` (gate fires when no search was
+intended) is the signal to revisit this value.
+
+**Full live re-verification, all three utterances, post-threshold-fix:**
+
+| Utterance | Score | gate_fired | Result |
+|---|---|---|---|
+| "Can you look up Apple's price hike for the MacBook Neo and iPad?" | 0.608 | True | Real `web_search` dispatch, 3 real results, grounded answer, no fabrication |
+| "Can you look up Microsoft's next-generation in-house AI models?" | 0.617 | True | Real `web_search` dispatch, 3 real results (Microsoft MAI/Build 2026 announcements), grounded answer, no fabrication |
+| "Can you look up their next-generation in-house Microsoft AI models?" | 0.621 | True | Real `web_search` dispatch, same real results, grounded answer, no fabrication |
+
+All three routed via `_priority3_tool()`'s semantic-gate path, confirming Priority 3 evaluates and
+short-circuits `route()` before Priority 4 is ever reached on these turns. Test suite (file-scoped,
+`tests/test_planner_phase3.py`): 65 → 69 (template addition) → 71 (threshold adjustment + two new
+boundary tests), 0 failures throughout. Note: these are file-scoped counts, not full-suite figures —
+the last confirmed full-suite total remains 339 (2026-06-22); a full-suite re-run to establish the
+current project-wide total has not yet been done.
+
+**Generation-Time Backstop (Prompt 2), 2026-06-25 — closes Open Item 11's user-facing impact, not
+mechanism.** The gate-calibration fix reduces exposure for one phrasing family but does not address
+generation-time behavior on any `tools=[]` turn regardless of cause. A detection-and-substitution
+guard was added directly to `conversational_agent.py`, the call site all five live incidents shared.
+
+Placement was confirmed by tracing real code, not assumed: `controller_agent._dispatch()` writes
+each agent's `AgentResult` to memory via `memory.add_agent_result()` immediately, before
+`_execute_plan()`'s implicit-extraction and working-state-update post-hooks read the same
+`results[0].output["answer"]` value — confirming the only point early enough to prevent propagation
+into working memory and Tier 2 extraction is inside `ConversationalAgent.run()` itself, before it
+returns.
+
+Detection: `_is_fabricated_toolcall()`, a module-level regex
+(`<\|?tool_?call.*?call:web.*?tool_?call\|>`, case-insensitive, dotall), matched against all seven
+real fabricated strings observed across the five live incidents to date — covering delimiter
+variants (`toolcall`/`tool_call`) and call-target variants (`websearch`/`web_search`/`web search`).
+Verified against five negative-control strings, including an adversarial near-miss ("You can call
+the web_search tool if needed.") that contains both "call" and "web_search" as separate words
+without the contiguous `call:web` substring or the `<|tool...tool_call|>` bracketing — correctly not
+matched. No real tool-calling contract exists in any runtime client in this codebase, so any match
+is unambiguously fabrication.
+
+On detection, at both the prebuilt-prompt call site (all five live incidents) and the legacy RAG
+call site (no live incidents, but identical structural exposure — included for consistency): `answer`
+is replaced with a fixed fallback message ("I don't have live search results for that — here's what
+I know from training, which may be stale or incomplete."), and `output["grounded"]`/`output["sources"]`
+are forced to `False`/`[]` regardless of what they would otherwise have been — confirmed by dedicated
+tests that the guard overrides a real `plan.fetch_rag=True` on the prebuilt path and a real
+corpus-hit-derived `grounded=True` on the legacy path. No retry is attempted. New test file
+`tests/test_conversational_agent_toolcall_guard.py`: 0 → 36, 0 failures.
+
+**What this closes and what it does not.** This closes Open Item 11's user-facing impact: a turn that
+fabricates this pattern can no longer surface the malformed string to the user, store it in working
+memory, or have it re-read as context by a later turn — the propagation behavior documented above and
+re-confirmed live during this same fix's verification pass (the Apple-utterance fabrication appearing
+as `Turn -2 [agent]` context on the following turn, before the threshold fix was applied) is now
+structurally prevented at the source. This does **not** close Open Item 11's "mechanism unknown"
+status — why the model reaches for this specific malformed string when it does remains unexplained.
+The model may still attempt to emit the pattern internally; this guard ensures it never reaches the
+user or persists anywhere.
+
+**Live verification of the backstop is explicitly limited, not papered over.** Fabrication is
+non-deterministic and cannot be reliably forced on demand, unlike the gate-calibration fix's
+live-verifiable score. The 36 mocked-runtime tests are the primary confirmation that the guard works
+mechanically. If a live recurrence is observed in normal use going forward, the check is: confirm the
+returned answer is the fallback message and `grounded=False`/`sources=[]` for that turn.
+
+**Status: Open Item 11's user-facing impact closed (2026-06-25); mechanism remains open and
+unexplained.** Both halves of the two-prompt plan (gate calibration; generation-time backstop) are
+implemented and verified to the extent each could be.
 
 ---
 
@@ -2479,29 +3034,355 @@ labels elsewhere in this codebase should treat §4.7's documented finding as
 a risk, not a certain prediction, and run their own diagnostic at the target
 temperature and prompt shape before committing.
 
+**Open Item 4 — `extract_working_state_update()` PARSE_FAILURE root-caused:
+reasoning-token exhaustion against `max_tokens=200`. CONFIRMED by live
+diagnostic, FIXED 2026-06-23 (same day, bundled with §3.7c shared-prefix
+fix below). See full status note at end of this entry.**
+
+*Originally:* logged via newly-added `WSU_DIAG` read-only diagnostic
+instrumentation (no gating logic, no behavior change) added to
+`process_working_state_update()` in a prior session, in response to a single
+live incident where a Tier 2 call returned an unparseable bare `'\n'`.
+
+*Live session evidence (2026-06-23):* a real session of 4 conversational
+turns — a simple knowledge question, a no-tool lookup, and a tool-call turn —
+produced **4/4 `PARSE_FAILURE` outcomes**, zero `CHANGED`, zero
+`UNCHANGED_NONE`, zero `INFER_FAILURE`. Every failure returned the identical
+bare `'\n'` raw response. Every call's `infer_elapsed_s` fell in the same
+12–14s band (11.958–13.972s) regardless of turn content or prompt length
+(`prompt_chars` ranged 334–1905 across the four calls). This moved the
+finding from "single historical incident, mechanism unknown" (§8.8 Open Item
+11 — see cross-reference below) to deterministically reproducible under this
+specific call's exact conditions.
+
+*Isolation diagnostic (read-only, same day, direct-to-oMLX, bypassing the
+FastAPI app entirely):* a standalone script sent the exact
+`_WORKING_STATE_UPDATE_SYSTEM` system message and a reconstructed user prompt
+matching the real call shape directly to `http://localhost:8000/v1/chat/completions`,
+mirroring `OMLXRuntimeClient.infer_stream()`'s real request/response contract
+exactly (`stream=True`, OpenAI-compatible SSE envelope, `choices[0].delta.content`)
+after an initial mis-shaped non-streaming test attempt failed with `KeyError`
+and was corrected by reading `omlx_runtime_client.py`'s real `infer_stream()`
+and `foundry_runtime_client.py`'s real `_iter_sse_chunks()` source directly
+rather than assuming the response shape.
+
+Three cases run, `temperature=0.0` throughout:
+1. **All-NONE previous state, `max_tokens=200`** (reproduction attempt): bare
+   `'\n'` returned, `finish_reason: "length"`. Reproduced the live failure
+   exactly.
+2. **Realistic non-empty previous state** (`current_focus`, `open_loops`,
+   `recent_decisions` all populated with real-looking values), `max_tokens=200`:
+   bare `'\n'` returned, `finish_reason: "length"`. Identical failure despite
+   non-empty state — **this rules out the all-NONE-previous-state-confuses-the-model
+   hypothesis directly**, rather than merely deprioritizing it.
+3. **Same all-NONE prompt as Case 1, `max_tokens=2000`**: succeeded.
+   `finish_reason: "stop"`. Returned a clean, fully parseable three-line
+   response: `FOCUS: Explaining the Localist Framework / OPEN_LOOPS: NONE /
+   DECISIONS: NONE`.
+
+*Mechanism, visible directly in the raw SSE stream (not inferred):* the model
+is emitting a distinct `reasoning_content` delta stream — a multi-step
+internal "Thinking Process" narrating its own analysis of the previous state,
+the new turn, and each of FOCUS/OPEN_LOOPS/DECISIONS in turn — entirely
+separate from the `content` delta stream the parser reads. In both 200-token
+failures, the reasoning trace was still mid-step (step 3–5 of its own
+6-step internal outline) when the token ceiling was hit; the only token(s)
+that reached `content` before the forced cutoff was the stray `'\n'` the
+parser then correctly rejected. In the 2000-token success case, the
+*identical* reasoning trace ran to its own natural conclusion (its own final
+step: *"Format Output: Apply the strict three-line format"*) and only then
+did the delta stream switch from `reasoning_content` to `content`, emitting
+the three labeled lines cleanly. The reasoning trace alone consumed roughly
+500–600 tokens before any `content` token appeared in the successful case —
+this is the real floor this call needs for reasoning, before the three-line
+answer's own token cost is added on top.
+
+*This explicitly rules out, by direct evidence rather than deprioritization:*
+- The SUMMARY/EOS mechanism from Open Item 3 — no "SUMMARY" token appears
+  anywhere in `_WORKING_STATE_UPDATE_SYSTEM`, and the failure is a hard
+  `finish_reason: "length"` truncation, not an EOS emission.
+- Previous-state emptiness as a causal factor (Case 2, above).
+- Turn-content dependence — the live session's 4/4 spanned three
+  meaningfully different turn shapes with identical failure behavior.
+
+*Not yet established:*
+- The true minimum viable `max_tokens` for this call. 2000 was chosen as
+  generous headroom for the isolation test, not as a tuned value — it is
+  very likely far larger than necessary. No bisection or systematic search
+  has been run.
+- Whether reasoning-trace length is roughly constant across turn content, or
+  varies meaningfully with longer/more complex turns (e.g. a turn involving
+  a tool-call result, which the live session's 4th turn was, but which has
+  not yet been isolation-tested directly — only reproduced live, not
+  isolation-tested with non-trivial response content).
+- Whether this same reasoning-token-exhaustion mechanism is present (and
+  currently silently absorbed by larger headroom) in any of this codebase's
+  other bounded extraction calls — `extract_content_from_instruction()`
+  (`max_tokens=60`) and `extract_implicit_episode()` have not been checked
+  against this same diagnostic approach. Given `extract_content_from_instruction()`'s
+  budget is smaller than the WSU call's, it is at least as exposed in
+  principle; not yet verified empirically either way.
+- Whether this is a property of the `gemma-4-e4b-it-4bit` model file itself,
+  an oMLX 0.4.2 serving configuration/default, or something that changed
+  between sessions — no comparison against a non-reasoning call configuration
+  has been attempted, and no version/config history has been checked.
+
+*Cross-reference:* §8.8 Open Item 11 (fabricated tool-call syntax, mechanism
+unknown) is a structurally different failure on the *main conversational*
+call (`max_tokens=1024`, not this call's `max_tokens=200`) and should **not**
+be conflated with this finding — they were produced by different calls with
+different parameters, and Open Item 11 remains unreproduced and
+unexplained on its own terms. The two are noted together only because both
+involve this model/serving setup producing output around its own internal
+process (an invented tool-call string; an exposed reasoning trace) in a way
+this codebase's call sites were not written expecting. Whether they share a
+deeper common cause (e.g. reasoning-capable generation behavior this harness
+doesn't yet account for anywhere) is an open question, not a finding.
+
+*Status:* root cause confirmed by direct live diagnostic, **fix implemented and
+verified, 2026-06-23 (same day).** `max_tokens` raised from 200 to 1024 on this
+call — chosen to match the main conversational call's existing budget, not a
+newly invented value, and confirmed comfortably above the ~570–600-token
+reasoning floor measured above. Implemented as part of the same Claude Code
+prompt as the system-message-sharing fix below (Open Item 4 and the §3.7c
+shared-prefix fix were deliberately bundled — both touch
+`extract_working_state_update()`'s call site). 73/73 tests passing
+post-implementation (66 pre-fix → 72 from the sharing/budget change → 73
+after one additional realistic-length verification test was requested and
+added). No live re-verification of the *fix itself* (i.e. running real turns
+and confirming `WSU_DIAG` no longer logs `PARSE_FAILURE` at the new budget)
+has been done yet — the isolation diagnostic proved the mechanism and that
+2000 tokens resolves it; 1024 tokens has not been independently
+isolation-tested, only reasoned to be sufficient by analogy to the
+measured ~570–600 token floor plus the main call's own budget convention.
+This is a real, if probably minor, gap — flagged rather than assumed away.
+
+The items below, all logged at diagnosis time, remain genuinely open even
+after this fix and were not addressed by it:
+- The true minimum viable `max_tokens` — 1024 is a reused convention, not a
+  tuned or bisected value, and remains unverified against the 1024 ceiling
+  specifically (only 200 and 2000 were ever tested).
+- Whether reasoning-trace length varies meaningfully across turn content
+  (e.g. tool-result turns) — still untested.
+- Whether `extract_content_from_instruction()` (`max_tokens=60`) or
+  `extract_implicit_episode()` share this exposure — still unchecked.
+- Whether this is a model-file property, an oMLX serving default, or
+  something that changed recently — still unestablished.
+
 ---
 
-### Session — 2026-06-21 (Slot 6A — Structured Working State)
+## 10. Semantic Search-Intent Classifier
 
-*Two-part build arc: Tier 1 + Tier 2 implementation, then SUMMARY-field removal.*
+### 10.1 Scope
 
-- **Tier 1** (`WorkingMemoryState`, `_slot6a_working_state()`, Step 5d gate,
-  P3c render-gating) shipped deterministically: `active_artifacts` carries
-  current-turn RAG source paths into `[WORKING STATE]`; `current_project` is
-  wired but inert at all current call sites (DB-scoping key, not a project name).
-- **Tier 2** (`WorkingStateStore`, `WorkingStateRecord`, `working_state` table
-  via v3→v4 migration, `episodic_extractor.py` Tier 2 extraction hook) built and
-  wired. Post-response hook runs on every completed turn regardless of routing
-  path, including P3c; update-vs-render distinction deliberate.
-- **SUMMARY field diagnostic and removal:** live testing confirmed that a 4-field
-  extraction format (adding `SUMMARY:`) fails at `temperature=0.0` with 0/3 success
-  rate (model emits bare EOS); 3-field format succeeds 3/3 at the same temperature,
-  all else constant. SUMMARY removed permanently from system prompt, extraction
-  function, `WorkingStateRecord`, `upsert()`, DB schema (v4→v5 migration), and all
-  tests. See §4.7 and §9.2 for the full finding and decision record.
-- **Test suite:** 318 tests, 0 failures (final state for this session). 1 new test
-  added (`test_exactly_three_labels_required` in `test_episodic_phase5.py`); 1
-  pre-existing broken test in `test_tool_dispatcher_phase6.py` fixed (missing
-  `[WORKING STATE]` label in slot-ceiling measurement).
+Before this change, `_priority3_tool()` in `planner.py` triggered `web_search` only when the
+instruction contained a literal keyword from `_WEB_SEARCH_KEYWORDS` — a small frozenset of
+recency and freshness terms ("latest", "today", "news", "current price", and similar). This
+produced a confirmed false negative in a real session.
+
+**The incident:** the user asked "What do you know about APC (Auto Prefix Cache)?" The corpus
+and episodic stores lacked APC-specific content; the model correctly stated it lacked specific
+information. The user then issued the follow-up: "Go ahead and look it up." No keyword from
+`_WEB_SEARCH_KEYWORDS` appeared in that instruction. `_priority3_tool()` returned `None`;
+routing fell to Priority 6 (direct answer); and the model responded with fabricated claims about
+APC — falsely presented as coming from "Web Search" despite no search tool ever being invoked.
+
+A second, distinct gap was found in the same incident: the full original APC instruction that
+preceded the follow-up — "Why don't you do a web search for APC and then tell me if you still
+stand by your previous answer?" — contains the literal phrase "web search". That instruction
+failed because of a keyword-coverage miss, not for any semantic reason.
+
+This section documents the resulting two-part fix: an embedding-based semantic classifier
+layered onto Priority 3 to catch natural-language search-action phrasings, and a literal-keyword
+addition to `_WEB_SEARCH_KEYWORDS` to close the separate coverage gap. Each fix targets a
+distinct failure mode; they were applied at different layers for that reason.
+
+### 10.2 Design Decisions
+
+**Two distinct failure shapes; two distinct fixes.** "Go ahead and look it up." is a
+bare-affirmative follow-up with no topic keyword; no literal phrase reliably covers the space of
+such instructions, which require semantic generalization. "Why don't you do a web search for
+APC..." contains the exact literal phrase "web search" and failed only because that phrase was
+absent from `_WEB_SEARCH_KEYWORDS`. Fixing the first gap by extending the keyword list would
+have required open-ended enumeration with no principled stopping point. Fixing the second gap by
+tuning the semantic threshold down to capture that one sentence (actual score: 0.638 vs. the 0.68
+threshold; margin of 0.023 above the closest false positive) would have changed gate behavior for
+all future utterances without any broader justification. Conflating these two failure shapes would
+have produced a worse fix in either direction.
+
+**Per-group cosine similarity against four canonical template groups, using the EmbeddingGemma
+model already resident in the process.** `_SEARCH_INTENT_TEMPLATES` defines four named groups —
+`explicit_search_action`, `lookup_request`, `knowledge_request_open`, `freshness_request` — with
+17 template strings total (5+5+4+3). At startup, `Planner.__init__()` embeds all 17 using the
+same EmbeddingGemma model (`mlx-community/embeddinggemma-300m-4bit`, 768-dimensional) that
+`EmbeddingEngine` already uses for corpus retrieval. The `embed_fn` callable is threaded into
+`Planner` as a new optional constructor parameter (`embed_fn: Callable[[str], list[float]] | None
+= None`), passed from the `main.py` lifespan function through `ControllerAgent`. `MemoryManager`
+already holds this callable for corpus scoring; `Planner` receives its own copy of the same
+already-initialized function rather than reaching into `MemoryManager._embed_fn` as a shortcut.
+A reach-through pattern exists elsewhere in the codebase (`controller_agent.py`'s `/embed`
+endpoint helper); it was noted and deliberately not replicated here.
+
+**Gating uses per-group scores from `all_scores`, not the global argmax.** `_semantic_search_intent()`
+returns a 3-tuple `(best_group, best_score, all_scores)` where `all_scores` is a dict mapping
+each group name to its own maximum cosine similarity across that group's templates. The gate in
+`_priority3_tool()` evaluates each gating group against its own score independently:
+
+```python
+semantic_triggered = any(
+    all_scores.get(group, 0.0) >= threshold
+    for group, threshold in _SEMANTIC_GATE_THRESHOLDS.items()
+)
+```
+
+This is load-bearing. If gating were evaluated on `best_group` only, a non-gating group winning
+the argmax would suppress the gate even when a gating group independently cleared its own
+threshold. In the live diagnostic evaluation, `knowledge_request_open` won the argmax in 3 of 7
+adversarial negative test cases — demonstrating how frequently this scenario arises in practice.
+
+**Only two of the four groups gate routing; the other two are informational only.** `_SEMANTIC_GATE_THRESHOLDS`
+contains exactly two entries: `explicit_search_action` (≥ 0.68) and `lookup_request` (≥ 0.65).
+`knowledge_request_open` and `freshness_request` are computed and logged on every turn but are
+excluded from gating. The evidence for `knowledge_request_open`: a live diagnostic pass found
+that "Explain this code to me." scored 0.795 on that group — higher than 5 of the 10 real
+positive search-intent paraphrases tested in the same pass — because that group's canonical
+templates ("tell me about this", "what do you know about this", "what is this", "explain this to
+me") are generically conversational phrasings that collide with ordinary non-search chat. For
+`freshness_request`: one adversarial negative scored inside the positive range during evaluation,
+and the group has not been independently stress-tested at a larger sample size. Both groups remain
+in the computation pipeline and are emitted to the debug log; neither may gate `tools_to_call`
+without a separate evaluation pass. See §10.4, Open Item 1.
+
+**Thresholds were derived from live-backend diagnostics, not tuned to fit any incident utterance.**
+The values 0.68 (`explicit_search_action`) and 0.65 (`lookup_request`) were determined from a
+structured evaluation pass run before the gating logic was written: 10 positive search-intent
+paraphrases, 7 adversarial negatives, and 1 negative-filter case (18 utterances total) submitted
+against the live EmbeddingGemma model. The second incident instruction ("Why don't you do a web
+search for APC...") was not used to tune these numbers — it scored 0.638, fell below the 0.68
+threshold, and was fixed at the literal-keyword layer specifically to avoid post-hoc threshold
+adjustment for one known utterance.
+
+**A negative filter short-circuits before the embedding call.** `_SEARCH_NEGATIVE_FILTER` is a
+frozenset of 9 phrases identifying meta-instructions that reference the conversation itself or
+the search tool — "did you search", "what tool did you use", "search my previous messages", and
+similar — rather than requesting a world-facing search. When any of these phrases appears in the
+lowered instruction, `_semantic_search_intent()` returns `None` immediately without invoking
+`embed_fn`. Verified live: "Did you search for that already?" triggered the filter and produced
+no embedding call.
+
+**"web search" and "do a search" added to `_WEB_SEARCH_KEYWORDS`.** The second incident gap was
+closed by adding these two phrases to the existing `_WEB_SEARCH_KEYWORDS` frozenset, matched via
+the existing `_any_whole_word()` boundary function with no new matching logic. "search for" was
+considered and deliberately excluded: it matches sentences like "search for a workaround in my
+own code" with no search-tool intent, and adding it would reintroduce the over-broad literal-match
+problem this arc was correcting.
+
+**Priority 3's semantic embedding call and Priority 4's corpus-retrieval embedding call are not
+shared.** Each computes a separate `embed_fn` invocation on the same query string. Sharing the
+computed query vector across both call sites was considered — on any turn where P3 semantic
+evaluation and P4 corpus retrieval both run, the vector is identical — and was explicitly
+deferred, not rejected, pending latency profiling on the 16 GB development machine. The
+EmbeddingGemma model is resident in memory; per-call overhead has not been measured at
+production-style turn rates. Revisit only if profiling shows the duplicate call contributes
+meaningfully to observed latency. This is the same accept-now/optimize-later posture applied to
+other unmeasured-cost decisions in this codebase.
+
+### 10.3 Live Verification — Original Incident, Recreated
+
+The following is a live, two-turn recreation of the original incident, run against the deployed
+backend after all four slots of the fix arc were applied.
+
+**Turn 1 — "What do you know about APC (Auto Prefix Cache)?"** The semantic gate did not fire:
+`knowledge_request_open` scored 0.624; neither `explicit_search_action` nor `lookup_request`
+cleared its threshold. Corpus and episodic retrieval both missed on APC specifically. The model
+correctly stated it lacked specific information rather than fabricating claims. **This turn's
+correct, non-hallucinating response is not attributable to this fix.** The gate did not fire;
+credit for the model's behavior here lies with prompt wording (e.g. the behavioral constraint
+"you do not simulate certainty"), not with the classifier.
+
+**Turn 2 — "Go ahead and look up APC (Auto Prefix Cache)."** This is a live, unscripted
+paraphrase — not identical to any string in the diagnostic dataset and not identical to the
+original incident's exact wording. `lookup_request` scored 0.740, clearing the 0.65 threshold.
+`tools_to_call = ['web_search']`. LangSearch returned three real, correctly-disambiguated results
+identifying APC as automatic prefix caching in LLM inference serving — including an arXiv paper
+and a Chinese-language vLLM technical article independently confirming the same expansion. These
+results directly contradicted the original incident's fabricated claims (networking/routing,
+database indexing, compression/streaming), confirming those claims were not merely unsupported
+but factually wrong.
+
+This is the first live, non-scripted confirmation that the semantic fix generalizes beyond the
+diagnostic dataset's curated test strings.
+
+### 10.4 Open Items
+
+**Open Item 1 — `freshness_request` gating status unresolved.** One adversarial negative
+example scored inside the positive range during the Diagnostic 2 evaluation pass; the group has
+not been stress-tested at a larger sample size. Remains informational-only — not a confirmed-safe
+candidate for routing gating — until a separate evaluation pass establishes a defensible
+threshold and negative margin.
+
+**Open Item 2 — Embedding call sharing deferred.** Priority 3's semantic classification and
+Priority 4's corpus-retrieval check each invoke `embed_fn` independently on the same query
+string. Sharing a single computed embedding across both call sites was scoped and explicitly
+deferred pending real latency data on the 16 GB development machine. Revisit only if profiling
+shows the cost matters in practice; do not optimize without measurement.
+
+**Open Item 3 — Threshold sample size.** 0.68 and 0.65 are derived from a single diagnostic
+pass: 10 positive paraphrases and 7 adversarial negatives. Treat as shippable-but-not-fully-validated.
+Revisit if live false positives (gate fires when no search was intended) or false negatives (gate
+misses a clear search instruction) are observed.
+
+**Open Item 4 — Live near-miss on `explicit_search_action` threshold, compound
+instruction (2026-06-23).** A live, unscripted turn — "Look up karpathy llm
+wiki then propose ways it implement it into Localist design." — scored
+`explicit_search_action: 0.618`, the highest of all four groups
+(`lookup_request: 0.597`, `knowledge_request_open: 0.462`,
+`freshness_request: 0.404`), but fell short of the 0.68 gating threshold.
+`tools_to_call` was not populated; no LangSearch call occurred. Priority 4
+matched instead via corpus score (0.638 ≥ 0.550), routing to
+`conversational_agent` with wiki-only RAG context. The model correctly
+stated it did not have the Karpathy material and asked the user to supply
+it, rather than fabricating a claim about Karpathy's content — the
+fail-safe (prompt-level "you do not simulate certainty" framing, not the
+classifier) held, consistent with Turn 1 of the §10.3 live recreation.
+
+This is structurally similar to §10.3 Turn 1 (a real informational-intent
+turn scoring sub-threshold, correctly falling back to an honest non-answer)
+but is a distinct data point: a different group won the argmax
+(`explicit_search_action` here vs. `knowledge_request_open` in the §10.3
+recreation), and the instruction was compound — a lookup clause ("Look up
+karpathy llm wiki") joined to a proposal clause ("propose ways... into
+Localist design") in a single 81-character instruction. Whether the
+proposal clause's embedding signal diluted the lookup clause's score below
+what it would have scored alone is a plausible mechanism, not a confirmed
+one — no isolated test of the lookup clause alone has been run.
+
+**Not actioned.** Per Open Item 3's standing posture and the project's
+single-occurrence discipline (a single proposed mechanism is a hypothesis
+to verify, not a finding to act on), no threshold change, no compound-
+instruction-splitting logic, and no new gating behavior follows from this
+one turn. Logged so it counts toward Open Item 3's "revisit if live false
+negatives are observed" criterion — this is one such occurrence, not yet a
+pattern. Revisit if additional compound or near-threshold instructions are
+observed scoring in the 0.60–0.68 band for `explicit_search_action`.
+
+### 10.5 Test Suite
+
+Final state: **339 tests, 0 failures** across all test files (verified against the live test
+suite as of 2026-06-22).
+
+The classifier was built across four sequential slots, all in `backend/tests/test_planner_phase3.py`:
+
+| Slot | Purpose | Before | After | Net |
+|---|---|---|---|---|
+| Diagnostic 1 | `_semantic_search_intent()` scaffold; `embed_fn` wiring; logging only, no routing change | 318 | 329 | +11 |
+| Diagnostic 2 | Expand return type to `(best_group, best_score, all_scores)`; per-group score logging | 329 | 331 | +2 |
+| Fix 1 | Live gating via `_SEMANTIC_GATE_THRESHOLDS`; first routing change in `_priority3_tool()` | 331 | 336 | +5 |
+| Fix 2 | "web search" and "do a search" added to `_WEB_SEARCH_KEYWORDS` | 336 | 339 | +3 |
+| **Total** | | **318** | **339** | **+21** |
+
+Fix 1's net of +5 reflects 7 new tests in `TestPriority3SemanticGating` minus 2 tests removed
+from its predecessor class `TestPriority3ToolUnaffectedBySemantic`, whose premise — "semantic
+signal never affects routing" — became false after that slot.
 
 *End of Localist Framework Canonical Architecture Specification*

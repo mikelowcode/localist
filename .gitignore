@@ -112,3 +112,7 @@ backend/localist_memory.db
 
 # Environment files (contain API keys)
 backend/.env
+
+# Sessions Log
+
+sessions-log.md

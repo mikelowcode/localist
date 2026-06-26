@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from memory_manager import MemoryManager
@@ -124,6 +124,8 @@ _WEB_SEARCH_KEYWORDS: frozenset[str] = frozenset({
     "today",
     "news",
     "recent",
+    "web search",
+    "do a search",
 })
 
 # Priority 3b — factual query keywords (trigger web search when corpus misses)
@@ -195,8 +197,96 @@ _FILE_OP_KEYWORDS: frozenset[str] = frozenset({
     "create a file",
 })
 
+# Diagnostic Slot 1 — canonical template groups for semantic search-intent scoring.
+# These strings are embedded at startup and used only for cosine-similarity logging;
+# they do not gate any routing decision until a threshold prompt replaces this comment.
+_SEARCH_INTENT_TEMPLATES: dict[str, tuple[str, ...]] = {
+    "explicit_search_action": (
+        "search the web for this",
+        "do a web search for this",
+        "search online for this",
+        "google this",
+        "go look it up",
+    ),
+    "lookup_request": (
+        "look up this",
+        "look that up",
+        "go ahead and look it up",
+        "find information on this",
+        "find out about this",
+        "can you look up",
+        "can you look that up for me",
+        "could you look up",
+        "can you look into this for me",
+    ),
+    "knowledge_request_open": (
+        "what is this",
+        "what do you know about this",
+        "tell me about this",
+        "explain this to me",
+    ),
+    "freshness_request": (
+        "what's the latest on this",
+        "what's the current status of this",
+        "is there anything new about this",
+    ),
+}
+
+_SEARCH_NEGATIVE_FILTER: frozenset[str] = frozenset({
+    "search your memory",
+    "search my previous messages",
+    "search this conversation",
+    "what did i just say",
+    "what did you just say",
+    "why didn't you search",
+    "why did you search",
+    "did you search",
+    "what tool did you use",
+})
+
 # Relevance threshold for Priority 4 corpus scoring
 _CORPUS_SCORE_THRESHOLD: float = 0.55
+
+# Slot [Fix 1] — semantic search-intent gating thresholds.
+# Derived from Diagnostic 2's live-backend score table (18 real
+# utterances against mlx-community/embeddinggemma-300m-4bit).
+# knowledge_request_open and freshness_request are deliberately
+# excluded from gating — see Diagnostic 2 findings: a non-search
+# utterance ("Explain this code to me.") scored 0.795 on
+# knowledge_request_open, higher than 5 of 10 real positive
+# paraphrases, because that group's templates are generically
+# conversational. freshness_request showed one ambiguous negative
+# (0.642, inside the positive range) and has not been independently
+# stress-tested. Both groups remain computed and logged for future
+# tuning but must never gate tools_to_call until separately re-evaluated.
+#
+# 2026-06-25 update A (§8.8 Open Item 11): lookup_request templates expanded
+# from 5 to 9. The original 5 were bare imperatives with vague pronoun
+# objects ("look up this", "look that up", etc.); they did not represent
+# the "Can/Could you + look up/look into + [specific object]" question-form
+# frame. Three live utterances using that frame scored 0.593, 0.598, and
+# 0.598 on lookup_request — consistently below the 0.65 gate — causing
+# gate_fired=False and no web_search dispatch. Four new templates appended:
+# "can you look up", "can you look that up for me", "could you look up",
+# "can you look into this for me". This was a template-coverage fix, not a
+# threshold adjustment; the 0.65 threshold was deliberately left unchanged.
+#
+# 2026-06-25 update B (§10.4 Open Item 3 revisit, §8.8 Open Item 11):
+# lookup_request threshold lowered from 0.65 to 0.60. Live re-verification
+# after update A showed the same three utterances scored 0.608, 0.621, and
+# 0.617 — a real, consistent improvement (+0.015 to +0.023) but still below
+# the 0.65 gate. Template coverage alone cannot close this remaining gap for
+# this phrasing family at this scale of addition. The 0.03–0.04 shortfall
+# across all three utterances matches Open Item 3's stated revisit criterion
+# ("if live false negatives are observed"). explicit_search_action (0.68) is
+# NOT changed. Known risk: the original 18-utterance diagnostic pass did not
+# retain per-utterance scores for lookup_request's adversarial negatives, so
+# the margin to the new 0.60 line is unknown. Accepted and named risk — any
+# live false positive on lookup_request is the trigger to revisit this value.
+_SEMANTIC_GATE_THRESHOLDS: dict[str, float] = {
+    "explicit_search_action": 0.68,
+    "lookup_request": 0.60,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -379,9 +469,11 @@ class Planner:
         self,
         runtime:        Any,
         memory_manager: "MemoryManager | None" = None,
+        embed_fn:       Callable[[str], list[float]] | None = None,
     ) -> None:
         self._runtime        = runtime
         self._memory_manager = memory_manager
+        self._embed_fn       = embed_fn
         # Session state for Priority 5 caching (§4.3)
         # _episodic_injected: True once episodic bullets have been injected
         #   this session; causes all further Priority 5 checks to return True
@@ -391,6 +483,28 @@ class Planner:
         #   be float lists.
         self._episodic_injected: bool = False
         self._episodic_cache_pairs: list[tuple[list[float], bool]] = []
+
+        # Diagnostic Slot 1 — flat list of (group_name, vector) pairs, one per
+        # template string across all groups in _SEARCH_INTENT_TEMPLATES.
+        # Only populated when embed_fn is available; left empty on failure so
+        # _semantic_search_intent() safely returns None without logging noise.
+        self._template_embeddings: list[tuple[str, list[float]]] = []
+        if embed_fn is not None:
+            try:
+                for group_name, phrases in _SEARCH_INTENT_TEMPLATES.items():
+                    for phrase in phrases:
+                        vec = embed_fn(phrase)
+                        self._template_embeddings.append((group_name, vec))
+                logger.debug(
+                    "Planner: pre-embedded %d search-intent templates across %d groups.",
+                    len(self._template_embeddings), len(_SEARCH_INTENT_TEMPLATES),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Planner: failed to embed search-intent templates — "
+                    "semantic search-intent check will be skipped. Error: %s", exc,
+                )
+                self._template_embeddings = []
 
     # -----------------------------------------------------------------------
     # Public API
@@ -623,6 +737,52 @@ class Planner:
                 return kw
         return None
 
+    def _semantic_search_intent(
+        self, lowered: str
+    ) -> tuple[str, float, dict[str, float]] | None:
+        """
+        Diagnostic-only (Slot [Diagnostic 2]): returns the best-matching
+        group, its score, AND the max score per group across all groups —
+        so collisions between groups can be inspected directly, not just
+        inferred from the argmax.
+
+        Returns (best_group, best_score, all_group_scores) or None under
+        the same conditions as Diagnostic 1 (no embed_fn, negative filter
+        match, embedding failure).
+        """
+        if self._embed_fn is None or not self._template_embeddings:
+            return None
+
+        if any(phrase in lowered for phrase in _SEARCH_NEGATIVE_FILTER):
+            logger.debug(
+                "Planner: Priority 3 semantic check skipped — negative filter matched (%r).",
+                next(p for p in _SEARCH_NEGATIVE_FILTER if p in lowered),
+            )
+            return None
+
+        try:
+            query_vec = self._embed_fn(lowered)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Planner: _semantic_search_intent — embed_fn raised: %s", exc,
+            )
+            return None
+
+        # Per-group max scores: accumulate highest similarity for each group.
+        group_scores: dict[str, float] = {g: -1.0 for g in _SEARCH_INTENT_TEMPLATES}
+        for group_name, tmpl_vec in self._template_embeddings:
+            score = _cosine_similarity(query_vec, tmpl_vec)
+            if score > group_scores[group_name]:
+                group_scores[group_name] = score
+
+        best_group = max(group_scores, key=lambda g: group_scores[g])
+        best_score = group_scores[best_group]
+
+        if best_score < 0:
+            return None
+
+        return (best_group, best_score, group_scores)
+
     def _priority3_tool(self, lowered: str) -> RoutingPlan | None:
         """
         Match condition: web search keyword OR file operation keyword present
@@ -641,6 +801,27 @@ class Planner:
             tools.append("web_search")
             logger.debug(
                 "Planner: Priority 3 — web_search signal detected (%r).", ws_kw
+            )
+
+        semantic_result = self._semantic_search_intent(lowered)
+        semantic_triggered = False
+        if semantic_result is not None:
+            best_group, best_score, all_scores = semantic_result
+            semantic_triggered = any(
+                all_scores.get(group, 0.0) >= threshold
+                for group, threshold in _SEMANTIC_GATE_THRESHOLDS.items()
+            )
+            logger.debug(
+                "Planner: Priority 3 — semantic signal best=%r(%.3f) all=%s "
+                "gate_fired=%s.",
+                best_group, best_score, all_scores, semantic_triggered,
+            )
+
+        if semantic_triggered and "web_search" not in tools:
+            tools.append("web_search")
+            logger.debug(
+                "Planner: Priority 3 — web_search signal detected via semantic "
+                "gate (best_group=%r, best_score=%.3f).", best_group, best_score,
             )
 
         fo_kw = self._any_whole_word(_FILE_OP_KEYWORDS, lowered)

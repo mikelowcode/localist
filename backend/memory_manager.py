@@ -75,7 +75,7 @@ Schema — three tables
   Cheap hit rate gain for repeated identical sub-queries within ResearchAgent.
 
     id          INTEGER PRIMARY KEY AUTOINCREMENT
-    query_hash  TEXT    NOT NULL          — sha256 of (query + str(top_n))
+    query_hash  TEXT    NOT NULL          — sha256 of (query + str(top_n) + str(doc_type))
     top_n       INTEGER NOT NULL
     result_json TEXT    NOT NULL          — JSON: [{name, path, doc_type, score}]
     created_at  REAL    NOT NULL
@@ -199,9 +199,9 @@ def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-def _query_hash(query: str, top_n: int) -> str:
+def _query_hash(query: str, top_n: int, doc_type: str | None) -> str:
     """Cache key for the retrieval_cache table."""
-    raw = f"{query}||{top_n}"
+    raw = f"{query}||{top_n}||{doc_type}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
@@ -1260,7 +1260,7 @@ class MemoryManager:
         list[DocumentResult]
             Sorted by relevance_score descending.
         """
-        q_hash = _query_hash(query, max_results)
+        q_hash = _query_hash(query, max_results, doc_type)
 
         # -- Cache check --
         cached = self._check_cache(q_hash)

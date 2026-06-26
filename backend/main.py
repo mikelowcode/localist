@@ -120,6 +120,7 @@ from conversational_agent import ConversationalAgent
 from embedding_engine import EmbeddingEngine
 from memory_manager import MemoryManager
 from runtime_factory import create_runtime
+from warmup import run_cache_warmup as _run_cache_warmup
 from wiki_agent import WikiAgent
 
 # ---------------------------------------------------------------------------
@@ -330,8 +331,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         runtime        = runtime,
         agents         = [wiki_agent, conversational_agent],
         memory_manager = memory_manager,
+        embed_fn       = embed_fn,
     )
     _state.controller = controller
+    _run_cache_warmup(controller, runtime, templates_dir)
 
     logger.info(
         "ControllerAgent ready — agents: %s",

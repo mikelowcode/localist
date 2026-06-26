@@ -189,6 +189,14 @@ def main(argv: list[str] | None = None) -> int:
             errors += 1
 
     elapsed = time.perf_counter() - t_start
+
+    # Invalidate retrieval cache once after all embedding updates so cached
+    # scores computed before embeddings existed don't survive the backfill.
+    if not args.dry_run and embedded > 0:
+        con.execute("UPDATE retrieval_cache SET valid = 0")
+        con.commit()
+        logger.info("Invalidated retrieval cache after backfill.")
+
     con.close()
 
     # -- Summary -------------------------------------------------------------

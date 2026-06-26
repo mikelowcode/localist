@@ -13,8 +13,9 @@ All tests use mocks — no SQLite, no runtime calls for P1–P4 and P6.
 P3c tests use a real MemoryManager with a temporary SQLite database.
 """
 
+import math
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -505,3 +506,460 @@ class TestPlannerP3c:
         assert plan.graph_query is None
         assert plan.agent == "conversational_agent"
         assert plan.tools_to_call == []
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic Slot 1 — _semantic_search_intent tests
+# ---------------------------------------------------------------------------
+
+def _unit_vector(dim: int = 4) -> list[float]:
+    """Return a simple normalised vector [1/sqrt(dim), ...] of length `dim`."""
+    v = 1.0 / math.sqrt(dim)
+    return [v] * dim
+
+
+class TestSemanticSearchIntent:
+    """Unit tests for Planner._semantic_search_intent (Diagnostic Slot 1)."""
+
+    def test_returns_none_when_embed_fn_is_none(self):
+        """No embed_fn → always None, no templates cached."""
+        p = Planner(runtime=make_runtime())
+        assert p._embed_fn is None
+        assert p._template_embeddings == []
+        result = p._semantic_search_intent("why don't you search for something")
+        assert result is None
+
+    def test_returns_none_when_negative_filter_matches_and_embed_fn_not_called(self):
+        """A phrase from _SEARCH_NEGATIVE_FILTER short-circuits before calling embed_fn."""
+        spy = MagicMock(return_value=_unit_vector())
+        p = Planner(runtime=make_runtime(), embed_fn=spy)
+        # Reset call count after __init__ (which calls embed_fn for templates)
+        spy.reset_mock()
+
+        result = p._semantic_search_intent("did you search for that already?")
+        assert result is None
+        # embed_fn must NOT have been called for the query
+        spy.assert_not_called()
+
+    def test_returns_group_and_score_for_matching_vector(self):
+        """
+        When embed_fn always returns the same unit vector, every template gets
+        that vector at __init__ time and the query also gets it — cosine
+        similarity of 1.0 with every template, so the returned score ≈ 1.0.
+        The returned group must be one of the known template groups.
+        """
+        from planner import _SEARCH_INTENT_TEMPLATES
+        fixed_vec = _unit_vector(8)
+        embed_fn = MagicMock(return_value=fixed_vec)
+        p = Planner(runtime=make_runtime(), embed_fn=embed_fn)
+
+        embed_fn.reset_mock()
+        result = p._semantic_search_intent("why don't you do a web search for APC")
+        assert result is not None
+        best_group, best_score, all_scores = result
+        assert best_group in _SEARCH_INTENT_TEMPLATES
+        assert abs(best_score - 1.0) < 1e-6  # cosine(v, v) == 1.0
+
+    def test_returns_none_gracefully_when_embed_fn_raises(self):
+        """embed_fn raising RuntimeError must not propagate — returns None instead."""
+        embed_fn = MagicMock(side_effect=RuntimeError("model unavailable"))
+        p = Planner(runtime=make_runtime(), embed_fn=embed_fn)
+        # __init__ will fail to embed templates (error swallowed), so
+        # _template_embeddings will be empty → returns None immediately.
+        # OR embed_fn raises during the query call if templates somehow cached.
+        # Either way, the method must return None, never raise.
+        result = p._semantic_search_intent("look it up online")
+        assert result is None
+
+    def test_returns_none_gracefully_when_embed_fn_raises_only_on_query(self):
+        """
+        embed_fn succeeds for template embedding at __init__ but raises when
+        called for the query string — _semantic_search_intent must return None.
+        """
+        call_count = {"n": 0}
+        template_total = sum(
+            len(v) for v in __import__("planner")._SEARCH_INTENT_TEMPLATES.values()
+        )
+
+        def embed_fn_that_fails_later(text: str) -> list[float]:
+            call_count["n"] += 1
+            if call_count["n"] > template_total:
+                raise RuntimeError("model unavailable on query call")
+            return _unit_vector(8)
+
+        p = Planner(runtime=make_runtime(), embed_fn=embed_fn_that_fails_later)
+        assert len(p._template_embeddings) == template_total  # templates loaded OK
+
+        result = p._semantic_search_intent("look it up")
+        assert result is None
+
+
+class TestSemanticSearchIntentDiag2:
+    """Diagnostic Slot 2 additions — per-group score dict shape and correctness."""
+
+    def test_all_group_scores_contains_exactly_four_expected_keys(self):
+        """all_group_scores must contain exactly the four template-group keys."""
+        from planner import _SEARCH_INTENT_TEMPLATES
+        expected_keys = set(_SEARCH_INTENT_TEMPLATES.keys())
+        assert expected_keys == {
+            "explicit_search_action",
+            "lookup_request",
+            "knowledge_request_open",
+            "freshness_request",
+        }
+
+        fixed_vec = _unit_vector(8)
+        p = Planner(runtime=make_runtime(), embed_fn=MagicMock(return_value=fixed_vec))
+        result = p._semantic_search_intent("find out about this topic online")
+        assert result is not None
+        _, _, all_scores = result
+        assert set(all_scores.keys()) == expected_keys
+
+    def test_per_group_max_scores_are_independent(self):
+        """
+        When embed_fn returns different vectors for different template strings,
+        the per-group score in all_group_scores reflects each group's own best
+        cosine similarity, not the global best.
+
+        Strategy: engineer two orthogonal basis vectors v1 and v2.
+        At __init__ time, embed_fn always returns v1, so all template
+        embeddings are v1. Then for the query, we switch the spy to return v2.
+        cosine(v2, v1) ≈ 0 (orthogonal) for all templates.
+
+        Then we patch _template_embeddings directly to give two groups
+        different representative vectors and confirm per-group reporting.
+        """
+        from planner import _SEARCH_INTENT_TEMPLATES
+
+        # Build a planner with any embed_fn to get past __init__ validation.
+        fixed_vec = _unit_vector(8)
+        p = Planner(runtime=make_runtime(), embed_fn=MagicMock(return_value=fixed_vec))
+
+        # Manually install two distinct group vectors:
+        # group A ("explicit_search_action") gets [1, 0, 0, 0]
+        # group B ("lookup_request")         gets [0, 1, 0, 0]
+        # all others get [0, 0, 0, 1] (low similarity to both query vectors)
+        def normalise(v: list[float]) -> list[float]:
+            import math
+            n = math.sqrt(sum(x * x for x in v))
+            return [x / n for x in v]
+
+        vec_a = normalise([1.0, 0.0, 0.0, 0.0])
+        vec_b = normalise([0.0, 1.0, 0.0, 0.0])
+        vec_other = normalise([0.0, 0.0, 0.0, 1.0])
+
+        group_to_vec = {
+            "explicit_search_action": vec_a,
+            "lookup_request":         vec_b,
+            "knowledge_request_open": vec_other,
+            "freshness_request":      vec_other,
+        }
+        p._template_embeddings = [
+            (g, group_to_vec[g]) for g in _SEARCH_INTENT_TEMPLATES
+        ]
+
+        # Query vector halfway between A and B: [1, 1, 0, 0] normalised.
+        query_vec = normalise([1.0, 1.0, 0.0, 0.0])
+        p._embed_fn = MagicMock(return_value=query_vec)
+
+        result = p._semantic_search_intent("some query")
+        assert result is not None
+        best_group, best_score, all_scores = result
+
+        # cos([1,1,0,0]/√2, [1,0,0,0]) = 1/√2 ≈ 0.707 for both A and B
+        # cos([1,1,0,0]/√2, [0,0,0,1]) = 0 for others
+        import math
+        expected_ab = 1.0 / math.sqrt(2)
+        assert abs(all_scores["explicit_search_action"] - expected_ab) < 1e-5
+        assert abs(all_scores["lookup_request"] - expected_ab) < 1e-5
+        assert abs(all_scores["knowledge_request_open"]) < 1e-5
+        assert abs(all_scores["freshness_request"]) < 1e-5
+
+        # best_group is either A or B (tied — max() picks the first alphabetically)
+        assert best_group in ("explicit_search_action", "lookup_request")
+        assert abs(best_score - expected_ab) < 1e-5
+
+
+def _planner_with_mocked_semantic(all_scores: dict[str, float]) -> "Planner":
+    """
+    Return a Planner whose _semantic_search_intent is patched to return
+    all_scores directly, bypassing embed_fn entirely.  Used to test the
+    gate logic in _priority3_tool with precise, normalization-free control.
+    """
+    p = Planner(runtime=make_runtime())
+    best_group = max(all_scores, key=lambda g: all_scores[g])
+    best_score = all_scores[best_group]
+    p._semantic_search_intent = MagicMock(
+        return_value=(best_group, best_score, all_scores)
+    )
+    return p
+
+
+class TestPriority3SemanticGating:
+    """
+    Slot [Fix 1]: verifies the semantic gate correctly controls tools_to_call.
+
+    Replaces TestPriority3ToolUnaffectedBySemantic (from Diagnostics 1/2).
+    That class contained three methods:
+      - test_no_literal_keyword_returns_none_despite_semantic_match
+        REMOVED: asserted semantic never adds web_search — false after this slot.
+      - test_route_unchanged_by_semantic_for_p6_instruction
+        REMOVED: asserted that a fixed-vector instruction falls to P6 — false
+        after this slot because a fixed unit vector scores 1.0 on all groups
+        including explicit_search_action ≥ 0.68, so it now routes via P3.
+      - test_existing_web_search_keyword_still_fires_with_embed_fn
+        PRESERVED below as test_literal_keyword_still_fires_with_embed_fn:
+        the invariant (literal keyword → web_search) is unchanged by this slot.
+
+    Seven new tests cover the gate boundary, the protected negative group, and
+    the deduplication guard.
+    """
+
+    def test_literal_keyword_still_fires_with_embed_fn(self):
+        """Literal _WEB_SEARCH_KEYWORDS match still produces web_search."""
+        fixed_vec = _unit_vector(8)
+        p = Planner(runtime=make_runtime(), embed_fn=MagicMock(return_value=fixed_vec))
+        plan = p.route("what is the latest news on APC?", context={})
+        assert "web_search" in plan.tools_to_call
+        assert plan.compound is True
+
+    def test_explicit_search_action_at_threshold_fires_web_search(self):
+        """explicit_search_action ≥ 0.68 alone → gate fires → web_search added."""
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.90,
+            "lookup_request":         0.10,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("can you check the internet for that")
+        assert result is not None
+        assert "web_search" in result.tools_to_call
+
+    def test_lookup_request_at_threshold_fires_web_search(self):
+        """lookup_request ≥ 0.65 alone → gate fires → web_search added."""
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.10,
+            "lookup_request":         0.90,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("go ahead and look it up")
+        assert result is not None
+        assert "web_search" in result.tools_to_call
+
+    def test_knowledge_group_alone_does_not_fire_gate(self):
+        """
+        knowledge_request_open at 0.95 with both gating groups below threshold
+        must NOT add web_search — this is the exact failure mode the
+        group-specific gate design prevents.
+        """
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.30,
+            "lookup_request":         0.30,
+            "knowledge_request_open": 0.95,
+            "freshness_request":      0.20,
+        })
+        result = p._priority3_tool("explain this code to me")
+        assert result is None
+
+    def test_score_just_below_lookup_threshold_does_not_fire(self):
+        """
+        lookup_request at 0.59 (below the 0.65 threshold; analogous to
+        NEG-03 from Diagnostic 2 which scored 0.601) must not trigger the gate.
+        """
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.30,
+            "lookup_request":         0.59,
+            "knowledge_request_open": 0.20,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("find me a good name for this variable")
+        assert result is None
+
+    def test_score_just_below_explicit_threshold_does_not_fire(self):
+        """explicit_search_action at 0.67 (below 0.68) must not trigger the gate."""
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.67,
+            "lookup_request":         0.30,
+            "knowledge_request_open": 0.20,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("can you just check something for me")
+        assert result is None
+
+    def test_no_duplicate_web_search_when_literal_and_semantic_both_match(self):
+        """
+        An instruction with a literal _WEB_SEARCH_KEYWORDS match AND a high
+        semantic score must produce exactly one 'web_search' in tools_to_call.
+        """
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.90,
+            "lookup_request":         0.10,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        # "latest" is a literal keyword; semantic gate also fires; no duplicate.
+        result = p._priority3_tool("what's the latest on this topic, look it up")
+        assert result is not None
+        assert result.tools_to_call.count("web_search") == 1
+
+    def test_route_falls_to_p6_when_all_semantic_scores_below_threshold(self):
+        """
+        An instruction with all semantic scores below both gating thresholds
+        and no literal P3 keywords must reach P6 (no tools, no retrieval).
+        """
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.30,
+            "lookup_request":         0.30,
+            "knowledge_request_open": 0.40,
+            "freshness_request":      0.20,
+        })
+        plan = p.route("what is 2 + 2?", context={})
+        assert plan.tools_to_call == []
+        assert plan.fetch_rag      is False
+        assert plan.fetch_episodic is False
+        assert plan.agent          == "conversational_agent"
+
+    # ------------------------------------------------------------------
+    # 2026-06-25: template-coverage fix for question-form lookup_request
+    # (§8.8 Open Item 11)
+    # ------------------------------------------------------------------
+
+    def test_new_lookup_request_templates_present(self):
+        """All four 2026-06-25 question-form templates are in lookup_request."""
+        from planner import _SEARCH_INTENT_TEMPLATES
+        templates = _SEARCH_INTENT_TEMPLATES["lookup_request"]
+        for expected in (
+            "can you look up",
+            "can you look that up for me",
+            "could you look up",
+            "can you look into this for me",
+        ):
+            assert expected in templates, f"Missing new template: {expected!r}"
+
+    def test_original_lookup_request_templates_unchanged(self):
+        """Regression guard: original five lookup_request templates are present and unmodified."""
+        from planner import _SEARCH_INTENT_TEMPLATES
+        templates = _SEARCH_INTENT_TEMPLATES["lookup_request"]
+        for expected in (
+            "look up this",
+            "look that up",
+            "go ahead and look it up",
+            "find information on this",
+            "find out about this",
+        ):
+            assert expected in templates, f"Original template missing or edited: {expected!r}"
+
+    def test_semantic_gate_thresholds_current_values(self):
+        """Regression lock: _SEMANTIC_GATE_THRESHOLDS must match current calibrated values.
+        lookup_request lowered 0.65 → 0.60 on 2026-06-25 (§10.4 Open Item 3 revisit).
+        explicit_search_action remains 0.68."""
+        from planner import _SEMANTIC_GATE_THRESHOLDS
+        assert _SEMANTIC_GATE_THRESHOLDS == {
+            "explicit_search_action": 0.68,
+            "lookup_request": 0.60,
+        }
+
+    def test_lookup_request_score_at_new_threshold_fires_gate(self):
+        """lookup_request at 0.605 (≥ 0.60) must fire the gate → web_search added."""
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.10,
+            "lookup_request":         0.605,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("can you look up something for me")
+        assert result is not None
+        assert "web_search" in result.tools_to_call
+
+    def test_lookup_request_score_just_below_new_threshold_does_not_fire(self):
+        """lookup_request at 0.595 (< 0.60) must NOT fire the gate."""
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.10,
+            "lookup_request":         0.595,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("can you look up something for me")
+        assert result is None
+
+    def test_other_template_groups_unmodified(self):
+        """Regression guard: explicit_search_action, knowledge_request_open, freshness_request are unchanged."""
+        from planner import _SEARCH_INTENT_TEMPLATES
+        assert _SEARCH_INTENT_TEMPLATES["explicit_search_action"] == (
+            "search the web for this",
+            "do a web search for this",
+            "search online for this",
+            "google this",
+            "go look it up",
+        )
+        assert _SEARCH_INTENT_TEMPLATES["knowledge_request_open"] == (
+            "what is this",
+            "what do you know about this",
+            "tell me about this",
+            "explain this to me",
+        )
+        assert _SEARCH_INTENT_TEMPLATES["freshness_request"] == (
+            "what's the latest on this",
+            "what's the current status of this",
+            "is there anything new about this",
+        )
+
+
+class TestWebSearchKeywordLiteralFix2:
+    """
+    Slot Fix 2: 'web search' and 'do a search' added to _WEB_SEARCH_KEYWORDS.
+
+    All tests use embed_fn=None so only the literal keyword path is reachable —
+    proving the fix does not depend on the embedding layer.
+    """
+
+    def test_web_search_phrase_triggers_literal_path(self):
+        """'web search' in instruction fires web_search via literal keyword match."""
+        p = Planner(runtime=make_runtime())  # embed_fn=None — literal path only
+        plan = p.route(
+            "Why don't you do a web search for APC and then tell me if you "
+            "still stand by your previous answer.",
+            context={},
+        )
+        assert "web_search" in plan.tools_to_call
+
+    def test_do_a_search_phrase_triggers_literal_path(self):
+        """'do a search' in instruction fires web_search via literal keyword match."""
+        p = Planner(runtime=make_runtime())  # embed_fn=None — literal path only
+        plan = p.route("Can you do a search for recent AI papers?", context={})
+        assert "web_search" in plan.tools_to_call
+
+    def test_unrelated_sentence_does_not_trigger(self):
+        """Sentence containing neither new phrase does not pick up a false positive."""
+        p = Planner(runtime=make_runtime())  # embed_fn=None — literal path only
+        plan = p.route("I searched online for new shoes yesterday.", context={})
+        assert "web_search" not in plan.tools_to_call
+
+
+class TestEmbedFnWiringSmoke:
+    """Smoke-level test: Planner receives a non-None embed_fn when supplied."""
+
+    def test_planner_stores_embed_fn_from_constructor(self):
+        """Constructor argument embed_fn is stored as _embed_fn."""
+        fn = MagicMock(return_value=_unit_vector())
+        p = Planner(runtime=make_runtime(), embed_fn=fn)
+        assert p._embed_fn is fn
+
+    def test_controller_agent_threads_embed_fn_to_planner(self):
+        """
+        ControllerAgent accepts embed_fn and passes it through to the Planner.
+        Verified by inspecting _planner._embed_fn on the constructed controller.
+        """
+        fn = MagicMock(return_value=_unit_vector())
+        rt = make_runtime()
+        agent = make_agent("conversational_agent")
+        ctrl = ControllerAgent(runtime=rt, agents=[agent], embed_fn=fn)
+        assert ctrl._planner._embed_fn is fn
+
+    def test_controller_agent_embed_fn_defaults_to_none(self):
+        """ControllerAgent with no embed_fn leaves Planner._embed_fn as None."""
+        rt = make_runtime()
+        agent = make_agent("conversational_agent")
+        ctrl = ControllerAgent(runtime=rt, agents=[agent])
+        assert ctrl._planner._embed_fn is None

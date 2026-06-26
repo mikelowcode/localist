@@ -32,7 +32,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     # Avoid a hard circular import at runtime; memory_manager imports nothing
@@ -590,10 +590,11 @@ class ControllerAgent:
         runtime:        RuntimeClient,
         agents:         list[AgentInterface],
         memory_manager: "MemoryManager | None" = None,
+        embed_fn:       Callable[[str], list[float]] | None = None,
     ) -> None:
         self._runtime        = runtime
         self._agents         = {a.name: a for a in agents}
-        self._planner        = _RulePlanner(runtime=runtime, memory_manager=memory_manager)
+        self._planner        = _RulePlanner(runtime=runtime, memory_manager=memory_manager, embed_fn=embed_fn)
         self._synthesizer    = Synthesizer(runtime)
         # IntentClassifier retired — routing is now handled by _RulePlanner
         self._memory_manager = memory_manager   # None → use ephemeral shim per request
@@ -1251,6 +1252,7 @@ class ControllerAgent:
                         mem_key     = mem_key,
                         runtime     = self._runtime,
                         db_path     = db_path,
+                        persona     = self._load_persona(),
                     )
             except Exception as exc:
                 logger.warning(

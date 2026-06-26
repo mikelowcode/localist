@@ -65,11 +65,41 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any
 
 from prompt_builder import PromptBuilder, RagSource
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Fabricated tool-call detection (§8.8 Open Item 11)
+# ---------------------------------------------------------------------------
+
+_FABRICATED_TOOLCALL_PATTERN = re.compile(
+    r"<\|?tool_?call.*?call:web.*?tool_?call\|>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_fabricated_toolcall(text: str) -> bool:
+    """
+    Detect the malformed tool-call-shaped string this model has been observed
+    to emit on tools=[] turns (§8.8 Open Item 11). No real tool-calling
+    contract exists in this codebase for any runtime client — any match is
+    fabrication, never a legitimate format to parse or honour.
+    """
+    return bool(_FABRICATED_TOOLCALL_PATTERN.search(text))
+
+
+# Substituted when fabricated tool-call syntax is detected.  Grounded=False
+# and sources=[] are forced alongside this message — a substituted fallback
+# is never grounded in real tool or RAG content.
+_SEARCH_UNAVAILABLE_FALLBACK = (
+    "I don't have live search results for that — here's what I know "
+    "from training, which may be stale or incomplete."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +233,22 @@ class ConversationalAgent:
                     output     = {},
                     error      = f"Inference error: {exc}",
                 )
+            if _is_fabricated_toolcall(answer):
+                logger.warning(
+                    "ConversationalAgent: fabricated tool-call syntax detected "
+                    "(prebuilt path) for subtask %s — %d raw chars discarded.",
+                    subtask.subtask_id, len(answer),
+                )
+                return AgentResult(
+                    subtask_id = subtask.subtask_id,
+                    agent_name = self.name,
+                    status     = TaskStatus.COMPLETE,
+                    output     = {
+                        "answer":   _SEARCH_UNAVAILABLE_FALLBACK,
+                        "sources":  [],
+                        "grounded": False,
+                    },
+                )
             return AgentResult(
                 subtask_id = subtask.subtask_id,
                 agent_name = self.name,
@@ -320,6 +366,23 @@ class ConversationalAgent:
                 status     = TaskStatus.FAILED,
                 output     = {},
                 error      = f"Inference error: {exc}",
+            )
+
+        if _is_fabricated_toolcall(answer):
+            logger.warning(
+                "ConversationalAgent: fabricated tool-call syntax detected "
+                "(legacy RAG path) for subtask %s — %d raw chars discarded.",
+                subtask.subtask_id, len(answer),
+            )
+            return AgentResult(
+                subtask_id = subtask.subtask_id,
+                agent_name = self.name,
+                status     = TaskStatus.COMPLETE,
+                output     = {
+                    "answer":   _SEARCH_UNAVAILABLE_FALLBACK,
+                    "sources":  [],
+                    "grounded": False,
+                },
             )
 
         logger.info(

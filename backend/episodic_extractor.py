@@ -27,8 +27,11 @@ Reference: §2 and Phase 5 of LOCALIST-Architecture.md
 
 from __future__ import annotations
 
+import datetime
 import logging
 import re
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,6 +39,17 @@ from memory_manager import EpisodicMemoryWriter, WorkingStateStore, WorkingState
 from prompt_builder import PromptBuilder
 
 logger = logging.getLogger(__name__)
+
+# Thread-local storage for passing diagnostic metadata from
+# extract_working_state_update() to process_working_state_update()
+# without changing the return type.
+# Assumes both functions run on the same thread for a given call — true
+# today because controller_agent.py is fully synchronous. If async
+# execution (e.g. asyncio.to_thread) is ever introduced for this call
+# path, threading.local() will silently produce empty/stale reads with no
+# exception; the bridge would need to become an explicit return value or
+# parameter rather than thread-local state.
+_wsu_diag = threading.local()
 
 _PROMPT_BUILDER = PromptBuilder()
 
@@ -107,8 +121,11 @@ _IMPLICIT_EXTRACTION_SYSTEM = (
     "No preamble. No explanation. One sentence or NONE."
 )
 
-# System prompt for the working-state update call (post-response hook, Slot 6A Tier 2).
-_WORKING_STATE_UPDATE_SYSTEM = (
+# Instructional content for the working-state update call (Slot 6A Tier 2).
+# Kept separate from the identity block so _build_wsu_system() can prepend
+# the same shared prefix as _slot1_system() — enabling oMLX block-0 KV-cache
+# reuse across the main conversational call and this Tier 2 call (§3.7c).
+_WSU_TASK_INSTRUCTIONS = (
     "You are a session-state tracker for a local AI research assistant. "
     "After each turn, you update three working-state fields based on the previous "
     "state and the new turn (user instruction + assistant response).\n\n"
@@ -129,6 +146,18 @@ _WORKING_STATE_UPDATE_SYSTEM = (
     "Only capture clear explicit choices or commitments, not tentative suggestions.\n"
     "- Never add preamble, explanation, or extra lines beyond the three."
 )
+
+
+def _build_wsu_system(persona: str | None) -> str:
+    """
+    Build the full system message for extract_working_state_update().
+
+    Prepends the same identity block that PromptBuilder._slot1_system(persona)
+    produces for the main conversational call, so oMLX's content-hash cache
+    treats both calls as the same block-0 lineage (§3.7c shared-prefix fix).
+    _WSU_TASK_INSTRUCTIONS follows after a double newline.
+    """
+    return _PROMPT_BUILDER._slot1_system(persona) + "\n\n" + _WSU_TASK_INSTRUCTIONS
 
 # Per-bullet truncation ceiling for open_loops and recent_decisions entries.
 # Mirrors memory_manager._MAX_BULLET_CHARS (80 chars) — same 20-token convention.
@@ -691,6 +720,7 @@ def extract_working_state_update(
     response:       str,
     previous_state: "WorkingStateRecord | None",
     runtime:        Any,
+    persona:        "str | None" = None,
 ) -> "tuple[str | None, list[str], list[str]] | None":
     """
     Extract updated Slot 6A Tier 2 fields from a conversation turn.
@@ -739,14 +769,25 @@ def extract_working_state_update(
         f"Assistant: {response}"
     )
 
+    _t0 = time.perf_counter()
     try:
         raw = runtime.infer(
-            system      = _WORKING_STATE_UPDATE_SYSTEM,
+            system      = _build_wsu_system(persona),
             prompt      = user_prompt,
-            max_tokens  = 200,
+            # §9.5 Open Item 4: live SSE inspection measured ~570-600 token
+            # reasoning trace on this call; 200 caused deterministic
+            # PARSE_FAILURE (finish_reason="length"). 1024 matches the main
+            # conversational call's budget.
+            max_tokens  = 1024,
             temperature = 0.0,
         )
+        _wsu_diag.infer_elapsed_s  = time.perf_counter() - _t0
+        _wsu_diag.raw_response     = raw
+        _wsu_diag.failure_category = None
     except Exception as exc:
+        _wsu_diag.infer_elapsed_s  = time.perf_counter() - _t0
+        _wsu_diag.raw_response     = ""
+        _wsu_diag.failure_category = "INFER_FAILURE"
         logger.warning(
             "extract_working_state_update: inference failed (%s).", exc
         )
@@ -769,6 +810,7 @@ def extract_working_state_update(
             decisions_val = line[len("DECISIONS:"):].strip()
 
     if any(v is None for v in (focus_val, open_loops_val, decisions_val)):
+        _wsu_diag.failure_category = "PARSE_FAILURE"
         logger.warning(
             "extract_working_state_update: parse failed — "
             "missing label(s) in response %r.", raw[:120],
@@ -814,6 +856,7 @@ def process_working_state_update(
     mem_key:     str,
     runtime:     Any,
     db_path:     Any,   # Path
+    persona:     "str | None" = None,
 ) -> "WorkingStateRecord | None":
     """
     Full working-state update pipeline: read → extract → resolve → write → return.
@@ -850,16 +893,51 @@ def process_working_state_update(
     store = WorkingStateStore(db_path=db_path)
 
     try:
+        # Diagnostic setup — reset thread-local state before the extraction call.
+        _diag_ts = datetime.datetime.now().isoformat(timespec="seconds")
+        _wsu_diag.infer_elapsed_s  = None
+        _wsu_diag.raw_response     = ""
+        _wsu_diag.failure_category = None
+
         previous_state = store.get(mem_key)
+
+        # Capture both reference-point candidates before the extraction call.
+        # The immediately-prior turn's raw instruction+response text is not
+        # retained anywhere by the time this hook runs — not accessible to
+        # this caller (finding, not a bug; only previous_state fields are
+        # available as a reference point at this call site).
+        _ref_focus     = previous_state.current_focus          if previous_state else None
+        _ref_loops     = list(previous_state.open_loops)       if previous_state else []
+        _ref_decisions = list(previous_state.recent_decisions) if previous_state else []
+        logger.debug(
+            "WSU_DIAG[%s] mem_key=%r ref=prev_state "
+            "focus=%r loops=%r decisions=%r "
+            "note='previous_turn_raw_text_not_retained_by_caller'",
+            _diag_ts, mem_key,
+            _ref_focus, _ref_loops, _ref_decisions,
+        )
 
         result = extract_working_state_update(
             instruction    = instruction,
             response       = response,
             previous_state = previous_state,
             runtime        = runtime,
+            persona        = persona,
         )
 
+        # Read back diagnostic metadata set by extract_working_state_update().
+        _elapsed  = getattr(_wsu_diag, "infer_elapsed_s",  None)
+        _raw      = getattr(_wsu_diag, "raw_response",     "")
+        _fail_cat = getattr(_wsu_diag, "failure_category", None)
+        _elapsed_str = f"{_elapsed:.3f}" if _elapsed is not None else "N/A"
+
         if result is None:
+            _outcome = _fail_cat or "PARSE_FAILURE"
+            logger.debug(
+                "WSU_DIAG[%s] mem_key=%r outcome=%s infer_elapsed_s=%s raw=%r",
+                _diag_ts, mem_key, _outcome,
+                _elapsed_str, (_raw or "")[:200],
+            )
             logger.warning(
                 "process_working_state_update: extraction returned None "
                 "for mem_key=%r — keeping previous state.", mem_key,
@@ -867,6 +945,24 @@ def process_working_state_update(
             return previous_state
 
         extracted_focus, open_loops, recent_decisions = result
+
+        # Determine CHANGED vs UNCHANGED_NONE by comparing resolved values
+        # to the reference point captured before the extraction call.
+        _resolved_focus = extracted_focus if extracted_focus is not None else _ref_focus
+        if (
+            _resolved_focus == _ref_focus
+            and open_loops  == _ref_loops
+            and recent_decisions == _ref_decisions
+        ):
+            _outcome = "UNCHANGED_NONE"
+        else:
+            _outcome = "CHANGED"
+        logger.debug(
+            "WSU_DIAG[%s] mem_key=%r outcome=%s infer_elapsed_s=%s "
+            "new={focus=%r loops=%r decisions=%r}",
+            _diag_ts, mem_key, _outcome, _elapsed_str,
+            _resolved_focus, open_loops, recent_decisions,
+        )
 
         # Resolve FOCUS: None means "keep previous value"
         if extracted_focus is None:

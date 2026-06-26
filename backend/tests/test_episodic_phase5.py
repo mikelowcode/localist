@@ -16,6 +16,7 @@ Covers:
 All DB tests use real SQLite via tmp_path. Runtime calls use MagicMock.
 """
 
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -41,7 +42,14 @@ from episodic_extractor import (
     ExtractionResult,
     _infer_type_from_content,
     _MAX_BULLET_CHARS,
+    _WSU_TASK_INSTRUCTIONS,
+    _build_wsu_system,
 )
+from prompt_builder import PromptBuilder
+from wiki_doc import parse_wiki_doc
+
+# Path to the wiki directory, used by tests that verify against live file content.
+_WIKI_DIR = Path(__file__).parent.parent / "wiki"
 from memory_manager import WorkingStateStore, WorkingStateRecord
 from controller_agent import ControllerAgent, TaskStatus, AgentResult
 
@@ -849,3 +857,199 @@ class TestProcessWorkingStateUpdate:
         assert "write integration test for loop reconciliation" not in result_2.open_loops
         assert result_2.open_loops == []
         assert result_2.recent_decisions == ["reconciliation test written"]
+
+
+# ---------------------------------------------------------------------------
+# Slot 6A Tier 2 diagnostic logging — four outcome categories
+# ---------------------------------------------------------------------------
+
+class TestWSUDiagnosticLogging:
+    """
+    Verify that each of the four WSU_DIAG outcome categories is emitted at
+    DEBUG level by process_working_state_update(). Control flow and return
+    values are unchanged from the existing tests above; only log output is
+    checked here.
+    """
+
+    @pytest.fixture()
+    def db_path(self, tmp_path: Path) -> Path:
+        path = tmp_path / "diag_test.db"
+        MemoryManager(db_path=path)
+        return path
+
+    def _run(self, db_path, rt, mem_key: str = "diag-sess"):
+        return process_working_state_update(
+            instruction = "test instruction",
+            response    = "test response",
+            mem_key     = mem_key,
+            runtime     = rt,
+            db_path     = db_path,
+        )
+
+    def test_changed_outcome_logged(self, db_path, caplog):
+        rt = make_runtime(infer_return=(
+            "FOCUS: brand new focus\n"
+            "OPEN_LOOPS: some open loop\n"
+            "DECISIONS: NONE"
+        ))
+        with caplog.at_level(logging.DEBUG, logger="episodic_extractor"):
+            self._run(db_path, rt)
+        assert any("outcome=CHANGED" in r.message for r in caplog.records)
+
+    def test_unchanged_none_outcome_logged(self, db_path, caplog):
+        # Seed the store; model returns NONE for all — resolves to same values.
+        store = WorkingStateStore(db_path=db_path)
+        store.upsert(
+            mem_key          = "diag-sess",
+            current_focus    = "existing focus",
+            open_loops       = [],
+            recent_decisions = [],
+        )
+        rt = make_runtime(infer_return=(
+            "FOCUS: NONE\n"
+            "OPEN_LOOPS: NONE\n"
+            "DECISIONS: NONE"
+        ))
+        with caplog.at_level(logging.DEBUG, logger="episodic_extractor"):
+            self._run(db_path, rt)
+        assert any("outcome=UNCHANGED_NONE" in r.message for r in caplog.records)
+
+    def test_parse_failure_outcome_logged(self, db_path, caplog):
+        # Mirrors the live '\n' response from the session on 2026-06-23.
+        rt = make_runtime(infer_return="\n")
+        with caplog.at_level(logging.DEBUG, logger="episodic_extractor"):
+            self._run(db_path, rt)
+        assert any("outcome=PARSE_FAILURE" in r.message for r in caplog.records)
+
+    def test_infer_failure_outcome_logged(self, db_path, caplog):
+        rt = MagicMock()
+        rt.infer.side_effect = RuntimeError("model offline")
+        with caplog.at_level(logging.DEBUG, logger="episodic_extractor"):
+            self._run(db_path, rt)
+        assert any("outcome=INFER_FAILURE" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Slot 6A Tier 2 — shared-prefix system message + reasoning-budget fix
+# (§3.7c KV-cache alignment + §9.5 Open Item 4)
+# ---------------------------------------------------------------------------
+
+class TestBuildWSUSystem:
+    """
+    Validates the shared-prefix construction introduced by _build_wsu_system()
+    and the threading of persona through extract/process_working_state_update().
+    """
+
+    _PB = PromptBuilder()
+
+    # 1. persona=None → output starts with PromptBuilder._SYSTEM; task instructions present.
+    def test_no_persona_starts_with_system_constant(self):
+        result = _build_wsu_system(None)
+        assert result.startswith(PromptBuilder._SYSTEM)
+        assert _WSU_TASK_INSTRUCTIONS in result
+
+    # 2. persona present → leading portion is BYTE-IDENTICAL to _slot1_system(persona).
+    #    This is the test that validates the entire KV-cache alignment goal (§3.7c).
+    def test_persona_prefix_byte_identical_to_slot1_system(self):
+        persona = "some test persona text"
+        expected_prefix = self._PB._slot1_system(persona)
+        result = _build_wsu_system(persona)
+        assert result.startswith(expected_prefix), (
+            f"Shared prefix mismatch.\n"
+            f"Expected prefix: {expected_prefix!r}\n"
+            f"Actual start:    {result[:len(expected_prefix)]!r}"
+        )
+
+    # 3. _WSU_TASK_INSTRUCTIONS text is present and unchanged after the identity block.
+    def test_task_instructions_unchanged_after_prefix(self):
+        result = _build_wsu_system(None)
+        # Double newline separates identity block from task instructions.
+        parts = result.split("\n\n", 1)
+        assert len(parts) == 2
+        assert parts[1] == _WSU_TASK_INSTRUCTIONS
+
+    # 4. extract_working_state_update() passes persona through to runtime.infer(system=...).
+    def test_extract_wsu_persona_passed_to_infer(self):
+        persona = "custom persona for cache test"
+        rt = make_runtime(infer_return=_WELL_FORMED_RESPONSE)
+        extract_working_state_update(
+            instruction    = "test",
+            response       = "test",
+            previous_state = None,
+            runtime        = rt,
+            persona        = persona,
+        )
+        called_system = rt.infer.call_args.kwargs.get("system") or rt.infer.call_args.args[0]
+        expected_prefix = self._PB._slot1_system(persona)
+        assert called_system.startswith(expected_prefix)
+
+    # 5. process_working_state_update() threads persona to extract_working_state_update().
+    def test_process_wsu_threads_persona(self, tmp_path):
+        from unittest.mock import patch
+        db = tmp_path / "thread_test.db"
+        MemoryManager(db_path=db)
+        persona = "threaded persona value"
+        rt = make_runtime(infer_return=_WELL_FORMED_RESPONSE)
+        with patch(
+            "episodic_extractor.extract_working_state_update",
+            wraps=extract_working_state_update,
+        ) as mock_extract:
+            process_working_state_update(
+                instruction = "test",
+                response    = "test",
+                mem_key     = "sess-thread",
+                runtime     = rt,
+                db_path     = db,
+                persona     = persona,
+            )
+        mock_extract.assert_called_once()
+        _, kwargs = mock_extract.call_args
+        assert kwargs.get("persona") == persona
+
+    # 6. max_tokens=1024 is the value actually sent to runtime.infer() (§9.5 Open Item 4).
+    def test_max_tokens_is_1024(self):
+        rt = make_runtime(infer_return=_WELL_FORMED_RESPONSE)
+        extract_working_state_update(
+            instruction    = "test",
+            response       = "test",
+            previous_state = None,
+            runtime        = rt,
+        )
+        called_max_tokens = rt.infer.call_args.kwargs.get("max_tokens")
+        assert called_max_tokens == 1024, (
+            f"Expected max_tokens=1024, got {called_max_tokens!r}"
+        )
+
+    # 7. Verify byte-identical prefix using the ACTUAL on-disk lora-persona.md
+    #    content (487-token version), parsed exactly as _load_persona() does.
+    #    Fails fast with a clear message if the file is missing or too short.
+    def test_actual_persona_prefix_byte_identical(self):
+        persona_path = _WIKI_DIR / "lora-persona.md"
+        assert persona_path.exists(), (
+            f"lora-persona.md not found at {persona_path} — "
+            "run the wiki re-index before this test"
+        )
+        raw_content  = persona_path.read_text(encoding="utf-8")
+        actual_persona = parse_wiki_doc(raw_content).body[:2000]
+
+        # Must be the new ~487-token persona, not the old shorter version.
+        est_tokens = len(actual_persona) // 4
+        assert est_tokens >= 400, (
+            f"Persona appears to be the old short version "
+            f"(est_tokens={est_tokens}). Expected ≥400 tokens after the edit."
+        )
+
+        expected_prefix = self._PB._slot1_system(actual_persona)
+        result          = _build_wsu_system(actual_persona)
+
+        assert result.startswith(expected_prefix), (
+            f"Byte-identical prefix FAILED with actual 487-token persona.\n"
+            f"Expected prefix (first 120 chars): {expected_prefix[:120]!r}\n"
+            f"Actual start   (first 120 chars): {result[:120]!r}"
+        )
+        # Confirm the task instructions follow after the shared prefix.
+        suffix = result[len(expected_prefix):]
+        assert suffix == "\n\n" + _WSU_TASK_INSTRUCTIONS, (
+            "Suffix after shared prefix does not match "
+            f"expected '\\n\\n' + _WSU_TASK_INSTRUCTIONS. Got: {suffix[:60]!r}"
+        )
