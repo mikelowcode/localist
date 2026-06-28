@@ -1104,3 +1104,192 @@ class TestIdentityCapabilityNegativeFilter:
         )
         assert result is not None, "Gate should fire for a real lookup-request utterance"
         assert "web_search" in result.tools_to_call
+
+
+# ---------------------------------------------------------------------------
+# 2026-06-27: greeting false-positive filter — §10.4
+# ---------------------------------------------------------------------------
+
+class TestGreetingFalsePositiveFilter:
+    """
+    Tests for the 4-phrase greeting block added to _SEARCH_NEGATIVE_FILTER
+    on 2026-06-27 after the live diagnostic in
+    diagnostics/score_greeting_collisions.py confirmed these utterances cross
+    the lookup_request 0.60 gate on the real embedding model.
+
+    What these tests DO verify:
+        Substring-match behavior: the filter's `phrase in lowered` check fires
+        correctly for each new entry and the surrounding confirmed-live
+        utterance forms (trailing punctuation, mixed case, etc.). This is
+        independent of any embedding model — the filter fires before embed_fn
+        is ever called.
+
+    What these tests CANNOT verify with a stub embed_fn:
+        Whether these utterances would actually clear the 0.60 lookup_request
+        gate on the REAL mlx-community/embeddinggemma-300m-4bit model. That
+        was confirmed by the live diagnostic (run separately from this suite),
+        not here. A stub embed_fn returning a synthetic vector has no
+        relationship to the real model's embedding geometry.
+    """
+
+    def _make_planner_with_embed(self) -> "Planner":
+        """Planner with a stub embed_fn; spy reset after __init__ template pre-embedding."""
+        fixed_vec = _unit_vector(8)
+        spy = MagicMock(return_value=fixed_vec)
+        p = Planner(runtime=make_runtime(), embed_fn=spy)
+        spy.reset_mock()
+        return p
+
+    # ------------------------------------------------------------------
+    # Group 1 — filter membership
+    # ------------------------------------------------------------------
+
+    def test_hey_lora_in_negative_filter(self):
+        """'hey lora' is a member of _SEARCH_NEGATIVE_FILTER (2026-06-27 addition)."""
+        from planner import _SEARCH_NEGATIVE_FILTER
+        assert "hey lora" in _SEARCH_NEGATIVE_FILTER
+
+    def test_hi_there_in_negative_filter(self):
+        """'hi there' is a member of _SEARCH_NEGATIVE_FILTER (2026-06-27 addition)."""
+        from planner import _SEARCH_NEGATIVE_FILTER
+        assert "hi there" in _SEARCH_NEGATIVE_FILTER
+
+    def test_hey_there_in_negative_filter(self):
+        """'hey there' is a member of _SEARCH_NEGATIVE_FILTER (2026-06-27 addition)."""
+        from planner import _SEARCH_NEGATIVE_FILTER
+        assert "hey there" in _SEARCH_NEGATIVE_FILTER
+
+    def test_whats_up_in_negative_filter(self):
+        """"what's up" is a member of _SEARCH_NEGATIVE_FILTER (2026-06-27 addition)."""
+        from planner import _SEARCH_NEGATIVE_FILTER
+        assert "what's up" in _SEARCH_NEGATIVE_FILTER
+
+    # ------------------------------------------------------------------
+    # Group 2 — behavioral: filter fires → _semantic_search_intent returns None
+    # ------------------------------------------------------------------
+
+    def test_hey_lora_exclamation_filtered(self):
+        """
+        'Hey LORA!' — the confirmed live false positive (2026-06-27) — is
+        intercepted by the 'hey lora' substring match before embedding runs.
+
+        Inlines the spy (rather than using _make_planner_with_embed) so that
+        spy.assert_not_called() can verify the filter truly short-circuits
+        before the embed call, not just that the method returns None.
+
+        Note: this stub cannot verify the real model would have scored this
+        ≥ 0.60 — that was confirmed by the live diagnostic only.
+        """
+        spy = MagicMock(return_value=_unit_vector(8))
+        p = Planner(runtime=make_runtime(), embed_fn=spy)
+        spy.reset_mock()
+
+        result = p._semantic_search_intent("hey lora!")
+        assert result is None
+        spy.assert_not_called()
+
+    def test_hi_there_filtered(self):
+        """'hi there' is caught by the filter → _semantic_search_intent returns None."""
+        p = self._make_planner_with_embed()
+        assert p._semantic_search_intent("hi there") is None
+
+    def test_whats_up_with_question_mark_filtered(self):
+        """"what's up?" (trailing ?) matches 'what's up' substring → returns None."""
+        p = self._make_planner_with_embed()
+        assert p._semantic_search_intent("what's up?") is None
+
+    def test_hey_lora_trailing_question_mark_filtered(self):
+        """
+        'hey lora?' — trailing punctuation — is caught by 'hey lora' substring.
+        Confirms the substring check is not accidentally anchored or
+        punctuation-sensitive at the tail of the string.
+        """
+        p = self._make_planner_with_embed()
+        assert p._semantic_search_intent("hey lora?") is None
+
+    # ------------------------------------------------------------------
+    # Group 3 — non-regression: genuine lookup utterance not swallowed
+    # ------------------------------------------------------------------
+
+    def test_genuine_lookup_not_caught_by_greeting_filter(self):
+        """
+        'can you look up this' — a genuine lookup-request utterance — is NOT
+        caught by any of the 4 new greeting-filter entries and still fires
+        the semantic gate → web_search is in tools_to_call.
+
+        Uses _planner_with_mocked_semantic (0.62 on lookup_request, above the
+        0.60 threshold) matching the existing pattern in
+        TestIdentityCapabilityNegativeFilter.test_original_lookup_incident_utterances_still_fire_gate.
+
+        Guards against a future edit accidentally widening one of the 4 new
+        phrases so it swallows real search intent.
+        """
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.10,
+            "lookup_request":         0.62,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("can you look up this")
+        assert result is not None, (
+            "Genuine lookup utterance must not be swallowed by the greeting filter"
+        )
+        assert "web_search" in result.tools_to_call
+
+    # ------------------------------------------------------------------
+    # Group 4 — documented gap: bare "hi" / "hey" deliberately NOT filtered
+    # ------------------------------------------------------------------
+
+    def test_bare_hi_not_filtered_documented_gap(self):
+        """
+        'hi' is deliberately NOT in _SEARCH_NEGATIVE_FILTER and is not
+        intercepted by the filter.
+
+        This is a DOCUMENTED GAP, not an omission. Bare 'hi' collides with
+        common substrings in legitimate queries under this filter's
+        substring-match mechanism ('history', 'this', 'high', 'vehicle',
+        etc.) — adding it would silently suppress the semantic gate on
+        unrelated queries.
+
+        See the 2026-06-27 comment block in planner.py (_SEARCH_NEGATIVE_FILTER)
+        and LOCALIST-Architecture.md §10.4 open items for the pending fix path
+        (word-boundary-matched filter or a different mechanism).
+
+        If you are reading this because you want to add 'hi' to the filter:
+        resolve the collision risk in the §10.4 open item first.
+        """
+        from planner import _SEARCH_NEGATIVE_FILTER
+        assert "hi" not in _SEARCH_NEGATIVE_FILTER
+
+        # Not intercepted → reaches the embedding path.
+        # With a stub embed_fn the result is non-None (synthetic scores returned).
+        p = self._make_planner_with_embed()
+        result = p._semantic_search_intent("hi")
+        assert result is not None, (
+            "'hi' must reach the embedding path; the filter must not intercept it"
+        )
+
+    def test_bare_hey_not_filtered_documented_gap(self):
+        """
+        'hey' is deliberately NOT in _SEARCH_NEGATIVE_FILTER and is not
+        intercepted by the filter.
+
+        This is a DOCUMENTED GAP, not an omission. Bare 'hey' collides with
+        'they' (and potentially other substrings) under this filter's
+        substring-match mechanism — adding it would suppress the gate for
+        utterances like 'what did they say?', 'can they look it up?', etc.
+
+        See the 2026-06-27 comment block in planner.py (_SEARCH_NEGATIVE_FILTER)
+        and LOCALIST-Architecture.md §10.4 open items for the pending fix path.
+
+        If you are reading this because you want to add 'hey' to the filter:
+        resolve the collision risk in the §10.4 open item first.
+        """
+        from planner import _SEARCH_NEGATIVE_FILTER
+        assert "hey" not in _SEARCH_NEGATIVE_FILTER
+
+        p = self._make_planner_with_embed()
+        result = p._semantic_search_intent("hey")
+        assert result is not None, (
+            "'hey' must reach the embedding path; the filter must not intercept it"
+        )

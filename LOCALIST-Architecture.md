@@ -3322,12 +3322,17 @@ adjustment for one known utterance. `lookup_request` was subsequently lowered fr
 on 2026-06-25 after confirmed live false negatives (see §10.4 Open Item 3 update).
 
 **A negative filter short-circuits before the embedding call.** `_SEARCH_NEGATIVE_FILTER` is a
-frozenset of 14 phrases (9 original + 5 added 2026-06-26) identifying meta-instructions that
-reference the conversation itself or the search tool — "did you search", "what tool did you use",
-"search my previous messages", and similar — rather than requesting a world-facing search, plus
-five identity/capability phrases ("who are you", "what are you", "what can you do",
-"what can you help with", "what do you do") added after a confirmed false-positive collision with
-the four 2026-06-25 `lookup_request` templates (see §10.4 Open Item 3 update). When any of these
+frozenset of 18 phrases (9 original + 5 added 2026-06-26 + 4 added 2026-06-27) identifying
+meta-instructions that reference the conversation itself or the search tool — "did you search",
+"what tool did you use", "search my previous messages", and similar — rather than requesting a
+world-facing search, plus five identity/capability phrases ("who are you", "what are you",
+"what can you do", "what can you help with", "what do you do") added after a confirmed
+false-positive collision with the four 2026-06-25 `lookup_request` templates (see §10.4 Open
+Item 3 update 2026-06-26), plus four greeting-form phrases ("hey lora", "hi there", "hey there",
+"what's up") added after "Hey LORA!" scored 0.612 on `lookup_request` in live use (see §10.4
+Open Item 3 update 2026-06-27). Bare "hi" and "hey" were assessed and deliberately excluded:
+under the filter's `phrase in lowered` substring mechanism, "hi" collides with common words
+("history", "this", "high", "vehicle", etc.) and "hey" collides with "they". When any of these
 phrases appears in the lowered instruction, `_semantic_search_intent()` returns `None` immediately
 without invoking `embed_fn`. Verified live: "Did you search for that already?" triggered the
 filter and produced no embedding call.
@@ -3478,6 +3483,70 @@ independently removable, with no impact on the gate logic itself.
   were raised and explicitly deferred; their scores have not been tested. Not blocked, but
   not covered.
 
+**Open Item 3 — Update 2026-06-27 (greeting false positives; `_SEARCH_NEGATIVE_FILTER`
+expansion).** "Hey LORA!" — a user greeting to open a session — produced `lookup_request=0.612`
+(≥ 0.60), dispatching a spurious `web_search` call. This is the named trigger from update B:
+a confirmed live false positive on `lookup_request`.
+
+*Diagnostic arc (two passes, one script):* `diagnostics/score_greeting_collisions.py` was run
+in two phases.
+
+- **Breadth pass:** The original probe set (exact_repeat / isolation / common_greeting /
+  known_anchor groups, 20 utterances) showed every short greeting clustering in a 0.60–0.65
+  band on `lookup_request`. The "LORA" token was specifically ruled out as the cause: bare
+  "Hey" (without "LORA") scored 0.648 — higher than "Hey LORA!" (0.612). "Hi" (0.636) and
+  "Hello" (0.612) also cleared the gate. Confirmed a broad class effect, not a token artifact.
+
+- **Length-controlled extension:** A three-track comparison (greetings vs. non-greeting small
+  talk vs. `lookup_request` templates, matched at 1–4 word lengths) addressed whether "short
+  strings in general collide" or "greetings specifically collide." The comparison table showed
+  the greeting track (mean 0.623→0.602) running ~0.03 above the small-talk track (mean
+  0.595→0.545) at every word count, with both tracks decaying with length. The initial read
+  was an additive length+greeting effect. Per-utterance inspection revised this: the gap was
+  produced by specific lead tokens ("hey", "hi", "what's up") scoring anomalously, not by
+  greeting-ness as a semantic category — "good morning" (0.586–0.594) and "hello" (0.601–0.612)
+  did not clear the gate reliably. The operative mechanism is lexical-token-specific, not
+  category-level. This revision is part of the record; the table itself is not wrong, but the
+  additive-effect interpretation was superseded by the per-utterance data.
+
+*Fix:* Four phrases added to `_SEARCH_NEGATIVE_FILTER` — "hey lora", "hi there", "hey there",
+"what's up" — blocking the embedding call before it reaches the gating logic. Selected over
+threshold adjustment or template-set change as the narrowest reversible option, consistent with
+the 2026-06-26 precedent. Bare "hi" and "hey" were assessed and deliberately excluded: under
+the filter's `phrase in lowered` substring mechanism, "hi" collides with "history", "this",
+"high", "vehicle", and similar; "hey" collides with "they". The multi-word forms carry no
+collisions found in testing.
+
+*Verification:*
+
+1. **Unit tests (+11):** `TestGreetingFalsePositiveFilter` in `test_planner_phase3.py` — 4
+   membership tests (one per new phrase); 4 behavioral tests confirming `_semantic_search_intent()`
+   returns `None` for the confirmed-live utterance forms ("Hey LORA!", "hi there", "what's up?",
+   "hey lora?", the last confirming the substring check is not tail-anchored); 1 non-regression
+   test confirming genuine `lookup_request` utterances still fire the gate; 2 documented-gap
+   tests asserting bare "hi" and "hey" are *not* in the filter, with docstrings pointing to
+   this open item and the collision data.
+2. **Live diagnostic (both passes):** Real `EmbeddingEngine`, real `Planner.__init__()`. The
+   known-anchor utterances reproduced prior scores (1.000 on their respective groups). The
+   four new filter phrases produced `None` returns confirmed by the first-pass output.
+
+*What remains open:*
+
+- **Bare "hi" and "hey" still unfiltered.** Collision data documented in the `planner.py`
+  comment block and in `TestGreetingFalsePositiveFilter`'s documented-gap tests. Pending
+  either a word-boundary-matched filter path or a different mechanism. Distinct from the
+  identity-adjacent siblings deferred in the 2026-06-26 update — both are known false-positive
+  candidates not yet added, but they arise from different data and different collision
+  constraints.
+- **Why these specific tokens collide is unknown.** The 300m EmbeddingGemma model places
+  "hi", "hey", and "what's up" anomalously close to the `lookup_request` template group;
+  no structural explanation was found in the diagnostic data. Logged only.
+- **General 0.60 negative-side margin still unverified.** This is the second confirmed
+  false-positive batch on `lookup_request` since the 2026-06-25 threshold lowering (the
+  first was the 2026-06-26 identity/capability batch). The same unverified-margin risk
+  named in that update persists; this update adds a second data point to the same open
+  problem rather than introducing a new one.
+
 **Open Item 4 — Live near-miss on `explicit_search_action` threshold, compound
 instruction (2026-06-23).** A live, unscripted turn — "Look up karpathy llm
 wiki then propose ways it implement it into Localist design." — scored
@@ -3514,7 +3583,7 @@ observed scoring in the 0.60–0.68 band for `explicit_search_action`.
 
 ### 10.5 Test Suite
 
-Current state: **425 tests, 0 failures** across all test files (verified fresh 2026-06-26).
+Current state: **436 tests, 0 failures** across all test files (verified fresh 2026-06-27).
 
 The classifier was built across four sequential slots (all in `backend/tests/test_planner_phase3.py`),
 then extended in two later sessions:
@@ -3528,7 +3597,8 @@ then extended in two later sessions:
 | OI 3 update A+B (2026-06-25) | `lookup_request` template expansion (5→9) and threshold lowering (0.65→0.60); 6 new tests in `TestPriority3SemanticGating` | 339 | 345 | +6 |
 | P4a removal (2026-06-26) | `_priority4a_identity()` / `force_rag` removed; −3 deleted, +16 added across `test_planner_phase3.py` and `test_controller_phase4.py` — see §8.8 OI 12 for full breakdown | 405* | 418 | +13 |
 | OI 3 update 2026-06-26 | `_SEARCH_NEGATIVE_FILTER` identity/capability additions; `TestIdentityCapabilityNegativeFilter` in `test_planner_phase3.py` | 418 | 425 | +7 |
-| **Total** | | **318** | **425** | **+107** |
+| OI 3 update 2026-06-27 | `_SEARCH_NEGATIVE_FILTER` greeting-form additions; `TestGreetingFalsePositiveFilter` in `test_planner_phase3.py` (4 membership + 4 behavioral short-circuit + 1 non-regression + 2 documented-gap) | 425 | 436 | +11 |
+| **Total** | | **318** | **436** | **+118** |
 
 \* The P4a-removal row uses 405 as its before-count because that was the confirmed baseline at the start of that session. The gap between 345 (OI 3 update A+B) and 405 reflects tests added across unrelated sessions (§8, §9, and other §8.8 close-outs) not tracked in this table.
 

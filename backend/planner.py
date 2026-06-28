@@ -227,6 +227,28 @@ _SEARCH_NEGATIVE_FILTER: frozenset[str] = frozenset({
     "what can you do",
     "what can you help with",
     "what do you do",
+    # 2026-06-27: greeting false positives confirmed via live diagnostic
+    # (diagnostics/score_greeting_collisions.py) — these utterances cross
+    # the lookup_request 0.60 gate. Live finding: "Hey LORA!" scored 0.612
+    # on lookup_request, the same gate the 2026-06-25 update B threshold-
+    # lowering commit named as the trigger for revisit on any live false
+    # positive. Follow-up diagnostic ruled out length and greeting-category
+    # as the operative mechanism; per-utterance data showed only a small
+    # set of specific lead tokens ("hey", "hi", "what's up") carry the
+    # anomalous score, not greetings as a class ("good morning", "hello"
+    # do not collide). Bare "hi" and "hey" are deliberately NOT added here:
+    # under this filter's substring-match mechanism, "hi" collides with
+    # common words ("history", "this", "high", "vehicle", etc.) and would
+    # silently suppress the semantic gate on unrelated legitimate queries.
+    # "hey" has at least one known collision ("they"). Both are tracked as
+    # a separate open item pending either a word-boundary-matched filter
+    # path or a different mechanism — see LOCALIST-Architecture.md §10.4
+    # open items. This entry covers only the multi-word forms, which are
+    # safe under substring matching with no collisions found in testing.
+    "hey lora",
+    "hi there",
+    "hey there",
+    "what's up",
 })
 
 # Relevance threshold for Priority 4 corpus scoring
