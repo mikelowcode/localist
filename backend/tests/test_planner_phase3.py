@@ -821,7 +821,7 @@ class TestPriority3SemanticGating:
 
     def test_score_just_below_lookup_threshold_does_not_fire(self):
         """
-        lookup_request at 0.59 (below the 0.65 threshold; analogous to
+        lookup_request at 0.59 (below the 0.60 threshold; analogous to
         NEG-03 from Diagnostic 2 which scored 0.601) must not trigger the gate.
         """
         p = _planner_with_mocked_semantic({
@@ -834,7 +834,7 @@ class TestPriority3SemanticGating:
         assert result is None
 
     def test_score_just_below_explicit_threshold_does_not_fire(self):
-        """explicit_search_action at 0.67 (below 0.68) must not trigger the gate."""
+        """explicit_search_action at 0.67 (below the current 0.72 threshold) must not trigger the gate."""
         p = _planner_with_mocked_semantic({
             "explicit_search_action": 0.67,
             "lookup_request":         0.30,
@@ -882,17 +882,35 @@ class TestPriority3SemanticGating:
     # (§8.8 Open Item 11)
     # ------------------------------------------------------------------
 
-    def test_new_lookup_request_templates_present(self):
-        """All four 2026-06-25 question-form templates are in lookup_request."""
+    def test_set1_lookup_request_templates_present(self):
+        """
+        All four Candidate Set 1 (object-specificity fix) templates are in lookup_request.
+        The four 2026-06-25 question-form templates were removed 2026-06-28 — this test
+        was renamed and updated from test_new_lookup_request_templates_present (pass→fail
+        change: old test asserted the removed templates; updated to assert the new Set 1
+        templates that replaced them).
+        """
         from planner import _SEARCH_INTENT_TEMPLATES
         templates = _SEARCH_INTENT_TEMPLATES["lookup_request"]
         for expected in (
+            "can you look up the release date for this",
+            "could you look up what year this happened",
+            "can you look up information about the latest Apple products",
+            "could you find out the current stock price for me",
+        ):
+            assert expected in templates, f"Missing Set 1 template: {expected!r}"
+
+    def test_old_2026_06_25_lookup_request_templates_removed(self):
+        """The 4 collision-prone templates added 2026-06-25 were removed 2026-06-28."""
+        from planner import _SEARCH_INTENT_TEMPLATES
+        templates = _SEARCH_INTENT_TEMPLATES["lookup_request"]
+        for removed in (
             "can you look up",
             "can you look that up for me",
             "could you look up",
             "can you look into this for me",
         ):
-            assert expected in templates, f"Missing new template: {expected!r}"
+            assert removed not in templates, f"Removed template still present: {removed!r}"
 
     def test_original_lookup_request_templates_unchanged(self):
         """Regression guard: original five lookup_request templates are present and unmodified."""
@@ -910,10 +928,12 @@ class TestPriority3SemanticGating:
     def test_semantic_gate_thresholds_current_values(self):
         """Regression lock: _SEMANTIC_GATE_THRESHOLDS must match current calibrated values.
         lookup_request lowered 0.65 → 0.60 on 2026-06-25 (§10.4 Open Item 3 revisit).
-        explicit_search_action remains 0.68."""
+        explicit_search_action raised 0.68 → 0.72 on 2026-06-28 per
+        explicit_search_action_margin_assessment_2026-06-28.md (pass→fail change:
+        old assertion was 0.68; updated to 0.72 after the threshold raise)."""
         from planner import _SEMANTIC_GATE_THRESHOLDS
         assert _SEMANTIC_GATE_THRESHOLDS == {
-            "explicit_search_action": 0.68,
+            "explicit_search_action": 0.72,
             "lookup_request": 0.60,
         }
 
@@ -1293,3 +1313,163 @@ class TestGreetingFalsePositiveFilter:
         assert result is not None, (
             "'hey' must reach the embedding path; the filter must not intercept it"
         )
+
+
+# ---------------------------------------------------------------------------
+# 2026-06-28: Candidate Set 1 template fix + explicit_search_action 0.68 → 0.72
+# ---------------------------------------------------------------------------
+
+class TestSet1TemplateFix20260628:
+    """
+    Validates the two 2026-06-28 planner.py changes:
+      1. lookup_request: 4 collision-prone templates replaced with Candidate Set 1
+         (object-specificity fix). Source: lookup_request_template_rework_2026-06-28.md,
+         full_pertable_lr_set1_esa_2026-06-28.md.
+      2. explicit_search_action threshold: 0.68 → 0.72. Source:
+         explicit_search_action_margin_assessment_2026-06-28.md.
+
+    Negative-filter protection for the 5 identity and 4 greeting phrases is
+    unchanged — the filter fires pre-gate independent of template content.
+    Verified by existing TestIdentityCapabilityNegativeFilter and
+    TestGreetingFalsePositiveFilter; no new filter tests added here.
+
+    All LR and ESA scores injected via _planner_with_mocked_semantic are
+    the actual measured values from full_pertable_lr_set1_esa_2026-06-28.md
+    and explicit_search_action_margin_assessment_2026-06-28.md.
+    """
+
+    # ------------------------------------------------------------------
+    # (a) Cat C — 2026-06-25 incident utterances still fire via LR at Set 1
+    # ------------------------------------------------------------------
+
+    def test_cat_c1_still_fires_via_lr_set1(self):
+        """
+        "Can you look up Apple's price hike for the MacBook Neo and iPad?"
+        LR(Set1)=0.7653, ESA=0.5424. LR ≥ 0.60 → gate fires.
+        """
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.5424,
+            "lookup_request":         0.7653,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool(
+            "can you look up apple's price hike for the macbook neo and ipad?"
+        )
+        assert result is not None
+        assert "web_search" in result.tools_to_call
+
+    def test_cat_c2_still_fires_via_lr_set1(self):
+        """
+        "Can you look up their next-generation in-house Microsoft AI models?"
+        LR(Set1)=0.6522, ESA=0.5785. LR ≥ 0.60 → gate fires.
+        """
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.5785,
+            "lookup_request":         0.6522,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool(
+            "can you look up their next-generation in-house microsoft ai models?"
+        )
+        assert result is not None
+        assert "web_search" in result.tools_to_call
+
+    def test_cat_c3_still_fires_via_lr_set1(self):
+        """
+        "Can you look up Microsoft's next-generation in-house AI models?"
+        LR(Set1)=0.6409, ESA=0.5735. LR ≥ 0.60 → gate fires.
+        """
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.5735,
+            "lookup_request":         0.6409,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool(
+            "can you look up microsoft's next-generation in-house ai models?"
+        )
+        assert result is not None
+        assert "web_search" in result.tools_to_call
+
+    # ------------------------------------------------------------------
+    # (b) Cat D — 2 utterances Set 1 fixes (LR now < 0.60 AND ESA < 0.72)
+    # ------------------------------------------------------------------
+
+    def test_can_you_help_does_not_fire_with_set1(self):
+        """
+        "Can you help?" — LR(Set1)=0.5901, ESA=0.5810. Both below thresholds.
+        Nearest miss in the fixed-8 group (0.0099 below LR threshold).
+        """
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.5810,
+            "lookup_request":         0.5901,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("can you help?")
+        assert result is None
+
+    def test_trip_to_japan_does_not_fire_with_set1(self):
+        """
+        "Would you help me plan a trip to Japan?" — LR(Set1)=0.4869, ESA=0.4735.
+        Both well below thresholds — generic-domain domain item.
+        """
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.4735,
+            "lookup_request":         0.4869,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("would you help me plan a trip to japan?")
+        assert result is None
+
+    # ------------------------------------------------------------------
+    # (c) ESA positive path still fires at the new 0.72 threshold
+    # ------------------------------------------------------------------
+
+    def test_esa_positive_still_fires_at_new_threshold(self):
+        """
+        A genuine explicit_search_action utterance with ESA score well above 0.72
+        still triggers the gate at the raised threshold.
+        LR injected below 0.60 to isolate the ESA path.
+        """
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.85,
+            "lookup_request":         0.10,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("can you search the web for the latest apple news")
+        assert result is not None
+        assert "web_search" in result.tools_to_call
+
+    def test_esa_score_just_above_new_threshold_fires(self):
+        """explicit_search_action at 0.73 (just above the new 0.72 threshold) must fire."""
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.73,
+            "lookup_request":         0.10,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("go search for that")
+        assert result is not None
+        assert "web_search" in result.tools_to_call
+
+    def test_esa_score_at_old_threshold_no_longer_fires(self):
+        """
+        explicit_search_action at 0.69 (above the old 0.68 but below the new 0.72)
+        must NOT fire the gate after the threshold raise.
+        The two ESA-floor Cat D items ("Would you look at this?" ESA=0.6990,
+        "Will you look into this?" ESA=0.6874) fall in this range and would
+        have fired before the 2026-06-28 change.
+        """
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.69,
+            "lookup_request":         0.10,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("would you look at this")
+        assert result is None

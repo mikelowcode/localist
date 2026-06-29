@@ -52,6 +52,7 @@
       const task = state.tasks[state.active_task_id];
       if (
         task &&
+        task.source === 'ingest' &&
         task.status === 'complete' &&
         !turns.some((t) => t.task_id === task.task_id)
       ) {
@@ -93,22 +94,22 @@
     instruction = '';
     autoResizeTextarea();
 
-    // Add user turn
+    const task_id = crypto.randomUUID();
+    const now = Date.now();
+
     turns = [
       ...turns,
-      { role: 'user', content: text, timestamp: Date.now() }
+      { role: 'user', content: text, task_id, timestamp: now }
     ];
     await scrollToBottom();
 
-    // Reserve assistant slot with empty answer
-    const tempId = `pending-${Date.now()}`;
     turns = [
       ...turns,
       {
         role: 'assistant',
         content: '',
-        task_id: tempId,
-        timestamp: Date.now(),
+        task_id,
+        timestamp: now + 1,
         status: 'planning',
         status_message: 'Planning…',
         sources: []
@@ -116,12 +117,7 @@
     ];
     await scrollToBottom();
 
-    const task_id = await submitTask(text);
-
-    // Update the reserved slot with the real task_id
-    turns = turns.map((t) =>
-      t.task_id === tempId ? { ...t, task_id } : t
-    );
+    await submitTask(text, {}, task_id);
 
     submitting = false;
     inputEl?.focus();

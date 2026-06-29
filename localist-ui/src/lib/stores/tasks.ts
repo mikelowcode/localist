@@ -20,6 +20,7 @@ export interface Task {
   error?: string;
   started_at: number;
   completed_at?: number;
+  source?: 'chat' | 'ingest';
   metadata?: {
     priority?:       number;
     fetch_rag?:      boolean;
@@ -83,20 +84,21 @@ function patchTask(task_id: string, patch: Partial<Task>): void {
 // ── Submit a task with SSE streaming ─────────────────────────
 export async function submitTask(
   instruction: string,
-  context: Record<string, unknown> = {}
+  context: Record<string, unknown> = {},
+  task_id?: string
 ): Promise<string> {
-  const task_id = crypto.randomUUID();
-  const task = createTask(task_id, instruction);
+  const id = task_id ?? crypto.randomUUID();
+  const task = createTask(id, instruction);
 
   tasksStore.update((s) => ({
     ...s,
-    active_task_id: task_id,
+    active_task_id: id,
     streaming: true,
-    tasks: { ...s.tasks, [task_id]: task }
+    tasks: { ...s.tasks, [id]: task }
   }));
 
   const body = JSON.stringify({
-    task_id,
+    task_id: id,
     instruction,
     context: { session_id: SESSION_ID, ...context },
   });
@@ -128,9 +130,9 @@ export async function submitTask(
         if (!line.startsWith('data: ')) continue;
         const raw = line.slice(6).trim();
         if (raw === '[DONE]') {
-          patchTask(task_id, { status: 'complete', completed_at: Date.now() });
+          patchTask(id, { status: 'complete', completed_at: Date.now() });
           tasksStore.update((s) => ({ ...s, streaming: false }));
-          return task_id;
+          return id;
         }
 
         let event: Record<string, unknown>;
@@ -140,11 +142,11 @@ export async function submitTask(
           continue;
         }
 
-        handleSSEEvent(task_id, event);
+        handleSSEEvent(id, event);
       }
     }
   } catch (err) {
-    patchTask(task_id, {
+    patchTask(id, {
       status: 'failed',
       error: String(err),
       completed_at: Date.now()
@@ -152,7 +154,7 @@ export async function submitTask(
     tasksStore.update((s) => ({ ...s, streaming: false }));
   }
 
-  return task_id;
+  return id;
 }
 
 function handleSSEEvent(task_id: string, event: Record<string, unknown>): void {
@@ -195,6 +197,11 @@ function handleSSEEvent(task_id: string, event: Record<string, unknown>): void {
       tasksStore.update((s) => {
         const t = s.tasks[task_id];
         if (!t) return s;
+        const correctedAnswer = event.answer as string | undefined;
+        const answerPatch =
+          correctedAnswer && correctedAnswer !== t.answer
+            ? { answer: correctedAnswer, tokens: [] as string[] }
+            : {};
         return {
           ...s,
           streaming: false,
@@ -202,6 +209,7 @@ function handleSSEEvent(task_id: string, event: Record<string, unknown>): void {
             ...s.tasks,
             [task_id]: {
               ...t,
+              ...answerPatch,
               status:       (event.status as Task['status']) ?? 'complete',
               metadata:     (event.metadata as Task['metadata']) ?? {},
               completed_at: Date.now(),

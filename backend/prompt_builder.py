@@ -49,6 +49,7 @@ class ToolResult:
     tool_name:  str
     parameters: str
     result:     str
+    success:    bool = True
 
 
 @dataclass

@@ -206,6 +206,7 @@ class ConversationalAgent:
         # When the controller has pre-assembled a full 6-slot prompt via
         # PromptBuilder, it passes it here. Skip internal RAG and prompt
         # assembly entirely — use the prebuilt prompt directly.
+        on_token         = context.get("_on_token")
         prebuilt_prompt  = context.get("_prebuilt_prompt")
         prebuilt_system  = context.get("_prebuilt_system")
 
@@ -215,12 +216,24 @@ class ConversationalAgent:
                 "(chars=%d).", len(prebuilt_prompt),
             )
             try:
-                answer = self._runtime.infer(
-                    prompt      = prebuilt_prompt,
-                    system      = prebuilt_system or system,
-                    max_tokens  = max_tokens,
-                    temperature = temperature,
-                )
+                if on_token is not None:
+                    chunks: list[str] = []
+                    for chunk in self._runtime.infer_stream(
+                        prompt      = prebuilt_prompt,
+                        system      = prebuilt_system or system,
+                        max_tokens  = max_tokens,
+                        temperature = temperature,
+                    ):
+                        on_token(chunk)
+                        chunks.append(chunk)
+                    answer = "".join(chunks)
+                else:
+                    answer = self._runtime.infer(
+                        prompt      = prebuilt_prompt,
+                        system      = prebuilt_system or system,
+                        max_tokens  = max_tokens,
+                        temperature = temperature,
+                    )
             except Exception as exc:
                 logger.error(
                     "ConversationalAgent: inference failed (prebuilt path) "
@@ -349,12 +362,24 @@ class ConversationalAgent:
 
         # -- Step 4: Inference -----------------------------------------------
         try:
-            answer = self._runtime.infer(
-                prompt      = prompt,
-                system      = system,
-                max_tokens  = max_tokens,
-                temperature = temperature,
-            )
+            if on_token is not None:
+                chunks = []
+                for chunk in self._runtime.infer_stream(
+                    prompt      = prompt,
+                    system      = system,
+                    max_tokens  = max_tokens,
+                    temperature = temperature,
+                ):
+                    on_token(chunk)
+                    chunks.append(chunk)
+                answer = "".join(chunks)
+            else:
+                answer = self._runtime.infer(
+                    prompt      = prompt,
+                    system      = system,
+                    max_tokens  = max_tokens,
+                    temperature = temperature,
+                )
         except Exception as exc:
             logger.error(
                 "ConversationalAgent: inference failed for subtask %s: %s",

@@ -209,6 +209,7 @@ class ToolDispatcher:
                     tool_name  = "web_search",
                     parameters = f"query={query!r}",
                     result     = f"ERROR: fallback search failed — {exc}",
+                    success    = False,
                 )
 
         # Real LangSearch call
@@ -278,6 +279,7 @@ class ToolDispatcher:
                 tool_name  = "web_search",
                 parameters = f"query={query!r}",
                 result     = f"ERROR: web_search failed — {exc}",
+                success    = False,
             )
 
     # -----------------------------------------------------------------------

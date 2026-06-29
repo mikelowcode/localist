@@ -884,15 +884,83 @@ async def _stream_task(
 
     yield _sse({"type": "status", "message": "Planning task…", "task_id": task_id})
 
+    # Route in a separate thread — some priority branches call embed_fn / infer().
     try:
-        result: dict[str, Any] = await asyncio.to_thread(
-            controller.handle_task, task_dict
+        plan = await asyncio.to_thread(
+            controller.route_task,
+            task_dict["instruction"],
+            task_dict.get("context", {}),
         )
+    except Exception as exc:
+        logger.exception("Error during routing for task %s.", task_id)
+        yield _sse({"type": "error", "message": str(exc), "task_id": task_id})
+        yield "data: [DONE]\n\n"
+        return
+
+    yield _sse({
+        "type":    "status",
+        "message": f"Routed to {plan.agent}",
+        "task_id": task_id,
+    })
+
+    # Execute the precomputed plan with real per-token streaming.
+    #
+    # Bridge design: asyncio.Queue + loop.call_soon_threadsafe
+    # --------------------------------------------------------
+    # ConversationalAgent.run() calls on_token(chunk) from a worker thread
+    # (via asyncio.to_thread).  call_soon_threadsafe schedules a put_nowait
+    # on the asyncio.Queue from that thread so we can await items on the
+    # event loop side without crossing the thread boundary per-get.  This
+    # avoids the overhead of wrapping every queue.get() in asyncio.to_thread.
+    # For agents that never call on_token (e.g. WikiAgent), the queue stays
+    # empty and the drain loop terminates immediately once the producer task
+    # is done — no stall.
+
+    event_queue: asyncio.Queue[dict[str, str]] = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+
+    def on_token(chunk: str) -> None:
+        loop.call_soon_threadsafe(event_queue.put_nowait, {"_kind": "token", "chunk": chunk})
+
+    def on_status(message: str) -> None:
+        loop.call_soon_threadsafe(event_queue.put_nowait, {"_kind": "status", "message": message})
+
+    def _drain_item(item: dict[str, str]) -> str:
+        if item["_kind"] == "status":
+            return _sse({"type": "status", "message": item["message"], "task_id": task_id})
+        return _sse({"type": "token", "token": item["chunk"]})
+
+    producer_task: asyncio.Task[dict[str, Any]] = asyncio.create_task(
+        asyncio.to_thread(
+            controller.handle_task_with_plan,
+            task_dict,
+            plan,
+            on_token=on_token,
+            on_status=on_status,
+        )
+    )
+
+    # Drain events while producer runs
+    while not producer_task.done():
+        try:
+            item = await asyncio.wait_for(event_queue.get(), timeout=0.05)
+            yield _drain_item(item)
+        except asyncio.TimeoutError:
+            pass
+
+    # Collect result / surface exception
+    try:
+        result: dict[str, Any] = await producer_task
     except Exception as exc:
         logger.exception("Error during planning/dispatch for task %s.", task_id)
         yield _sse({"type": "error", "message": str(exc), "task_id": task_id})
         yield "data: [DONE]\n\n"
         return
+
+    # Drain any events queued between the last poll and task completion
+    while not event_queue.empty():
+        item = event_queue.get_nowait()
+        yield _drain_item(item)
 
     if result.get("status") == "failed":
         yield _sse({
@@ -903,21 +971,13 @@ async def _stream_task(
         yield "data: [DONE]\n\n"
         return
 
-    yield _sse({"type": "status", "message": "Streaming answer…", "task_id": task_id})
-
-    answer: str = result.get("answer", "")
-    words = answer.split(" ")
-    for i, word in enumerate(words):
-        chunk = word if i == 0 else " " + word
-        yield _sse({"type": "token", "token": chunk})
-        await asyncio.sleep(0)
-
     yield _sse({"type": "sources",  "sources": result.get("sources", [])})
     yield _sse({
         "type":     "done",
         "task_id":  task_id,
         "status":   result.get("status", "complete"),
         "metadata": result.get("metadata", {}),
+        "answer":   result.get("answer", ""),
     })
     yield "data: [DONE]\n\n"
 

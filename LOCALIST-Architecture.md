@@ -1522,6 +1522,16 @@ returns `ToolResult` objects for injection into Slot 5.
 - Result format: `• {name}\n  {body[:300]}\n  [{displayUrl}]` per result
 - Key loaded via `load_dotenv()` at server startup in `main.py`
 
+#### 4.6.1 Corpus fallback on `web_search` failure (added 2026-06-28)
+
+**Design constraint.** `Planner.route()` commits to one priority branch per turn before any tool executes. It has no way to know in advance whether `web_search` will fail, so a routing-layer fix is not possible — the fallback lives in `_execute_plan()`, after tool dispatch and before final answer generation.
+
+**`ToolResult.success` field.** `ToolResult` in `prompt_builder.py` gained a `success: bool = True` field, defaulting `True`. All pre-existing construction sites in `tool_dispatcher.py` required zero changes. The two `web_search` exception-handling branches — the LangSearch API exception path and the inference-stub exception path — now set `success=False` alongside the existing `result = f"ERROR: ..."` string. The string is retained for logging and Slot 5 display; the boolean is the structured signal `_execute_plan()` checks.
+
+**Step 3b in `_execute_plan()`.** Inserted between Step 3 (tool dispatch) and Step 4 (RAG fetch). If any dispatched result has `tool_name == "web_search"` and `success == False`, `_execute_plan()` calls `self._memory_manager.query_corpus()` directly using the original instruction (`max_results=3`, `use_embeddings=True`). Results with `relevance_score ≥ 0.55` that do not match `lora-persona.md` are wrapped as `RagSource` objects and injected into `rag_sources` — the same list that Step 4 populates for normal P4 routes, and that PromptBuilder reads as Slot 4 RAG context. The 0.55 threshold and persona-exclusion guard are identical to those applied in Step 4; corpus fallback is intentionally a like-for-like substitute for normal RAG grounding. If no results clear the threshold, `rag_sources` stays empty and the pipeline falls through unchanged to its existing honest "I don't have live results" framing. Scoped to `web_search` failures only — `file_op` and `url_fetch` failures are explicitly out of scope for this mechanism.
+
+**Verification status.** 436/436 tests passed before and after this change (confirmed by Claude Code). Live verification is partial: a LangSearch outage occurred once on the same day *before* this fix shipped (confirmed during fabrication-correction-fix testing) and once *after* it shipped, but the second occurrence was a LangSearch SUCCESS (3 real results returned), not a failure — the new fallback code path has **not yet been exercised under real failure conditions**. This is an open verification gap; the fix is not confirmed-working under live outage conditions.
+
 ### 4.7 Gemma 4B Behavioral Constraints
 
 Live testing revealed several behavioral constraints of `gemma-4-e4b-it-4bit`
@@ -1949,6 +1959,155 @@ Fact | Relationship | Context
 Localist UI proxies all `/api/*` requests to `http://localhost:8001` via
 the Vite dev server config. Production deployments should configure an
 equivalent reverse proxy. The `/api` prefix is stripped before forwarding.
+
+### 7.6 Status Bar & Live Turn Rendering
+
+#### Header status chips
+
+`StatusBar.svelte` (`localist-ui/src/lib/components/StatusBar.svelte`) renders three chip types in the right section of the application header: agents, model, and connectivity. A fourth chip — a "streaming" indicator driven by `$tasksStore.streaming` — existed in earlier versions and was removed 2026-06-28. It duplicated the in-bubble status line already present in `ChatPanel.svelte`; the in-bubble status line is now the canonical live-status indicator for in-flight tasks.
+
+**Agents chip.** Reads `$agents.agents` (a `string[]` of agent names) and `$agents.loaded` (boolean) from `$lib/stores/server`. Hidden until `$agents.loaded === true && $agents.agents.length > 0`. The store exposes agent names only — not per-agent activity state, task assignment, or health. The chip label is the agent count (e.g. `2 agents`). Clicking it toggles a popover anchored below the chip (`position: absolute; top: calc(100% + 6px); right: 0`) listing each name as a `role="menuitem"` row. The button carries `aria-expanded` and `aria-haspopup="true"`.
+
+**Popover close behavior.** Three paths close the popover: re-clicking the chip (`on:click={() => (agentsOpen = !agentsOpen)}`), clicking outside the `.agents-wrap` container, and pressing Escape. Click-away and Escape are handled via `window.addEventListener` calls registered in `onMount`. Cleanup runs in `onDestroy`, guarded by `if (browser)` — where `browser` is imported from `$app/environment`:
+
+```svelte
+onDestroy(() => {
+  if (browser) {
+    window.removeEventListener('click', handleWindowClick);
+    window.removeEventListener('keydown', handleWindowKeydown);
+  }
+});
+```
+
+The guard is necessary because `onDestroy` runs during SSR teardown (SvelteKit pre-renders routes on the server), not only during client-side unmount. `window` is undefined in the server environment. An earlier unguarded version of this code caused a live `ReferenceError: window is not defined` crash on `/conversation` page load (2026-06-28); the `browser` guard was the direct fix.
+
+#### SSE status event sequence
+
+The streaming endpoint (`POST /api/task/stream`, `_stream_task()` in `backend/main.py`) yields the following sequence for a normal chat request:
+
+| Order | Event type | `message` / payload | Emitted after |
+|---|---|---|---|
+| 1 | `status` | `"Planning task…"` | Immediately, before any blocking work |
+| 2 | `status` | `"Routed to {agent}"` | `controller.route_task()` returns |
+| 3–N | `token` | one chunk per event | Real-time from `on_token` drain loop; ConversationalAgent routes only (see §7.7) |
+| N+1 | `status` | `"Updating working memory…"` | Before `process_working_state_update()`; conditional on post-dispatch gate (see §7.7) |
+| N+2 | `sources` | sources array | After `handle_task_with_plan()` returns |
+| N+3 | `done` | task_id, status, metadata, answer | — |
+| N+4 | `[DONE]` | (raw sentinel, not JSON) | — |
+
+Event 1 is emitted unconditionally at the top of `_stream_task()` (`main.py:885`). Events 2 onward follow only after the corresponding blocking work completes.
+
+**Routing split.** The "Routed to {agent}" event is emitted after `controller.route_task()` (`controller_agent.py:836`) returns. `route_task()` is a thin wrapper around `self._planner.route()`, dispatched via `asyncio.to_thread` because some priority branches in `Planner.route()` call `embed_fn` or `runtime.infer()`, both synchronous. Once `route_task()` returns a `RoutingPlan`, `_stream_task()` yields event 2, then dispatches `controller.handle_task_with_plan()` (`controller_agent.py:847`) in a second `asyncio.to_thread`. `handle_task_with_plan()` calls `_execute_plan()` directly with the precomputed `RoutingPlan`, bypassing `_execute()` and therefore not calling `_planner.route()` again. Routing runs exactly once per streaming request.
+
+**Unchanged surface.** `controller.handle_task()` (`controller_agent.py:786`) retains its original signature. `POST /task` (non-streaming) still calls `handle_task()` via `asyncio.to_thread`, unchanged.
+
+#### Known limitation — word-replay resolved for ConversationalAgent; WikiAgent buffer path retained by design
+
+**RESOLVED for ConversationalAgent (2026-06-28).** `_stream_task()` now uses a real producer/consumer bridge: an `asyncio.Queue[dict[str, str]]` populated from the worker thread via `loop.call_soon_threadsafe`, drained by `await asyncio.wait_for(queue.get(), timeout=0.05)` while the producer task runs. `ConversationalAgent.run()` calls `on_token(chunk)` for each chunk emitted by `infer_stream()`, and those chunks reach the SSE layer in real time — not as a post-hoc buffer replay. The word-split loop and its `asyncio.sleep(0)` separator are removed entirely. Full architecture in §7.7.
+
+**WikiAgent — buffer path retained permanently.** WikiAgent's output contract is structured XML consumed by `parse_model_xml()`; streaming partial XML before the full response is available would surface malformed output to the user. For WikiAgent-routed plans, `on_token` is never called and the drain loop terminates promptly with an empty queue once `producer_task.done()`.
+
+*Historical record of the pre-2026-06-28 word-replay approach (superseded):* `_stream_task()`'s former token loop split the completed answer on whitespace and yielded one `"token"` event per word, separated only by `await asyncio.sleep(0)`. Because both agents called `self._runtime.infer()` synchronously, the full answer was already in memory when the loop began; it completed faster than a single browser paint cycle, making the "Streaming answer…" status frame and the full answer content effectively simultaneous in the UI. The routing-status frames were the only phases where visible progressive rendering occurred. Documented as an accepted cosmetic gap in the original §7.6 entry.
+
+**Correction to in-session pacing/streaming diagnosis (2026-06-28).** During this session — after the `infer_stream()` wiring described in the RESOLVED block above was already applied — specific test cases appeared to show "no visible word-by-word streaming" or "all arrived at once." An earlier draft of this subsection tentatively attributed this to residual blocking-`infer()` usage (the same causal mechanism as the pre-fix era, based on a stale in-session read of `conversational_agent.py`). **This diagnosis was wrong.** Confirmed against current on-disk `conversational_agent.py`: both the prebuilt-prompt branch (lines 219–229) and the main RAG branch (lines 364–375) call `self._runtime.infer_stream()` when `on_token` is not `None`. The wiring was complete at the time the incorrect diagnosis was made — the apparent "missing streaming" was not caused by `infer()` usage or missing pacing/`sleep(0)`. The pacing-and-sleep explanation was removed rather than softened; it was simply not the actual mechanism. The actual cause was a separate bug: the fabrication-correction propagation gap, documented in the next subsection. Garbled fabricated-tool-call text was being streamed live to the client with no correction ever arriving, which made genuine streaming look like "nothing is happening" or "all arrived at once" in the specific test cases triggered during this session.
+
+#### Fabrication-correction propagation gap (fixed 2026-06-28)
+
+A companion bug to the open-item fabrication detection (§8.8 Open Item 11): even when `_is_fabricated_toolcall()` correctly detected fabricated tool-call syntax and substituted `_SEARCH_UNAVAILABLE_FALLBACK`, the corrected answer never reached the client's chat bubble.
+
+**Detection sequence (unchanged, pre-existing).** In `ConversationalAgent.run()`, both the prebuilt-prompt branch and the main RAG branch run the `on_token` streaming loop first, yielding each chunk to the SSE queue as inference progresses. `_is_fabricated_toolcall()` is called *after* that loop completes, on the fully-assembled `answer` string. On a positive match, the method returns an `AgentResult` with `output["answer"] = _SEARCH_UNAVAILABLE_FALLBACK`, `output["sources"] = []`, `output["grounded"] = False`. This correctly threads through `controller_agent.py`'s `_execute_plan()` fast-path into `ControllerResult.answer` → `result["answer"]` in the dict returned by `handle_task_with_plan()`.
+
+**The bug.** `_stream_task()` in `main.py` emitted the `"done"` SSE event with only `task_id`, `status`, and `metadata`. The corrected `result["answer"]` existed in scope at that point but was never included in the event payload. `tasks.ts`'s `case 'done'` handler received no `answer` field, so it never overwrote the task's accumulated streamed text. The chat bubble permanently displayed whatever garbled fabricated-tool-call chunks had already been streamed, with no correction arriving — ever.
+
+**Fix.**
+- `main.py` (`_stream_task()`): The `"done"` SSE event now includes `"answer": result.get("answer", "")`. (See `main.py` lines 974–982, which also updated the SSE event table above from `task_id, status, metadata` to `task_id, status, metadata, answer`.)
+- `tasks.ts` (`case 'done'`): Conditionally overwrites `task.answer` and clears `task.tokens` only when `event.answer` is present and differs from the already-accumulated streamed answer. For the normal (no fabrication) case, the condition `correctedAnswer !== t.answer` evaluates false and the patch is a no-op — no disruption to correctly streamed turns.
+- `ChatPanel.svelte`: No changes required. Its existing reactive block already syncs bubble content from `tasksStore` on any store change.
+
+**Live verification (same day).** The same incident shape was re-triggered after the fix: LangSearch returned a 500, the model fabricated tool-call syntax as its entire output, `_is_fabricated_toolcall()` detected and substituted the fallback. The chat bubble now shows `_SEARCH_UNAVAILABLE_FALLBACK` ("I don't have live search results for that — here's what I know from training, which may be stale or incomplete.") instead of the permanently garbled text seen before the fix.
+
+#### Turn/task_id reconciliation — historical fix (2026-06-28)
+
+**Prior bug.** `ChatPanel.svelte`'s `handleSubmit()` previously created the assistant turn with a temporary placeholder id (`const tempId = \`pending-${Date.now()}\``). The real `task_id` was only available once `submitTask()` resolved, which on the SSE path does not happen until the `[DONE]` sentinel arrives. `ChatPanel.svelte`'s reactive block (lines 30–46) matches live store updates to turns by `t.task_id === activeTask.task_id`; because the turn held `tempId` and `tasksStore` was keyed by the real UUID, no match ever occurred during an in-flight request. Every SSE status event updated the store correctly but nothing in `turns` reflected any of it until the stream ended. Only the final committed state was ever rendered; live status transitions and token-by-token content were never visible.
+
+**Fix.** `submitTask()` in `tasks.ts` now accepts an optional third parameter (`task_id?: string`, line 88). Internally it uses `const id = task_id ?? crypto.randomUUID()` (line 90) for all store operations and the request body. `handleSubmit()` in `ChatPanel.svelte` generates `const task_id = crypto.randomUUID()` before creating either turn and passes it as the third argument to `submitTask(text, {}, task_id)`. Both the user turn and assistant turn receive the real `task_id` at creation time, so the reactive block finds a match from the first SSE event onward. The `tempId` variable and the post-`await` `turns.map(...)` reconciliation patch were removed entirely — no remaining references to `tempId` exist in `ChatPanel.svelte`.
+
+This bug predated 2026-06-28's other changes. It was only surfaced when the addition of the "Routed to {agent}" status event created a visible gap: for the first time there was a status transition (routing → execution) that should have been visible mid-stream but was not, revealing that no live update ever reached the turn.
+
+---
+
+### 7.7 Real-Time Token Streaming and In-Flight Status Visibility (2026-06-28)
+
+#### Real-time token streaming — ConversationalAgent only
+
+**Callback threading.** `handle_task_with_plan()` in `controller_agent.py` gained a fourth optional parameter `on_token: Callable[[str], None] | None = None`, and `_execute_plan()` gained the same parameter. When `on_token` is not None, `_execute_plan()` injects it into `subtask_context` under the key `"_on_token"`, alongside the existing `"_prebuilt_prompt"`, `"_prebuilt_system"`, and `"_routing"` keys. The `AgentInterface.run()` Protocol signature and `_dispatch()` are **unchanged** — the callback travels via `SubTask.context`, not the dispatch layer.
+
+**`ConversationalAgent.run()`.** `on_token = context.get("_on_token")` is read once at the top of `run()`. At both existing `infer()` call sites — the prebuilt-prompt branch and the main RAG branch:
+- If `on_token` is None: `self._runtime.infer(...)` is called exactly as before; behavior is unchanged.
+- If `on_token` is not None: `self._runtime.infer_stream(...)` is called instead. Each yielded chunk is passed to `on_token(chunk)` and appended to a local list; the list is joined into the same `answer` variable that all downstream lines — `AgentResult` construction, `output["answer"]`, sources, grounded — already read. Both branches are wrapped in the same `try/except Exception` as the original blocking path.
+
+**WikiAgent exclusion — permanent.** WikiAgent is not touched. Its output is raw XML consumed by `parse_model_xml()`; streaming partial XML before the full response is parseable would surface malformed output. This exclusion is structural: it falls out of WikiAgent never receiving `"_on_token"` in its `SubTask.context`.
+
+**Queue-based SSE bridge in `main.py`.** `_stream_task()` uses an `asyncio.Queue[dict[str, str]]` (named `event_queue`) populated from the worker thread via `loop.call_soon_threadsafe(event_queue.put_nowait, item)`. Items are tagged dicts:
+- `{"_kind": "token", "chunk": chunk}` — pushed by `on_token`
+- `{"_kind": "status", "message": message}` — pushed by `on_status` (see next section)
+
+`call_soon_threadsafe` was chosen over per-get `asyncio.to_thread` to avoid thread-crossing overhead for every token. The drain loop uses `await asyncio.wait_for(event_queue.get(), timeout=0.05)` while `producer_task.done()` is False, then a final synchronous `get_nowait()` drain after the task completes. A `_drain_item(item)` helper dispatches on `_kind`: `"status"` items yield `_sse({"type": "status", "message": ..., "task_id": ...})`; `"token"` items yield `_sse({"type": "token", "token": item["chunk"]})`. Both the live loop and the post-completion drain call `_drain_item()`.
+
+For WikiAgent-routed plans, `on_token` is never called, the queue stays empty, the drain loop exhausts its 50 ms timeout on each iteration until `producer_task.done()`, and terminates immediately — no stall.
+
+`handle_task_with_plan` is called with keyword arguments for both optional callbacks — `on_token=on_token, on_status=on_status` — making the binding explicit and position-safe against any future signature change.
+
+#### on_status visibility event
+
+A fifth optional parameter `on_status: Callable[[str], None] | None = None` follows `on_token` in both `handle_task_with_plan()` and `_execute_plan()`, threaded identically to `on_token`. Unlike `on_token`, it is **not** injected into `SubTask.context` — its sole call site is inside `_execute_plan()` itself, after the implicit extraction phase completes.
+
+`on_status` is called exactly once per request at most: immediately after the `"TIMING implicit_extraction_end"` log line and before the `"TIMING working_state_start"` log line — i.e., right before `process_working_state_update()` runs. The call:
+```python
+if on_status is not None:
+    on_status("Updating working memory…")
+```
+fires only inside the existing post-dispatch gate:
+```python
+if (db_path is not None and not plan.write_episode
+        and results and results[0].status == TaskStatus.COMPLETE):
+```
+Turns where `plan.write_episode` is True, WikiAgent turns, failed results, or missing MemoryManager never enter this block — `on_status` is simply never called and no SSE event is emitted. No "done" counterpart is emitted for this status; the existing `"done"` SSE event already covers completion.
+
+**Frontend compatibility — zero changes required.** `tasks.ts`'s `handleSSEEvent()` has a `case 'status'` handler at line 164 that patches `status_message` for any message string. `"Updating working memory…"` is rendered by the same in-bubble status line as `"Planning task…"` and `"Routed to {agent}"` — no frontend change was needed. This was confirmed by reading `tasks.ts` directly before writing code.
+
+#### TIMING instrumentation
+
+Seven `logger.info("TIMING %s t=%.4f", label, time.monotonic())` lines were added to `_execute_plan()` in `controller_agent.py` as permanent diagnostic instrumentation (not stripped). `import time` was added at module level. Labels and positions:
+
+| Label | Position in `_execute_plan()` |
+|---|---|
+| `dispatch_start` | Immediately before `results = self._dispatch(...)` |
+| `dispatch_end` | Immediately after `_dispatch()` returns |
+| `implicit_extraction_start` | Before the `process_implicit_extraction` try block (inside the post-dispatch gate) |
+| `implicit_extraction_end` | After that try/except closes |
+| `working_state_start` | Before the `process_working_state_update` try block |
+| `working_state_end` | After that try/except closes |
+| `execute_plan_end` | Before the `if effective_agent_name == "conversational_agent"` final branching block |
+
+`dispatch_end` marks the moment the full answer is already known — `ConversationalAgent.run()` has returned its complete `AgentResult` and `_dispatch()` has unblocked. For ConversationalAgent routes with streaming enabled, the last token was sent to the SSE queue before `_dispatch()` returned. The wall-clock gap `dispatch_end → execute_plan_end` is the total post-dispatch hook cost visible to the user as tail latency.
+
+Grep pattern to isolate: `grep "TIMING" <server-log>`.
+
+#### Tail-latency finding — process_working_state_update() dominates post-dispatch cost
+
+Live timing (2026-06-28) confirmed `process_working_state_update()` accounts for the observed pause between the last streamed token and the "done" SSE event. Two live data points (normal conversational turns, `plan.write_episode=False`, `results[0].status=COMPLETE`):
+
+| Turn | `working_state_start → working_state_end` | Outcome |
+|---|---|---|
+| 1 | 23.134 s | CHANGED |
+| 2 | 18.835 s | CHANGED |
+
+Both produced real state changes. Cross-reference: §9.5 Open Item 1 (pre-gate decision) and §9.5 Open Item 4 (reasoning-token exhaustion mechanism, previously confirmed at the inference layer). The `on_status("Updating working memory…")` event above was added specifically because of this finding — a 20+ second silent pause was the user-visible symptom.
+
+#### Process note — mount staleness (recurring pattern, 2026-06-28)
+
+Context staleness from mount-time reads recurred across multiple files in this session: `main.py`, `ChatPanel.svelte`, `controller_agent.py`, and `episodic_extractor.py` each exhibited stale-context issues traceable to reading file or variable state at initialization rather than at use time. Each instance was a new occurrence of the pattern documented in §3.7 (persona-cache staleness), §8.8 Open Item 6 (database-path disambiguation), and §8.8 Open Item 9 (cache-read disambiguation) — not a new principle. The existing discipline — verify the mechanism from current on-disk source, not from earlier in-context descriptions — applied uniformly across all four files. No new architectural rule is warranted.
 
 ---
 
@@ -3075,6 +3234,15 @@ depends on how often Tier 2 updates produce useful state changes vs. `NONE`
 returns on short, low-context turns. No decision has been made; flagged for
 live observation rather than speculative pre-optimization.
 
+**Live timing data (2026-06-28, n=2).** Two live conversational turns were timed via `TIMING` instrumentation added to `_execute_plan()` (see §7.7). Both satisfied the post-dispatch gate. Elapsed time from `working_state_start` to `working_state_end`:
+
+| Turn | Elapsed | `process_working_state_update()` outcome |
+|---|---|---|
+| 1 | 23.134 s | CHANGED |
+| 2 | 18.835 s | CHANGED |
+
+Both produced real state changes. n=2 argues against the pre-gate trigger condition having been observed yet — neither call was a `NONE` return that a pre-gate would have prevented. The item remains open; these two data points represent an upper-end sample of the cost distribution (calls that produce changes), not a steady-state average. An `on_status("Updating working memory…")` SSE event was added as an immediate visibility mitigation (see §7.7) so the user is no longer presented with a silent 20+ second wait while this call runs.
+
 **Open Item 2 — Tier 2 render wiring not yet done.** `current_focus`,
 `open_loops`, and `recent_decisions` are stored and updated per turn but
 never appear in the rendered `[WORKING STATE]` block. Wiring them in requires
@@ -3271,7 +3439,7 @@ have produced a worse fix in either direction.
 **Per-group cosine similarity against four canonical template groups, using the EmbeddingGemma
 model already resident in the process.** `_SEARCH_INTENT_TEMPLATES` defines four named groups —
 `explicit_search_action`, `lookup_request`, `knowledge_request_open`, `freshness_request` — with
-21 template strings total (5+9+4+3; `lookup_request` expanded from 5 to 9 on 2026-06-25 — see §10.4 Open Item 3 update). At startup, `Planner.__init__()` embeds all 21 using the
+21 template strings total (5+9+4+3; `lookup_request` expanded from 5 to 9 on 2026-06-25, then its 4 added templates replaced by Candidate Set 1 on 2026-06-28 — see §10.4 Open Item 3 updates). At startup, `Planner.__init__()` embeds all 21 using the
 same EmbeddingGemma model (`mlx-community/embeddinggemma-300m-4bit`, 768-dimensional) that
 `EmbeddingEngine` already uses for corpus retrieval. The `embed_fn` callable is threaded into
 `Planner` as a new optional constructor parameter (`embed_fn: Callable[[str], list[float]] | None
@@ -3299,7 +3467,10 @@ threshold. In the live diagnostic evaluation, `knowledge_request_open` won the a
 adversarial negative test cases — demonstrating how frequently this scenario arises in practice.
 
 **Only two of the four groups gate routing; the other two are informational only.** `_SEMANTIC_GATE_THRESHOLDS`
-contains exactly two entries: `explicit_search_action` (≥ 0.68) and `lookup_request` (≥ 0.60; original value was 0.65, lowered 2026-06-25 — see §10.4 Open Item 3 update).
+contains exactly two entries: `explicit_search_action` (≥ 0.72; raised from 0.68 on 2026-06-28 —
+**UNDER OBSERVATION**, not finalized; see §10.4 Open Item 3 Update 2026-06-28) and `lookup_request`
+(≥ 0.60; original value was 0.65, lowered 2026-06-25, templates partially revised 2026-06-28 —
+see §10.4 Open Item 3 updates).
 `knowledge_request_open` and `freshness_request` are computed and logged on every turn but are
 excluded from gating. The evidence for `knowledge_request_open`: a live diagnostic pass found
 that "Explain this code to me." scored 0.795 on that group — higher than 5 of the 10 real
@@ -3320,6 +3491,10 @@ search for APC...") was not used to tune these numbers — it scored 0.638, fell
 threshold, and was fixed at the literal-keyword layer specifically to avoid post-hoc threshold
 adjustment for one known utterance. `lookup_request` was subsequently lowered from 0.65 to 0.60
 on 2026-06-25 after confirmed live false negatives (see §10.4 Open Item 3 update).
+`explicit_search_action` was subsequently raised from 0.68 to 0.72 on 2026-06-28 after two
+adversarial negatives scored ESA 0.69–0.70 via the single bare-verb template "go look it up"
+colliding with "look at"/"look into" phrasing; the 0.72 value is **under observation**, not
+finalized (see §10.4 Open Item 3 Update 2026-06-28).
 
 **A negative filter short-circuits before the embedding call.** `_SEARCH_NEGATIVE_FILTER` is a
 frozenset of 18 phrases (9 original + 5 added 2026-06-26 + 4 added 2026-06-27) identifying
@@ -3414,7 +3589,10 @@ up this", "look that up", etc.) and did not cover the "Can/Could you + look up/l
   look up", "can you look that up for me", "could you look up", "can you look into this for me".
   Total expanded from 5 to 9. Post-addition, the same three utterances scored 0.608, 0.621, and
   0.617 respectively — real, consistent improvement (+0.015 to +0.023) but still below the 0.65
-  gate.
+  gate. **These four templates were replaced by Candidate Set 1 on 2026-06-28** after live
+  diagnostics confirmed they produced a threshold-unfixable false-positive surface (6/14
+  adversarial negatives scoring 0.81–0.90 — above every true positive). See Update 2026-06-28
+  below.
 - **Threshold lowering (update B):** `lookup_request` threshold lowered from 0.65 to 0.60. The
   remaining 0.03–0.04 gap was consistent enough across all three utterances to satisfy the Open
   Item 3 "live false negatives observed" revisit criterion; template coverage alone could not close
@@ -3547,12 +3725,73 @@ collisions found in testing.
   named in that update persists; this update adds a second data point to the same open
   problem rather than introducing a new one.
 
+**Open Item 3 — Update 2026-06-28 (lookup_request template replacement — Candidate Set 1;
+explicit_search_action threshold raised 0.68 → 0.72).** Two changes shipped to `planner.py`,
+both backed by diagnostic reports in `diagnostics/reports/` dated 2026-06-28.
+
+**Change 1 — `lookup_request` template replacement.** The four templates added 2026-06-25 ("can
+you look up", "can you look that up for me", "could you look up", "can you look into this for me")
+produced a threshold-unfixable false-positive surface: 6 of 14 tested adversarial phrasings in
+the "can/could/would you + verb" family scored 0.81–0.90 against those templates — above every
+confirmed true positive's score. These four templates were replaced with Candidate Set 1
+(object-specificity fix), which anchors on concrete queryable objects rather than the bare
+modal-question scaffold. The current live `lookup_request` templates (production values as of
+2026-06-28, read from `planner.py` directly):
+
+- *(original 5, unchanged)* `"look up this"`, `"look that up"`, `"go ahead and look it up"`,
+  `"find information on this"`, `"find out about this"`
+- *(Candidate Set 1, replacing the 4 removed templates)* `"can you look up the release date for
+  this"`, `"could you look up what year this happened"`, `"can you look up information about the
+  latest Apple products"`, `"could you find out the current stock price for me"`
+
+Effect on the three 2026-06-25 incident utterances ("Can you look up Apple's price hike for the
+MacBook Neo and iPad?", "Can you look up their next-generation in-house Microsoft AI models?",
+"Can you look up Microsoft's next-generation in-house AI models?"): all three remain gate-positive
+(LR 0.7653 / 0.6522 / 0.6409, all ≥ 0.60 threshold). Cat A live false positives (3/3): all now
+score below 0.60 under Set 1. Cat D adversarial false positives at 0.60: 13/14 → 6/14 remaining.
+Source: `diagnostics/reports/lookup_request_template_rework_2026-06-28.md` and
+`diagnostics/reports/full_pertable_lr_set1_esa_2026-06-28.md`.
+
+**KNOWN ACCEPTED RESIDUAL — 6/14 adversarial phrasings remain gate-positive under Set 1.** These
+fire via the modal-question scaffold and are not eliminated by object-specificity alone. By
+category (per `diagnostics/reports/full_pertable_lr_set1_esa_2026-06-28.md`):
+
+- D-verb-swap ×4: "Can you help me with this?", "Could you check this for me?", "Would you look
+  at this?", "Can you tell me about this?"
+- D-modal-swap ×2: "Will you look into this?", "Do you mind looking at this?"
+
+Each can be individually patched via `_SEARCH_NEGATIVE_FILTER` if confirmed as a live false
+positive. They are not pre-emptively added because `_SEARCH_NEGATIVE_FILTER` uses substring
+matching, and conservative addition prevents silent suppression of legitimate queries.
+
+**Change 2 — `explicit_search_action` threshold raised 0.68 → 0.72.** Two adversarial negatives
+scored ESA 0.69–0.70 via the single bare-verb template "go look it up" — whose bare "look" token
+produces syntactic overlap with "look at"/"look into" phrasing. Zero cost to true positives: the
+three 2026-06-25 incident utterances all scored ESA ≤ 0.5785, well below either threshold.
+Source: `diagnostics/reports/explicit_search_action_margin_assessment_2026-06-28.md`.
+
+**PROVISIONAL STATUS — `explicit_search_action` threshold (0.72) is under observation.** Per
+Michael's stated intent, this is being shipped to observe live behavior for several days before
+being treated as settled. Any confirmed live false negative on `explicit_search_action` (gate
+misses a genuine explicit-search instruction in the 0.68–0.72 band) is the trigger to revisit.
+Not a permanently closed item.
+
+Tests (+9 net in `test_planner_phase3.py`, file-scoped count 101 → 110): 2 stale-comment-only
+fixes (pass/fail unchanged); 2 existing tests updated for the template and threshold changes
+(flagged pass→fail in docstrings); new class `TestSet1TemplateFix20260628` (8 tests): 3 Cat C
+true-positive gate assertions, 2 Cat D fixed-false-positive assertions (no longer fire under
+Set 1), 3 ESA threshold boundary tests (0.73 fires, 0.69 does not, 0.85 fires).
+
+---
+
 **Open Item 4 — Live near-miss on `explicit_search_action` threshold, compound
 instruction (2026-06-23).** A live, unscripted turn — "Look up karpathy llm
 wiki then propose ways it implement it into Localist design." — scored
 `explicit_search_action: 0.618`, the highest of all four groups
 (`lookup_request: 0.597`, `knowledge_request_open: 0.462`,
-`freshness_request: 0.404`), but fell short of the 0.68 gating threshold.
+`freshness_request: 0.404`), but fell short of the then-current 0.68 gating threshold (raised
+to 0.72 on 2026-06-28 — see Update 2026-06-28 above — making this utterance 0.102 below the
+current threshold, a wider gap than when this item was first logged).
 `tools_to_call` was not populated; no LangSearch call occurred. Priority 4
 matched instead via corpus score (0.638 ≥ 0.550), routing to
 `conversational_agent` with wiki-only RAG context. The model correctly
@@ -3581,9 +3820,44 @@ negatives are observed" criterion — this is one such occurrence, not yet a
 pattern. Revisit if additional compound or near-threshold instructions are
 observed scoring in the 0.60–0.68 band for `explicit_search_action`.
 
+**Open Item 5 — `web_search` SUCCESS with irrelevant results; no fallback mechanism (2026-06-28).** A live turn asking "Tell me about Localist Framework?" scored `lookup_request=0.670` (≥ 0.65 gating threshold), routing correctly to `web_search` via Priority 3. LangSearch returned 3 real results and the call SUCCEEDED — no error, no `success=False`, so the Step 3b corpus fallback introduced in §4.6.1 did not fire. The returned results were entirely irrelevant: generic uses of "localism" and "localist" in unrelated academic and ML contexts, not information about this project. The model's response reflected the irrelevant web content.
+
+This is a distinct failure mode from §4.6.1: that fix handles tool FAILURE (search returns an error or throws an exception); this case is tool SUCCESS with semantically irrelevant results, for which no fallback mechanism exists today.
+
+**Routing-destination question, not threshold-tuning.** Project-specific questions about the Localist Framework itself are structurally better served by corpus/RAG than by generic web search, regardless of classifier gate accuracy — the project is not publicly indexed, so a web search for "Localist Framework" will reliably surface unrelated content. This is a routing-destination problem: the classifier gates correctly on lookup intent, but sends the query to the wrong tool for this class of subject matter. It is not a false-positive problem (the gate should not have fired at all). The distinction matters for deciding the right fix: threshold tuning would suppress a correctly-gated query, whereas destination logic would route certain classes of query to the corpus even when the search gate fires. Michael's explicit choice was to file this under §10.4 alongside the threshold/classifier open items rather than as a separate routing-architecture item, since the boundary between "tune the classifier" and "add destination logic" is unresolved.
+
+No action taken. Single occurrence; not yet a pattern. Logged per the project's single-occurrence discipline.
+
+**Open Item 6 — P3 semantic gate short-circuits before P4 corpus evaluation; `_WIKI_QUERY_KEYWORDS`
+lacks coverage for "wiki files"-style phrasings. Both unresolved as of 2026-06-28.** Confirmed
+live during the 2026-06-28 incident that originated the `lookup_request` template diagnostic.
+Two structural facts about the routing ladder:
+
+1. **P3 short-circuits before P4.** When Priority 3's semantic gate fires, `route()` returns
+   immediately — Priority 4 corpus evaluation is never reached. For instructions with lookup
+   intent directed at local corpus content (e.g. "Can you read my wiki files?"), this means the
+   corpus that contains the answer is not consulted even when a matching document exists. The
+   2026-06-28 Candidate Set 1 fix reduces the probability of false-positive P3 fires on these
+   phrasings (Cat A LR scores dropped below 0.60 under Set 1), but does not address the
+   structural ordering.
+
+2. **`_WIKI_QUERY_KEYWORDS` lacks coverage for "wiki files"-style phrasings.** Priority 4 Path A
+   fires on explicit wiki/vault trigger keywords ("check the wiki", "search the wiki", "from the
+   wiki", "in the wiki", "vault", etc.). A phrasing like "my wiki files" does not match any
+   current `_WIKI_QUERY_KEYWORDS` entry, so P4 Path A cannot catch it even when P3 does not
+   fire. P4 Path B coverage (corpus score ≥ 0.55) is not guaranteed.
+
+Neither root cause was addressed by the 2026-06-28 template change; that change targeted the
+false-positive collisions that made incorrect P3 routing likely, not the structural ordering or
+keyword-coverage gap that makes P4 the correct destination for this phrasing class. Not
+scheduled. Logging here so the originating incident's unresolved structural causes are not
+conflated with the shipped threshold/template fix.
+
 ### 10.5 Test Suite
 
-Current state: **436 tests, 0 failures** across all test files (verified fresh 2026-06-27).
+Current state: **436 + 9 = ~445 tests, 0 failures** (436 verified fresh 2026-06-27; +9 net in
+`test_planner_phase3.py` from the 2026-06-28 session, file-scoped count confirmed 101 → 110;
+full-suite re-run not performed for that session).
 
 The classifier was built across four sequential slots (all in `backend/tests/test_planner_phase3.py`),
 then extended in two later sessions:
@@ -3598,7 +3872,8 @@ then extended in two later sessions:
 | P4a removal (2026-06-26) | `_priority4a_identity()` / `force_rag` removed; −3 deleted, +16 added across `test_planner_phase3.py` and `test_controller_phase4.py` — see §8.8 OI 12 for full breakdown | 405* | 418 | +13 |
 | OI 3 update 2026-06-26 | `_SEARCH_NEGATIVE_FILTER` identity/capability additions; `TestIdentityCapabilityNegativeFilter` in `test_planner_phase3.py` | 418 | 425 | +7 |
 | OI 3 update 2026-06-27 | `_SEARCH_NEGATIVE_FILTER` greeting-form additions; `TestGreetingFalsePositiveFilter` in `test_planner_phase3.py` (4 membership + 4 behavioral short-circuit + 1 non-regression + 2 documented-gap) | 425 | 436 | +11 |
-| **Total** | | **318** | **436** | **+118** |
+| OI 3 update 2026-06-28 | `lookup_request` Candidate Set 1 template replacement; ESA threshold 0.68→0.72; `TestSet1TemplateFix20260628` (8 new tests); 2 stale-comment fixes; 2 pass→fail updates in existing tests — all in `test_planner_phase3.py` (file-scoped: 101→110; full-suite not re-run) | 436 | ~445 | +9 |
+| **Total** | | **318** | **~445** | **+127** |
 
 \* The P4a-removal row uses 405 as its before-count because that was the confirmed baseline at the start of that session. The gap between 345 (OI 3 update A+B) and 405 reflects tests added across unrelated sessions (§8, §9, and other §8.8 close-outs) not tracked in this table.
 

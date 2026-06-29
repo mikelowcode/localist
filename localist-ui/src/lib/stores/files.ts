@@ -100,6 +100,7 @@ export function injectCompletedTask(
     sources,
     started_at:     now,
     completed_at:   now,
+    source:         'ingest',
   };
 
   tasksStore.update((s) => ({

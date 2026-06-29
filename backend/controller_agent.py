@@ -29,6 +29,7 @@ Layer placement
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
     # the dependency graph clean.
     from memory_manager import MemoryManager
 
-from planner import Planner as _RulePlanner
+from planner import Planner as _RulePlanner, RoutingPlan
 from pathlib import Path
 from prompt_builder import PromptBuilder, Turn, EpisodeBullet, RagSource, UserProfileFact, GraphQueryResult, GraphLinkEntry, WorkingMemoryState
 from memory_manager import (
@@ -833,6 +834,75 @@ class ControllerAgent:
         logger.info("Controller completed task %s with status '%s'.", task.task_id, result.status)
         return result.to_dict()
 
+    def route_task(self, instruction: str, context: dict[str, Any]) -> RoutingPlan:
+        """
+        Run the routing step standalone, without executing the rest of the
+        pipeline. Used by the streaming endpoint to surface the routing
+        decision as an SSE event before the heavy execution begins.
+
+        Must be called inside asyncio.to_thread — some priority branches
+        invoke embed_fn and/or runtime.infer() which are blocking calls.
+        """
+        return self._planner.route(instruction=instruction, context=context)
+
+    def handle_task_with_plan(
+        self,
+        task_dict:  dict[str, Any],
+        plan:       RoutingPlan,
+        on_token:   Callable[[str], None] | None = None,
+        on_status:  Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Entry point for callers that have already run routing separately.
+
+        Identical to handle_task() except it skips _execute() (which calls
+        _planner.route()) and calls _execute_plan() directly with the
+        precomputed plan. Routing runs exactly once per request on this path.
+
+        handle_task() is left unchanged — POST /task and any other caller
+        that doesn't need the early routing event still uses it unmodified.
+        """
+        try:
+            task = Task.from_dict(task_dict)
+        except ValueError as exc:
+            return ControllerResult(
+                task_id = task_dict.get("task_id", "unknown"),
+                status  = TaskStatus.FAILED,
+                answer  = "",
+                error   = f"Invalid task payload: {exc}",
+            ).to_dict()
+
+        logger.info("Controller received task %s: '%s'", task.task_id, task.instruction[:80])
+        logger.info(
+            "Planner plan (precomputed): agent=%s  fetch_rag=%s  fetch_episodic=%s  "
+            "tools=%s  write_episode=%s  compound=%s",
+            plan.agent, plan.fetch_rag, plan.fetch_episodic,
+            plan.tools_to_call, plan.write_episode, plan.compound,
+        )
+
+        memory: _AnyMemory = self._memory_manager or _EphemeralMemory()
+        mem_key = _memory_key(task)
+        memory.add(
+            "user",
+            task.instruction,
+            metadata={"task_id": task.task_id},
+            task_id=mem_key,
+        )
+
+        try:
+            result = self._execute_plan(task, plan, memory, on_token=on_token, on_status=on_status)
+        except Exception as exc:
+            logger.exception("Unhandled exception in controller for task %s.", task.task_id)
+            result = ControllerResult(
+                task_id = task.task_id,
+                status  = TaskStatus.FAILED,
+                answer  = "",
+                error   = str(exc),
+            )
+
+        logger.info("Controller completed task %s with status '%s'.", task.task_id, result.status)
+        return result.to_dict()
+
     def register_agent(self, agent: AgentInterface) -> None:
         """Dynamically register a new sub-agent at runtime."""
         self._agents[agent.name] = agent
@@ -844,9 +914,11 @@ class ControllerAgent:
 
     def _execute_plan(
         self,
-        task:   Task,
-        plan:   "RoutingPlan",
-        memory: _AnyMemory,
+        task:      Task,
+        plan:      "RoutingPlan",
+        memory:    _AnyMemory,
+        on_token:  Callable[[str], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
     ) -> ControllerResult:
         """
         Execute the 7-step contract from §4.4 of LOCALIST-Architecture.md.
@@ -953,8 +1025,55 @@ class ControllerAgent:
                     "continuing without tool results.", exc,
                 )
 
-        # -- Step 4: RAG fetch -----------------------------------------------
+        # -- Step 3b: Corpus fallback when web_search fails -----------------
+        # Runs only when the P3 tool path was taken and every web_search
+        # result came back failed. Queries the corpus with the original
+        # instruction using the same threshold (_priority4_corpus reuses 0.55)
+        # so the answer can be grounded in vault content even when live
+        # search is unavailable.
         rag_sources: list[RagSource] = []
+        _web_search_failed = any(
+            r.tool_name == "web_search" and not r.success
+            for r in dispatched_tool_results
+        )
+        if _web_search_failed and self._memory_manager is not None:
+            try:
+                _fallback_docs = self._memory_manager.query_corpus(
+                    task.instruction,
+                    max_results    = 3,
+                    use_embeddings = True,
+                )
+                rag_sources = [
+                    RagSource(
+                        path    = str(doc.path),
+                        content = parse_wiki_doc(doc.content).body[:2000],
+                    )
+                    for doc in _fallback_docs
+                    if doc.relevance_score >= 0.55
+                    and not str(doc.path).endswith("lora-persona.md")
+                ]
+                if rag_sources:
+                    logger.info(
+                        "_execute_plan: web_search failed — corpus fallback "
+                        "found %d relevant source(s).",
+                        len(rag_sources),
+                    )
+                else:
+                    logger.info(
+                        "_execute_plan: web_search failed — corpus fallback "
+                        "found no sources clearing threshold; proceeding "
+                        "without grounding.",
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "_execute_plan: corpus fallback fetch failed (%s) — "
+                    "continuing without context.", exc,
+                )
+
+        # -- Step 4: RAG fetch -----------------------------------------------
+        # rag_sources is initialized above (Step 3b).  Step 4 populates it
+        # on fetch_rag (P4) routes; on P3 routes fetch_rag is False so the
+        # fallback-populated list flows through untouched.
         if plan.fetch_rag and self._memory_manager is not None:
             try:
                 docs = self._memory_manager.query_corpus(
@@ -1013,6 +1132,7 @@ class ControllerAgent:
             plan.fetch_episodic          # P5 route
             or plan.fetch_rag            # P4 corpus route
             or bool(episodic_bullets)    # episodic bullets fired
+            or bool(rag_sources)         # corpus fallback fired (web_search failed)
         )
         if _should_inject_profile:
             try:
@@ -1186,6 +1306,8 @@ class ControllerAgent:
                 "graph_query":    plan.graph_query,
             },
         }
+        if on_token is not None:
+            subtask_context["_on_token"] = on_token
 
         subtask = SubTask(
             subtask_id  = f"{task.task_id}-0",
@@ -1194,7 +1316,9 @@ class ControllerAgent:
             context     = subtask_context,
         )
 
+        logger.info("TIMING dispatch_start t=%.4f", time.monotonic())
         results = self._dispatch([subtask], memory, mem_key)
+        logger.info("TIMING dispatch_end t=%.4f", time.monotonic())
 
         # -- Post-response hook: implicit episodic extraction ----------------
         # Run after every dispatch. Catches durable facts the user revealed
@@ -1209,6 +1333,7 @@ class ControllerAgent:
             and results
             and results[0].status == TaskStatus.COMPLETE
         ):
+            logger.info("TIMING implicit_extraction_start t=%.4f", time.monotonic())
             try:
                 agent_response = results[0].output.get("answer", "")
                 if agent_response:
@@ -1235,12 +1360,16 @@ class ControllerAgent:
                     "_execute_plan: implicit extraction failed (%s) — "
                     "continuing.", exc,
                 )
+            logger.info("TIMING implicit_extraction_end t=%.4f", time.monotonic())
+            if on_status is not None:
+                on_status("Updating working memory…")
 
             # Working state update — separate try for independent error isolation.
             # Runs regardless of plan.graph_query: P3c exclusivity guards Slot 6A
             # *rendering* on the next turn, not whether working state is captured
             # after a graph-query turn. The instruction/response pair from any
             # route represents real conversational state worth persisting.
+            logger.info("TIMING working_state_start t=%.4f", time.monotonic())
             try:
                 ws_response = results[0].output.get("answer", "")
                 if ws_response:
@@ -1257,7 +1386,9 @@ class ControllerAgent:
                     "_execute_plan: working state update failed (%s) — "
                     "continuing.", exc,
                 )
+            logger.info("TIMING working_state_end t=%.4f", time.monotonic())
 
+        logger.info("TIMING execute_plan_end t=%.4f", time.monotonic())
         if effective_agent_name == "conversational_agent" and len(results) == 1:
             r = results[0]
             if r.status == TaskStatus.COMPLETE:

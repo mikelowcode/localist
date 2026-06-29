@@ -190,10 +190,23 @@ _SEARCH_INTENT_TEMPLATES: dict[str, tuple[str, ...]] = {
         "go ahead and look it up",
         "find information on this",
         "find out about this",
-        "can you look up",
-        "can you look that up for me",
-        "could you look up",
-        "can you look into this for me",
+        # 2026-06-28: The 4 polite-imperative templates added 2026-06-25 caused a
+        # confirmed, threshold-unfixable false-positive surface: 6/14 fresh adversarial
+        # negatives scored 0.81–0.90, ABOVE every true positive's max (~0.62). Replaced
+        # with Candidate Set 1 (object-specificity fix) per:
+        #   diagnostics/reports/lookup_request_template_rework_2026-06-28.md
+        #   diagnostics/reports/full_pertable_lr_set1_esa_2026-06-28.md
+        # Effect: Cat D false positives 13/14 → 6/14; 3 true positives fully preserved
+        # (3/3); 5 negative-filter-protected identity/greeting phrases unaffected.
+        # KNOWN ACCEPTED RESIDUAL — 6/14 adversarial negatives remain gate-positive:
+        #   D-verb-swap ×4: "Can you help me with this?", "Could you check this for me?",
+        #                   "Would you look at this?", "Can you tell me about this?"
+        #   D-modal-swap ×2: "Will you look into this?", "Do you mind looking at this?"
+        # These fire via the modal-question scaffold; not eliminated by Set 1.
+        "can you look up the release date for this",
+        "could you look up what year this happened",
+        "can you look up information about the latest Apple products",
+        "could you find out the current stock price for me",
     ),
     "knowledge_request_open": (
         "what is this",
@@ -291,7 +304,14 @@ _CORPUS_SCORE_THRESHOLD: float = 0.55
 # the margin to the new 0.60 line is unknown. Accepted and named risk — any
 # live false positive on lookup_request is the trigger to revisit this value.
 _SEMANTIC_GATE_THRESHOLDS: dict[str, float] = {
-    "explicit_search_action": 0.68,
+    # 2026-06-28: raised from 0.68 → 0.72 per
+    # diagnostics/reports/explicit_search_action_margin_assessment_2026-06-28.md.
+    # The single template "go look it up" (bare verb "look") collided with "look at"/
+    # "look into" phrasing in 2 adversarial negatives at ESA 0.69–0.70. Zero cost to
+    # true positives: Cat C max ESA score = 0.58, well under either threshold.
+    # Per Michael's decision: shipping to observe live behavior for several days before
+    # treating as final — not a permanently closed item.
+    "explicit_search_action": 0.72,
     "lookup_request": 0.60,
 }
 
