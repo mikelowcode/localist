@@ -916,7 +916,7 @@ async def _stream_task(
     # empty and the drain loop terminates immediately once the producer task
     # is done — no stall.
 
-    event_queue: asyncio.Queue[dict[str, str]] = asyncio.Queue()
+    event_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     loop = asyncio.get_event_loop()
 
     def on_token(chunk: str) -> None:
@@ -925,7 +925,12 @@ async def _stream_task(
     def on_status(message: str) -> None:
         loop.call_soon_threadsafe(event_queue.put_nowait, {"_kind": "status", "message": message})
 
-    def _drain_item(item: dict[str, str]) -> str:
+    def on_answer_ready(result_dict: dict[str, Any]) -> None:
+        loop.call_soon_threadsafe(
+            event_queue.put_nowait, {"_kind": "answer_ready", "result": result_dict}
+        )
+
+    def _drain_item(item: dict[str, Any]) -> str:
         if item["_kind"] == "status":
             return _sse({"type": "status", "message": item["message"], "task_id": task_id})
         return _sse({"type": "token", "token": item["chunk"]})
@@ -937,14 +942,37 @@ async def _stream_task(
             plan,
             on_token=on_token,
             on_status=on_status,
+            on_answer_ready=on_answer_ready,
         )
     )
+
+    # Tracks whether sources+done were already emitted via on_answer_ready.
+    # When True, the post-hook [DONE] sentinel closes the stream without
+    # re-emitting those events; failure events are only logged, not sent.
+    answer_ready_emitted = False
 
     # Drain events while producer runs
     while not producer_task.done():
         try:
             item = await asyncio.wait_for(event_queue.get(), timeout=0.05)
-            yield _drain_item(item)
+            if item["_kind"] == "answer_ready":
+                # Answer is complete — emit sources+done immediately so the
+                # client unblocks before memory hooks finish.
+                answer_ready_emitted = True
+                rd = item["result"]
+                yield _sse({"type": "sources", "sources": rd.get("sources", [])})
+                yield _sse({
+                    "type":     "done",
+                    "task_id":  task_id,
+                    "status":   rd.get("status", "complete"),
+                    "metadata": rd.get("metadata", {}),
+                    "answer":   rd.get("answer", ""),
+                })
+            elif not answer_ready_emitted:
+                # Relay token/status events only before 'done' is sent; silently
+                # drop post-done hook status events (e.g. "Updating working memory…")
+                # to avoid flickering the task status back to 'planning'.
+                yield _drain_item(item)
         except asyncio.TimeoutError:
             pass
 
@@ -952,15 +980,29 @@ async def _stream_task(
     try:
         result: dict[str, Any] = await producer_task
     except Exception as exc:
-        logger.exception("Error during planning/dispatch for task %s.", task_id)
-        yield _sse({"type": "error", "message": str(exc), "task_id": task_id})
+        if answer_ready_emitted:
+            # Error occurred in post-answer hooks — answer already sent, so do
+            # not attempt to emit an error event over an already-closed stream.
+            logger.exception(
+                "Error in post-answer hooks for task %s (answer already sent).", task_id
+            )
+        else:
+            logger.exception("Error during planning/dispatch for task %s.", task_id)
+            yield _sse({"type": "error", "message": str(exc), "task_id": task_id})
         yield "data: [DONE]\n\n"
         return
 
-    # Drain any events queued between the last poll and task completion
+    # Drain any events queued between the last poll and task completion.
+    # Skip answer_ready (already handled) and post-done hook events.
     while not event_queue.empty():
         item = event_queue.get_nowait()
-        yield _drain_item(item)
+        if item["_kind"] not in ("answer_ready",) and not answer_ready_emitted:
+            yield _drain_item(item)
+
+    if answer_ready_emitted:
+        # sources+done already sent — just close the stream.
+        yield "data: [DONE]\n\n"
+        return
 
     if result.get("status") == "failed":
         yield _sse({

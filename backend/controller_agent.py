@@ -847,10 +847,11 @@ class ControllerAgent:
 
     def handle_task_with_plan(
         self,
-        task_dict:  dict[str, Any],
-        plan:       RoutingPlan,
-        on_token:   Callable[[str], None] | None = None,
-        on_status:  Callable[[str], None] | None = None,
+        task_dict:      dict[str, Any],
+        plan:           RoutingPlan,
+        on_token:       Callable[[str], None]            | None = None,
+        on_status:      Callable[[str], None]            | None = None,
+        on_answer_ready: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """
         Entry point for callers that have already run routing separately.
@@ -890,7 +891,12 @@ class ControllerAgent:
         )
 
         try:
-            result = self._execute_plan(task, plan, memory, on_token=on_token, on_status=on_status)
+            result = self._execute_plan(
+                task, plan, memory,
+                on_token=on_token,
+                on_status=on_status,
+                on_answer_ready=on_answer_ready,
+            )
         except Exception as exc:
             logger.exception("Unhandled exception in controller for task %s.", task.task_id)
             result = ControllerResult(
@@ -914,11 +920,12 @@ class ControllerAgent:
 
     def _execute_plan(
         self,
-        task:      Task,
-        plan:      "RoutingPlan",
-        memory:    _AnyMemory,
-        on_token:  Callable[[str], None] | None = None,
-        on_status: Callable[[str], None] | None = None,
+        task:            Task,
+        plan:            "RoutingPlan",
+        memory:          _AnyMemory,
+        on_token:        Callable[[str], None]            | None = None,
+        on_status:       Callable[[str], None]            | None = None,
+        on_answer_ready: Callable[[dict[str, Any]], None] | None = None,
     ) -> ControllerResult:
         """
         Execute the 7-step contract from §4.4 of LOCALIST-Architecture.md.
@@ -1320,6 +1327,14 @@ class ControllerAgent:
         results = self._dispatch([subtask], memory, mem_key)
         logger.info("TIMING dispatch_end t=%.4f", time.monotonic())
 
+        # Early-completion signal — fire before memory hooks so the streaming
+        # endpoint can emit 'sources'/'done' and unblock the client immediately
+        # after the answer is ready, rather than waiting 18-23 s for hooks.
+        if on_answer_ready is not None:
+            _early = self._build_conversational_result(task, plan, effective_agent_name, results)
+            if _early is not None:
+                on_answer_ready(_early.to_dict())
+
         # -- Post-response hook: implicit episodic extraction ----------------
         # Run after every dispatch. Catches durable facts the user revealed
         # without an explicit memory command. Skipped when:
@@ -1389,31 +1404,9 @@ class ControllerAgent:
             logger.info("TIMING working_state_end t=%.4f", time.monotonic())
 
         logger.info("TIMING execute_plan_end t=%.4f", time.monotonic())
-        if effective_agent_name == "conversational_agent" and len(results) == 1:
-            r = results[0]
-            if r.status == TaskStatus.COMPLETE:
-                return ControllerResult(
-                    task_id  = task.task_id,
-                    status   = TaskStatus.COMPLETE,
-                    answer   = r.output.get("answer", ""),
-                    sources  = [
-                        {
-                            "path": s,
-                            "type": "wiki" if "/wiki/" in s else "raw",
-                            "name": s.split("/")[-1].replace(".md", "").replace("-", " ").title(),
-                        }
-                        for s in r.output.get("sources", [])
-                    ],
-                    metadata = {
-                        "agent":          effective_agent_name,
-                        "priority":       plan.priority,
-                        "fetch_rag":      plan.fetch_rag,
-                        "fetch_episodic": plan.fetch_episodic,
-                        "tools_fired":    plan.tools_to_call,
-                        "grounded":       r.output.get("grounded", False),
-                    },
-                )
-
+        final_result = self._build_conversational_result(task, plan, effective_agent_name, results)
+        if final_result is not None:
+            return final_result
         return self._synthesizer.synthesize(task, results, memory)
 
     def _execute(self, task: Task, memory: _AnyMemory) -> ControllerResult:
@@ -1433,6 +1426,48 @@ class ControllerAgent:
         )
 
         return self._execute_plan(task, plan, memory)
+
+    def _build_conversational_result(
+        self,
+        task:                 Task,
+        plan:                 "RoutingPlan",
+        effective_agent_name: str,
+        results:              list[AgentResult],
+    ) -> "ControllerResult | None":
+        """
+        Build a ControllerResult for a successful single-agent conversational dispatch.
+        Returns None when the synthesizer path should be used instead (non-conversational
+        agent, multi-result, or failed dispatch).
+
+        Used by both the early on_answer_ready callback and the final return path so
+        the answer-extraction logic is never duplicated.
+        """
+        if not (effective_agent_name == "conversational_agent" and len(results) == 1):
+            return None
+        r = results[0]
+        if r.status != TaskStatus.COMPLETE:
+            return None
+        return ControllerResult(
+            task_id  = task.task_id,
+            status   = TaskStatus.COMPLETE,
+            answer   = r.output.get("answer", ""),
+            sources  = [
+                {
+                    "path": s,
+                    "type": "wiki" if "/wiki/" in s else "raw",
+                    "name": s.split("/")[-1].replace(".md", "").replace("-", " ").title(),
+                }
+                for s in r.output.get("sources", [])
+            ],
+            metadata = {
+                "agent":          effective_agent_name,
+                "priority":       plan.priority,
+                "fetch_rag":      plan.fetch_rag,
+                "fetch_episodic": plan.fetch_episodic,
+                "tools_fired":    plan.tools_to_call,
+                "grounded":       r.output.get("grounded", False),
+            },
+        )
 
     def _dispatch(
         self,

@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { tasksStore, submitTask, type Task } from '$lib/stores/tasks';
+  import { get } from 'svelte/store';
+  import { tasksStore, submitTask } from '$lib/stores/tasks';
+  import { chatHistoryStore } from '$lib/stores/chatHistory';
   import MarkdownRenderer from '$lib/components/MarkdownRenderer.svelte';
 
   let instruction = '';
@@ -8,44 +10,36 @@
   let inputEl: HTMLTextAreaElement;
   let submitting = false;
 
-  // Conversation history (pairs of user instruction + task result)
-  interface Turn {
-    role: 'user' | 'assistant';
-    content: string;
-    task_id?: string;
-    timestamp: number;
-    status?: Task['status'];
-    sources?: Task['sources'];
-    status_message?: string;
-    metadata?: Task['metadata'];
-  }
-
-  let turns: Turn[] = [];
-
   $: activeTask = $tasksStore.active_task_id
     ? $tasksStore.tasks[$tasksStore.active_task_id]
     : null;
 
-  // Reactively update the last assistant turn from the streaming store
+  // Reactively update the last assistant turn from the streaming store.
+  // Uses get() to read the store without subscribing, avoiding an infinite loop.
   $: if (activeTask) {
-    const idx = turns.findLastIndex(
+    const current = get(chatHistoryStore);
+    const idx = current.findLastIndex(
       (t) => t.role === 'assistant' && t.task_id === activeTask!.task_id
     );
     if (idx >= 0) {
-      turns[idx] = {
-        ...turns[idx],
-        content:        activeTask.answer,
-        status:         activeTask.status,
-        sources:        activeTask.sources,
-        metadata:       activeTask.metadata,
-        status_message: activeTask.status_message
-      };
-      turns = turns; // trigger reactivity
+      chatHistoryStore.update((turns) => {
+        const next = [...turns];
+        next[idx] = {
+          ...next[idx],
+          content:        activeTask!.answer,
+          status:         activeTask!.status,
+          sources:        activeTask!.sources,
+          metadata:       activeTask!.metadata,
+          status_message: activeTask!.status_message
+        };
+        return next;
+      });
       scrollToBottom();
     }
   }
 
-  // Pick up tasks injected by ingestFile() before navigation
+  // Pick up tasks injected by ingestFile() before navigation.
+  // Uses get() to read the store without subscribing, avoiding an infinite loop.
   $: {
     const state = $tasksStore;
     if (state.active_task_id) {
@@ -54,9 +48,9 @@
         task &&
         task.source === 'ingest' &&
         task.status === 'complete' &&
-        !turns.some((t) => t.task_id === task.task_id)
+        !get(chatHistoryStore).some((t) => t.task_id === task.task_id)
       ) {
-        turns = [
+        chatHistoryStore.update((turns) => [
           ...turns,
           {
             role:      'user',
@@ -73,7 +67,7 @@
             metadata:       task.metadata,
             status_message: task.status_message,
           },
-        ];
+        ]);
         scrollToBottom();
       }
     }
@@ -97,13 +91,13 @@
     const task_id = crypto.randomUUID();
     const now = Date.now();
 
-    turns = [
+    chatHistoryStore.update((turns) => [
       ...turns,
       { role: 'user', content: text, task_id, timestamp: now }
-    ];
+    ]);
     await scrollToBottom();
 
-    turns = [
+    chatHistoryStore.update((turns) => [
       ...turns,
       {
         role: 'assistant',
@@ -114,7 +108,7 @@
         status_message: 'Planning…',
         sources: []
       }
-    ];
+    ]);
     await scrollToBottom();
 
     await submitTask(text, {}, task_id);
@@ -148,7 +142,7 @@
 <div class="chat-panel">
   <!-- Messages -->
   <div class="messages" bind:this={messagesEl}>
-    {#if turns.length === 0}
+    {#if $chatHistoryStore.length === 0}
       <div class="empty-state">
         <div class="empty-icon" aria-hidden="true">
           <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round">
@@ -159,7 +153,7 @@
         <p class="empty-sub">Ask LORA a question or give an instruction to get started.</p>
       </div>
     {:else}
-      {#each turns as turn (turn.timestamp)}
+      {#each $chatHistoryStore as turn (turn.timestamp)}
         <div class="turn turn-{turn.role} fade-in">
           <div class="turn-meta">
             <span class="turn-role">{turn.role === 'user' ? 'You' : 'LORA'}</span>
@@ -255,14 +249,13 @@
         on:input={autoResizeTextarea}
         placeholder="Ask LORA a question or give an instruction…"
         rows="1"
-        disabled={$tasksStore.streaming || submitting}
         class="chat-input"
         aria-label="Message input"
       />
       <button
         class="send-btn"
         on:click={handleSubmit}
-        disabled={!instruction.trim() || $tasksStore.streaming || submitting}
+        disabled={!instruction.trim() || $tasksStore.streaming}
         aria-label="Send message"
         title="Send (Enter)"
       >

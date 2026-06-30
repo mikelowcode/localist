@@ -2034,6 +2034,12 @@ A companion bug to the open-item fabrication detection (§8.8 Open Item 11): eve
 
 This bug predated 2026-06-28's other changes. It was only surfaced when the addition of the "Routed to {agent}" status event created a visible gap: for the first time there was a status transition (routing → execution) that should have been visible mid-stream but was not, revealing that no live update ever reached the turn.
 
+**Update 2026-06-29 — submitTask() resolves on 'done', not [DONE].** After the on_answer_ready fix caused `tasksStore.streaming` to flip false at the `'done'` SSE event, a secondary gap emerged: `submitTask()` in `tasks.ts` still resolved its `Promise<string>` only on the `[DONE]` sentinel, which `main.py` emits only after `producer_task` fully resolves (hooks included). This meant `submitting` in `ChatPanel.svelte`'s `handleSubmit()` stayed `true` for the full hooks duration — the textarea re-enabled visually but a fast follow-up Send was silently swallowed by the guard clause (`if (!text || submitting || $tasksStore.streaming) return`).
+
+**Fix:** `submitTask()` restructured from `async function` to `function returning new Promise<string>((resolve) => { (async () => { ... })(); })`. `resolve(id)` is called at the `'done'` event (after `handleSSEEvent`'s store patch completes; the SSE read loop continues running un-awaited by the caller) and at `[DONE]` as a no-op safety-net (Promise spec: subsequent settle calls are silently ignored). Three additional safety-net resolves cover abrupt stream close, fetch error, and non-200 response. External signature (`(instruction, context?, task_id?) => Promise<string>`) is unchanged; the single call site in `ChatPanel.svelte` (`const task_id = await submitTask(text, {}, task_id)`) required no change.
+
+*Minor open item:* a network drop after `'done'` resolves but before `[DONE]` causes `catch` to run post-resolve; `patchTask({status: 'failed'})` still executes, meaning a task the user experienced as complete could transiently show `status: 'failed'` in the store. Pre-existing race shape — the window is slightly wider now. Revisit on live evidence only.
+
 ---
 
 ### 7.7 Real-Time Token Streaming and In-Flight Status Visibility (2026-06-28)
@@ -2074,6 +2080,8 @@ if (db_path is not None and not plan.write_episode
 ```
 Turns where `plan.write_episode` is True, WikiAgent turns, failed results, or missing MemoryManager never enter this block — `on_status` is simply never called and no SSE event is emitted. No "done" counterpart is emitted for this status; the existing `"done"` SSE event already covers completion.
 
+**Update 2026-06-29 — silently dropped after on_answer_ready.** Once `answer_ready_emitted` is set to `True` in `main.py`'s drain loop, subsequent queue events — including this `on_status("Updating working memory…")` — are dropped before reaching the SSE layer. The `'done'` event has already been sent by the time `on_status` fires (hooks run after `on_answer_ready` returns), so this status event no longer reaches the frontend on any qualifying conversational turn. The call site in `_execute_plan()` is unchanged; the suppression is entirely in the drain loop.
+
 **Frontend compatibility — zero changes required.** `tasks.ts`'s `handleSSEEvent()` has a `case 'status'` handler at line 164 that patches `status_message` for any message string. `"Updating working memory…"` is rendered by the same in-bubble status line as `"Planning task…"` and `"Routed to {agent}"` — no frontend change was needed. This was confirmed by reading `tasks.ts` directly before writing code.
 
 #### TIMING instrumentation
@@ -2105,9 +2113,27 @@ Live timing (2026-06-28) confirmed `process_working_state_update()` accounts for
 
 Both produced real state changes. Cross-reference: §9.5 Open Item 1 (pre-gate decision) and §9.5 Open Item 4 (reasoning-token exhaustion mechanism, previously confirmed at the inference layer). The `on_status("Updating working memory…")` event above was added specifically because of this finding — a 20+ second silent pause was the user-visible symptom.
 
+*Update 2026-06-29 — user-visible impact closed.* The `on_answer_ready` early-completion callback (see next section) causes the `'done'` SSE event to fire immediately after dispatch, before either memory hook runs. The 18–23s pause still occurs server-side but `tasksStore.streaming` flips to `false` and the input re-enables before the hooks begin. Cross-reference: §9.5 Open Item 1 (pre-gate decision) remains open — this fix removes the user-visible consequence of the latency, not the latency itself.
+
+#### Early-completion callback — on_answer_ready (2026-06-29)
+
+The tail-latency finding above (18–23s post-dispatch pause) was confirmed to also cause full input lockout — the chat textarea and send button remained disabled for the entire duration of both memory hooks on every turn, not just during active streaming. Root cause: `on_status("Updating working memory…")` fired before `process_working_state_update()` ran, but the `'done'` SSE event (which flips `tasksStore.streaming` to `false` in `tasks.ts`, which drives `ChatPanel.svelte`'s `disabled` bindings) was only emitted after `_execute_plan()` returned — which required both hooks to complete first.
+
+**Fix:** new `on_answer_ready: Callable[[dict[str, Any]], None] | None = None` parameter added to both `handle_task_with_plan()` and `_execute_plan()`, threaded identically to `on_token`/`on_status`. A new `_build_conversational_result()` helper (factored from the conversational_agent fast-path synthesizer block) constructs the `answer`/`sources`/`status`/`metadata` payload used by both the early callback and the final return path. `on_answer_ready` is called immediately after `results = self._dispatch(...)` returns, before either memory hook runs. Only fires on complete single-agent conversational dispatch — WikiAgent, failed, and synthesizer paths are unchanged.
+
+In `main.py`, `on_answer_ready` bridges to `event_queue` via `call_soon_threadsafe` (same pattern as `on_token`/`on_status`). The drain loop handles `_kind == "answer_ready"` by immediately yielding `sources` + `done` SSE events and setting `answer_ready_emitted = True`. Subsequent queue events after this point (including the `on_status("Updating working memory…")` from the hooks) are silently dropped to avoid flickering the task status back to `'planning'` after `'done'`. After `await producer_task` completes (hooks finished), only the `[DONE]` sentinel is emitted. If `producer_task` raises after `'done'` was already sent, the error is logged but no error SSE event is emitted over the already-completed stream. All failure paths (routing exception, producer exception before `'done'`, `result.status == 'failed'`) are unaffected — they apply only when `on_answer_ready` was never called.
+
 #### Process note — mount staleness (recurring pattern, 2026-06-28)
 
 Context staleness from mount-time reads recurred across multiple files in this session: `main.py`, `ChatPanel.svelte`, `controller_agent.py`, and `episodic_extractor.py` each exhibited stale-context issues traceable to reading file or variable state at initialization rather than at use time. Each instance was a new occurrence of the pattern documented in §3.7 (persona-cache staleness), §8.8 Open Item 6 (database-path disambiguation), and §8.8 Open Item 9 (cache-read disambiguation) — not a new principle. The existing discipline — verify the mechanism from current on-disk source, not from earlier in-context descriptions — applied uniformly across all four files. No new architectural rule is warranted.
+
+### 7.8 Chat History Persistence (2026-06-29)
+
+Conversation history (`turns: Turn[]`) was previously local component state in `ChatPanel.svelte`. Because Conversations and Files are separate SvelteKit routes (`+page.svelte` files rendered into `+layout.svelte`'s `<slot />`), navigating between tabs unmounted and remounted `ChatPanel`, resetting `turns` to `[]` on every navigation.
+
+**Fix:** new `$lib/stores/chatHistory.ts` exports `chatHistoryStore: writable<Turn[]>([])` and the `Turn` interface (moved from `ChatPanel.svelte`). `ChatPanel.svelte` reads and writes through `$chatHistoryStore` / `chatHistoryStore.update()` exclusively — no local `turns` variable remains. The store lives at module level and survives any number of route navigations, resetting only on full page reload (by design — `SESSION_ID` in `tasks.ts` has the same lifecycle).
+
+**Open item:** `chatHistoryStore` has no programmatic clear/reset path. Only a full page reload empties it. Not yet addressed; flagged for live observation.
 
 ---
 
@@ -3242,6 +3268,8 @@ live observation rather than speculative pre-optimization.
 | 2 | 18.835 s | CHANGED |
 
 Both produced real state changes. n=2 argues against the pre-gate trigger condition having been observed yet — neither call was a `NONE` return that a pre-gate would have prevented. The item remains open; these two data points represent an upper-end sample of the cost distribution (calls that produce changes), not a steady-state average. An `on_status("Updating working memory…")` SSE event was added as an immediate visibility mitigation (see §7.7) so the user is no longer presented with a silent 20+ second wait while this call runs.
+
+*Update 2026-06-29.* The `on_answer_ready` early-completion fix (§7.7) removes the user-visible consequence of this latency — `'done'` now fires before the hooks run, so the input re-enables immediately and the 18–23s cost is no longer presented to the user as a wait. Open Item 1's pre-gate question (whether `process_working_state_update()` should be gated on a signal that its output will produce a meaningful state change, to avoid inference cost on low-value turns) remains genuinely open and unaddressed by this fix — the hooks still run on every qualifying turn at the same cost, just off the user-visible response path.
 
 **Open Item 2 — Tier 2 render wiring not yet done.** `current_focus`,
 `open_loops`, and `recent_decisions` are stored and updated per turn but

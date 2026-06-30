@@ -82,7 +82,11 @@ function patchTask(task_id: string, patch: Partial<Task>): void {
 }
 
 // ── Submit a task with SSE streaming ─────────────────────────
-export async function submitTask(
+// Resolves as soon as the 'done' SSE event is processed (store already
+// patched), so the caller's submitting flag clears immediately. The reader
+// loop keeps draining in the background until the [DONE] sentinel closes
+// the stream, ensuring no bytes are abandoned mid-connection.
+export function submitTask(
   instruction: string,
   context: Record<string, unknown> = {},
   task_id?: string
@@ -103,58 +107,71 @@ export async function submitTask(
     context: { session_id: SESSION_ID, ...context },
   });
 
-  try {
-    const res = await fetch(`${BASE}/task/stream`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body
-    });
+  return new Promise<string>((resolve) => {
+    (async () => {
+      try {
+        const res = await fetch(`${BASE}/task/stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body
+        });
 
-    if (!res.ok) {
-      throw new Error(`Server error: HTTP ${res.status}`);
-    }
-
-    const reader = res.body!.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const raw = line.slice(6).trim();
-        if (raw === '[DONE]') {
-          patchTask(id, { status: 'complete', completed_at: Date.now() });
-          tasksStore.update((s) => ({ ...s, streaming: false }));
-          return id;
+        if (!res.ok) {
+          throw new Error(`Server error: HTTP ${res.status}`);
         }
 
-        let event: Record<string, unknown>;
-        try {
-          event = JSON.parse(raw);
-        } catch {
-          continue;
-        }
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
 
-        handleSSEEvent(id, event);
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const raw = line.slice(6).trim();
+            if (raw === '[DONE]') {
+              patchTask(id, { status: 'complete', completed_at: Date.now() });
+              tasksStore.update((s) => ({ ...s, streaming: false }));
+              resolve(id);
+              return;
+            }
+
+            let event: Record<string, unknown>;
+            try {
+              event = JSON.parse(raw);
+            } catch {
+              continue;
+            }
+
+            handleSSEEvent(id, event);
+
+            // Resolve immediately after the store is patched by the 'done'
+            // event — loop continues draining until [DONE] arrives.
+            // resolve() is idempotent: subsequent calls after the first are
+            // no-ops per the Promise spec.
+            if ((event.type as string) === 'done') {
+              resolve(id);
+            }
+          }
+        }
+        resolve(id); // stream closed without [DONE]
+      } catch (err) {
+        patchTask(id, {
+          status: 'failed',
+          error: String(err),
+          completed_at: Date.now()
+        });
+        tasksStore.update((s) => ({ ...s, streaming: false }));
+        resolve(id); // always resolve with id, never reject — matches prior behaviour
       }
-    }
-  } catch (err) {
-    patchTask(id, {
-      status: 'failed',
-      error: String(err),
-      completed_at: Date.now()
-    });
-    tasksStore.update((s) => ({ ...s, streaming: false }));
-  }
-
-  return id;
+    })();
+  });
 }
 
 function handleSSEEvent(task_id: string, event: Record<string, unknown>): void {
