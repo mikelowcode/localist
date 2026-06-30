@@ -10,6 +10,63 @@
   let inputEl: HTMLTextAreaElement;
   let submitting = false;
 
+  // Attached session files — display-only; source of truth is the backend cache.
+  interface AttachedFile {
+    filename: string;
+    tokenEstimate: number;
+  }
+  let attachedFiles: AttachedFile[] = [];
+  let fileInputEl: HTMLInputElement;
+  let attachError: string | null = null;
+
+  const ALLOWED_EXTENSIONS = new Set([
+    '.md', '.txt', '.py', '.ts', '.js', '.svelte', '.json',
+    '.yaml', '.yml', '.toml', '.sh', '.env', '.csv', '.xml',
+    '.html', '.css', '.rs', '.go', '.rb', '.java', '.c', '.cpp',
+    '.h', '.hpp', '.sql',
+  ]);
+
+  async function handleFileSelect(e: Event) {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';   // reset so the same file can be re-selected after removal
+    if (!file) return;
+
+    attachError = null;
+
+    // Client-side extension check (defence in depth — server enforces the real gate)
+    const ext = '.' + file.name.split('.').pop()?.toLowerCase();
+    if (!ALLOWED_EXTENSIONS.has(ext)) {
+      attachError = `File type '${ext}' is not supported.`;
+      return;
+    }
+
+    const form = new FormData();
+    form.append('file', file);
+
+    try {
+      const res = await fetch('/api/chat/files', { method: 'POST', body: form });
+      const body = await res.json();
+      if (!res.ok) {
+        attachError = body.detail ?? `Upload failed (HTTP ${res.status}).`;
+        return;
+      }
+      attachedFiles = [...attachedFiles, { filename: body.filename, tokenEstimate: body.token_estimate }];
+    } catch (err) {
+      attachError = 'Could not reach the server. Is the backend running?';
+    }
+  }
+
+  async function removeAttachedFile(filename: string) {
+    try {
+      await fetch(`/api/chat/files/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+    } catch {
+      // Best-effort — backend cache may already be clear on restart
+    }
+    attachedFiles = attachedFiles.filter(f => f.filename !== filename);
+    attachError = null;
+  }
+
   $: activeTask = $tasksStore.active_task_id
     ? $tasksStore.tasks[$tasksStore.active_task_id]
     : null;
@@ -242,6 +299,18 @@
   <!-- Input bar -->
   <div class="input-bar">
     <div class="input-wrap">
+      <button
+        class="attach-btn"
+        on:click={() => fileInputEl.click()}
+        disabled={$tasksStore.streaming || submitting}
+        aria-label="Attach a file"
+        title="Attach file"
+        type="button"
+      >
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+        </svg>
+      </button>
       <textarea
         bind:this={inputEl}
         bind:value={instruction}
@@ -265,9 +334,45 @@
         </svg>
       </button>
     </div>
+    {#if attachedFiles.length > 0 || attachError}
+      <div class="attached-files">
+        {#each attachedFiles as f (f.filename)}
+          <span class="file-pill">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+            </svg>
+            <span class="file-pill-name" title={f.filename}>{f.filename}</span>
+            <span class="file-pill-tokens">~{f.tokenEstimate.toLocaleString()}t</span>
+            <button
+              class="file-pill-remove"
+              on:click={() => removeAttachedFile(f.filename)}
+              aria-label="Remove {f.filename}"
+              title="Remove"
+            >
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
+                <line x1="18" y1="6" x2="6" y2="18"/>
+                <line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </span>
+        {/each}
+        {#if attachError}
+          <span class="attach-error">{attachError}</span>
+        {/if}
+      </div>
+    {/if}
     <p class="input-hint">
       <kbd>Enter</kbd> to send · <kbd>Shift+Enter</kbd> for new line
     </p>
+    <input
+      bind:this={fileInputEl}
+      type="file"
+      accept={[...ALLOWED_EXTENSIONS].join(',')}
+      style="display:none"
+      on:change={handleFileSelect}
+      aria-hidden="true"
+      tabindex="-1"
+    />
   </div>
 </div>
 
@@ -538,4 +643,69 @@
   .prov-tool     { background: #1e1e1e;           color: #cf9a7e; border-color: #4a3020; }
   .prov-episodic-mem { background: #2a2218;       color: #cfb07e; border-color: #5a4a2d; }
   .prov-grounded { background: #1a2a1a;           color: #7ecf7e; border-color: #2d4a2d; }
+
+  .attach-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: var(--radius);
+    color: var(--text-tertiary);
+    flex-shrink: 0;
+    transition: color var(--dur-fast) var(--ease);
+  }
+  .attach-btn:hover:not(:disabled) { color: var(--text-secondary); }
+  .attach-btn:disabled { opacity: 0.4; }
+
+  .attached-files {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--sp-1);
+    padding: var(--sp-2) 0 0;
+  }
+
+  .file-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 2px var(--sp-2);
+    font-size: 11px;
+    font-family: var(--font-mono);
+    color: var(--text-secondary);
+    max-width: 280px;
+  }
+
+  .file-pill-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 180px;
+  }
+
+  .file-pill-tokens {
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+
+  .file-pill-remove {
+    display: flex;
+    align-items: center;
+    color: var(--text-muted);
+    flex-shrink: 0;
+    padding: 0;
+    transition: color var(--dur-fast) var(--ease);
+  }
+  .file-pill-remove:hover { color: var(--error); }
+
+  .attach-error {
+    font-size: 11px;
+    color: var(--error);
+    font-family: var(--font-mono);
+    padding: 0 var(--sp-1);
+  }
 </style>

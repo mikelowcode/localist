@@ -68,6 +68,8 @@ import os
 import re
 from typing import Any
 
+import session_files as _session_files
+
 from prompt_builder import PromptBuilder, RagSource
 
 logger = logging.getLogger(__name__)
@@ -198,8 +200,9 @@ class ConversationalAgent:
         system         = str(context.get("system", PromptBuilder._SYSTEM))
 
         logger.info(
-            "ConversationalAgent.run() — subtask=%s  chars=%d  max_results=%d",
+            "ConversationalAgent.run() — subtask=%s  chars=%d  max_results=%d  session_files=%d",
             subtask.subtask_id, len(instruction), max_results,
+            len(_session_files.get_files()),
         )
 
         # -- Prebuilt prompt passthrough (Phase 4 controller integration) --------
@@ -356,8 +359,9 @@ class ConversationalAgent:
             if results else None
         )
         system, prompt = _PROMPT_BUILDER.build(
-            instruction  = instruction,
-            rag_snippets = rag_sources,
+            instruction   = instruction,
+            session_files = _session_files.get_files(),
+            rag_snippets  = rag_sources,
         )
 
         # -- Step 4: Inference -----------------------------------------------

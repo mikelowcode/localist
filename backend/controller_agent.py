@@ -59,6 +59,7 @@ from episodic_extractor import (
 from tool_dispatcher import ToolDispatcher
 from prompt_builder import ToolResult as _ToolResult
 from wiki_doc import load_wiki_doc, parse_wiki_doc
+import session_files as _session_files
 
 logger = logging.getLogger(__name__)
 
@@ -1258,16 +1259,18 @@ class ControllerAgent:
             graph_result     = graph_result             or None,
             working_state    = working_state,
             working_memory   = working_turns            or None,
+            session_files    = _session_files.get_files() or None,
         )
 
         logger.debug(
             "_execute_plan: prompt assembled — "
             "system_chars=%d  user_chars=%d  "
             "working_turns=%d  episodic_bullets=%d  rag_sources=%d  "
-            "working_state_artifacts=%d",
+            "working_state_artifacts=%d  session_files=%d",
             len(system_prompt), len(user_prompt),
             len(working_turns), len(episodic_bullets), len(rag_sources),
             len(working_state.active_artifacts) if working_state is not None else 0,
+            len(_session_files.get_files()),
         )
         logger.debug(
             "_execute_plan: assembled system_prompt:\n%s",

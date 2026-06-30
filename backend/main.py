@@ -120,6 +120,7 @@ from conversational_agent import ConversationalAgent
 from embedding_engine import EmbeddingEngine
 from memory_manager import MemoryManager
 from runtime_factory import create_runtime
+import session_files
 from warmup import run_cache_warmup as _run_cache_warmup
 from wiki_agent import WikiAgent
 
@@ -856,6 +857,54 @@ async def post_file_upload(file: UploadFile = File(...)) -> FileEntry:
             )
 
     return _file_entry(dest)
+
+
+# ---------------------------------------------------------------------------
+# Chat file attachments (session-scoped, ephemeral, no wiki ingestion)
+# ---------------------------------------------------------------------------
+
+@app.post("/chat/files")
+async def attach_chat_file(file: UploadFile = File(...)):
+    """
+    Upload a text file into the ephemeral session file cache.
+
+    The file is read, decoded as UTF-8, and passed to session_files.add_file().
+    Returns 200 + {filename, token_estimate} on success.
+    Returns 400 + {detail} on rejection (type, size, or budget).
+    Returns 422 on encoding failure (binary/non-UTF-8 file).
+    """
+    raw = await file.read()
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"'{file.filename}' could not be read as UTF-8 text. Binary files are not supported.",
+        )
+
+    error = session_files.add_file(file.filename, content)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+
+    return {
+        "filename":       file.filename,
+        "token_estimate": len(content) // 4,
+    }
+
+
+@app.delete("/chat/files/{filename}")
+async def detach_chat_file(filename: str):
+    """
+    Remove a file from the ephemeral session file cache by filename.
+
+    Returns 200 + {removed: true} if found and removed.
+    Returns 404 if the filename was not in the cache.
+    """
+    removed = session_files.remove_file(filename)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"'{filename}' not found in session files.")
+    return {"removed": True}
+
 
 # ---------------------------------------------------------------------------
 # SSE streaming helper

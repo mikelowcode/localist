@@ -45,6 +45,12 @@ class RagSource:
 
 
 @dataclass
+class SessionFile:
+    filename: str   # original filename, used as the label in the slot
+    content:  str   # full extracted text; truncation enforced at render-time in slot builder
+
+
+@dataclass
 class ToolResult:
     tool_name:  str
     parameters: str
@@ -89,7 +95,7 @@ class PromptBuilder:
 
     USER MESSAGE (static-first ordering for KV-cache prefix reuse)
       Slot 3  [EPISODIC MEMORY] — durable facts; conditional; 150-token ceiling
-      Slot 4  [CONTEXT]         — RAG snippets; conditional; 450-token ceiling
+      Slot 4  [CONTEXT]         — RAG snippets; conditional; 800-token ceiling
       Slot 5  [TOOL RESULTS]    — tool output; conditional; 500-token ceiling
       Slot 5b [GRAPH RESULT]    — graph query result; emitted whenever a graph
                                   query resolved, even with zero edges;
@@ -147,6 +153,8 @@ class PromptBuilder:
     _CEIL_GRAPH:    int = 300   # slot 5b
     _CEIL_WORKING_STATE: int = 100   # slot 6a
     _CEIL_WORKING:       int = 300   # slot 6
+    _CEIL_SESSION_FILES_EACH:  int = 4000   # per-file ceiling, tokens
+    _CEIL_SESSION_FILES_TOTAL: int = 20000  # total slot ceiling, tokens
 
     # -----------------------------------------------------------------------
     # Internal token helpers
@@ -185,6 +193,53 @@ class PromptBuilder:
             return self._SYSTEM
         truncated = self._truncate_to_tokens(persona, self._CEIL_PERSONA)
         return self._SYSTEM + "\n\n" + truncated
+
+    def _slot_session_files(
+        self,
+        files: list[SessionFile] | None,
+    ) -> str:
+        """
+        Return the [SESSION FILES] slot, or "" if files is None/empty.
+
+        This slot is unnumbered and positioned before all other user-message
+        slots (before Slot 3 / [EPISODIC MEMORY]) so that uploaded file
+        content sits as early as possible in the KV-cache prefix. It is
+        populated directly from the backend ephemeral session file cache and
+        bypasses the Planner routing ladder entirely.
+
+        Per-file ceiling: 4,000 tokens (16,000 chars).
+        Total slot ceiling: 20,000 tokens.
+
+        Each file is rendered as:
+            [SESSION FILES]
+            --- filename.ext ---
+            {content}
+            --- end filename.ext ---
+
+        Multiple files are separated by a single blank line.
+        Truncation appends the standard '… [truncated]' marker via
+        _truncate_to_tokens(), consistent with all other slot builders.
+        """
+        if not files:
+            return ""
+
+        rendered_files: list[str] = []
+        total_tokens = 0
+
+        for f in files:
+            truncated = self._truncate_to_tokens(f.content, self._CEIL_SESSION_FILES_EACH)
+            block = f"--- {f.filename} ---\n{truncated}\n--- end {f.filename} ---"
+            block_tokens = self._estimate_tokens(block)
+            if total_tokens + block_tokens > self._CEIL_SESSION_FILES_TOTAL:
+                break
+            rendered_files.append(block)
+            total_tokens += block_tokens
+
+        if not rendered_files:
+            return ""
+
+        body = "\n\n".join(rendered_files)
+        return f"[SESSION FILES]\n{body}"
 
     def _slot3_combined(
         self,
@@ -257,7 +312,7 @@ class PromptBuilder:
             Source: {path}
             {content snippet}
 
-        The 450-token ceiling is enforced across all sources combined.
+        The 800-token ceiling is enforced across all sources combined.
         Each source's content is truncated at a sentence boundary when
         possible. Maximum 3 sources (callers should pre-rank; this method
         takes the first 3).
@@ -507,6 +562,7 @@ class PromptBuilder:
     def build(
         self,
         instruction:      str,
+        session_files:    list[SessionFile]        | None = None,
         persona:          str | None              = None,
         episodic_summary: list[EpisodeBullet]     | None = None,
         profile_facts:    list[UserProfileFact]   | None = None,
@@ -523,6 +579,10 @@ class PromptBuilder:
         ----------
         instruction :
             The raw user instruction (Slot 7). Never transformed.
+        session_files :
+            Uploaded session files ([SESSION FILES], unnumbered slot before
+            Slot 3). Per-file ceiling 4,000 tokens; total slot ceiling
+            20,000 tokens. Pass None or [] to omit.
         persona :
             Optional persona string (Slot 1b). Injected into the system
             message when provided; 500-token ceiling enforced.
@@ -556,7 +616,8 @@ class PromptBuilder:
         (system_prompt, user_prompt) : tuple[str, str]
             system_prompt : Slot 1a + optional 1b. Pass as `system=` to
                             the runtime.
-            user_prompt   : Slots 3–7 joined with double newlines.
+            user_prompt   : [SESSION FILES] (when present) followed by
+                            Slots 3–7 joined with double newlines.
                             Empty slots are cleanly absent. Slot 3 includes
                             an optional [USER PROFILE] sub-block (Slot 3b)
                             when profile_facts are provided. Slot 5b
@@ -566,6 +627,7 @@ class PromptBuilder:
         system_prompt = self._slot1_system(persona)
 
         slots = [
+            self._slot_session_files(session_files),   # unnumbered — before Slot 3
             self._slot3_combined(episodic_summary, profile_facts),
             self._slot4_rag(rag_snippets),
             self._slot5_tools(tool_results),
