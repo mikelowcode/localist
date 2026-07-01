@@ -20,6 +20,7 @@
 9. [Slot 6A — Structured Working State](#9-slot-6a--structured-working-state)
 10. [Semantic Search-Intent Classifier](#10-semantic-search-intent-classifier)
 11. [Session File Attachments](#11-session-file-attachments)
+12. [Chat History Tab](#12-chat-history-tab)
 
 ---
 
@@ -2199,6 +2200,8 @@ Conversation history (`turns: Turn[]`) was previously local component state in `
 
 **Open item:** `chatHistoryStore` has no programmatic clear/reset path. Only a full page reload empties it. Not yet addressed; flagged for live observation.
 
+*Forward reference: durable, cross-session, searchable persistence of chat turns — a separate concern from this session-only store — shipped later as the Chat History Tab; see §12.*
+
 ---
 
 ## 8. Graph Retrieval Layer
@@ -2541,13 +2544,52 @@ body-clean, no-close-fence-fallback-unchanged, standard-fence-at-line-zero-unaff
 3 in `test_wiki_agent.py` — strips-leading-newline, strips-trailing-whitespace,
 strips-trailing-only), 0 failures.
 
-**Open Item 7 — `build_graph.py` manual-trigger gap.** No automated trigger (no
-hook, no CI step, no runbook) runs `build_graph.py` after wiki content changes.
-This is what allowed the live P3c resolution failure to go undetected until manual
-testing — the graph was simply never built against the production database. Not
-urgent, but warrants a deliberate decision: wire into the WikiAgent post-ingest
-path (the migration path noted in §8.2), add a CI/startup check, or leave manual
-with an explicit runbook note. No decision made; flagged for a future session.
+**Open Item 7 — `build_graph.py` manual-trigger gap. CLOSED 2026-07-01.**
+
+*Originally:* no automated trigger (no hook, no CI step, no runbook) ran
+`build_graph.py` after wiki content changes. This is what allowed the live P3c
+resolution failure to go undetected until manual testing — the graph was simply
+never built against the production database.
+
+*Decision:* three options were considered — a WikiAgent post-ingest hook, a
+startup check, and a runbook-only note. Runbook-only was rejected: it is the
+same manual-reminder approach that already failed once, and that failure is
+literally how this item was discovered. The two remaining options were
+combined rather than choosing one — the hook covers the primary ingestion
+path live, while the startup check is the safety net for drift from any other
+source (manual file edits, restores, between-session drift). The startup
+check specifically would have caught the original incident immediately at
+boot rather than on a failed live query.
+
+*Fix (two parts, two separate Claude Code prompts, one file each):* Part B
+(`main.py`, applied first) — `build_graph` imported and called in `lifespan()`
+right after the "MemoryManager ready" log line, wrapped in try/except and
+logging a warning (non-fatal) rather than propagating the exception — a
+deliberate departure from the unguarded `index_directory()` precedent in the
+same function, since graph state is lower-stakes and already degrades
+gracefully. Part A (`wiki_agent.py`, applied second) — `build_graph` imported
+and called immediately after the existing `index_document()` loop, still
+inside the existing `if self._memory_manager is not None and written:` guard
+so it only fires when pages were actually written, using the same non-fatal
+try/except pattern.
+
+*Live-verified:* Part B — a backend restart showed `"Graph rebuilt at
+startup — nodes=5 edges=11 resolved=8 unresolved=3"`, matching the known-good
+Phase C baseline. Part A — a real WikiAgent write produced `"Graph rebuilt
+after write — nodes=6 edges=13 resolved=10 unresolved=3"`, independently
+matching a standalone manual `build_graph.py` run against the same database
+exactly; test artifacts were cleaned up afterward and the pre-test state
+(nodes=5/edges=11/resolved=8/unresolved=3) was confirmed restored via `git
+status` and a final clean re-run.
+
+*Test suite:* 447 passed throughout both prompts, 0 regressions, 0 new tests
+(both changes are additive/non-fatal with no new branching logic requiring
+dedicated coverage).
+
+*Note:* both call sites use `build_graph()`'s full-rebuild behavior (clears
+and re-walks all `graph_edges`) rather than an incremental update — fine at
+current corpus size (~6 wiki files), not filed as a numbered open item, just
+noted as a forward-looking scaling consideration.
 
 **Open Item 8 — `raw/`-in-RAG via `force_rag` bypass. CLOSED 2026-06-21.**
 
@@ -4117,5 +4159,291 @@ No new test files were added for this feature. The `SessionFile` dataclass and
 `_slot_session_files()` builder are covered by the smoke test run during Prompt 1
 implementation (throwaway script, not committed). A permanent test class for
 `session_files.py` and the new `PromptBuilder` slot is a future addition.
+
+---
+
+## 12. Chat History Tab
+
+*Shipped 2026-07-01 across six sequential Claude Code prompts; see
+session-log entry for the step-by-step account (`sessions-log.md`,
+"2026-07-01 — Chat History Tab").*
+
+### 12.1 Scope
+
+Durable, searchable, user-manageable persistence of chat turns — distinct from
+both:
+- `conversation_log` — task-scoped working memory used to build prompts
+  (§ Schema — three tables in `memory_manager.py`'s module docstring), and
+- the existing `chatHistoryStore` (§7.8) — a session-only, in-memory Svelte
+  store that resets on every full page reload.
+
+Shipped end-to-end across six sequential steps: schema migration, backend
+write path, settings CRUD endpoints, a read/search endpoint, and a new
+SvelteKit route (`/history`) with a retention-preset dropdown and a
+searchable, paginated turn list.
+
+**Implemented:**
+- `memory_manager.py` — `chat_turns`, `chat_turns_fts`, three sync triggers,
+  and `chat_history_settings` (v5→v6 schema migration). New public methods:
+  `add_chat_turn()`, `get_chat_turns()`, `get_chat_history_eviction_preset()`,
+  `set_chat_history_eviction_preset()`.
+- `main.py` — `_persist_chat_turn()` write helper wired into `post_task()` and
+  `_stream_task()`; `_require_memory_manager()` dependency helper; three new
+  endpoints (`GET`/`PUT /chat/history/settings`, `GET /chat/history`).
+- `localist-ui` — new route `src/routes/history/+page.svelte`; new stores
+  `chatHistorySettings.ts` and `chatHistoryList.ts`; new `Sidebar.svelte` nav
+  entry.
+
+**Explicitly not implemented (see §12.7):** eviction sweep execution.
+
+### 12.2 Design Decisions
+
+**`conversation_log` rejected as a reuse target.** Two mismatches, both
+structural, not stylistic:
+- *Scoping key.* `conversation_log` rows are grouped by `task_id`, and the
+  frontend mints a new `task_id` per turn via `crypto.randomUUID()` in
+  `ChatPanel.svelte` (`const task_id = crypto.randomUUID();`), not once per
+  conversation. A durable, cross-session, searchable transcript needs a
+  table that is not keyed to a value that changes every message.
+- *Eviction semantics.* `conversation_log` evicts FIFO-by-count via
+  `_evict_conversation_log()` (`_CONV_LOG_CAP_PER_TASK = 200` rows per
+  `task_id`). Chat History's eviction requirement is age-based (7d/30d/90d/
+  forever), which has no natural expression in a count-capped-per-task_id
+  table.
+
+**Eviction preset is user-set only — no default.** `chat_history_settings`
+starts with **zero rows**; `get_chat_history_eviction_preset()` returns
+`None` until the user explicitly picks a preset via the UI dropdown or
+`PUT /chat/history/settings`. This is a deliberate absence, not an
+oversight — the dropdown renders an explicit disabled placeholder option
+("Choose a retention policy…") rather than silently defaulting to any of the
+four real presets. **Eviction sweep execution is not yet implemented** —
+this arc shipped the settings storage and its read/write API only. Any
+future sweep implementation must treat "no row in `chat_history_settings`"
+as "do nothing," not as an error or an implicit default preset.
+
+**Write path lives in `main.py`, not `controller_agent.py`.**
+`_persist_chat_turn()` sits at the request/response boundary in `main.py` —
+called from `post_task()` and both of `_stream_task()`'s two
+mutually-exclusive completion paths (the `answer_ready` event and the
+fallback path) — deliberately decoupled from `controller_agent.py`'s
+agent-internal `conversation_log` writes. `_persist_chat_turn()` no-ops
+silently when `_state.memory_manager` is `None` and otherwise wraps the call
+in `try/except`, logging a warning on failure without raising — a
+chat_turns write failure must never break the actual task response, since
+the source of truth for an in-flight answer is the SSE stream / `TaskResponse`,
+not this table.
+
+**FTS5 full-text search, not substring matching.** `get_chat_turns()` queries
+`chat_turns_fts` via `MATCH` and orders by `bm25(chat_turns_fts) ASC`.
+Confirmed empirically (not assumed) that ascending is the correct direction:
+SQLite FTS5's `bm25()` returns more-negative values for better matches, so a
+row that repeats the search term multiple times outranks a row mentioning it
+once under `ASC` ordering — verified both in `test_fts_search_ranks_best_match_first`
+and live against real data (§12.6). The raw query string is wrapped as a
+single quoted FTS5 phrase (embedded `"` doubled) before being passed to
+`MATCH`, so punctuation-heavy input (`"what's"`, hyphens, FTS5 operator
+keywords) is treated as literal text instead of `MATCH` syntax; a residual
+`sqlite3.OperationalError` from the FTS5 query is caught and degrades to an
+empty result set rather than raising.
+
+### 12.3 Schema
+
+Current `_SCHEMA_VERSION` is **6** (v5→v6 migration added to
+`memory_manager.py`; v5 was the working-state `turn_summaries_json`-removal
+migration from §9).
+
+```sql
+CREATE TABLE IF NOT EXISTS chat_turns (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         TEXT    NOT NULL,
+    role            TEXT    NOT NULL,
+    content         TEXT    NOT NULL,
+    sources_json    TEXT    NOT NULL DEFAULT '[]',
+    status_message  TEXT,
+    metadata_json   TEXT    NOT NULL DEFAULT '{}',
+    created_at      REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chat_turns_created
+    ON chat_turns(created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_turns_task
+    ON chat_turns(task_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chat_turns_fts USING fts5(
+    content,
+    content='chat_turns',
+    content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS chat_turns_ai AFTER INSERT ON chat_turns BEGIN
+    INSERT INTO chat_turns_fts(rowid, content) VALUES (new.id, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS chat_turns_ad AFTER DELETE ON chat_turns BEGIN
+    INSERT INTO chat_turns_fts(chat_turns_fts, rowid, content) VALUES ('delete', old.id, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS chat_turns_au AFTER UPDATE ON chat_turns BEGIN
+    INSERT INTO chat_turns_fts(chat_turns_fts, rowid, content) VALUES ('delete', old.id, old.content);
+    INSERT INTO chat_turns_fts(rowid, content) VALUES (new.id, new.content);
+END;
+
+CREATE TABLE IF NOT EXISTS chat_history_settings (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    eviction_preset TEXT
+);
+```
+
+`chat_turns_fts` is an external-content FTS5 table (`content='chat_turns'`,
+`content_rowid='id'`) — it stores no independent copy of `content`, only the
+inverted index, and is kept in sync purely by the three triggers above:
+`chat_turns_ai` (`AFTER INSERT`) indexes the new row; `chat_turns_ad`
+(`AFTER DELETE`) removes the old row's index entries via FTS5's
+`('delete', rowid, content)` special-insert form; `chat_turns_au`
+(`AFTER UPDATE`) does both — deletes the old index entry, then indexes the
+new content — since FTS5 external-content tables have no native `UPDATE`
+support.
+
+`chat_history_settings` is a single-row table (`id INTEGER PRIMARY KEY CHECK
+(id = 1)`) with **no seed row inserted anywhere** — neither in the fresh-DB
+`_init_db()` script nor in the v5→v6 `_migrate()` block. Absence of a row
+means "no policy set," by design (§12.2).
+
+### 12.4 Backend API
+
+Three new endpoints in `main.py`, all guarded by a new `_require_memory_manager()`
+dependency helper (503 if `_state.memory_manager is None`, matching
+`_require_controller()`/`_require_runtime()`'s exact style):
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/chat/history/settings` | Returns `ChatHistorySettingsResponse{eviction_preset: str \| None}`. `None` when the user has never set one. |
+| `PUT` | `/chat/history/settings` | Body `ChatHistorySettingsRequest{eviction_preset: Literal["7d","30d","90d","forever"]}` — the `Literal` type rejects invalid values at the Pydantic/FastAPI validation layer (422) before the handler runs. Calls `set_chat_history_eviction_preset()`, then re-reads via `get_chat_history_eviction_preset()` and returns the re-read value (confirms the write landed rather than echoing the request back). |
+| `GET` | `/chat/history` | Query params `q: str \| None = None`, `limit: int = 50` (clamped to 200 at the endpoint, matching `list_episodes()`'s ceiling, and clamped again inside `get_chat_turns()`), `offset: int = 0`. Returns `ChatHistoryResponse{turns: ChatTurnItem[], total: int, offset: int, limit: int}`. |
+
+`ChatTurnItem` fields: `id: int`, `task_id: str`, `role: str`, `content: str`,
+`sources: list[dict] = []`, `status_message: str | None = None`,
+`metadata: dict = {}`, `created_at: float`.
+
+**`total` is a true count, deliberately not `GET /memory/episodes`'s
+`total=len(rows)` quirk.** `get_chat_turns()` returns `(rows, total_count)`
+where `total_count` comes from a separate `SELECT COUNT(*)` (unfiltered) or
+`SELECT COUNT(*) FROM chat_turns_fts WHERE chat_turns_fts MATCH ?` (filtered)
+— it reflects the full matching set, not just the current page. This was a
+deliberate choice, not an oversight: `GET /memory/episodes`'s existing
+`total = len(episodes)` (the page size, not the true total) was noted during
+implementation and not copied.
+
+### 12.5 Frontend
+
+New route `src/routes/history/+page.svelte`, added to `Sidebar.svelte`'s
+`nav` array as `{ href: '/history', label: 'History', icon: 'history' }`
+(positioned after Memory, before Files) with a new clock-face SVG icon
+branch (`stroke-width="1.75"`, matching the other four nav icons).
+
+Two new stores, kept separate from each other and from the existing
+`chatHistory.ts` (§7.8) — three distinct concerns:
+
+- **`chatHistorySettings.ts`** — `chatHistorySettings: Writable<{eviction_preset: string | null}>`,
+  `chatHistorySettingsLoading`, `chatHistorySettingsError`;
+  `loadChatHistorySettings()` (`GET /api/chat/history/settings`) and
+  `setChatHistoryEvictionPreset()` (`PUT /api/chat/history/settings`). On
+  failure, `chatHistorySettings` is left untouched — no optimistic update —
+  so the dropdown reflects the server's actual last-known state, not the
+  user's pending click.
+- **`chatHistoryList.ts`** — `chatTurns`, `chatTurnsTotal`, `chatTurnsLoading`,
+  `chatTurnsError`, `chatHistoryQuery`, `chatHistoryOffset`, and a fixed
+  `CHAT_HISTORY_PAGE_SIZE = 25`. `loadChatTurns()` (`GET /api/chat/history`)
+  omits the `q` param entirely when the query is empty; on failure,
+  `chatTurns`/`chatTurnsTotal` are left unchanged, matching
+  `chatHistorySettings.ts`'s convention. `resetChatHistoryOffset()` returns
+  to page 1, called whenever the search text changes.
+
+`+page.svelte`'s turn-search input is debounced 300ms (`setTimeout`/
+`clearTimeout`, cleared on `onDestroy`) before writing to `chatHistoryQuery`
+and firing `loadChatTurns()`, so the displayed query state never gets ahead
+of the displayed results. Distinct empty states for "no turns yet"
+(`total === 0 && query === ''`) versus "no results for your search"
+(`total === 0 && query !== ''`). Pagination is a Previous/Next button pair
+(no such control existed anywhere in the app to mirror — `episodes.ts`/
+`EpisodesPanel.svelte` carry `offset`/`limit`/`total` state but render no
+pagination UI at all — so this was built from scratch), disabled at
+`offset === 0` and `offset + pageSize >= total` respectively.
+
+### 12.6 Live Verification
+
+With a live backend (`main:app`, port 8001) and a live LLM runtime (oMLX,
+port 8000) already running, three real requests were sent through the
+actual production write path — two via `POST /task` ("what is a zebra?",
+"fun fact about pangolins") and one via `POST /task/stream` ("what color is
+the sky?") — writing 6 real rows into `chat_turns`.
+
+- **Direct SQLite inspection** of all 6 rows: `role` values exactly `"user"`/
+  `"assistant"` (no stray values); `content` non-empty and matching the real
+  conversation; `sources_json`/`metadata_json` valid JSON round-tripping
+  correctly (`[]`/`{}` for user turns, the expected
+  `{agent, priority, fetch_rag, fetch_episodic, tools_fired, grounded}` dict
+  for assistant turns); `status_message` consistently `NULL` (expected — no
+  call site populates it yet); `created_at` timestamps strictly increasing.
+- **`GET /chat/history`** (direct and through the Vite dev proxy at
+  `/api/chat/history`) returned all 6 rows, newest first, `total: 6`.
+- **FTS search correctness in both directions:** `?q=zebra` returned exactly
+  the 2 rows containing "zebra" (the user question *and* the assistant
+  answer); `?q=sky` returned exactly the 2 "sky" rows; `?q=nonexistentxyz`
+  returned `{turns: [], total: 0}`.
+- **Pagination correctness:** `?limit=2&offset=2` returned rows 3–4 of the
+  unfiltered set while `total` remained `6` (the full count, not the page
+  size) — confirming the §12.4 total-count design decision holds under real
+  data, not just unit tests.
+- The rendered `/history` page (fetched through the Vite dev proxy) showed
+  the expected markup (`turn-card` elements, search input, retention
+  dropdown) against this real data.
+
+Test rows were deleted after verification, restoring `chat_turns` to empty.
+
+This live-fire pass also closed an outstanding gap from step 2: the
+`_stream_task()` write path had shipped on test-suite-pass alone, with no
+direct live verification at the time (no SSE test harness exists in this
+repo) — the `POST /task/stream` request in this pass was the first live
+confirmation that its `answer_ready` persistence branch actually fires
+correctly end-to-end.
+
+### 12.7 Open Items
+
+**Open Item 1 — Eviction sweep execution not yet implemented.**
+`chat_history_settings` can be read and written via the two settings
+endpoints, but nothing currently acts on the stored preset. No scheduled
+job, no request-time sweep, no manual trigger exists. A future
+implementation must treat an absent row as "no policy set — do nothing,"
+per §12.2.
+
+**Open Item 2 — Leading-`\n` in assistant answers (cosmetic, out-of-scope).**
+Assistant `content` values sometimes begin with a literal `\n` (e.g.
+`"\nA zebra is a genus of equid..."`, observed live in §12.6). This is
+inherited verbatim from `result.get("answer")` — a synthesizer/prompt-output
+quirk upstream of persistence, not a `chat_turns` or `add_chat_turn()` bug.
+`chat_turns` is correctly persisting exactly what the pipeline produced.
+
+**Open Item 3 — No automated frontend test coverage.** No test framework
+(`vitest`, `jest`, or otherwise) exists anywhere in this repo — confirmed
+twice independently during this arc (once during the settings-store step,
+once during the searchable-list step) via `package.json` and a repo-wide
+search for `*.test.ts`. Not introduced as part of this feature; frontend
+verification for this arc relied on `svelte-check`, `vite build`, and the
+live-fire pass in §12.6.
+
+### 12.8 Test Suite
+
+Backend test suite: **447 → 489 (+42)** across the full six-step arc, 0 real
+failures. The full-suite run at the end of this arc reports 9 failures
+(`test_tool_dispatcher_phase6.py::TestWebSearch` and one
+`test_controller_phase4.py` test), all attributable to a pre-existing,
+unrelated network flake — live HTTP calls to `api.langsearch.com`
+intermittently returning 500s when run alongside the rest of the suite.
+Both files pass 73/73 when run in isolation; this flake predates this
+feature and recurred identically (with a varying failure count, 7–9) across
+every step of this arc.
+
+No frontend test coverage was added (§12.7, Open Item 3).
+
+---
 
 *End of Localist Framework Canonical Architecture Specification*

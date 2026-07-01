@@ -1302,10 +1302,15 @@ class ControllerAgent:
                 "conversational_agent.", plan.agent,
             )
 
+        prebuilt_sources = [s.path for s in rag_sources] + [
+            f"session://{sf.filename}" for sf in _session_files.get_files()
+        ]
+
         subtask_context = {
             **task.context,
             "_prebuilt_prompt":  user_prompt,
             "_prebuilt_system":  system_prompt,
+            "_prebuilt_sources": prebuilt_sources,
             "_routing": {
                 "fetch_rag":      plan.fetch_rag,
                 "fetch_episodic": plan.fetch_episodic,
@@ -1455,11 +1460,19 @@ class ControllerAgent:
             status   = TaskStatus.COMPLETE,
             answer   = r.output.get("answer", ""),
             sources  = [
-                {
-                    "path": s,
-                    "type": "wiki" if "/wiki/" in s else "raw",
-                    "name": s.split("/")[-1].replace(".md", "").replace("-", " ").title(),
-                }
+                (
+                    {
+                        "path": s[len("session://"):],
+                        "type": "session",
+                        "name": s[len("session://"):],
+                    }
+                    if s.startswith("session://")
+                    else {
+                        "path": s,
+                        "type": "wiki" if "/wiki/" in s else "raw",
+                        "name": s.split("/")[-1].replace(".md", "").replace("-", " ").title(),
+                    }
+                )
                 for s in r.output.get("sources", [])
             ],
             metadata = {

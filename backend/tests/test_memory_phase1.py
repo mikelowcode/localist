@@ -602,7 +602,7 @@ class TestGraphSchema:
         assert "idx_graph_edges_target_path" in indexes
         assert "idx_graph_edges_resolved"    in indexes
 
-    # Test 2 — Fresh database schema_version is current (_SCHEMA_VERSION = 5).
+    # Test 2 — Fresh database schema_version is current (_SCHEMA_VERSION = 6).
     def test_fresh_db_schema_version_is_current(self, tmp_path):
         path = tmp_path / "test.db"
         MemoryManager(db_path=path)
@@ -611,7 +611,7 @@ class TestGraphSchema:
         version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
         conn.close()
 
-        assert version == 5
+        assert version == 6
 
     # Test 3 — v2 database opens cleanly and exits with current schema version + graph tables.
     def test_v2_migration_creates_graph_tables(self, tmp_path):
@@ -639,7 +639,7 @@ class TestGraphSchema:
         ).fetchall()}
         conn.close()
 
-        assert version_after == 5
+        assert version_after == 6
         assert "graph_nodes" in tables_after
         assert "graph_edges" in tables_after
 
@@ -1031,7 +1031,7 @@ class TestWorkingStateStore:
         conn.close()
 
         assert "working_state" in tables
-        assert version == 5
+        assert version == 6
         assert "turn_summaries_json" not in cols
 
     # 7. Migration path: v3 database (no working_state) gains the table and
@@ -1050,7 +1050,7 @@ class TestWorkingStateStore:
         assert version_before == 3
         assert "working_state" not in tables_before
 
-        # Open with MemoryManager → triggers _migrate(from_version=3) → v3→v4→v5.
+        # Open with MemoryManager → triggers _migrate(from_version=3) → v3→v4→v5→v6.
         MemoryManager(db_path=path)
 
         conn = sqlite3.connect(str(path))
@@ -1063,6 +1063,6 @@ class TestWorkingStateStore:
         ).fetchall()}
         conn.close()
 
-        assert version_after == 5
+        assert version_after == 6
         assert "working_state" in tables_after
         assert "turn_summaries_json" not in cols_after

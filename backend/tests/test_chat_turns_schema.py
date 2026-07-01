@@ -1,0 +1,451 @@
+"""
+Tests for the v5→v6 chat_turns/chat_turns_fts/chat_history_settings schema
+(Chat History Tab feature), plus the add_chat_turn() write path.
+
+No read endpoints or eviction sweep exist yet — those are later steps.
+"""
+
+import json
+import sqlite3
+import time
+from pathlib import Path
+
+import pytest
+
+from memory_manager import MemoryManager
+
+
+# ---------------------------------------------------------------------------
+# _create_v5_db — helper for the v5→v6 migration test
+# ---------------------------------------------------------------------------
+
+def _create_v5_db(path: Path) -> None:
+    """Create a v5-schema SQLite database (no chat_turns objects) for migration tests."""
+    conn = sqlite3.connect(str(path))
+    conn.executescript("""
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (5);
+        CREATE TABLE conversation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            meta_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL
+        );
+        CREATE TABLE document_index (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            path TEXT NOT NULL UNIQUE,
+            doc_type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            token_set TEXT NOT NULL DEFAULT '',
+            embedding BLOB DEFAULT NULL,
+            content_hash TEXT NOT NULL DEFAULT '',
+            indexed_at REAL NOT NULL
+        );
+        CREATE TABLE retrieval_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            query_hash TEXT NOT NULL UNIQUE,
+            top_n INTEGER NOT NULL,
+            result_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            valid INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE episodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_type TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            content TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 1.0,
+            source TEXT NOT NULL,
+            task_id TEXT,
+            conversation_id TEXT,
+            project_context TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at REAL NOT NULL,
+            last_accessed REAL,
+            embedding BLOB
+        );
+        CREATE TABLE graph_nodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_path TEXT NOT NULL UNIQUE,
+            node_type TEXT,
+            title TEXT,
+            source_doc_path TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE graph_edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_node_id INTEGER NOT NULL REFERENCES graph_nodes(id),
+            target_path TEXT NOT NULL,
+            target_node_id INTEGER REFERENCES graph_nodes(id),
+            target_resolved INTEGER NOT NULL DEFAULT 0,
+            link_text TEXT NOT NULL,
+            source_doc_path TEXT NOT NULL
+        );
+        CREATE TABLE working_state (
+            mem_key TEXT PRIMARY KEY,
+            current_focus TEXT,
+            open_loops_json TEXT NOT NULL DEFAULT '[]',
+            recent_decisions_json TEXT NOT NULL DEFAULT '[]',
+            updated_at REAL NOT NULL
+        );
+    """)
+    conn.close()
+
+
+def _tables(conn: sqlite3.Connection) -> set[str]:
+    return {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+
+
+# ---------------------------------------------------------------------------
+# TestChatTurnsFreshSchema — fresh-DB path
+# ---------------------------------------------------------------------------
+
+class TestChatTurnsFreshSchema:
+
+    def test_fresh_db_has_chat_turns_objects(self, tmp_path):
+        path = tmp_path / "fresh.db"
+        MemoryManager(db_path=path)
+
+        conn = sqlite3.connect(str(path))
+        names = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master"
+        ).fetchall()}
+        conn.close()
+
+        assert "chat_turns" in names
+        assert "chat_turns_fts" in names
+        assert "chat_history_settings" in names
+        assert "chat_turns_ai" in names
+        assert "chat_turns_ad" in names
+        assert "chat_turns_au" in names
+
+    def test_chat_turns_fts_stays_in_sync_via_triggers(self, tmp_path):
+        path = tmp_path / "fts.db"
+        MemoryManager(db_path=path)
+
+        conn = sqlite3.connect(str(path))
+        conn.row_factory = sqlite3.Row
+        now = time.time()
+        cursor = conn.execute(
+            """
+            INSERT INTO chat_turns (task_id, role, content, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("task-1", "user", "hello searchable world", now),
+        )
+        conn.commit()
+        row_id = cursor.lastrowid
+
+        match = conn.execute(
+            "SELECT rowid FROM chat_turns_fts WHERE chat_turns_fts MATCH ?",
+            ("searchable",),
+        ).fetchone()
+        assert match is not None
+        assert match["rowid"] == row_id
+
+        conn.execute("DELETE FROM chat_turns WHERE id = ?", (row_id,))
+        conn.commit()
+
+        match_after_delete = conn.execute(
+            "SELECT rowid FROM chat_turns_fts WHERE chat_turns_fts MATCH ?",
+            ("searchable",),
+        ).fetchone()
+        assert match_after_delete is None
+        conn.close()
+
+    def test_chat_history_settings_has_no_default_row(self, tmp_path):
+        path = tmp_path / "settings.db"
+        MemoryManager(db_path=path)
+
+        conn = sqlite3.connect(str(path))
+        count = conn.execute(
+            "SELECT COUNT(*) FROM chat_history_settings"
+        ).fetchone()[0]
+        conn.close()
+
+        assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# TestChatTurnsMigration — v5→v6 migration path
+# ---------------------------------------------------------------------------
+
+class TestChatTurnsMigration:
+
+    def test_v5_migration_creates_chat_turns_objects(self, tmp_path):
+        path = tmp_path / "migrate.db"
+        _create_v5_db(path)
+
+        # Precondition: truly v5, none of the chat_turns objects exist yet.
+        conn = sqlite3.connect(str(path))
+        version_before = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        tables_before = _tables(conn)
+        conn.close()
+        assert version_before == 5
+        assert "chat_turns" not in tables_before
+        assert "chat_history_settings" not in tables_before
+
+        # Open with MemoryManager → triggers _migrate(from_version=5) → v5→v6.
+        MemoryManager(db_path=path)
+
+        conn = sqlite3.connect(str(path))
+        version_after = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        names_after = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master"
+        ).fetchall()}
+        conn.close()
+
+        assert version_after == 6
+        assert "chat_turns" in names_after
+        assert "chat_turns_fts" in names_after
+        assert "chat_history_settings" in names_after
+        assert "chat_turns_ai" in names_after
+        assert "chat_turns_ad" in names_after
+        assert "chat_turns_au" in names_after
+
+
+# ---------------------------------------------------------------------------
+# TestAddChatTurn — write path (memory_manager.MemoryManager.add_chat_turn)
+# ---------------------------------------------------------------------------
+
+class TestAddChatTurn:
+
+    @pytest.fixture()
+    def mm(self, tmp_path) -> MemoryManager:
+        return MemoryManager(db_path=tmp_path / "add_chat_turn.db")
+
+    def _rows(self, mm: MemoryManager) -> list[sqlite3.Row]:
+        conn = sqlite3.connect(str(mm._db_path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM chat_turns ORDER BY id").fetchall()
+        conn.close()
+        return rows
+
+    def test_insert_creates_row_with_expected_fields(self, mm):
+        mm.add_chat_turn(
+            task_id  = "task-1",
+            role     = "user",
+            content  = "hello world",
+            sources  = [{"name": "doc-a"}],
+            metadata = {"agent": "wiki"},
+        )
+
+        rows = self._rows(mm)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["task_id"] == "task-1"
+        assert row["role"] == "user"
+        assert row["content"] == "hello world"
+        assert row["status_message"] is None
+        assert isinstance(row["created_at"], float)
+        assert row["created_at"] > 0
+
+    def test_sources_and_metadata_round_trip_through_json(self, mm):
+        mm.add_chat_turn(
+            task_id  = "task-2",
+            role     = "assistant",
+            content  = "the answer",
+            sources  = [{"name": "doc-a", "type": "wiki"}, {"name": "doc-b"}],
+            metadata = {"agent": "conversational", "latency_ms": 42},
+        )
+
+        row = self._rows(mm)[0]
+        assert json.loads(row["sources_json"]) == [
+            {"name": "doc-a", "type": "wiki"}, {"name": "doc-b"},
+        ]
+        assert json.loads(row["metadata_json"]) == {
+            "agent": "conversational", "latency_ms": 42,
+        }
+
+    def test_sources_and_metadata_default_to_empty(self, mm):
+        mm.add_chat_turn(task_id="task-3", role="user", content="no extras")
+
+        row = self._rows(mm)[0]
+        assert json.loads(row["sources_json"]) == []
+        assert json.loads(row["metadata_json"]) == {}
+
+    def test_fts_sync_on_insert(self, mm):
+        mm.add_chat_turn(task_id="task-4", role="user", content="a searchable phrase")
+
+        conn = sqlite3.connect(str(mm._db_path))
+        conn.row_factory = sqlite3.Row
+        match = conn.execute(
+            "SELECT rowid FROM chat_turns_fts WHERE chat_turns_fts MATCH ?",
+            ("searchable",),
+        ).fetchone()
+        conn.close()
+
+        assert match is not None
+        assert match["rowid"] == self._rows(mm)[0]["id"]
+
+    def test_does_not_touch_conversation_log(self, mm):
+        mm.add_chat_turn(task_id="task-5", role="user", content="x")
+
+        conn = sqlite3.connect(str(mm._db_path))
+        count = conn.execute("SELECT COUNT(*) FROM conversation_log").fetchone()[0]
+        conn.close()
+
+        assert count == 0
+
+    def test_multiple_turns_ordered_by_insertion(self, mm):
+        mm.add_chat_turn(task_id="task-6", role="user", content="first")
+        mm.add_chat_turn(task_id="task-6", role="assistant", content="second")
+
+        rows = self._rows(mm)
+        assert [r["role"] for r in rows] == ["user", "assistant"]
+        assert [r["content"] for r in rows] == ["first", "second"]
+
+
+# ---------------------------------------------------------------------------
+# TestChatHistorySettings — eviction preset read/write
+# (memory_manager.MemoryManager.get/set_chat_history_eviction_preset)
+# ---------------------------------------------------------------------------
+
+class TestChatHistorySettings:
+
+    @pytest.fixture()
+    def mm(self, tmp_path) -> MemoryManager:
+        return MemoryManager(db_path=tmp_path / "chat_history_settings.db")
+
+    def test_get_returns_none_on_fresh_db(self, mm):
+        assert mm.get_chat_history_eviction_preset() is None
+
+    @pytest.mark.parametrize("preset", ["7d", "30d", "90d", "forever"])
+    def test_set_then_get_round_trips(self, mm, preset):
+        mm.set_chat_history_eviction_preset(preset)
+        assert mm.get_chat_history_eviction_preset() == preset
+
+    def test_set_twice_overwrites_not_duplicates(self, mm):
+        mm.set_chat_history_eviction_preset("7d")
+        mm.set_chat_history_eviction_preset("90d")
+        assert mm.get_chat_history_eviction_preset() == "90d"
+
+        conn = sqlite3.connect(str(mm._db_path))
+        count = conn.execute("SELECT COUNT(*) FROM chat_history_settings").fetchone()[0]
+        conn.close()
+        assert count == 1
+
+    def test_set_invalid_preset_raises_value_error(self, mm):
+        with pytest.raises(ValueError, match="60d"):
+            mm.set_chat_history_eviction_preset("60d")
+
+        # No row should have been written on rejection.
+        assert mm.get_chat_history_eviction_preset() is None
+
+
+# ---------------------------------------------------------------------------
+# TestGetChatTurns — read/list path (memory_manager.MemoryManager.get_chat_turns)
+# ---------------------------------------------------------------------------
+
+class TestGetChatTurns:
+
+    @pytest.fixture()
+    def mm(self, tmp_path) -> MemoryManager:
+        return MemoryManager(db_path=tmp_path / "get_chat_turns.db")
+
+    def test_empty_table_returns_empty_list_and_zero_total(self, mm):
+        rows, total = mm.get_chat_turns()
+        assert rows == []
+        assert total == 0
+
+    def test_unfiltered_pagination_and_total_count(self, mm):
+        for i in range(5):
+            mm.add_chat_turn(task_id="t", role="user", content=f"turn {i}")
+
+        page1, total1 = mm.get_chat_turns(limit=2, offset=0)
+        page2, total2 = mm.get_chat_turns(limit=2, offset=2)
+        page3, total3 = mm.get_chat_turns(limit=2, offset=4)
+
+        assert total1 == total2 == total3 == 5
+        assert len(page1) == 2
+        assert len(page2) == 2
+        assert len(page3) == 1
+
+    def test_unfiltered_ordering_is_created_at_desc(self, mm):
+        mm.add_chat_turn(task_id="t", role="user", content="first")
+        mm.add_chat_turn(task_id="t", role="assistant", content="second")
+        mm.add_chat_turn(task_id="t", role="user", content="third")
+
+        rows, total = mm.get_chat_turns(limit=10)
+        assert total == 3
+        assert [r["content"] for r in rows] == ["third", "second", "first"]
+
+    def test_row_shape_includes_expected_keys_and_json_decoded_fields(self, mm):
+        mm.add_chat_turn(
+            task_id  = "t1",
+            role     = "assistant",
+            content  = "the answer",
+            sources  = [{"name": "doc-a"}],
+            metadata = {"agent": "wiki"},
+        )
+        rows, _ = mm.get_chat_turns()
+        row = rows[0]
+
+        assert set(row.keys()) == {
+            "id", "task_id", "role", "content", "sources",
+            "status_message", "metadata", "created_at",
+        }
+        assert row["sources"]  == [{"name": "doc-a"}]
+        assert row["metadata"] == {"agent": "wiki"}
+        assert row["status_message"] is None
+
+    def test_fts_search_returns_only_matching_rows(self, mm):
+        mm.add_chat_turn(task_id="t", role="user", content="tell me about zebras")
+        mm.add_chat_turn(task_id="t", role="assistant", content="zebras are striped equines")
+        mm.add_chat_turn(task_id="t", role="user", content="what is the capital of France")
+
+        rows, total = mm.get_chat_turns(query="zebras")
+
+        assert total == 2
+        assert len(rows) == 2
+        assert all("zebra" in r["content"].lower() for r in rows)
+
+    def test_fts_search_ranks_best_match_first(self, mm):
+        mm.add_chat_turn(task_id="t", role="user", content="a passing mention of pangolins")
+        mm.add_chat_turn(task_id="t", role="assistant", content="pangolins pangolins pangolins")
+
+        rows, total = mm.get_chat_turns(query="pangolins")
+
+        assert total == 2
+        assert rows[0]["content"] == "pangolins pangolins pangolins"
+
+    def test_fts_search_no_match_returns_empty_not_error(self, mm):
+        mm.add_chat_turn(task_id="t", role="user", content="hello world")
+
+        rows, total = mm.get_chat_turns(query="nonexistentterm")
+
+        assert rows == []
+        assert total == 0
+
+    def test_fts_search_pagination(self, mm):
+        for i in range(5):
+            mm.add_chat_turn(task_id="t", role="user", content=f"widget number {i}")
+
+        page1, total1 = mm.get_chat_turns(query="widget", limit=2, offset=0)
+        page2, total2 = mm.get_chat_turns(query="widget", limit=2, offset=4)
+
+        assert total1 == total2 == 5
+        assert len(page1) == 2
+        assert len(page2) == 1
+
+    @pytest.mark.parametrize("special_query", [
+        "what's up",
+        "-",
+        '"unterminated quote',
+        "AND OR NOT",
+        "()",
+        "col:value",
+    ])
+    def test_fts_special_characters_do_not_raise(self, mm, special_query):
+        mm.add_chat_turn(task_id="t", role="user", content="ordinary content")
+
+        rows, total = mm.get_chat_turns(query=special_query)
+
+        assert isinstance(rows, list)
+        assert isinstance(total, int)

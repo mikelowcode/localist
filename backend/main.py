@@ -102,7 +102,7 @@ import logging
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -115,6 +115,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # ---------------------------------------------------------------------------
 
 from base_runtime_client import BaseRuntimeClient
+from build_graph import build_graph
 from controller_agent import ControllerAgent
 from conversational_agent import ConversationalAgent
 from embedding_engine import EmbeddingEngine
@@ -306,6 +307,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stats["db_size_kb"], stats["embeddings_pct"],
     )
 
+    if wiki_dir.exists():
+        try:
+            graph_summary = build_graph(wiki_dir, memory_manager)
+            logger.info(
+                "Graph rebuilt at startup — nodes=%d edges=%d resolved=%d unresolved=%d",
+                graph_summary["nodes"], graph_summary["edges"],
+                graph_summary["resolved"], graph_summary["unresolved"],
+            )
+        except Exception as exc:
+            logger.warning("Graph build failed at startup (non-fatal): %s", exc)
+    else:
+        logger.info("Graph build skipped — wiki_dir does not exist yet (%s).", wiki_dir)
+
     # -- Agents --------------------------------------------------------------
 
     wiki_agent = WikiAgent(
@@ -474,6 +488,36 @@ class FileContentResponse(BaseModel):
     content: str
 
 
+class ChatHistorySettingsResponse(BaseModel):
+    """Response body for GET/PUT /chat/history/settings."""
+    eviction_preset: str | None = None
+
+
+class ChatHistorySettingsRequest(BaseModel):
+    """Payload accepted by PUT /chat/history/settings."""
+    eviction_preset: Literal["7d", "30d", "90d", "forever"]
+
+
+class ChatTurnItem(BaseModel):
+    """A single chat_turns record returned by GET /chat/history."""
+    id:             int
+    task_id:        str
+    role:           str
+    content:        str
+    sources:        list[dict[str, Any]] = Field(default_factory=list)
+    status_message: str | None = None
+    metadata:       dict[str, Any]       = Field(default_factory=dict)
+    created_at:     float
+
+
+class ChatHistoryResponse(BaseModel):
+    """Response body for GET /chat/history."""
+    turns:  list[ChatTurnItem]
+    total:  int
+    offset: int
+    limit:  int
+
+
 # ---------------------------------------------------------------------------
 # Dependency helpers
 # ---------------------------------------------------------------------------
@@ -488,6 +532,12 @@ def _require_runtime() -> BaseRuntimeClient:
     if _state.runtime is None:
         raise HTTPException(status_code=503, detail="Runtime not initialised.")
     return _state.runtime
+
+
+def _require_memory_manager() -> MemoryManager:
+    if _state.memory_manager is None:
+        raise HTTPException(status_code=503, detail="MemoryManager not initialised.")
+    return _state.memory_manager
 
 
 def _enrich_context(context: dict[str, Any]) -> dict[str, Any]:
@@ -509,6 +559,37 @@ def _enrich_context(context: dict[str, Any]) -> dict[str, Any]:
         defaults["auto_apply"] = _state.settings.auto_apply
 
     return {**defaults, **context}
+
+
+def _persist_chat_turn(
+    role:           str,
+    content:        str,
+    task_id:        str,
+    sources:        list[dict[str, Any]] | None = None,
+    status_message: str | None = None,
+    metadata:       dict[str, Any] | None = None,
+) -> None:
+    """
+    Best-effort write of one chat turn to the chat_turns table.
+
+    No-ops silently when no memory_manager is configured. Never raises —
+    a chat_turns write failure must not break the actual task response,
+    since the source of truth for an in-flight answer is the SSE stream /
+    TaskResponse, not this table.
+    """
+    if _state.memory_manager is None:
+        return
+    try:
+        _state.memory_manager.add_chat_turn(
+            task_id        = task_id,
+            role           = role,
+            content        = content,
+            sources        = sources,
+            status_message = status_message,
+            metadata       = metadata,
+        )
+    except Exception:
+        logger.warning("Failed to persist chat turn (role=%s, task_id=%s).", role, task_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +618,8 @@ async def post_task(request: TaskRequest) -> TaskResponse:
         "metadata":    request.metadata,
     }
 
+    _persist_chat_turn("user", request.instruction, request.task_id)
+
     try:
         result: dict[str, Any] = await asyncio.to_thread(
             controller.handle_task, task_dict
@@ -544,6 +627,12 @@ async def post_task(request: TaskRequest) -> TaskResponse:
     except Exception as exc:
         logger.exception("Unhandled error in POST /task for task %s.", request.task_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    _persist_chat_turn(
+        "assistant", result.get("answer", ""), request.task_id,
+        sources  = result.get("sources"),
+        metadata = result.get("metadata"),
+    )
 
     return TaskResponse(**result)
 
@@ -907,6 +996,83 @@ async def detach_chat_file(filename: str):
 
 
 # ---------------------------------------------------------------------------
+# Chat history settings  (Chat History Tab — eviction preset only)
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/chat/history/settings",
+    response_model = ChatHistorySettingsResponse,
+    summary        = "Read the chat history eviction preset",
+)
+async def get_chat_history_settings() -> ChatHistorySettingsResponse:
+    """
+    Return the current chat_turns eviction preset.
+
+    ``eviction_preset`` is None when the user has never set one.
+    """
+    mm = _require_memory_manager()
+    preset = await asyncio.to_thread(mm.get_chat_history_eviction_preset)
+    return ChatHistorySettingsResponse(eviction_preset=preset)
+
+
+@app.put(
+    "/chat/history/settings",
+    response_model = ChatHistorySettingsResponse,
+    summary        = "Set the chat history eviction preset",
+)
+async def put_chat_history_settings(
+    request: ChatHistorySettingsRequest,
+) -> ChatHistorySettingsResponse:
+    """
+    Set the chat_turns eviction preset.
+
+    Does not trigger an eviction sweep — this endpoint only persists the
+    preference. Returns the value re-read from the database to confirm the
+    write landed.
+    """
+    mm = _require_memory_manager()
+    await asyncio.to_thread(mm.set_chat_history_eviction_preset, request.eviction_preset)
+    preset = await asyncio.to_thread(mm.get_chat_history_eviction_preset)
+    return ChatHistorySettingsResponse(eviction_preset=preset)
+
+
+@app.get(
+    "/chat/history",
+    response_model = ChatHistoryResponse,
+    summary        = "List chat_turns, optionally full-text filtered",
+)
+async def get_chat_history(
+    q:      str | None = None,
+    limit:  int         = 50,
+    offset: int         = 0,
+) -> ChatHistoryResponse:
+    """
+    Return a paginated list of chat_turns, newest first.
+
+    Query parameters
+    ----------------
+    q      : optional full-text search string (matched via chat_turns_fts)
+    limit  : max results (default 50, max 200)
+    offset : pagination offset (default 0)
+
+    Read-only — no eviction/deletion happens here.
+    """
+    mm = _require_memory_manager()
+    limit = min(limit, 200)
+
+    rows, total = await asyncio.to_thread(
+        mm.get_chat_turns, query=q, limit=limit, offset=offset,
+    )
+
+    return ChatHistoryResponse(
+        turns  = [ChatTurnItem(**row) for row in rows],
+        total  = total,
+        offset = offset,
+        limit  = limit,
+    )
+
+
+# ---------------------------------------------------------------------------
 # SSE streaming helper
 # ---------------------------------------------------------------------------
 
@@ -932,6 +1098,8 @@ async def _stream_task(
         return f"data: {json.dumps(payload)}\n\n"
 
     yield _sse({"type": "status", "message": "Planning task…", "task_id": task_id})
+
+    _persist_chat_turn("user", task_dict["instruction"], task_id)
 
     # Route in a separate thread — some priority branches call embed_fn / infer().
     try:
@@ -1017,6 +1185,11 @@ async def _stream_task(
                     "metadata": rd.get("metadata", {}),
                     "answer":   rd.get("answer", ""),
                 })
+                _persist_chat_turn(
+                    "assistant", rd.get("answer", ""), task_id,
+                    sources  = rd.get("sources"),
+                    metadata = rd.get("metadata"),
+                )
             elif not answer_ready_emitted:
                 # Relay token/status events only before 'done' is sent; silently
                 # drop post-done hook status events (e.g. "Updating working memory…")
@@ -1061,6 +1234,12 @@ async def _stream_task(
         })
         yield "data: [DONE]\n\n"
         return
+
+    _persist_chat_turn(
+        "assistant", result.get("answer", ""), task_id,
+        sources  = result.get("sources"),
+        metadata = result.get("metadata"),
+    )
 
     yield _sse({"type": "sources",  "sources": result.get("sources", [])})
     yield _sse({

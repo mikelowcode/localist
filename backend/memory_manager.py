@@ -145,13 +145,16 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION   = 5          # increment when schema changes require migration
+_SCHEMA_VERSION   = 6          # increment when schema changes require migration
 _EMBEDDING_DIM    = 768        # EmbeddingGemma-300M-4bit output dimension
 _EMBEDDING_FORMAT = ">768f"    # big-endian float32 × 768
 
 # Soft cap: keep at most this many conversation_log rows per task_id.
 # Older rows are deleted (FIFO) when the cap is exceeded.
 _CONV_LOG_CAP_PER_TASK = 200
+
+# Closed set of valid chat_history_settings.eviction_preset values.
+_CHAT_HISTORY_EVICTION_PRESETS: frozenset[str] = frozenset({"7d", "30d", "90d", "forever"})
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +458,43 @@ class MemoryManager:
                         recent_decisions_json  TEXT    NOT NULL DEFAULT '[]',
                         updated_at             REAL    NOT NULL
                     );
+
+                    CREATE TABLE IF NOT EXISTS chat_turns (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        task_id         TEXT    NOT NULL,
+                        role            TEXT    NOT NULL,
+                        content         TEXT    NOT NULL,
+                        sources_json    TEXT    NOT NULL DEFAULT '[]',
+                        status_message  TEXT,
+                        metadata_json   TEXT    NOT NULL DEFAULT '{}',
+                        created_at      REAL    NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_chat_turns_created
+                        ON chat_turns(created_at);
+                    CREATE INDEX IF NOT EXISTS idx_chat_turns_task
+                        ON chat_turns(task_id);
+
+                    CREATE VIRTUAL TABLE IF NOT EXISTS chat_turns_fts USING fts5(
+                        content,
+                        content='chat_turns',
+                        content_rowid='id'
+                    );
+
+                    CREATE TRIGGER IF NOT EXISTS chat_turns_ai AFTER INSERT ON chat_turns BEGIN
+                        INSERT INTO chat_turns_fts(rowid, content) VALUES (new.id, new.content);
+                    END;
+                    CREATE TRIGGER IF NOT EXISTS chat_turns_ad AFTER DELETE ON chat_turns BEGIN
+                        INSERT INTO chat_turns_fts(chat_turns_fts, rowid, content) VALUES ('delete', old.id, old.content);
+                    END;
+                    CREATE TRIGGER IF NOT EXISTS chat_turns_au AFTER UPDATE ON chat_turns BEGIN
+                        INSERT INTO chat_turns_fts(chat_turns_fts, rowid, content) VALUES ('delete', old.id, old.content);
+                        INSERT INTO chat_turns_fts(rowid, content) VALUES (new.id, new.content);
+                    END;
+
+                    CREATE TABLE IF NOT EXISTS chat_history_settings (
+                        id              INTEGER PRIMARY KEY CHECK (id = 1),
+                        eviction_preset TEXT
+                    );
                 """)
 
                 # Ensure schema_version row exists.
@@ -565,6 +605,47 @@ class MemoryManager:
                 conn.executescript(
                     "ALTER TABLE working_state DROP COLUMN turn_summaries_json;"
                 )
+
+        if from_version < 6:
+            logger.info("Applying migration v5→v6: creating chat_turns, chat_turns_fts, and chat_history_settings.")
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS chat_turns (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id         TEXT    NOT NULL,
+                    role            TEXT    NOT NULL,
+                    content         TEXT    NOT NULL,
+                    sources_json    TEXT    NOT NULL DEFAULT '[]',
+                    status_message  TEXT,
+                    metadata_json   TEXT    NOT NULL DEFAULT '{}',
+                    created_at      REAL    NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_turns_created
+                    ON chat_turns(created_at);
+                CREATE INDEX IF NOT EXISTS idx_chat_turns_task
+                    ON chat_turns(task_id);
+
+                CREATE VIRTUAL TABLE IF NOT EXISTS chat_turns_fts USING fts5(
+                    content,
+                    content='chat_turns',
+                    content_rowid='id'
+                );
+
+                CREATE TRIGGER IF NOT EXISTS chat_turns_ai AFTER INSERT ON chat_turns BEGIN
+                    INSERT INTO chat_turns_fts(rowid, content) VALUES (new.id, new.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS chat_turns_ad AFTER DELETE ON chat_turns BEGIN
+                    INSERT INTO chat_turns_fts(chat_turns_fts, rowid, content) VALUES ('delete', old.id, old.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS chat_turns_au AFTER UPDATE ON chat_turns BEGIN
+                    INSERT INTO chat_turns_fts(chat_turns_fts, rowid, content) VALUES ('delete', old.id, old.content);
+                    INSERT INTO chat_turns_fts(rowid, content) VALUES (new.id, new.content);
+                END;
+
+                CREATE TABLE IF NOT EXISTS chat_history_settings (
+                    id              INTEGER PRIMARY KEY CHECK (id = 1),
+                    eviction_preset TEXT
+                );
+            """)
 
         conn.execute(
             "UPDATE schema_version SET version = ?", (_SCHEMA_VERSION,)
@@ -780,6 +861,217 @@ class MemoryManager:
                 "Evicted %d old conversation_log rows for task_id=%s.",
                 excess, task_id,
             )
+
+    # -----------------------------------------------------------------------
+    # Chat turns  (Chat History Tab — write + read/list; no eviction yet)
+    # -----------------------------------------------------------------------
+
+    def add_chat_turn(
+        self,
+        task_id:        str,
+        role:           str,
+        content:        str,
+        sources:        list[dict[str, Any]] | None = None,
+        status_message: str | None = None,
+        metadata:       dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Append one entry to the chat_turns table.
+
+        Parameters
+        ----------
+        task_id :
+            Groups turns by task.
+        role :
+            "user" | "assistant"
+        content :
+            The text content of the turn.
+        sources :
+            Optional list of source dicts, stored as JSON. Defaults to [].
+        status_message :
+            Optional final status string for this turn. Not populated by any
+            current call site — reserved for future use.
+        metadata :
+            Optional dict stored as JSON. Defaults to {}.
+        """
+        sources_json  = json.dumps(sources or [])
+        metadata_json = json.dumps(metadata or {})
+        now           = time.time()
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO chat_turns
+                        (task_id, role, content, sources_json, status_message,
+                         metadata_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (task_id, role, content, sources_json, status_message,
+                     metadata_json, now),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def get_chat_turns(
+        self,
+        query:  str | None = None,
+        limit:  int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """
+        Return a page of chat_turns rows plus the total matching count.
+
+        Read-only — no eviction, no writes.
+
+        Parameters
+        ----------
+        query :
+            Optional full-text search string. When None or empty, returns
+            an unfiltered page ordered by created_at DESC. When non-empty,
+            searches chat_turns_fts and orders by bm25() ascending (best
+            match first — FTS5's bm25() returns more-negative scores for
+            better matches, so ascending puts the best match on top). The
+            raw query is wrapped as a single quoted FTS5 phrase (embedded
+            double quotes doubled) so punctuation-heavy input — "what's",
+            hyphens, FTS5 operator keywords — is treated as literal text
+            instead of MATCH syntax. If the sanitised query still raises
+            an FTS5 syntax error, an empty result set is returned rather
+            than propagating the exception.
+        limit :
+            Max rows to return (capped at 200, matching list_episodes()).
+        offset :
+            Row offset for pagination.
+
+        Returns
+        -------
+        tuple[list[dict], int]
+            (rows, total_count). total_count reflects the full matching
+            set (unfiltered table count, or FTS match count) — not just
+            the current page. Each row dict has keys: id, task_id, role,
+            content, sources, status_message, metadata, created_at.
+        """
+        limit = min(limit, 200)
+        conn = self._connect()
+        try:
+            if not query:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM chat_turns"
+                ).fetchone()[0]
+                rows = conn.execute(
+                    """
+                    SELECT id, task_id, role, content, sources_json,
+                           status_message, metadata_json, created_at
+                    FROM   chat_turns
+                    ORDER  BY created_at DESC
+                    LIMIT  ? OFFSET ?
+                    """,
+                    (limit, offset),
+                ).fetchall()
+            else:
+                fts_query = '"' + query.replace('"', '""') + '"'
+                try:
+                    total = conn.execute(
+                        """
+                        SELECT COUNT(*) FROM chat_turns_fts
+                        WHERE  chat_turns_fts MATCH ?
+                        """,
+                        (fts_query,),
+                    ).fetchone()[0]
+                    rows = conn.execute(
+                        """
+                        SELECT c.id, c.task_id, c.role, c.content, c.sources_json,
+                               c.status_message, c.metadata_json, c.created_at
+                        FROM   chat_turns_fts
+                        JOIN   chat_turns c ON c.id = chat_turns_fts.rowid
+                        WHERE  chat_turns_fts MATCH ?
+                        ORDER  BY bm25(chat_turns_fts) ASC
+                        LIMIT  ? OFFSET ?
+                        """,
+                        (fts_query, limit, offset),
+                    ).fetchall()
+                except sqlite3.OperationalError as exc:
+                    logger.debug(
+                        "get_chat_turns: FTS5 query failed for %r — %s", query, exc,
+                    )
+                    return [], 0
+        finally:
+            conn.close()
+
+        result = [
+            {
+                "id":             row["id"],
+                "task_id":        row["task_id"],
+                "role":           row["role"],
+                "content":        row["content"],
+                "sources":        json.loads(row["sources_json"]),
+                "status_message": row["status_message"],
+                "metadata":       json.loads(row["metadata_json"]),
+                "created_at":     row["created_at"],
+            }
+            for row in rows
+        ]
+        return result, total
+
+    # -----------------------------------------------------------------------
+    # Chat history settings  (Chat History Tab — eviction preset read/write)
+    # -----------------------------------------------------------------------
+
+    def get_chat_history_eviction_preset(self) -> str | None:
+        """
+        Read the current chat_turns eviction preset.
+
+        Returns None when no row exists yet — this is the expected default
+        state (the user has never set a preset), not an error.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT eviction_preset FROM chat_history_settings WHERE id = 1"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        return row["eviction_preset"] if row is not None else None
+
+    def set_chat_history_eviction_preset(self, preset: str) -> None:
+        """
+        Insert or update the chat_turns eviction preset (row id=1).
+
+        Parameters
+        ----------
+        preset :
+            Must be one of _CHAT_HISTORY_EVICTION_PRESETS.
+
+        Raises
+        ------
+        ValueError
+            If preset is not one of the allowed values.
+        """
+        if preset not in _CHAT_HISTORY_EVICTION_PRESETS:
+            raise ValueError(
+                f"preset {preset!r} not in allowed set. "
+                f"Valid: {sorted(_CHAT_HISTORY_EVICTION_PRESETS)}"
+            )
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO chat_history_settings (id, eviction_preset)
+                    VALUES (1, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        eviction_preset = excluded.eviction_preset
+                    """,
+                    (preset,),
+                )
+                conn.commit()
+                logger.info("set_chat_history_eviction_preset: preset=%r.", preset)
+            finally:
+                conn.close()
 
     # -----------------------------------------------------------------------
     # Document index  (WikiAgent → index; ResearchAgent → query)

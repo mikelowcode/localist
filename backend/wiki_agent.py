@@ -104,6 +104,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
 
+from build_graph import build_graph
 from prompt_builder import PromptBuilder
 from wiki_doc import parse_wiki_doc
 
@@ -954,6 +955,16 @@ class WikiAgent:
                                 "[%s] MemoryManager.index_document failed for '%s': %s",
                                 self.name, page_name, exc,
                             )
+
+                try:
+                    graph_summary = build_graph(wiki_dir, self._memory_manager)
+                    logger.info(
+                        "[%s] Graph rebuilt after write — nodes=%d edges=%d resolved=%d unresolved=%d",
+                        self.name, graph_summary["nodes"], graph_summary["edges"],
+                        graph_summary["resolved"], graph_summary["unresolved"],
+                    )
+                except Exception as exc:
+                    logger.warning("[%s] Graph rebuild failed after write (non-fatal): %s", self.name, exc)
 
         # -- 10. Build and return AgentResult --------------------------------
 

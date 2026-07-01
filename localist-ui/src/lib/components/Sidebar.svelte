@@ -10,6 +10,7 @@
   const nav: NavItem[] = [
     { href: '/conversation', label: 'Conversation', icon: 'chat' },
     { href: '/memory',       label: 'Memory',       icon: 'memory' },
+    { href: '/history',      label: 'History',      icon: 'history' },
     { href: '/files',        label: 'Files',        icon: 'folder' },
     { href: '/settings',     label: 'Settings',     icon: 'settings' }
   ];
@@ -48,6 +49,11 @@
                   <ellipse cx="12" cy="5" rx="9" ry="3"/>
                   <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
                   <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+                </svg>
+              {:else if item.icon === 'history'}
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="9"/>
+                  <path d="M12 7v5l3.5 2"/>
                 </svg>
               {:else if item.icon === 'folder'}
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">

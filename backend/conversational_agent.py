@@ -271,7 +271,7 @@ class ConversationalAgent:
                 status     = TaskStatus.COMPLETE,
                 output     = {
                     "answer":   answer,
-                    "sources":  [],     # sources are in the prompt; not re-parsed here
+                    "sources":  context.get("_prebuilt_sources", []),
                     "grounded": bool(context.get("_routing", {}).get("fetch_rag")),
                 },
             )
@@ -413,6 +413,8 @@ class ConversationalAgent:
                     "grounded": False,
                 },
             )
+
+        sources += [f"session://{sf.filename}" for sf in _session_files.get_files()]
 
         logger.info(
             "ConversationalAgent.run() complete — answer_chars=%d  "

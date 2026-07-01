@@ -271,7 +271,7 @@
                 <div class="sources-row">
                   {#each turn.sources as src}
                     <span class="badge badge-muted source-badge" title={src.path}>
-                      {src.type === 'wiki' ? '📄' : '📁'} {src.name}
+                      {src.type === 'wiki' ? '📄' : src.type === 'session' ? '📎' : '📁'} {src.name}
                     </span>
                   {/each}
                 </div>
