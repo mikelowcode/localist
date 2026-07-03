@@ -118,5 +118,6 @@ backend/__pycache__/
 
 # Sessions Log
 
+sessions-log.md
 sessions-log.md.DS_Store
 **/.DS_Store

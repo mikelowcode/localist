@@ -21,6 +21,7 @@
 10. [Semantic Search-Intent Classifier](#10-semantic-search-intent-classifier)
 11. [Session File Attachments](#11-session-file-attachments)
 12. [Chat History Tab](#12-chat-history-tab)
+13. [Localist CLI (start_localist.sh)](#13-localist-cli-start_localistsh)
 
 ---
 
@@ -4249,25 +4250,30 @@ empty result set rather than raising.
 
 ### 12.3 Schema
 
-Current `_SCHEMA_VERSION` is **6** (v5→v6 migration added to
-`memory_manager.py`; v5 was the working-state `turn_summaries_json`-removal
-migration from §9).
+Current `_SCHEMA_VERSION` is **7** (v6→v7 migration added to
+`memory_manager.py`; v5→v6 was the original Chat History Tab migration
+above; v4→v5 was the working-state `turn_summaries_json`-removal migration
+from §9).
 
 ```sql
 CREATE TABLE IF NOT EXISTS chat_turns (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id         TEXT    NOT NULL,
-    role            TEXT    NOT NULL,
-    content         TEXT    NOT NULL,
-    sources_json    TEXT    NOT NULL DEFAULT '[]',
-    status_message  TEXT,
-    metadata_json   TEXT    NOT NULL DEFAULT '{}',
-    created_at      REAL    NOT NULL
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id             TEXT    NOT NULL,
+    role                TEXT    NOT NULL,
+    content             TEXT    NOT NULL,
+    sources_json        TEXT    NOT NULL DEFAULT '[]',
+    status_message      TEXT,
+    metadata_json       TEXT    NOT NULL DEFAULT '{}',
+    conversation_id     TEXT    NOT NULL DEFAULT 'legacy',
+    conversation_title  TEXT,
+    created_at          REAL    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chat_turns_created
     ON chat_turns(created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_turns_task
     ON chat_turns(task_id);
+CREATE INDEX IF NOT EXISTS idx_chat_turns_conversation
+    ON chat_turns(conversation_id, created_at);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chat_turns_fts USING fts5(
     content,
@@ -4307,9 +4313,81 @@ support.
 `_init_db()` script nor in the v5→v6 `_migrate()` block. Absence of a row
 means "no policy set," by design (§12.2).
 
+**v6→v7 migration — conversation grouping.** Adds two columns to
+`chat_turns` — `conversation_id TEXT NOT NULL DEFAULT 'legacy'` and
+`conversation_title TEXT` — plus `idx_chat_turns_conversation`
+(`ON chat_turns(conversation_id, created_at)`), the composite index that
+`get_chat_turns()`'s `conversation_id`-filtered queries and
+`get_conversations()`'s `GROUP BY conversation_id` rely on. Both
+`ALTER TABLE ... ADD COLUMN` statements are gated on a
+`PRAGMA table_info(chat_turns)` column-existence check (idempotent —
+skipped if the column is already present), matching the v4→v5 migration's
+existing pattern. **No separate backfill `UPDATE` is needed:** every
+pre-v7 row lacks a stored `conversation_id`, and SQLite applies an
+`ADD COLUMN ... DEFAULT 'legacy'` column default to all existing rows as
+part of the same `ALTER TABLE` statement (this only works because the
+default is a constant, not an expression) — so every row written before
+this migration reads back with `conversation_id = 'legacy'` with no extra
+migration step.
+
+**`_init_db()` control-flow fix, found during live verification of the
+v6→v7 migration.** Previously, `_init_db()` ran the full fresh-install
+`executescript()` unconditionally on every startup and only afterward
+checked `schema_version` to decide whether to also call `_migrate()`. This
+was harmless as long as every statement in the fresh-install script was
+independently idempotent against an existing database — but it broke the
+first time a schema change added an index on a column that only
+`_migrate()`, not the fresh-install script's prior revision, would have
+added on an existing (non-fresh) database. Concretely: on a database still
+at `schema_version = 6`, the fresh-install script's
+`CREATE INDEX IF NOT EXISTS idx_chat_turns_conversation ON
+chat_turns(conversation_id, created_at)` ran before `_migrate()` ever got a
+chance to `ALTER TABLE chat_turns ADD COLUMN conversation_id`, so the index
+referenced a column that did not yet exist and startup failed. The fix
+restructures `_init_db()` so `schema_version` is created first (its own
+idempotent `CREATE TABLE IF NOT EXISTS`) and read *before* either the
+fresh-install script or `_migrate()` runs — the two are now mutually
+exclusive branches: `row is None` → genuinely fresh database, run the full
+DDL once; `row["version"] < _SCHEMA_VERSION` → existing database, run only
+`_migrate()`'s incremental blocks for the versions it's behind. This is a
+structural fix to `_init_db()`'s control flow, not specific to
+`chat_turns` — it affects every future migration that adds an index (or
+any DDL) referencing a column introduced by that same migration, not just
+this one.
+
+**New/changed `MemoryManager` methods.** `add_chat_turn()`'s signature now
+requires `conversation_id: str` (previously absent) and accepts an
+optional `conversation_title: str | None = None`; both are written
+straight through to the new columns on `INSERT`. `get_chat_turns()` gained
+an optional `conversation_id: str | None = None` filter — when set, both
+the unfiltered and FTS-filtered query paths add a
+`WHERE conversation_id = ?` / `AND c.conversation_id = ?` clause, and the
+accompanying `COUNT(*)` total is filtered the same way, preserving the
+§12.4 true-total-count guarantee on a per-conversation basis; when omitted,
+behavior is unchanged from v6 (searches/lists across all conversations).
+New `get_conversations()` returns one summary row per distinct
+`conversation_id` — `conversation_id`, `conversation_title`,
+`last_created_at` (`MAX(created_at)`), `first_created_at`
+(`MIN(created_at)`) — from a single `GROUP BY conversation_id` query,
+ordered by `last_created_at DESC`. Since `conversation_title` is written on
+only the first turn of a conversation (every later turn passes
+`conversation_title=None`), the query relies on SQLite's bare-column
+aggregate behavior to surface that one title-bearing row's value per
+group rather than an arbitrary row's — empirically confirmed (not just
+assumed) that with two `MIN`/`MAX` aggregates in the same `SELECT`, the
+bare `conversation_title` column tracks whichever of the two is listed
+*last* (`MIN(created_at) AS first_created_at`, i.e. the earliest row —
+exactly the row the title is written on). This is a real SQLite quirk, not
+a literal correlated subquery; it is also order-fragile — swapping the
+`MAX`/`MIN` lines in the `SELECT` would silently make `conversation_title`
+track the *latest* row instead, which is always `NULL`, breaking every
+conversation's displayed title without a query error.
+
 ### 12.4 Backend API
 
-Three new endpoints in `main.py`, all guarded by a new `_require_memory_manager()`
+Four endpoints in `main.py` (the original three from the v6 arc plus
+`GET /chat/history/conversations`, added with the v6→v7 conversation-
+grouping migration), all guarded by a new `_require_memory_manager()`
 dependency helper (503 if `_state.memory_manager is None`, matching
 `_require_controller()`/`_require_runtime()`'s exact style):
 
@@ -4317,11 +4395,18 @@ dependency helper (503 if `_state.memory_manager is None`, matching
 |---|---|---|
 | `GET` | `/chat/history/settings` | Returns `ChatHistorySettingsResponse{eviction_preset: str \| None}`. `None` when the user has never set one. |
 | `PUT` | `/chat/history/settings` | Body `ChatHistorySettingsRequest{eviction_preset: Literal["7d","30d","90d","forever"]}` — the `Literal` type rejects invalid values at the Pydantic/FastAPI validation layer (422) before the handler runs. Calls `set_chat_history_eviction_preset()`, then re-reads via `get_chat_history_eviction_preset()` and returns the re-read value (confirms the write landed rather than echoing the request back). |
-| `GET` | `/chat/history` | Query params `q: str \| None = None`, `limit: int = 50` (clamped to 200 at the endpoint, matching `list_episodes()`'s ceiling, and clamped again inside `get_chat_turns()`), `offset: int = 0`. Returns `ChatHistoryResponse{turns: ChatTurnItem[], total: int, offset: int, limit: int}`. |
+| `GET` | `/chat/history` | Query params `q: str \| None = None`, `limit: int = 50` (clamped to 200 at the endpoint, matching `list_episodes()`'s ceiling, and clamped again inside `get_chat_turns()`), `offset: int = 0`, and a new optional `conversation_id: str \| None = None` — when provided, restricts results to one conversation; when omitted, searches/lists across all conversations (unchanged v6 behavior). Returns `ChatHistoryResponse{turns: ChatTurnItem[], total: int, offset: int, limit: int}`. |
+| `GET` | `/chat/history/conversations` | No query params. Returns `ConversationListResponse{conversations: ConversationSummary[]}`, one entry per distinct `conversation_id` ordered by `last_created_at` descending — powers the sidebar's conversation sub-list (§12.5). Read-only; guarded by the same `_require_memory_manager()` convention as the other two endpoints. |
 
 `ChatTurnItem` fields: `id: int`, `task_id: str`, `role: str`, `content: str`,
 `sources: list[dict] = []`, `status_message: str | None = None`,
-`metadata: dict = {}`, `created_at: float`.
+`metadata: dict = {}`, `conversation_id: str`,
+`conversation_title: str | None = None`, `created_at: float`.
+
+`ConversationSummary` fields (new): `conversation_id: str`,
+`conversation_title: str | None = None`, `last_created_at: float`,
+`first_created_at: float` — a direct mirror of `get_conversations()`'s
+return dict (§12.3).
 
 **`total` is a true count, deliberately not `GET /memory/episodes`'s
 `total=len(rows)` quirk.** `get_chat_turns()` returns `(rows, total_count)`
@@ -4334,39 +4419,86 @@ implementation and not copied.
 
 ### 12.5 Frontend
 
-New route `src/routes/history/+page.svelte`, added to `Sidebar.svelte`'s
-`nav` array as `{ href: '/history', label: 'History', icon: 'history' }`
-(positioned after Memory, before Files) with a new clock-face SVG icon
-branch (`stroke-width="1.75"`, matching the other four nav icons).
+*Merged with the Chat tab 2026-07-02 — this subsection previously described
+a standalone `History` nav entry (per-turn card view, search box, retention
+dropdown). That implementation still exists on disk (see the last bullet
+below) but is no longer reachable from navigation; what follows describes
+the current merged architecture.*
 
-Two new stores, kept separate from each other and from the existing
-`chatHistory.ts` (§7.8) — three distinct concerns:
+**Sidebar (`Sidebar.svelte`).** The previously separate `Conversation` and
+`History` nav entries are now one `Chat` entry (`{ href: '/conversation',
+label: 'Chat', icon: 'chat' }`). Whenever the active route starts with
+`/conversation`, the sidebar additionally renders a sub-list of
+conversations beneath the main nav, sourced from
+`GET /chat/history/conversations` and refetched on every navigation to a
+`/conversation*` route (a reactive `$:` block keyed off the current path,
+so it also re-fires on `/conversation/[id]` → `/conversation/[id]`
+transitions). A **"+ New chat"** button is pinned above the conversation
+sub-list; it calls `startNewConversation()` (below) and navigates to the
+freshly minted conversation's route. Each sub-list entry links to
+`/conversation/<conversation_id>` and is labelled with
+`conversation_title` when set, or a formatted "New conversation — <date>"
+fallback (derived from `last_created_at`) when not.
 
-- **`chatHistorySettings.ts`** — `chatHistorySettings: Writable<{eviction_preset: string | null}>`,
-  `chatHistorySettingsLoading`, `chatHistorySettingsError`;
-  `loadChatHistorySettings()` (`GET /api/chat/history/settings`) and
-  `setChatHistoryEvictionPreset()` (`PUT /api/chat/history/settings`). On
-  failure, `chatHistorySettings` is left untouched — no optimistic update —
-  so the dropdown reflects the server's actual last-known state, not the
-  user's pending click.
-- **`chatHistoryList.ts`** — `chatTurns`, `chatTurnsTotal`, `chatTurnsLoading`,
-  `chatTurnsError`, `chatHistoryQuery`, `chatHistoryOffset`, and a fixed
-  `CHAT_HISTORY_PAGE_SIZE = 25`. `loadChatTurns()` (`GET /api/chat/history`)
-  omits the `q` param entirely when the query is empty; on failure,
-  `chatTurns`/`chatTurnsTotal` are left unchanged, matching
-  `chatHistorySettings.ts`'s convention. `resetChatHistoryOffset()` returns
-  to page 1, called whenever the search text changes.
+**New dynamic route `src/routes/conversation/[id]/+page.svelte`.** Renders
+`ChatPanel` (unchanged) and owns loading the selected conversation's
+history. A reactive block syncs `currentConversationId` (new store, below)
+to `$page.params.id`, clears `chatHistoryStore` immediately (so switching
+conversations doesn't flash the previous conversation's turns while the
+new ones load), and re-fetches from `GET /chat/history?conversation_id=...
+&limit=200` on every `id` change. The response is reversed (backend orders
+`created_at DESC`; the feed renders oldest-first) and each row's
+`created_at` (seconds) is multiplied by 1000 to match `Turn.timestamp`'s
+millisecond convention (§7.8's `chatHistory.ts`). A failed fetch degrades
+to an empty store rather than throwing (logged via `console.warn`), matching
+the fail-soft convention established elsewhere in this arc — e.g. §12.2's
+`_persist_chat_turn()`.
 
-`+page.svelte`'s turn-search input is debounced 300ms (`setTimeout`/
-`clearTimeout`, cleared on `onDestroy`) before writing to `chatHistoryQuery`
-and firing `loadChatTurns()`, so the displayed query state never gets ahead
-of the displayed results. Distinct empty states for "no turns yet"
-(`total === 0 && query === ''`) versus "no results for your search"
-(`total === 0 && query !== ''`). Pagination is a Previous/Next button pair
-(no such control existed anywhere in the app to mirror — `episodes.ts`/
-`EpisodesPanel.svelte` carry `offset`/`limit`/`total` state but render no
-pagination UI at all — so this was built from scratch), disabled at
-`offset === 0` and `offset + pageSize >= total` respectively.
+**Bare `/conversation` route.** `src/routes/conversation/+page.svelte`
+redirects client-side to `/conversation/<currentConversationId>` via
+`onMount()` + `goto(..., { replaceState: true })` — explicitly **not** a
+`+page.ts` `load()`/`redirect()`, because `currentConversationId` reads
+`localStorage`, which is unavailable during SSR; a universal `load()`
+would see a fresh, non-persisted id on the server and redirect to the
+wrong conversation.
+
+**New store `src/lib/stores/conversation.ts`.** Owns three exports,
+distinct from `tasks.ts`'s `SESSION_ID` (see below):
+- `currentConversationId: Writable<string>` — backed by `localStorage`
+  under key `localist:conversationId`; on first-ever load it mints a
+  `crypto.randomUUID()` and persists it, otherwise loads the stored value.
+  A `subscribe()` write-through keeps `localStorage` in sync with every
+  later update (including from `startNewConversation()`).
+- `startNewConversation(): string` — mints and persists a fresh id, sets
+  `currentConversationId`, and resets `isFirstTurnOfConversation` to
+  `true`. Called by the sidebar's "+ New chat" button.
+- `isFirstTurnOfConversation: Writable<boolean>` — starts `true`, flipped
+  to `false` by `ChatPanel.svelte` the instant a turn is submitted (before
+  the request goes out, guarding against a rapid double-submit sending a
+  title twice), and reset to `true` by `startNewConversation()`. Controls
+  whether the next submitted turn sends a `conversation_title` — the
+  backend contract is that `conversation_title` is sent on exactly the
+  first turn of a `conversation_id` and never after. `ChatPanel.svelte`
+  derives the title itself: the submitted message text, truncated to 60
+  characters with a trailing `…` if longer.
+
+**`tasks.ts`'s `submitTask()`**, extended with two new trailing optional
+params, `conversation_id?: string` and `conversation_title?: string`,
+both passed straight through in the `POST /task/stream` request body.
+This is separate from, and does not touch, the pre-existing
+`SESSION_ID` constant (`tasks.ts:53`) — `SESSION_ID` is a page-load-scoped
+id used for backend `conversation_log` working-memory grouping (§12.2);
+`conversation_id` is the durable, user-facing chat-thread identifier
+persisted across reloads. The two must not be conflated: one resets on
+every full page reload by design, the other explicitly does not.
+
+**`src/routes/history/+page.svelte` still exists on disk, unlinked from
+nav.** It retains its original retention-preset dropdown and
+cross-conversation FTS search UI (`chatHistorySettings.ts`,
+`chatHistoryList.ts` — both also still present, unchanged). This is
+flagged explicitly as **not yet integrated into the merged Chat tab, an
+open item** (§12.7) — not dead code that has been fully superseded and
+could be deleted outright.
 
 ### 12.6 Live Verification
 
@@ -4430,6 +4562,26 @@ search for `*.test.ts`. Not introduced as part of this feature; frontend
 verification for this arc relied on `svelte-check`, `vite build`, and the
 live-fire pass in §12.6.
 
+**Open Item 4 — `src/routes/history/+page.svelte` not yet integrated into
+the merged Chat tab.** Unlinked from `Sidebar.svelte`'s nav since the
+2026-07-02 Chat + History merge (§12.5) but still present on disk with its
+original retention-preset dropdown and cross-conversation FTS search UI —
+functionality the merged `/conversation/[id]` route does not yet expose
+anywhere. This is a known gap to fold in, not dead code safe to delete.
+
+**Open Item 5 — Mid-stream navigate-away-and-back does not reconstruct
+in-progress streaming state.** If the user leaves a `/conversation/[id]`
+route while an answer is still streaming and returns before it completes,
+`loadConversationHistory()` (§12.5) only has `GET /chat/history` to work
+from, which reflects committed rows — the in-flight assistant turn's
+partial tokens, `status`, and `status_message` are not reconstructed. The
+completed turn simply appears, in full, the next time the fetch runs (on
+return to that route, or on a subsequent navigation), rather than the feed
+picking the stream back up mid-flight.
+
+Startup/lifecycle tooling for running the full stack (backend, fetcher, and
+this UI) together is documented separately in §13 — Localist CLI.
+
 ### 12.8 Test Suite
 
 Backend test suite: **447 → 489 (+42)** across the full six-step arc, 0 real
@@ -4443,6 +4595,57 @@ feature and recurred identically (with a varying failure count, 7–9) across
 every step of this arc.
 
 No frontend test coverage was added (§12.7, Open Item 3).
+
+---
+
+## 13. Localist CLI (start_localist.sh)
+
+### 13.1 Overview
+
+`start_localist.sh` manages three local services as a single lifecycle unit:
+backend (FastAPI/uvicorn, port 8001), fetcher (FastAPI/uvicorn, port 8002),
+and the Localist UI dev server (SvelteKit/Vite, port 5173). All three start
+together, log to `logs/backend.log`, `logs/fetcher.log`, and
+`logs/frontend.log` with prefixed interleaved tailing, and stop together on
+Ctrl+C or via `./start_localist.sh --stop`. The inference engine (oMLX,
+MLX-LM, Ollama, LM Studio, etc.) remains managed separately, per the
+existing engine-agnostic design principle (§1).
+
+### 13.2 Service Launch
+
+Backend and fetcher both run from `cwd = backend/` — required for import
+resolution (`main:app` and `fetcher.main:app`). The frontend runs from
+`localist-ui/` via a subshell, so it doesn't disturb that shared `cwd`.
+
+Preflight checks confirm `backend/.venv/bin/python` and
+`localist-ui/node_modules` exist before launch, failing fast with a
+remediation command if either is missing.
+
+### 13.3 Reload Directory Scoping
+
+Backend's uvicorn invocation passes `--reload-exclude 'fetcher/*'`;
+fetcher's passes `--reload-dir fetcher`. Effect: editing backend code
+reloads only the backend process; editing `backend/fetcher/*.py` reloads
+only the fetcher process. Both processes still resolve imports from
+`cwd = backend/` — only the reload-watch scope is separated.
+
+Design constraint to revisit if it becomes relevant: the current glob-based
+exclude only matches direct children of `fetcher/`, not deeper nested
+paths. If `backend/fetcher/` grows subpackages, this scoping will need to
+be revisited.
+
+### 13.4 Port Configuration
+
+The frontend port is pinned via `localist-ui/vite.config.ts`
+(`server.port: 5173`, `server.strictPort: true`) rather than left to
+Vite's default-with-fallback behavior, so the script's port-based
+assumptions (`--stop`, preflight warnings, banner URL) stay valid.
+
+### 13.5 Test Coverage
+
+This tooling has no automated test suite. Verification is live/manual:
+service startup, log prefixing, Ctrl+C/`--stop` cleanup, and reload-scope
+isolation.
 
 ---
 

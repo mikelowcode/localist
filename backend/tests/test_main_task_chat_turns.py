@@ -70,7 +70,10 @@ class TestPostTaskChatTurns:
             "metadata": {"agent": "wiki"},
         }
 
-        resp = client.post("/task", json={"task_id": "t1", "instruction": "do something"})
+        resp = client.post(
+            "/task",
+            json={"task_id": "t1", "instruction": "do something", "conversation_id": "c1"},
+        )
         assert resp.status_code == 200
 
         rows = _chat_turns(main._state.memory_manager)
@@ -83,7 +86,10 @@ class TestPostTaskChatTurns:
     def test_failed_task_persists_user_row_only(self, client):
         main._state.controller.handle_task.side_effect = RuntimeError("boom")
 
-        resp = client.post("/task", json={"task_id": "t2", "instruction": "trigger a failure"})
+        resp = client.post(
+            "/task",
+            json={"task_id": "t2", "instruction": "trigger a failure", "conversation_id": "c2"},
+        )
         assert resp.status_code == 500
 
         rows = _chat_turns(main._state.memory_manager)
@@ -103,7 +109,10 @@ class TestPostTaskChatTurns:
         with patch.object(
             main._state.memory_manager, "add_chat_turn", side_effect=RuntimeError("db down"),
         ):
-            resp = client.post("/task", json={"task_id": "t3", "instruction": "trigger a memory failure"})
+            resp = client.post(
+                "/task",
+                json={"task_id": "t3", "instruction": "trigger a memory failure", "conversation_id": "c3"},
+            )
 
         assert resp.status_code == 200
         assert resp.json()["answer"] == "still works"
@@ -148,7 +157,7 @@ class TestChatHistoryEndpoint:
     def test_paginated_results_without_q(self, client):
         for i in range(3):
             main._state.memory_manager.add_chat_turn(
-                task_id="t", role="user", content=f"turn {i}",
+                task_id="t", role="user", content=f"turn {i}", conversation_id="conv-1",
             )
 
         resp = client.get("/chat/history", params={"limit": 2, "offset": 0})
@@ -162,9 +171,9 @@ class TestChatHistoryEndpoint:
         assert body["turns"][0]["content"] == "turn 2"   # newest first
 
     def test_q_filters_to_matching_subset(self, client):
-        main._state.memory_manager.add_chat_turn(task_id="t", role="user", content="tell me about zebras")
-        main._state.memory_manager.add_chat_turn(task_id="t", role="assistant", content="zebras are striped")
-        main._state.memory_manager.add_chat_turn(task_id="t", role="user", content="capital of France")
+        main._state.memory_manager.add_chat_turn(task_id="t", role="user", content="tell me about zebras", conversation_id="conv-1")
+        main._state.memory_manager.add_chat_turn(task_id="t", role="assistant", content="zebras are striped", conversation_id="conv-1")
+        main._state.memory_manager.add_chat_turn(task_id="t", role="user", content="capital of France", conversation_id="conv-1")
 
         resp = client.get("/chat/history", params={"q": "zebras"})
         assert resp.status_code == 200
@@ -177,7 +186,7 @@ class TestChatHistoryEndpoint:
     def test_out_of_range_offset_returns_empty_turns_correct_total(self, client):
         for i in range(3):
             main._state.memory_manager.add_chat_turn(
-                task_id="t", role="user", content=f"turn {i}",
+                task_id="t", role="user", content=f"turn {i}", conversation_id="conv-1",
             )
 
         resp = client.get("/chat/history", params={"offset": 100})

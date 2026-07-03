@@ -401,10 +401,12 @@ class TaskRequest(BaseModel):
             "auto_apply": false
         }
     """
-    task_id:     str              = Field(default_factory=lambda: str(uuid.uuid4()))
-    instruction: str              = Field(..., min_length=1)
-    context:     dict[str, Any]   = Field(default_factory=dict)
-    metadata:    dict[str, Any]   = Field(default_factory=dict)
+    task_id:            str              = Field(default_factory=lambda: str(uuid.uuid4()))
+    instruction:        str              = Field(..., min_length=1)
+    context:            dict[str, Any]   = Field(default_factory=dict)
+    metadata:           dict[str, Any]   = Field(default_factory=dict)
+    conversation_id:    str              = Field(..., min_length=1)
+    conversation_title: str | None       = Field(default=None)
 
 
 class TaskResponse(BaseModel):
@@ -500,14 +502,16 @@ class ChatHistorySettingsRequest(BaseModel):
 
 class ChatTurnItem(BaseModel):
     """A single chat_turns record returned by GET /chat/history."""
-    id:             int
-    task_id:        str
-    role:           str
-    content:        str
-    sources:        list[dict[str, Any]] = Field(default_factory=list)
-    status_message: str | None = None
-    metadata:       dict[str, Any]       = Field(default_factory=dict)
-    created_at:     float
+    id:                 int
+    task_id:            str
+    role:               str
+    content:            str
+    sources:            list[dict[str, Any]] = Field(default_factory=list)
+    status_message:     str | None = None
+    metadata:           dict[str, Any]       = Field(default_factory=dict)
+    conversation_id:    str
+    conversation_title: str | None = None
+    created_at:         float
 
 
 class ChatHistoryResponse(BaseModel):
@@ -516,6 +520,19 @@ class ChatHistoryResponse(BaseModel):
     total:  int
     offset: int
     limit:  int
+
+
+class ConversationSummary(BaseModel):
+    """One row per distinct conversation, for the sidebar list."""
+    conversation_id:    str
+    conversation_title: str | None = None
+    last_created_at:    float
+    first_created_at:   float
+
+
+class ConversationListResponse(BaseModel):
+    """Response body for GET /chat/history/conversations."""
+    conversations: list[ConversationSummary]
 
 
 # ---------------------------------------------------------------------------
@@ -562,12 +579,14 @@ def _enrich_context(context: dict[str, Any]) -> dict[str, Any]:
 
 
 def _persist_chat_turn(
-    role:           str,
-    content:        str,
-    task_id:        str,
-    sources:        list[dict[str, Any]] | None = None,
-    status_message: str | None = None,
-    metadata:       dict[str, Any] | None = None,
+    role:               str,
+    content:            str,
+    task_id:            str,
+    conversation_id:    str,
+    sources:            list[dict[str, Any]] | None = None,
+    status_message:     str | None = None,
+    metadata:           dict[str, Any] | None = None,
+    conversation_title: str | None = None,
 ) -> None:
     """
     Best-effort write of one chat turn to the chat_turns table.
@@ -576,17 +595,26 @@ def _persist_chat_turn(
     a chat_turns write failure must not break the actual task response,
     since the source of truth for an in-flight answer is the SSE stream /
     TaskResponse, not this table.
+
+    Parameters
+    ----------
+    conversation_id :
+        Groups turns by conversation. Required.
+    conversation_title :
+        Optional human-readable title for the conversation.
     """
     if _state.memory_manager is None:
         return
     try:
         _state.memory_manager.add_chat_turn(
-            task_id        = task_id,
-            role           = role,
-            content        = content,
-            sources        = sources,
-            status_message = status_message,
-            metadata       = metadata,
+            task_id            = task_id,
+            role               = role,
+            content            = content,
+            conversation_id    = conversation_id,
+            sources            = sources,
+            status_message     = status_message,
+            metadata           = metadata,
+            conversation_title = conversation_title,
         )
     except Exception:
         logger.warning("Failed to persist chat turn (role=%s, task_id=%s).", role, task_id, exc_info=True)
@@ -618,7 +646,10 @@ async def post_task(request: TaskRequest) -> TaskResponse:
         "metadata":    request.metadata,
     }
 
-    _persist_chat_turn("user", request.instruction, request.task_id)
+    _persist_chat_turn(
+        "user", request.instruction, request.task_id, request.conversation_id,
+        conversation_title = request.conversation_title,
+    )
 
     try:
         result: dict[str, Any] = await asyncio.to_thread(
@@ -629,7 +660,7 @@ async def post_task(request: TaskRequest) -> TaskResponse:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     _persist_chat_turn(
-        "assistant", result.get("answer", ""), request.task_id,
+        "assistant", result.get("answer", ""), request.task_id, request.conversation_id,
         sources  = result.get("sources"),
         metadata = result.get("metadata"),
     )
@@ -664,7 +695,10 @@ async def post_task_stream(request: TaskRequest) -> StreamingResponse:
     }
 
     return StreamingResponse(
-        _stream_task(controller, runtime, task_dict, request.task_id),
+        _stream_task(
+            controller, runtime, task_dict, request.task_id,
+            request.conversation_id, request.conversation_title,
+        ),
         media_type = "text/event-stream",
         headers    = {
             "Cache-Control":    "no-cache",
@@ -1042,18 +1076,22 @@ async def put_chat_history_settings(
     summary        = "List chat_turns, optionally full-text filtered",
 )
 async def get_chat_history(
-    q:      str | None = None,
-    limit:  int         = 50,
-    offset: int         = 0,
+    q:               str | None = None,
+    limit:           int         = 50,
+    offset:          int         = 0,
+    conversation_id: str | None = None,
 ) -> ChatHistoryResponse:
     """
     Return a paginated list of chat_turns, newest first.
 
     Query parameters
     ----------------
-    q      : optional full-text search string (matched via chat_turns_fts)
-    limit  : max results (default 50, max 200)
-    offset : pagination offset (default 0)
+    q               : optional full-text search string (matched via chat_turns_fts)
+    limit           : max results (default 50, max 200)
+    offset          : pagination offset (default 0)
+    conversation_id : optional conversation_id filter — when provided, restricts
+                      results to one conversation; when omitted, searches/lists
+                      across all conversations.
 
     Read-only — no eviction/deletion happens here.
     """
@@ -1062,6 +1100,7 @@ async def get_chat_history(
 
     rows, total = await asyncio.to_thread(
         mm.get_chat_turns, query=q, limit=limit, offset=offset,
+        conversation_id=conversation_id,
     )
 
     return ChatHistoryResponse(
@@ -1072,15 +1111,37 @@ async def get_chat_history(
     )
 
 
+@app.get(
+    "/chat/history/conversations",
+    response_model = ConversationListResponse,
+    summary        = "List distinct conversations, newest first",
+)
+async def get_conversations() -> ConversationListResponse:
+    """
+    Return one summary row per distinct conversation_id, ordered by
+    last_created_at descending — used to populate the Chat tab's
+    conversation sub-list in the sidebar.
+
+    Read-only.
+    """
+    mm = _require_memory_manager()
+    rows = await asyncio.to_thread(mm.get_conversations)
+    return ConversationListResponse(
+        conversations = [ConversationSummary(**row) for row in rows]
+    )
+
+
 # ---------------------------------------------------------------------------
 # SSE streaming helper
 # ---------------------------------------------------------------------------
 
 async def _stream_task(
-    controller: ControllerAgent,
-    runtime:    BaseRuntimeClient,
-    task_dict:  dict[str, Any],
-    task_id:    str,
+    controller:         ControllerAgent,
+    runtime:            BaseRuntimeClient,
+    task_dict:          dict[str, Any],
+    task_id:            str,
+    conversation_id:    str,
+    conversation_title: str | None = None,
 ) -> AsyncIterator[str]:
     """
     Async generator that drives the streaming endpoint.
@@ -1099,7 +1160,10 @@ async def _stream_task(
 
     yield _sse({"type": "status", "message": "Planning task…", "task_id": task_id})
 
-    _persist_chat_turn("user", task_dict["instruction"], task_id)
+    _persist_chat_turn(
+        "user", task_dict["instruction"], task_id, conversation_id,
+        conversation_title = conversation_title,
+    )
 
     # Route in a separate thread — some priority branches call embed_fn / infer().
     try:
@@ -1186,7 +1250,7 @@ async def _stream_task(
                     "answer":   rd.get("answer", ""),
                 })
                 _persist_chat_turn(
-                    "assistant", rd.get("answer", ""), task_id,
+                    "assistant", rd.get("answer", ""), task_id, conversation_id,
                     sources  = rd.get("sources"),
                     metadata = rd.get("metadata"),
                 )
@@ -1236,7 +1300,7 @@ async def _stream_task(
         return
 
     _persist_chat_turn(
-        "assistant", result.get("answer", ""), task_id,
+        "assistant", result.get("answer", ""), task_id, conversation_id,
         sources  = result.get("sources"),
         metadata = result.get("metadata"),
     )

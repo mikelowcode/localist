@@ -89,7 +89,9 @@ function patchTask(task_id: string, patch: Partial<Task>): void {
 export function submitTask(
   instruction: string,
   context: Record<string, unknown> = {},
-  task_id?: string
+  task_id?: string,
+  conversation_id?: string,
+  conversation_title?: string
 ): Promise<string> {
   const id = task_id ?? crypto.randomUUID();
   const task = createTask(id, instruction);
@@ -105,6 +107,8 @@ export function submitTask(
     task_id: id,
     instruction,
     context: { session_id: SESSION_ID, ...context },
+    conversation_id,
+    conversation_title,
   });
 
   return new Promise<string>((resolve) => {

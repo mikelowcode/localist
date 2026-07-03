@@ -3,6 +3,7 @@
   import { get } from 'svelte/store';
   import { tasksStore, submitTask } from '$lib/stores/tasks';
   import { chatHistoryStore } from '$lib/stores/chatHistory';
+  import { currentConversationId, isFirstTurnOfConversation } from '$lib/stores/conversation';
   import MarkdownRenderer from '$lib/components/MarkdownRenderer.svelte';
 
   let instruction = '';
@@ -148,6 +149,13 @@
     const task_id = crypto.randomUUID();
     const now = Date.now();
 
+    const conversationId = get(currentConversationId);
+    let conversationTitle: string | undefined;
+    if (get(isFirstTurnOfConversation)) {
+      conversationTitle = text.length > 60 ? text.slice(0, 60) + '…' : text;
+      isFirstTurnOfConversation.set(false);
+    }
+
     chatHistoryStore.update((turns) => [
       ...turns,
       { role: 'user', content: text, task_id, timestamp: now }
@@ -168,7 +176,7 @@
     ]);
     await scrollToBottom();
 
-    await submitTask(text, {}, task_id);
+    await submitTask(text, {}, task_id, conversationId, conversationTitle);
 
     submitting = false;
     inputEl?.focus();

@@ -1,5 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
+  import { goto } from '$app/navigation';
+  import { startNewConversation } from '$lib/stores/conversation';
 
   interface NavItem {
     href: string;
@@ -8,14 +10,63 @@
   }
 
   const nav: NavItem[] = [
-    { href: '/conversation', label: 'Conversation', icon: 'chat' },
-    { href: '/memory',       label: 'Memory',       icon: 'memory' },
-    { href: '/history',      label: 'History',      icon: 'history' },
-    { href: '/files',        label: 'Files',        icon: 'folder' },
-    { href: '/settings',     label: 'Settings',     icon: 'settings' }
+    { href: '/conversation', label: 'Chat',     icon: 'chat' },
+    { href: '/memory',       label: 'Memory',   icon: 'memory' },
+    { href: '/files',        label: 'Files',    icon: 'folder' },
+    { href: '/settings',     label: 'Settings', icon: 'settings' }
   ];
 
   $: active = $page.url.pathname;
+  $: showConversationList = active.startsWith('/conversation');
+  $: activeConversationId = $page.params.id;
+
+  interface ConversationSummary {
+    conversation_id:    string;
+    conversation_title: string | null;
+    last_created_at:    number;
+    first_created_at:   number;
+  }
+
+  let conversations: ConversationSummary[] = [];
+  let conversationsLoading = false;
+  let conversationsError: string | null = null;
+
+  async function loadConversations(): Promise<void> {
+    conversationsLoading = true;
+    conversationsError = null;
+    try {
+      const res = await fetch('/api/chat/history/conversations');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data: { conversations: ConversationSummary[] } = await res.json();
+      conversations = data.conversations;
+    } catch (err) {
+      conversationsError = err instanceof Error ? err.message : String(err);
+    } finally {
+      conversationsLoading = false;
+    }
+  }
+
+  // Re-fetch on every navigation to a /conversation* route — this reactive
+  // assignment re-runs whenever `active` changes (even between two
+  // /conversation/[id] routes), which also covers the moment right after
+  // startNewConversation() navigates to the freshly minted conversation.
+  $: if (showConversationList) {
+    loadConversations();
+  }
+
+  function conversationLabel(c: ConversationSummary): string {
+    if (c.conversation_title) return c.conversation_title;
+    const ts = new Date(c.last_created_at * 1000).toLocaleString([], {
+      month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'
+    });
+    return `New conversation — ${ts}`;
+  }
+
+  async function handleNewConversation(): Promise<void> {
+    const id = startNewConversation();
+    await goto(`/conversation/${id}`);
+    loadConversations();
+  }
 </script>
 
 <aside class="sidebar" aria-label="Main navigation">
@@ -50,11 +101,6 @@
                   <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
                   <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
                 </svg>
-              {:else if item.icon === 'history'}
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-                  <circle cx="12" cy="12" r="9"/>
-                  <path d="M12 7v5l3.5 2"/>
-                </svg>
               {:else if item.icon === 'folder'}
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
@@ -74,6 +120,49 @@
         </li>
       {/each}
     </ul>
+
+    {#if showConversationList}
+      <ul class="sub-nav">
+        <li>
+          <button
+            type="button"
+            class="new-conversation-btn"
+            on:click={handleNewConversation}
+            aria-label="Start new conversation"
+          >
+            <span class="nav-icon" aria-hidden="true">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 5v14M5 12h14"/>
+              </svg>
+            </span>
+            <span class="nav-label">New chat</span>
+          </button>
+        </li>
+
+        {#if conversationsLoading}
+          <li class="sub-nav-state">Loading…</li>
+        {:else if conversationsError}
+          <li class="sub-nav-state" style="color:var(--error)">{conversationsError}</li>
+        {:else if conversations.length === 0}
+          <li class="sub-nav-state">No conversations yet.</li>
+        {:else}
+          {#each conversations as c (c.conversation_id)}
+            {@const isActive = c.conversation_id === activeConversationId}
+            <li>
+              <a
+                href={`/conversation/${c.conversation_id}`}
+                class="sub-nav-link"
+                class:active={isActive}
+                aria-current={isActive ? 'page' : undefined}
+                title={conversationLabel(c)}
+              >
+                {conversationLabel(c)}
+              </a>
+            </li>
+          {/each}
+        {/if}
+      </ul>
+    {/if}
   </nav>
 
   <!-- Footer label -->
@@ -189,6 +278,72 @@
 
   .nav-label {
     flex: 1;
+  }
+
+  /* Conversation sub-list */
+  .sub-nav {
+    margin-top: var(--sp-2);
+    padding-top: var(--sp-2);
+    border-top: 1px solid var(--border-soft);
+    max-height: 240px;
+    overflow-y: auto;
+  }
+
+  .new-conversation-btn {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    padding: var(--sp-2) var(--sp-3);
+    border-radius: var(--radius);
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: var(--text-sm);
+    font-family: inherit;
+    cursor: pointer;
+    transition:
+      color var(--dur-fast) var(--ease),
+      background var(--dur-fast) var(--ease);
+  }
+
+  .new-conversation-btn:hover {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+  }
+
+  .sub-nav-link {
+    display: block;
+    padding: var(--sp-2) var(--sp-3);
+    margin-left: var(--sp-3);
+    border-radius: var(--radius);
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    text-decoration: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition:
+      color var(--dur-fast) var(--ease),
+      background var(--dur-fast) var(--ease);
+  }
+
+  .sub-nav-link:hover {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+  }
+
+  .sub-nav-link.active {
+    color: var(--text-accent);
+    background: var(--accent-glow);
+    font-weight: 500;
+  }
+
+  .sub-nav-state {
+    padding: var(--sp-2) var(--sp-3);
+    margin-left: var(--sp-3);
+    font-size: var(--text-xs);
+    color: var(--text-tertiary);
   }
 
   /* Active accent bar — left edge */

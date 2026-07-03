@@ -145,7 +145,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION   = 6          # increment when schema changes require migration
+_SCHEMA_VERSION   = 7          # increment when schema changes require migration
 _EMBEDDING_DIM    = 768        # EmbeddingGemma-300M-4bit output dimension
 _EMBEDDING_FORMAT = ">768f"    # big-endian float32 × 768
 
@@ -358,148 +358,167 @@ class MemoryManager:
         with self._lock:
             conn = self._connect()
             try:
+                # The schema_version check must happen before any other DDL —
+                # the fresh-install script below and _migrate()'s incremental
+                # blocks are mutually exclusive paths, so we need to know
+                # which one applies before running either. Create just
+                # schema_version first (idempotent) so it can be queried.
                 conn.executescript("""
                     CREATE TABLE IF NOT EXISTS schema_version (
                         version  INTEGER NOT NULL
                     );
-
-                    CREATE TABLE IF NOT EXISTS conversation_log (
-                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                        task_id     TEXT    NOT NULL,
-                        role        TEXT    NOT NULL,
-                        content     TEXT    NOT NULL,
-                        meta_json   TEXT    NOT NULL DEFAULT '{}',
-                        created_at  REAL    NOT NULL
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_conv_task
-                        ON conversation_log(task_id, created_at);
-
-                    CREATE TABLE IF NOT EXISTS document_index (
-                        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name         TEXT    NOT NULL,
-                        path         TEXT    NOT NULL UNIQUE,
-                        doc_type     TEXT    NOT NULL,
-                        content      TEXT    NOT NULL,
-                        token_set    TEXT    NOT NULL DEFAULT '',
-                        embedding    BLOB    DEFAULT NULL,
-                        content_hash TEXT    NOT NULL DEFAULT '',
-                        indexed_at   REAL    NOT NULL
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_doc_name
-                        ON document_index(name);
-                    CREATE INDEX IF NOT EXISTS idx_doc_type
-                        ON document_index(doc_type);
-
-                    CREATE TABLE IF NOT EXISTS retrieval_cache (
-                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                        query_hash  TEXT    NOT NULL UNIQUE,
-                        top_n       INTEGER NOT NULL,
-                        result_json TEXT    NOT NULL,
-                        created_at  REAL    NOT NULL,
-                        valid       INTEGER NOT NULL DEFAULT 1
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_cache_hash
-                        ON retrieval_cache(query_hash, valid);
-
-                    CREATE TABLE IF NOT EXISTS episodes (
-                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                        episode_type    TEXT    NOT NULL,
-                        subject         TEXT    NOT NULL,
-                        content         TEXT    NOT NULL,
-                        confidence      REAL    NOT NULL DEFAULT 1.0,
-                        source          TEXT    NOT NULL,
-                        task_id         TEXT,
-                        conversation_id TEXT,
-                        project_context TEXT,
-                        status          TEXT    NOT NULL DEFAULT 'active',
-                        created_at      REAL    NOT NULL,
-                        last_accessed   REAL,
-                        embedding       BLOB
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_episodes_type_status
-                        ON episodes (episode_type, status);
-                    CREATE INDEX IF NOT EXISTS idx_episodes_subject
-                        ON episodes (subject, status);
-                    CREATE INDEX IF NOT EXISTS idx_episodes_project
-                        ON episodes (project_context, status);
-
-                    CREATE TABLE IF NOT EXISTS graph_nodes (
-                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                        doc_path        TEXT    NOT NULL UNIQUE,
-                        node_type       TEXT,
-                        title           TEXT,
-                        source_doc_path TEXT    NOT NULL,
-                        created_at      REAL    NOT NULL,
-                        updated_at      REAL    NOT NULL
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_graph_nodes_doc_path
-                        ON graph_nodes(doc_path);
-
-                    CREATE TABLE IF NOT EXISTS graph_edges (
-                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                        source_node_id  INTEGER NOT NULL REFERENCES graph_nodes(id),
-                        target_path     TEXT    NOT NULL,
-                        target_node_id  INTEGER REFERENCES graph_nodes(id),
-                        target_resolved INTEGER NOT NULL DEFAULT 0,
-                        link_text       TEXT    NOT NULL,
-                        source_doc_path TEXT    NOT NULL
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_graph_edges_source
-                        ON graph_edges(source_node_id);
-                    CREATE INDEX IF NOT EXISTS idx_graph_edges_target_path
-                        ON graph_edges(target_path);
-                    CREATE INDEX IF NOT EXISTS idx_graph_edges_resolved
-                        ON graph_edges(target_resolved);
-
-                    CREATE TABLE IF NOT EXISTS working_state (
-                        mem_key                TEXT    PRIMARY KEY,
-                        current_focus          TEXT,
-                        open_loops_json        TEXT    NOT NULL DEFAULT '[]',
-                        recent_decisions_json  TEXT    NOT NULL DEFAULT '[]',
-                        updated_at             REAL    NOT NULL
-                    );
-
-                    CREATE TABLE IF NOT EXISTS chat_turns (
-                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                        task_id         TEXT    NOT NULL,
-                        role            TEXT    NOT NULL,
-                        content         TEXT    NOT NULL,
-                        sources_json    TEXT    NOT NULL DEFAULT '[]',
-                        status_message  TEXT,
-                        metadata_json   TEXT    NOT NULL DEFAULT '{}',
-                        created_at      REAL    NOT NULL
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_chat_turns_created
-                        ON chat_turns(created_at);
-                    CREATE INDEX IF NOT EXISTS idx_chat_turns_task
-                        ON chat_turns(task_id);
-
-                    CREATE VIRTUAL TABLE IF NOT EXISTS chat_turns_fts USING fts5(
-                        content,
-                        content='chat_turns',
-                        content_rowid='id'
-                    );
-
-                    CREATE TRIGGER IF NOT EXISTS chat_turns_ai AFTER INSERT ON chat_turns BEGIN
-                        INSERT INTO chat_turns_fts(rowid, content) VALUES (new.id, new.content);
-                    END;
-                    CREATE TRIGGER IF NOT EXISTS chat_turns_ad AFTER DELETE ON chat_turns BEGIN
-                        INSERT INTO chat_turns_fts(chat_turns_fts, rowid, content) VALUES ('delete', old.id, old.content);
-                    END;
-                    CREATE TRIGGER IF NOT EXISTS chat_turns_au AFTER UPDATE ON chat_turns BEGIN
-                        INSERT INTO chat_turns_fts(chat_turns_fts, rowid, content) VALUES ('delete', old.id, old.content);
-                        INSERT INTO chat_turns_fts(rowid, content) VALUES (new.id, new.content);
-                    END;
-
-                    CREATE TABLE IF NOT EXISTS chat_history_settings (
-                        id              INTEGER PRIMARY KEY CHECK (id = 1),
-                        eviction_preset TEXT
-                    );
                 """)
 
-                # Ensure schema_version row exists.
                 row = conn.execute("SELECT version FROM schema_version").fetchone()
+
                 if row is None:
+                    # Genuinely fresh database — safe to run the full DDL in
+                    # one shot, since every column referenced by every index
+                    # below (e.g. chat_turns.conversation_id) is created
+                    # earlier in this same script.
+                    conn.executescript("""
+                        CREATE TABLE IF NOT EXISTS schema_version (
+                            version  INTEGER NOT NULL
+                        );
+
+                        CREATE TABLE IF NOT EXISTS conversation_log (
+                            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                            task_id     TEXT    NOT NULL,
+                            role        TEXT    NOT NULL,
+                            content     TEXT    NOT NULL,
+                            meta_json   TEXT    NOT NULL DEFAULT '{}',
+                            created_at  REAL    NOT NULL
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_conv_task
+                            ON conversation_log(task_id, created_at);
+
+                        CREATE TABLE IF NOT EXISTS document_index (
+                            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                            name         TEXT    NOT NULL,
+                            path         TEXT    NOT NULL UNIQUE,
+                            doc_type     TEXT    NOT NULL,
+                            content      TEXT    NOT NULL,
+                            token_set    TEXT    NOT NULL DEFAULT '',
+                            embedding    BLOB    DEFAULT NULL,
+                            content_hash TEXT    NOT NULL DEFAULT '',
+                            indexed_at   REAL    NOT NULL
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_doc_name
+                            ON document_index(name);
+                        CREATE INDEX IF NOT EXISTS idx_doc_type
+                            ON document_index(doc_type);
+
+                        CREATE TABLE IF NOT EXISTS retrieval_cache (
+                            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                            query_hash  TEXT    NOT NULL UNIQUE,
+                            top_n       INTEGER NOT NULL,
+                            result_json TEXT    NOT NULL,
+                            created_at  REAL    NOT NULL,
+                            valid       INTEGER NOT NULL DEFAULT 1
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_cache_hash
+                            ON retrieval_cache(query_hash, valid);
+
+                        CREATE TABLE IF NOT EXISTS episodes (
+                            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                            episode_type    TEXT    NOT NULL,
+                            subject         TEXT    NOT NULL,
+                            content         TEXT    NOT NULL,
+                            confidence      REAL    NOT NULL DEFAULT 1.0,
+                            source          TEXT    NOT NULL,
+                            task_id         TEXT,
+                            conversation_id TEXT,
+                            project_context TEXT,
+                            status          TEXT    NOT NULL DEFAULT 'active',
+                            created_at      REAL    NOT NULL,
+                            last_accessed   REAL,
+                            embedding       BLOB
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_episodes_type_status
+                            ON episodes (episode_type, status);
+                        CREATE INDEX IF NOT EXISTS idx_episodes_subject
+                            ON episodes (subject, status);
+                        CREATE INDEX IF NOT EXISTS idx_episodes_project
+                            ON episodes (project_context, status);
+
+                        CREATE TABLE IF NOT EXISTS graph_nodes (
+                            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                            doc_path        TEXT    NOT NULL UNIQUE,
+                            node_type       TEXT,
+                            title           TEXT,
+                            source_doc_path TEXT    NOT NULL,
+                            created_at      REAL    NOT NULL,
+                            updated_at      REAL    NOT NULL
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_graph_nodes_doc_path
+                            ON graph_nodes(doc_path);
+
+                        CREATE TABLE IF NOT EXISTS graph_edges (
+                            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                            source_node_id  INTEGER NOT NULL REFERENCES graph_nodes(id),
+                            target_path     TEXT    NOT NULL,
+                            target_node_id  INTEGER REFERENCES graph_nodes(id),
+                            target_resolved INTEGER NOT NULL DEFAULT 0,
+                            link_text       TEXT    NOT NULL,
+                            source_doc_path TEXT    NOT NULL
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_graph_edges_source
+                            ON graph_edges(source_node_id);
+                        CREATE INDEX IF NOT EXISTS idx_graph_edges_target_path
+                            ON graph_edges(target_path);
+                        CREATE INDEX IF NOT EXISTS idx_graph_edges_resolved
+                            ON graph_edges(target_resolved);
+
+                        CREATE TABLE IF NOT EXISTS working_state (
+                            mem_key                TEXT    PRIMARY KEY,
+                            current_focus          TEXT,
+                            open_loops_json        TEXT    NOT NULL DEFAULT '[]',
+                            recent_decisions_json  TEXT    NOT NULL DEFAULT '[]',
+                            updated_at             REAL    NOT NULL
+                        );
+
+                        CREATE TABLE IF NOT EXISTS chat_turns (
+                            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                            task_id             TEXT    NOT NULL,
+                            role                TEXT    NOT NULL,
+                            content             TEXT    NOT NULL,
+                            sources_json        TEXT    NOT NULL DEFAULT '[]',
+                            status_message      TEXT,
+                            metadata_json       TEXT    NOT NULL DEFAULT '{}',
+                            conversation_id     TEXT    NOT NULL DEFAULT 'legacy',
+                            conversation_title  TEXT,
+                            created_at          REAL    NOT NULL
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_chat_turns_created
+                            ON chat_turns(created_at);
+                        CREATE INDEX IF NOT EXISTS idx_chat_turns_task
+                            ON chat_turns(task_id);
+                        CREATE INDEX IF NOT EXISTS idx_chat_turns_conversation
+                            ON chat_turns(conversation_id, created_at);
+
+                        CREATE VIRTUAL TABLE IF NOT EXISTS chat_turns_fts USING fts5(
+                            content,
+                            content='chat_turns',
+                            content_rowid='id'
+                        );
+
+                        CREATE TRIGGER IF NOT EXISTS chat_turns_ai AFTER INSERT ON chat_turns BEGIN
+                            INSERT INTO chat_turns_fts(rowid, content) VALUES (new.id, new.content);
+                        END;
+                        CREATE TRIGGER IF NOT EXISTS chat_turns_ad AFTER DELETE ON chat_turns BEGIN
+                            INSERT INTO chat_turns_fts(chat_turns_fts, rowid, content) VALUES ('delete', old.id, old.content);
+                        END;
+                        CREATE TRIGGER IF NOT EXISTS chat_turns_au AFTER UPDATE ON chat_turns BEGIN
+                            INSERT INTO chat_turns_fts(chat_turns_fts, rowid, content) VALUES ('delete', old.id, old.content);
+                            INSERT INTO chat_turns_fts(rowid, content) VALUES (new.id, new.content);
+                        END;
+
+                        CREATE TABLE IF NOT EXISTS chat_history_settings (
+                            id              INTEGER PRIMARY KEY CHECK (id = 1),
+                            eviction_preset TEXT
+                        );
+                    """)
+
                     conn.execute(
                         "INSERT INTO schema_version (version) VALUES (?)",
                         (_SCHEMA_VERSION,),
@@ -645,6 +664,24 @@ class MemoryManager:
                     id              INTEGER PRIMARY KEY CHECK (id = 1),
                     eviction_preset TEXT
                 );
+            """)
+
+        if from_version < 7:
+            logger.info("Applying migration v6→v7: adding conversation_id/conversation_title to chat_turns.")
+            cols = {row[1] for row in conn.execute(
+                "PRAGMA table_info(chat_turns)"
+            ).fetchall()}
+            if "conversation_id" not in cols:
+                conn.executescript(
+                    "ALTER TABLE chat_turns ADD COLUMN conversation_id TEXT NOT NULL DEFAULT 'legacy';"
+                )
+            if "conversation_title" not in cols:
+                conn.executescript(
+                    "ALTER TABLE chat_turns ADD COLUMN conversation_title TEXT;"
+                )
+            conn.executescript("""
+                CREATE INDEX IF NOT EXISTS idx_chat_turns_conversation
+                    ON chat_turns(conversation_id, created_at);
             """)
 
         conn.execute(
@@ -868,12 +905,14 @@ class MemoryManager:
 
     def add_chat_turn(
         self,
-        task_id:        str,
-        role:           str,
-        content:        str,
-        sources:        list[dict[str, Any]] | None = None,
-        status_message: str | None = None,
-        metadata:       dict[str, Any] | None = None,
+        task_id:            str,
+        role:               str,
+        content:            str,
+        conversation_id:    str,
+        sources:            list[dict[str, Any]] | None = None,
+        status_message:     str | None = None,
+        metadata:           dict[str, Any] | None = None,
+        conversation_title: str | None = None,
     ) -> None:
         """
         Append one entry to the chat_turns table.
@@ -886,6 +925,8 @@ class MemoryManager:
             "user" | "assistant"
         content :
             The text content of the turn.
+        conversation_id :
+            Groups turns by conversation.
         sources :
             Optional list of source dicts, stored as JSON. Defaults to [].
         status_message :
@@ -893,6 +934,8 @@ class MemoryManager:
             current call site — reserved for future use.
         metadata :
             Optional dict stored as JSON. Defaults to {}.
+        conversation_title :
+            Optional human-readable title for the conversation.
         """
         sources_json  = json.dumps(sources or [])
         metadata_json = json.dumps(metadata or {})
@@ -905,11 +948,11 @@ class MemoryManager:
                     """
                     INSERT INTO chat_turns
                         (task_id, role, content, sources_json, status_message,
-                         metadata_json, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                         metadata_json, conversation_id, conversation_title, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (task_id, role, content, sources_json, status_message,
-                     metadata_json, now),
+                     metadata_json, conversation_id, conversation_title, now),
                 )
                 conn.commit()
             finally:
@@ -917,9 +960,10 @@ class MemoryManager:
 
     def get_chat_turns(
         self,
-        query:  str | None = None,
-        limit:  int = 50,
-        offset: int = 0,
+        query:           str | None = None,
+        limit:           int = 50,
+        offset:          int = 0,
+        conversation_id: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """
         Return a page of chat_turns rows plus the total matching count.
@@ -944,6 +988,8 @@ class MemoryManager:
             Max rows to return (capped at 200, matching list_episodes()).
         offset :
             Row offset for pagination.
+        conversation_id :
+            Optional filter restricting results to a single conversation.
 
         Returns
         -------
@@ -951,47 +997,92 @@ class MemoryManager:
             (rows, total_count). total_count reflects the full matching
             set (unfiltered table count, or FTS match count) — not just
             the current page. Each row dict has keys: id, task_id, role,
-            content, sources, status_message, metadata, created_at.
+            content, sources, status_message, metadata, conversation_id,
+            conversation_title, created_at.
         """
         limit = min(limit, 200)
         conn = self._connect()
         try:
             if not query:
-                total = conn.execute(
-                    "SELECT COUNT(*) FROM chat_turns"
-                ).fetchone()[0]
-                rows = conn.execute(
-                    """
-                    SELECT id, task_id, role, content, sources_json,
-                           status_message, metadata_json, created_at
-                    FROM   chat_turns
-                    ORDER  BY created_at DESC
-                    LIMIT  ? OFFSET ?
-                    """,
-                    (limit, offset),
-                ).fetchall()
-            else:
-                fts_query = '"' + query.replace('"', '""') + '"'
-                try:
+                if conversation_id is not None:
                     total = conn.execute(
-                        """
-                        SELECT COUNT(*) FROM chat_turns_fts
-                        WHERE  chat_turns_fts MATCH ?
-                        """,
-                        (fts_query,),
+                        "SELECT COUNT(*) FROM chat_turns WHERE conversation_id = ?",
+                        (conversation_id,),
                     ).fetchone()[0]
                     rows = conn.execute(
                         """
-                        SELECT c.id, c.task_id, c.role, c.content, c.sources_json,
-                               c.status_message, c.metadata_json, c.created_at
-                        FROM   chat_turns_fts
-                        JOIN   chat_turns c ON c.id = chat_turns_fts.rowid
-                        WHERE  chat_turns_fts MATCH ?
-                        ORDER  BY bm25(chat_turns_fts) ASC
+                        SELECT id, task_id, role, content, sources_json,
+                               status_message, metadata_json, conversation_id,
+                               conversation_title, created_at
+                        FROM   chat_turns
+                        WHERE  conversation_id = ?
+                        ORDER  BY created_at DESC
                         LIMIT  ? OFFSET ?
                         """,
-                        (fts_query, limit, offset),
+                        (conversation_id, limit, offset),
                     ).fetchall()
+                else:
+                    total = conn.execute(
+                        "SELECT COUNT(*) FROM chat_turns"
+                    ).fetchone()[0]
+                    rows = conn.execute(
+                        """
+                        SELECT id, task_id, role, content, sources_json,
+                               status_message, metadata_json, conversation_id,
+                               conversation_title, created_at
+                        FROM   chat_turns
+                        ORDER  BY created_at DESC
+                        LIMIT  ? OFFSET ?
+                        """,
+                        (limit, offset),
+                    ).fetchall()
+            else:
+                fts_query = '"' + query.replace('"', '""') + '"'
+                try:
+                    if conversation_id is not None:
+                        total = conn.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM   chat_turns_fts
+                            JOIN   chat_turns c ON c.id = chat_turns_fts.rowid
+                            WHERE  chat_turns_fts MATCH ? AND c.conversation_id = ?
+                            """,
+                            (fts_query, conversation_id),
+                        ).fetchone()[0]
+                        rows = conn.execute(
+                            """
+                            SELECT c.id, c.task_id, c.role, c.content, c.sources_json,
+                                   c.status_message, c.metadata_json, c.conversation_id,
+                                   c.conversation_title, c.created_at
+                            FROM   chat_turns_fts
+                            JOIN   chat_turns c ON c.id = chat_turns_fts.rowid
+                            WHERE  chat_turns_fts MATCH ? AND c.conversation_id = ?
+                            ORDER  BY bm25(chat_turns_fts) ASC
+                            LIMIT  ? OFFSET ?
+                            """,
+                            (fts_query, conversation_id, limit, offset),
+                        ).fetchall()
+                    else:
+                        total = conn.execute(
+                            """
+                            SELECT COUNT(*) FROM chat_turns_fts
+                            WHERE  chat_turns_fts MATCH ?
+                            """,
+                            (fts_query,),
+                        ).fetchone()[0]
+                        rows = conn.execute(
+                            """
+                            SELECT c.id, c.task_id, c.role, c.content, c.sources_json,
+                                   c.status_message, c.metadata_json, c.conversation_id,
+                                   c.conversation_title, c.created_at
+                            FROM   chat_turns_fts
+                            JOIN   chat_turns c ON c.id = chat_turns_fts.rowid
+                            WHERE  chat_turns_fts MATCH ?
+                            ORDER  BY bm25(chat_turns_fts) ASC
+                            LIMIT  ? OFFSET ?
+                            """,
+                            (fts_query, limit, offset),
+                        ).fetchall()
                 except sqlite3.OperationalError as exc:
                     logger.debug(
                         "get_chat_turns: FTS5 query failed for %r — %s", query, exc,
@@ -1002,18 +1093,64 @@ class MemoryManager:
 
         result = [
             {
-                "id":             row["id"],
-                "task_id":        row["task_id"],
-                "role":           row["role"],
-                "content":        row["content"],
-                "sources":        json.loads(row["sources_json"]),
-                "status_message": row["status_message"],
-                "metadata":       json.loads(row["metadata_json"]),
-                "created_at":     row["created_at"],
+                "id":                 row["id"],
+                "task_id":            row["task_id"],
+                "role":               row["role"],
+                "content":            row["content"],
+                "sources":            json.loads(row["sources_json"]),
+                "status_message":     row["status_message"],
+                "metadata":           json.loads(row["metadata_json"]),
+                "conversation_id":    row["conversation_id"],
+                "conversation_title": row["conversation_title"],
+                "created_at":         row["created_at"],
             }
             for row in rows
         ]
         return result, total
+
+    def get_conversations(self) -> list[dict[str, Any]]:
+        """
+        Return one summary row per distinct conversation_id in chat_turns.
+
+        Read-only — no eviction, no writes.
+
+        Returns
+        -------
+        list[dict]
+            Rows ordered by last_created_at DESC. Each row dict has keys:
+            conversation_id, conversation_title, last_created_at,
+            first_created_at.
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT
+                    t1.conversation_id,
+                    (SELECT t2.conversation_title
+                       FROM   chat_turns t2
+                       WHERE  t2.conversation_id = t1.conversation_id
+                         AND  t2.conversation_title IS NOT NULL
+                       LIMIT  1)                      AS conversation_title,
+                    MAX(t1.created_at)                AS last_created_at,
+                    MIN(t1.created_at)                AS first_created_at
+                FROM   chat_turns t1
+                GROUP  BY t1.conversation_id
+                ORDER  BY last_created_at DESC
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+
+        return [
+            {
+                "conversation_id":    row["conversation_id"],
+                "conversation_title": row["conversation_title"],
+                "last_created_at":    row["last_created_at"],
+                "first_created_at":   row["first_created_at"],
+            }
+            for row in rows
+        ]
 
     # -----------------------------------------------------------------------
     # Chat history settings  (Chat History Tab — eviction preset read/write)

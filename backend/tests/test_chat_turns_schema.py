@@ -102,6 +102,36 @@ def _tables(conn: sqlite3.Connection) -> set[str]:
     ).fetchall()}
 
 
+def _insert_chat_turn_raw(
+    db_path: Path,
+    *,
+    conversation_id:    str,
+    conversation_title: str | None,
+    created_at:         float,
+    content:            str = "turn",
+) -> None:
+    """
+    Insert one chat_turns row with an explicit created_at, bypassing
+    add_chat_turn()'s time.time() timestamp.
+
+    Needed for get_conversations() tests that assert on relative ordering
+    (MIN/MAX(created_at), ORDER BY last_created_at) across rows inserted
+    within the same test — sequential add_chat_turn() calls don't offer
+    enough control over timestamp spacing for that.
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        INSERT INTO chat_turns
+            (task_id, role, content, conversation_id, conversation_title, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        ("t", "user", content, conversation_id, conversation_title, created_at),
+    )
+    conn.commit()
+    conn.close()
+
+
 # ---------------------------------------------------------------------------
 # TestChatTurnsFreshSchema — fresh-DB path
 # ---------------------------------------------------------------------------
@@ -191,7 +221,9 @@ class TestChatTurnsMigration:
         assert "chat_turns" not in tables_before
         assert "chat_history_settings" not in tables_before
 
-        # Open with MemoryManager → triggers _migrate(from_version=5) → v5→v6.
+        # Open with MemoryManager → triggers _migrate(from_version=5) →
+        # v5→v6→v7 (chat_turns objects land at v6; v6→v7 then adds
+        # conversation_id/conversation_title on top, per §12.3).
         MemoryManager(db_path=path)
 
         conn = sqlite3.connect(str(path))
@@ -201,7 +233,7 @@ class TestChatTurnsMigration:
         ).fetchall()}
         conn.close()
 
-        assert version_after == 6
+        assert version_after == 7
         assert "chat_turns" in names_after
         assert "chat_turns_fts" in names_after
         assert "chat_history_settings" in names_after
@@ -229,11 +261,12 @@ class TestAddChatTurn:
 
     def test_insert_creates_row_with_expected_fields(self, mm):
         mm.add_chat_turn(
-            task_id  = "task-1",
-            role     = "user",
-            content  = "hello world",
-            sources  = [{"name": "doc-a"}],
-            metadata = {"agent": "wiki"},
+            task_id         = "task-1",
+            role            = "user",
+            content         = "hello world",
+            sources         = [{"name": "doc-a"}],
+            metadata        = {"agent": "wiki"},
+            conversation_id = "conv-1",
         )
 
         rows = self._rows(mm)
@@ -248,11 +281,12 @@ class TestAddChatTurn:
 
     def test_sources_and_metadata_round_trip_through_json(self, mm):
         mm.add_chat_turn(
-            task_id  = "task-2",
-            role     = "assistant",
-            content  = "the answer",
-            sources  = [{"name": "doc-a", "type": "wiki"}, {"name": "doc-b"}],
-            metadata = {"agent": "conversational", "latency_ms": 42},
+            task_id         = "task-2",
+            role            = "assistant",
+            content         = "the answer",
+            sources         = [{"name": "doc-a", "type": "wiki"}, {"name": "doc-b"}],
+            metadata        = {"agent": "conversational", "latency_ms": 42},
+            conversation_id = "conv-2",
         )
 
         row = self._rows(mm)[0]
@@ -264,14 +298,14 @@ class TestAddChatTurn:
         }
 
     def test_sources_and_metadata_default_to_empty(self, mm):
-        mm.add_chat_turn(task_id="task-3", role="user", content="no extras")
+        mm.add_chat_turn(task_id="task-3", role="user", content="no extras", conversation_id="conv-3")
 
         row = self._rows(mm)[0]
         assert json.loads(row["sources_json"]) == []
         assert json.loads(row["metadata_json"]) == {}
 
     def test_fts_sync_on_insert(self, mm):
-        mm.add_chat_turn(task_id="task-4", role="user", content="a searchable phrase")
+        mm.add_chat_turn(task_id="task-4", role="user", content="a searchable phrase", conversation_id="conv-4")
 
         conn = sqlite3.connect(str(mm._db_path))
         conn.row_factory = sqlite3.Row
@@ -285,7 +319,7 @@ class TestAddChatTurn:
         assert match["rowid"] == self._rows(mm)[0]["id"]
 
     def test_does_not_touch_conversation_log(self, mm):
-        mm.add_chat_turn(task_id="task-5", role="user", content="x")
+        mm.add_chat_turn(task_id="task-5", role="user", content="x", conversation_id="conv-5")
 
         conn = sqlite3.connect(str(mm._db_path))
         count = conn.execute("SELECT COUNT(*) FROM conversation_log").fetchone()[0]
@@ -294,8 +328,8 @@ class TestAddChatTurn:
         assert count == 0
 
     def test_multiple_turns_ordered_by_insertion(self, mm):
-        mm.add_chat_turn(task_id="task-6", role="user", content="first")
-        mm.add_chat_turn(task_id="task-6", role="assistant", content="second")
+        mm.add_chat_turn(task_id="task-6", role="user", content="first", conversation_id="conv-6")
+        mm.add_chat_turn(task_id="task-6", role="assistant", content="second", conversation_id="conv-6")
 
         rows = self._rows(mm)
         assert [r["role"] for r in rows] == ["user", "assistant"]
@@ -356,7 +390,7 @@ class TestGetChatTurns:
 
     def test_unfiltered_pagination_and_total_count(self, mm):
         for i in range(5):
-            mm.add_chat_turn(task_id="t", role="user", content=f"turn {i}")
+            mm.add_chat_turn(task_id="t", role="user", content=f"turn {i}", conversation_id="conv-1")
 
         page1, total1 = mm.get_chat_turns(limit=2, offset=0)
         page2, total2 = mm.get_chat_turns(limit=2, offset=2)
@@ -368,9 +402,9 @@ class TestGetChatTurns:
         assert len(page3) == 1
 
     def test_unfiltered_ordering_is_created_at_desc(self, mm):
-        mm.add_chat_turn(task_id="t", role="user", content="first")
-        mm.add_chat_turn(task_id="t", role="assistant", content="second")
-        mm.add_chat_turn(task_id="t", role="user", content="third")
+        mm.add_chat_turn(task_id="t", role="user", content="first", conversation_id="conv-1")
+        mm.add_chat_turn(task_id="t", role="assistant", content="second", conversation_id="conv-1")
+        mm.add_chat_turn(task_id="t", role="user", content="third", conversation_id="conv-1")
 
         rows, total = mm.get_chat_turns(limit=10)
         assert total == 3
@@ -378,27 +412,29 @@ class TestGetChatTurns:
 
     def test_row_shape_includes_expected_keys_and_json_decoded_fields(self, mm):
         mm.add_chat_turn(
-            task_id  = "t1",
-            role     = "assistant",
-            content  = "the answer",
-            sources  = [{"name": "doc-a"}],
-            metadata = {"agent": "wiki"},
+            task_id         = "t1",
+            role            = "assistant",
+            content         = "the answer",
+            sources         = [{"name": "doc-a"}],
+            metadata        = {"agent": "wiki"},
+            conversation_id = "conv-1",
         )
         rows, _ = mm.get_chat_turns()
         row = rows[0]
 
         assert set(row.keys()) == {
             "id", "task_id", "role", "content", "sources",
-            "status_message", "metadata", "created_at",
+            "status_message", "metadata", "conversation_id",
+            "conversation_title", "created_at",
         }
         assert row["sources"]  == [{"name": "doc-a"}]
         assert row["metadata"] == {"agent": "wiki"}
         assert row["status_message"] is None
 
     def test_fts_search_returns_only_matching_rows(self, mm):
-        mm.add_chat_turn(task_id="t", role="user", content="tell me about zebras")
-        mm.add_chat_turn(task_id="t", role="assistant", content="zebras are striped equines")
-        mm.add_chat_turn(task_id="t", role="user", content="what is the capital of France")
+        mm.add_chat_turn(task_id="t", role="user", content="tell me about zebras", conversation_id="conv-1")
+        mm.add_chat_turn(task_id="t", role="assistant", content="zebras are striped equines", conversation_id="conv-1")
+        mm.add_chat_turn(task_id="t", role="user", content="what is the capital of France", conversation_id="conv-1")
 
         rows, total = mm.get_chat_turns(query="zebras")
 
@@ -407,8 +443,8 @@ class TestGetChatTurns:
         assert all("zebra" in r["content"].lower() for r in rows)
 
     def test_fts_search_ranks_best_match_first(self, mm):
-        mm.add_chat_turn(task_id="t", role="user", content="a passing mention of pangolins")
-        mm.add_chat_turn(task_id="t", role="assistant", content="pangolins pangolins pangolins")
+        mm.add_chat_turn(task_id="t", role="user", content="a passing mention of pangolins", conversation_id="conv-1")
+        mm.add_chat_turn(task_id="t", role="assistant", content="pangolins pangolins pangolins", conversation_id="conv-1")
 
         rows, total = mm.get_chat_turns(query="pangolins")
 
@@ -416,7 +452,7 @@ class TestGetChatTurns:
         assert rows[0]["content"] == "pangolins pangolins pangolins"
 
     def test_fts_search_no_match_returns_empty_not_error(self, mm):
-        mm.add_chat_turn(task_id="t", role="user", content="hello world")
+        mm.add_chat_turn(task_id="t", role="user", content="hello world", conversation_id="conv-1")
 
         rows, total = mm.get_chat_turns(query="nonexistentterm")
 
@@ -425,7 +461,7 @@ class TestGetChatTurns:
 
     def test_fts_search_pagination(self, mm):
         for i in range(5):
-            mm.add_chat_turn(task_id="t", role="user", content=f"widget number {i}")
+            mm.add_chat_turn(task_id="t", role="user", content=f"widget number {i}", conversation_id="conv-1")
 
         page1, total1 = mm.get_chat_turns(query="widget", limit=2, offset=0)
         page2, total2 = mm.get_chat_turns(query="widget", limit=2, offset=4)
@@ -443,9 +479,90 @@ class TestGetChatTurns:
         "col:value",
     ])
     def test_fts_special_characters_do_not_raise(self, mm, special_query):
-        mm.add_chat_turn(task_id="t", role="user", content="ordinary content")
+        mm.add_chat_turn(task_id="t", role="user", content="ordinary content", conversation_id="conv-1")
 
         rows, total = mm.get_chat_turns(query=special_query)
 
         assert isinstance(rows, list)
         assert isinstance(total, int)
+
+
+# ---------------------------------------------------------------------------
+# TestGetConversations — conversation summary path
+# (memory_manager.MemoryManager.get_conversations)
+# ---------------------------------------------------------------------------
+
+class TestGetConversations:
+
+    @pytest.fixture()
+    def mm(self, tmp_path) -> MemoryManager:
+        return MemoryManager(db_path=tmp_path / "get_conversations.db")
+
+    def test_multiple_conversations_return_one_row_each(self, mm):
+        mm.add_chat_turn(task_id="t1", role="user", content="hi",    conversation_id="conv-1")
+        mm.add_chat_turn(task_id="t2", role="user", content="hello", conversation_id="conv-2")
+        mm.add_chat_turn(task_id="t3", role="user", content="hey",   conversation_id="conv-3")
+
+        conversations = mm.get_conversations()
+
+        assert len(conversations) == 3
+        assert {c["conversation_id"] for c in conversations} == {"conv-1", "conv-2", "conv-3"}
+
+    def test_conversation_title_resolves_from_non_first_row(self, mm):
+        # The title is on the *middle* row by created_at — neither the
+        # earliest (MIN) nor the latest (MAX) row in the group — so this
+        # only passes if conversation_title is resolved via "any row with
+        # a non-null title" semantics, not by (accidentally or otherwise)
+        # tracking whichever of MIN/MAX(created_at) a query happens to key
+        # off of.
+        _insert_chat_turn_raw(
+            mm._db_path, conversation_id="conv-1", conversation_title=None,
+            created_at=100.0, content="earliest, no title",
+        )
+        _insert_chat_turn_raw(
+            mm._db_path, conversation_id="conv-1", conversation_title="Chosen Title",
+            created_at=200.0, content="middle, has title",
+        )
+        _insert_chat_turn_raw(
+            mm._db_path, conversation_id="conv-1", conversation_title=None,
+            created_at=300.0, content="latest, no title",
+        )
+
+        conversations = mm.get_conversations()
+
+        assert len(conversations) == 1
+        convo = conversations[0]
+        assert convo["conversation_id"]    == "conv-1"
+        assert convo["conversation_title"] == "Chosen Title"
+        assert convo["first_created_at"]   == 100.0
+        assert convo["last_created_at"]    == 300.0
+
+    def test_conversation_title_none_when_no_row_has_it(self, mm):
+        mm.add_chat_turn(task_id="t1", role="user",      content="hi",    conversation_id="legacy")
+        mm.add_chat_turn(task_id="t1", role="assistant", content="hello", conversation_id="legacy")
+
+        conversations = mm.get_conversations()
+
+        assert len(conversations) == 1
+        assert conversations[0]["conversation_id"]    == "legacy"
+        assert conversations[0]["conversation_title"] is None
+
+    def test_first_and_last_created_at_reflect_min_max_per_conversation(self, mm):
+        _insert_chat_turn_raw(mm._db_path, conversation_id="conv-1", conversation_title=None, created_at=10.0)
+        _insert_chat_turn_raw(mm._db_path, conversation_id="conv-1", conversation_title=None, created_at=30.0)
+        _insert_chat_turn_raw(mm._db_path, conversation_id="conv-1", conversation_title=None, created_at=20.0)
+
+        conversations = mm.get_conversations()
+
+        assert len(conversations) == 1
+        assert conversations[0]["first_created_at"] == 10.0
+        assert conversations[0]["last_created_at"]  == 30.0
+
+    def test_ordered_by_last_created_at_desc(self, mm):
+        _insert_chat_turn_raw(mm._db_path, conversation_id="conv-old", conversation_title=None, created_at=10.0)
+        _insert_chat_turn_raw(mm._db_path, conversation_id="conv-new", conversation_title=None, created_at=50.0)
+        _insert_chat_turn_raw(mm._db_path, conversation_id="conv-mid", conversation_title=None, created_at=30.0)
+
+        conversations = mm.get_conversations()
+
+        assert [c["conversation_id"] for c in conversations] == ["conv-new", "conv-mid", "conv-old"]

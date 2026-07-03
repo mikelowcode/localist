@@ -1,21 +1,14 @@
 <script lang="ts">
-  import ChatPanel from '$lib/components/ChatPanel.svelte';
+  import { onMount } from 'svelte';
+  import { get } from 'svelte/store';
+  import { goto } from '$app/navigation';
+  import { currentConversationId } from '$lib/stores/conversation';
+
+  // Redirect client-side (onMount + goto), not via a +page.ts load()/redirect() —
+  // currentConversationId is backed by localStorage, which only exists in the
+  // browser. A universal load() also runs during SSR, where it would see a
+  // fresh, non-persisted id and redirect to the wrong conversation.
+  onMount(() => {
+    goto(`/conversation/${get(currentConversationId)}`, { replaceState: true });
+  });
 </script>
-
-<svelte:head>
-  <title>Conversation — Localist</title>
-</svelte:head>
-
-<div class="page-inner">
-  <ChatPanel />
-</div>
-
-<style>
-  .page-inner {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    height: 100%;
-  }
-</style>
