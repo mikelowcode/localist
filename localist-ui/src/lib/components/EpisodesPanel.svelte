@@ -138,7 +138,8 @@
   .episodes-panel {
     display: flex;
     flex-direction: column;
-    height: 100%;
+    flex: 1;
+    min-height: 0;
     overflow: hidden;
   }
 
@@ -212,6 +213,7 @@
   /* Episode list */
   .episode-list {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     padding: var(--sp-4) var(--sp-6);
     display: flex;

@@ -13,7 +13,7 @@
 2. [Episodic Memory Schema](#2-episodic-memory-schema)
 3. [Unified Prompt Contract](#3-unified-prompt-contract)
 4. [Planner Routing Model](#4-planner-routing-model)
-5. [Fetcher Service](#5-fetcher-service)
+5. [Fetcher Service (Retired)](#5-fetcher-service-retired)
 6. [Build-Order Checklist](#6-build-order-checklist)
 7. [Localist UI](#7-localist-ui)
 8. [Graph Retrieval Layer](#8-graph-retrieval-layer)
@@ -22,6 +22,7 @@
 11. [Session File Attachments](#11-session-file-attachments)
 12. [Chat History Tab](#12-chat-history-tab)
 13. [Localist CLI (start_localist.sh)](#13-localist-cli-start_localistsh)
+14. [localist-mcp / MCP Tool Layer](#14-localist-mcp--mcp-tool-layer)
 
 ---
 
@@ -1570,23 +1571,35 @@ the same `RoutingPlan`. Both retrievals run before the agent call.
 
 ### 4.6 Tool Dispatcher
 
-The `ToolDispatcher` executes tool calls specified in a `RoutingPlan` and
-returns `ToolResult` objects for injection into Slot 5.
+> **Superseded (Phases 1–4, 2026-07-03).** `ToolDispatcher` (`tool_dispatcher.py`)
+> was the original in-process implementation described below through 2026-06-28.
+> It has been fully migrated to `MCPToolDispatcher` calling out to the
+> `localist-mcp` service over MCP, and the legacy class was deleted in Phase 4
+> once nothing referenced it. See §14 for the current architecture — this
+> section is kept as the historical record of the pre-MCP design.
+
+`MCPToolDispatcher` (`mcp_tool_dispatcher.py`) executes tool calls specified
+in a `RoutingPlan` and returns `ToolResult` objects for injection into
+Slot 5. All three registered tools are served by the `localist-mcp` MCP
+server (port 8003) — see §14 for the full tool contracts, transport, and
+error-shape details; the table below is kept at the same level of detail
+the original `ToolDispatcher` table had, pointed at the real
+implementation.
 
 **Registered tools:**
 
 | Tool name | Trigger | Implementation |
 |---|---|---|
-| `web_search` | P3 web keywords or P3b factual + corpus miss | LangSearch API (`https://api.langsearch.com/v1/web-search`). Returns top 3 results as formatted bullets. Falls back to inference stub when `LANGSEARCH_API_KEY` is absent. Max 3 queries per dispatch call. |
-| `file_op` | P3 file keywords (`"read the file"`, `"write"`, `"open the file"`, `"save"`, `"create a file"`) | Read, write, or append local files. All paths resolved relative to `project_root` and sandboxed — no path traversal outside `project_root` permitted. Max 4000 chars on read. |
-| `url_fetch` | P3 URL fetch keywords or any `https?://` URL in instruction | HTTP POST to Fetcher service `/extract` endpoint (`http://localhost:8002/extract`). Returns title, source URL, word count, and full extracted text. PromptBuilder enforces Slot 5 ceiling. |
+| `web_search` | P3 web keywords or P3b factual + corpus miss | MCP tool `web_search` on `localist-mcp` — LangSearch API (`https://api.langsearch.com/v1/web-search`), ported verbatim from the original implementation. Returns top 3 results as formatted bullets. Missing `LANGSEARCH_API_KEY` now raises a clean error (`success=False`) — the old inference-stub hallucination fallback was removed in Phase 3 (see §4.6.1). Max 3 queries per dispatch call. |
+| `file_op` | P3 file keywords (`"read the file"`, `"write"`, `"open the file"`, `"save"`, `"create a file"`) | MCP tools `read_file`/`write_file`/`append_file` on `localist-mcp`. Paths resolved relative to a sandbox root and validated — no path traversal outside it permitted. Max 4000 chars on read. |
+| `url_fetch` | P3 URL fetch keywords or any `https?://` URL in instruction | MCP tool `fetch_url` on `localist-mcp` — readability extraction ported in-process from the retired standalone Fetcher microservice (§5). Returns title, source URL, word count, and full extracted text. PromptBuilder enforces Slot 5 ceiling. |
 
-**LangSearch integration:**
+**LangSearch integration (unchanged request/response contract, now async):**
 - Endpoint: `POST https://api.langsearch.com/v1/web-search`
-- Auth: `Authorization: Bearer {LANGSEARCH_API_KEY}` (from `backend/.env`)
+- Auth: `Authorization: Bearer {LANGSEARCH_API_KEY}` (from `backend/.env`, loaded by `localist-mcp`'s own `load_dotenv()` call — a separate process from the main backend, so it does not inherit the backend's dotenv load)
 - Request: `{"query": q, "summary": true, "count": 3, "freshness": "noLimit"}`
 - Result format: `• {name}\n  {body[:300]}\n  [{displayUrl}]` per result
-- Key loaded via `load_dotenv()` at server startup in `main.py`
+- Call made via `httpx.AsyncClient`, not the legacy synchronous `requests` call
 
 #### 4.6.1 Corpus fallback on `web_search` failure (added 2026-06-28)
 
@@ -1596,7 +1609,35 @@ returns `ToolResult` objects for injection into Slot 5.
 
 **Step 3b in `_execute_plan()`.** Inserted between Step 3 (tool dispatch) and Step 4 (RAG fetch). If any dispatched result has `tool_name == "web_search"` and `success == False`, `_execute_plan()` calls `self._memory_manager.query_corpus()` directly using the original instruction (`max_results=3`, `use_embeddings=True`). Results with `relevance_score ≥ 0.55` that do not match `lora-persona.md` are wrapped as `RagSource` objects and injected into `rag_sources` — the same list that Step 4 populates for normal P4 routes, and that PromptBuilder reads as Slot 4 RAG context. The 0.55 threshold and persona-exclusion guard are identical to those applied in Step 4; corpus fallback is intentionally a like-for-like substitute for normal RAG grounding. If no results clear the threshold, `rag_sources` stays empty and the pipeline falls through unchanged to its existing honest "I don't have live results" framing. Scoped to `web_search` failures only — `file_op` and `url_fetch` failures are explicitly out of scope for this mechanism.
 
-**Verification status.** 436/436 tests passed before and after this change (confirmed by Claude Code). Live verification is partial: a LangSearch outage occurred once on the same day *before* this fix shipped (confirmed during fabrication-correction-fix testing) and once *after* it shipped, but the second occurrence was a LangSearch SUCCESS (3 real results returned), not a failure — the new fallback code path has **not yet been exercised under real failure conditions**. This is an open verification gap; the fix is not confirmed-working under live outage conditions.
+**Verification status (superseded — see update below).** 436/436 tests passed before and after this change (confirmed by Claude Code). Live verification is partial: a LangSearch outage occurred once on the same day *before* this fix shipped (confirmed during fabrication-correction-fix testing) and once *after* it shipped, but the second occurrence was a LangSearch SUCCESS (3 real results returned), not a failure — the new fallback code path has **not yet been exercised under real failure conditions**. This is an open verification gap; the fix is not confirmed-working under live outage conditions.
+
+#### 4.6.1 Update — Corpus Fallback Live-Verified Under Real Failure (2026-07-03)
+
+**The verification gap above is closed.** Phase 3 (web_search migration to
+`localist-mcp`, 2026-07-03) live-verified Step 3b end-to-end under a real
+failure condition: with `LANGSEARCH_API_KEY` forced empty, a `web_search`
+instruction produced `success=False`, `_execute_plan()`'s log confirmed
+`"web_search failed — corpus fallback found 3 relevant source(s)"`, and
+the assembled prompt's `[CONTEXT]` slot contained real indexed wiki
+content (`how-localist-works.md`) that visibly grounded the model's
+answer. Zero `runtime.infer()` calls occurred on this path, confirmed by
+log inspection between the tool failure and final prompt assembly.
+
+**Locked behavior change, not a preservation.** Prior to Phase 3, a missing
+`LANGSEARCH_API_KEY` triggered a fallback that called `runtime.infer()` to
+generate plausible-sounding bullet points and returned them as
+`success=True` — model-hallucinated content indistinguishable from a real
+search result to every downstream consumer, including this very corpus
+fallback (a hallucinated "success" would never have triggered Step 3b at
+all). That fallback was removed entirely in Phase 3: a missing API key now
+always produces a clean `success=False` `ToolResult`
+(`"ERROR: LANGSEARCH_API_KEY not configured"`), with no inference call
+anywhere on that path. This is what makes Step 3b reliably reachable under
+the exact condition it was designed for.
+
+Open Item 5 in §10.4 (SUCCESS with irrelevant results) is a distinct,
+still-open failure mode — see that section; it is not addressed by this
+update.
 
 ### 4.7 Gemma 4B Behavioral Constraints
 
@@ -1668,103 +1709,42 @@ as a risk for this failure mode, particularly at `temperature=0.0`.
 
 ---
 
-## 5. Fetcher Service
+## 5. Fetcher Service (Retired)
 
-### 5.1 Overview
+> **Retired in Phase 2 (2026-07-03).** The standalone Fetcher microservice
+> described below ran as a separate FastAPI process on port 8002 from
+> project inception through Phase 1. In Phase 2, its `/extract` path
+> (`client.py`'s `fetch()` + `extractor.py`'s `extract()`) was ported
+> verbatim, in-process, into the `fetch_url` MCP tool on `localist-mcp`
+> (port 8003) — see §14. `/fetch` (raw HTML) and `/api` (JSON passthrough)
+> were **not** ported: nothing in the codebase called them, and `url_fetch`
+> only ever needed `/extract`'s "get me readable content" behavior. The
+> standalone service, its directory (`backend/fetcher/`), and the
+> `LOCALIST_FETCHER_URL` environment variable were all deleted in Phase 4
+> once nothing referenced them. Port 8002 is unbound; `start_localist.sh`
+> no longer manages a fetcher process (§13).
 
-The Fetcher is a **standalone FastAPI microservice** running on port 8002.
-It is separate from the main LORA backend (port 8001) and has no shared
-code with it. The main backend's `ToolDispatcher` calls it over HTTP as
-part of `url_fetch` tool execution.
+This section is kept as the historical record of the pre-Phase-2 design,
+in case any of its implementation notes are useful for a future standalone
+service. It no longer describes anything live in the running system.
 
-**Start command (from `backend/` with venv activated):**
-```bash
-python -m uvicorn fetcher.main:app --host 127.0.0.1 --port 8002 --reload
-```
+**What it was:** a standalone FastAPI microservice on port 8002 with three
+endpoints — `POST /fetch` (raw HTML fetch, for debugging), `POST /extract`
+(fetch + `readability-lxml` extraction — the one `ToolDispatcher`'s
+`url_fetch` actually called), and `POST /api` (strict JSON REST passthrough).
+Error handling used a structured `ErrorResponse` with an `error_code`
+taxonomy (`connection_error`, `timeout`, `http_client_error`,
+`http_server_error`, `extraction_failed`, `not_json`) — that same taxonomy
+(minus `not_json`, since `/api` was never ported) is preserved in
+`fetch_url`'s error shape today; see §14.
 
-**Directory layout:**
-```
-backend/fetcher/
-├── __init__.py      (empty)
-├── main.py          FastAPI app, lifespan, three endpoints
-├── models.py        Pydantic request/response models
-├── extractor.py     readability-lxml + lxml.html extraction logic
-└── client.py        httpx async fetch logic
-```
-
-**Dependencies:** `httpx`, `readability-lxml`, `lxml` (all in venv).
-
-### 5.2 Endpoints
-
-**`POST /fetch`** — Raw HTTP fetch.
-Returns status code, content-type, raw HTML, and response headers.
-Used for debugging and inspection.
-
-```
-Request:  FetchRequest  { url, timeout=10.0, headers={} }
-Response: FetchResponse { url, status_code, content_type, html,
-                          headers, fetch_duration_ms }
-```
-
-**`POST /extract`** — Fetch + readability extraction.
-Primary endpoint called by `ToolDispatcher`. Returns cleaned article text.
-Full content returned — PromptBuilder enforces Slot 5 truncation.
-
-```
-Request:  ExtractRequest  { url, timeout=10.0 }
-Response: ExtractResponse { url, title, author, date_published,
-                            cleaned_text, word_count,
-                            fetch_duration_ms, extractor_used }
-```
-
-**`POST /api`** — JSON REST endpoint fetch.
-Strictly for `application/json` responses. Returns parsed JSON data.
-Returns HTTP 422 if content-type is not `application/json`.
-
-```
-Request:  ApiRequest  { url, timeout=10.0, headers={} }
-Response: ApiResponse { url, status_code, content_type, data,
-                        fetch_duration_ms }
-```
-
-**`GET /health`** — Service health check.
-Returns `{"healthy": true, "service": "localist-fetcher", "port": 8002}`.
-
-### 5.3 Error Handling
-
-All endpoints return structured `ErrorResponse` on failure. Never raises
-through the endpoint boundary.
-
-| Condition | `error_code` | HTTP status |
-|---|---|---|
-| DNS / connection failure | `connection_error` | 502 |
-| Timeout | `timeout` | 504 |
-| HTTP 4xx from target | `http_client_error` | 502 |
-| HTTP 5xx from target | `http_server_error` | 502 |
-| Readability extraction failed | `extraction_failed` | 422 |
-| Non-JSON response on `/api` | `not_json` | 422 |
-
-### 5.4 Implementation Notes
-
-- **`readability-lxml` 0.8.4.1** expects a decoded string, not bytes.
-  `html.decode("utf-8", errors="replace")` is applied before passing to
-  `Document()`.
-- **Browser-like User-Agent** is set in `client.py` to reduce bot-blocking
-  on common sites.
-- **Async model:** `httpx.AsyncClient` with `follow_redirects=True`. The
-  service runs its own uvicorn event loop entirely independently of the
-  main backend.
-- **URL fetch UX note:** The URL regex in `_priority3_tool()` fires on any
-  `http://` or `https://` in the instruction, enabling drop-a-link UX.
-  Edge case: "what's the difference between http and https?" will also
-  trigger `url_fetch`. Monitor in practice; fix if it becomes noisy by
-  requiring explicit keyword + URL rather than either/or.
-
-### 5.5 Environment Variable
-
-```
-LOCALIST_FETCHER_URL=http://localhost:8002   # in backend/.env
-```
+Implementation notes worth preserving: `readability-lxml` 0.8.4.1 expects a
+decoded string, not bytes (`html.decode("utf-8", errors="replace")` before
+`Document()`); a browser-like User-Agent reduces bot-blocking; the URL
+regex in Planner's `_priority3_tool()` fires on any `http://`/`https://` in
+the instruction, so "what's the difference between http and https?" also
+triggers `url_fetch` — an edge case still present today, unrelated to the
+retirement, worth monitoring if it becomes noisy.
 
 ---
 
@@ -4603,19 +4583,25 @@ No frontend test coverage was added (§12.7, Open Item 3).
 ### 13.1 Overview
 
 `start_localist.sh` manages three local services as a single lifecycle unit:
-backend (FastAPI/uvicorn, port 8001), fetcher (FastAPI/uvicorn, port 8002),
-and the Localist UI dev server (SvelteKit/Vite, port 5173). All three start
-together, log to `logs/backend.log`, `logs/fetcher.log`, and
+backend (FastAPI/uvicorn, port 8001), `localist-mcp` (FastAPI/uvicorn, port
+8003), and the Localist UI dev server (SvelteKit/Vite, port 5173). All
+three start together, log to `logs/backend.log`, `logs/mcp_server.log`, and
 `logs/frontend.log` with prefixed interleaved tailing, and stop together on
 Ctrl+C or via `./start_localist.sh --stop`. The inference engine (oMLX,
 MLX-LM, Ollama, LM Studio, etc.) remains managed separately, per the
 existing engine-agnostic design principle (§1).
 
+> **Note:** through Phase 1, this script managed a third service — the
+> standalone Fetcher microservice on port 8002 — in place of `localist-mcp`.
+> Phase 2 retired the Fetcher (§5) and swapped it for `localist-mcp`; see
+> §14 for what that service does.
+
 ### 13.2 Service Launch
 
-Backend and fetcher both run from `cwd = backend/` — required for import
-resolution (`main:app` and `fetcher.main:app`). The frontend runs from
-`localist-ui/` via a subshell, so it doesn't disturb that shared `cwd`.
+Backend and `localist-mcp` both run from `cwd = backend/` — required for
+import resolution (`main:app` and `mcp_server.main:app`). The frontend
+runs from `localist-ui/` via a subshell, so it doesn't disturb that shared
+`cwd`.
 
 Preflight checks confirm `backend/.venv/bin/python` and
 `localist-ui/node_modules` exist before launch, failing fast with a
@@ -4623,16 +4609,16 @@ remediation command if either is missing.
 
 ### 13.3 Reload Directory Scoping
 
-Backend's uvicorn invocation passes `--reload-exclude 'fetcher/*'`;
-fetcher's passes `--reload-dir fetcher`. Effect: editing backend code
-reloads only the backend process; editing `backend/fetcher/*.py` reloads
-only the fetcher process. Both processes still resolve imports from
-`cwd = backend/` — only the reload-watch scope is separated.
+Backend's uvicorn invocation passes `--reload-exclude 'mcp_server/*'`;
+`localist-mcp`'s passes `--reload-dir mcp_server`. Effect: editing backend
+code reloads only the backend process; editing `backend/mcp_server/*.py`
+reloads only the `localist-mcp` process. Both processes still resolve
+imports from `cwd = backend/` — only the reload-watch scope is separated.
 
 Design constraint to revisit if it becomes relevant: the current glob-based
-exclude only matches direct children of `fetcher/`, not deeper nested
-paths. If `backend/fetcher/` grows subpackages, this scoping will need to
-be revisited.
+exclude only matches direct children of `mcp_server/`, not deeper nested
+paths. If `backend/mcp_server/` grows subpackages, this scoping will need
+to be revisited.
 
 ### 13.4 Port Configuration
 
@@ -4646,6 +4632,165 @@ assumptions (`--stop`, preflight warnings, banner URL) stay valid.
 This tooling has no automated test suite. Verification is live/manual:
 service startup, log prefixing, Ctrl+C/`--stop` cleanup, and reload-scope
 isolation.
+
+---
+
+## 14. localist-mcp / MCP Tool Layer
+
+### 14.1 Overview
+
+`localist-mcp` is a standalone service on **port 8003**, built on the
+official `mcp` Python SDK's `FastMCP`, mounted inside a FastAPI app
+(`backend/mcp_server/main.py`) the same way the rest of the backend mounts
+FastAPI — logger setup, CORS for local-only access, startup/shutdown
+logging. It exposes tools over **MCP's SSE transport** (`GET /sse`,
+`POST /messages/`, both mounted from `FastMCP.sse_app()`) plus a plain
+`GET /health` returning `{"status": "ok"}`.
+
+This is where `file_op`, `url_fetch`, and `web_search` actually execute.
+`MCPToolDispatcher` (`backend/mcp_tool_dispatcher.py`) is the client —
+`controller_agent.py`'s `_execute_plan()` constructs one per dispatch call
+(the same single seam `ToolDispatcher` used to occupy) and calls it over
+an MCP `ClientSession` per tool invocation.
+
+Built across four phases (all 2026-07-03): Phase 1 migrated `file_op` and
+stood up the service; Phase 2 added `fetch_url`, retiring the standalone
+Fetcher microservice (§5); Phase 3 added `web_search`, retiring the
+`runtime.infer()` hallucination fallback for a missing API key (§4.6.1);
+Phase 4 deleted the now-fully-superseded `ToolDispatcher` class and
+brought this document back in sync.
+
+### 14.2 Tools
+
+| MCP tool | Backing module | Signature | Returns |
+|---|---|---|---|
+| `read_file` | `mcp_server/file_ops.py` | `(path: str) -> str` | File content (max 4000 chars, `"\n… [truncated]"` suffix if longer) |
+| `write_file` | `mcp_server/file_ops.py` | `(path: str, content: str) -> str` | `"OK: wrote {n} characters to {name}"` |
+| `append_file` | `mcp_server/file_ops.py` | `(path: str, content: str) -> str` | `"OK: appended {n} characters to {name}"` |
+| `fetch_url` | `mcp_server/url_fetch.py` | `(url: str, timeout: float = 10.0) -> dict` | `{url, title, author, date_published, cleaned_text, word_count, fetch_duration_ms}` |
+| `web_search` | `mcp_server/web_search.py` | `(query: str) -> dict` | `{query, result_text, result_count}` — `result_text` is the formatted bullet block, or `"No results found."` |
+
+**`file_op` sandboxing:** every path is resolved against a sandbox root
+and rejected if the resolved absolute path escapes it — same check
+`ToolDispatcher._run_file_op` used to perform, now server-side. The root
+is configurable via `LOCALIST_MCP_PROJECT_ROOT` (default: `backend/`, the
+parent of `mcp_server/`).
+
+**`fetch_url` error taxonomy** (ported from the retired Fetcher's
+`ErrorResponse.error_code`, minus `not_json` since `/api` was never
+ported): `connection_error`, `timeout`, `http_client_error`,
+`http_server_error`, `extraction_failed`. Timeout is clamped to 1.0–30.0s,
+same bounds the Fetcher's `ExtractRequest` validator used.
+
+**`web_search`** requires `LANGSEARCH_API_KEY` (from `backend/.env` —
+`localist-mcp` calls `load_dotenv()` itself, since it's a separate process
+from the main backend and does not inherit its dotenv load). A missing or
+empty key raises immediately with no network call and no inference
+fallback (§4.6.1). LangSearch request/response handling is unchanged from
+the original `ToolDispatcher` implementation, just async (`httpx`, not
+`requests`).
+
+All three failure-capable tools raise on error rather than returning a
+success-shaped result — this is what lets the MCP protocol layer set
+`isError=True` on the client's `CallToolResult`, the mechanism
+`MCPToolDispatcher` depends on to distinguish success from failure (see
+§14.3).
+
+### 14.3 MCPToolDispatcher
+
+Same public signature the original `ToolDispatcher` had
+(`dispatch(tools_to_call, instruction, context) -> list[ToolResult]`), so
+`controller_agent.py`'s dispatch seam needed only a one-line swap in
+Phase 1. Internally:
+
+- **`file_op`** — `file_op_action`/`file_op_path`/`file_op_content` from
+  `context` map to `read_file`/`write_file`/`append_file`.
+- **`url_fetch`** — URL resolved from `context["fetch_url"]` or a
+  `https?://` regex over the instruction (same pattern the legacy
+  `_run_url_fetch` used), then calls `fetch_url`.
+- **`web_search`** — query resolution ported verbatim from the legacy
+  `_run_web_search`: explicit `context["web_search_queries"]` (max 3 used)
+  if present, else derived from the instruction by stripping known filler
+  prefixes (`"what is the "`, `"search for "`, etc.) and taking the first
+  120 characters. Calls `web_search` once per resolved query, up to 3.
+- **Any other tool name** — Planner never routes `tools_to_call` to
+  anything but the three above (see §4.2's priority tree), so this is an
+  unreachable-in-practice defensive path. Produces an inline
+  `ToolResult(success=False, result="ERROR: unknown tool '<name>'")` — the
+  one surviving fragment of the legacy `ToolDispatcher`'s "else" branch,
+  ported inline once the class it lived in was deleted (Phase 4).
+
+**Error-shape translation — `_normalize_mcp_error_text()`.** FastMCP wraps
+every raised tool exception as `"Error executing tool <name>: <message>"`
+(an MCP SDK implementation detail, `mcp/server/fastmcp/tools/base.py`).
+Since every tool here raises `"ERROR: ..."`-prefixed messages,
+`_normalize_mcp_error_text()` strips that wrapper back down to the bare
+`"ERROR: ..."` string before it reaches `ToolResult.result` — this is what
+keeps `controller_agent.py`'s existing `startswith("ERROR:")` slot-6
+filter working unmodified. Discovered as a live-verification gap in the
+Phase 1 follow-up (file_op's traversal error was leaking into slot 5
+mid-prefixed with the FastMCP wrapper) and fixed once, reused unchanged by
+`url_fetch` and `web_search` in the phases after.
+
+**`success` is always explicit.** Every `ToolResult` constructed by
+`MCPToolDispatcher` sets `success` explicitly — never relies on the
+dataclass's `True` default. This was a known gap in the legacy
+`ToolDispatcher` (several error paths, including the unknown-tool branch,
+never set `success=False`) and is fixed across the board here, which is
+what makes §4.6.1's corpus fallback (`Step 3b` checking
+`tool_name == "web_search" and not r.success`) reliable.
+
+**Connection failure.** If `localist-mcp` is unreachable, `dispatch()`
+catches the exception and returns `ToolResult(success=False, result="ERROR: localist-mcp unreachable — {exc}")`
+rather than raising — `controller_agent.py`'s try/except around dispatch
+is a safety net, not the primary handling path.
+
+### 14.4 Configuration
+
+```
+LOCALIST_MCP_URL             Override the localist-mcp SSE endpoint,
+                              read by MCPToolDispatcher (client side).
+                              Default: http://localhost:8003 (+ "/sse")
+
+LOCALIST_MCP_PROJECT_ROOT    file_op sandbox root, read by localist-mcp
+                              itself (server side).
+                              Default: backend/ (parent of mcp_server/)
+
+LANGSEARCH_API_KEY           Required for web_search. Read from
+                              backend/.env via localist-mcp's own
+                              load_dotenv() call.
+
+LOCALIST_LOG_LEVEL           localist-mcp's root log level. Default: INFO.
+```
+
+`LOCALIST_FETCHER_URL` (§5) is gone — nothing reads it anymore.
+
+### 14.5 Port Topology
+
+| Port | Service | Status |
+|---|---|---|
+| 8000 | Inference engine (oMLX, or whichever backend is configured) | Managed separately (§1) |
+| 8001 | Main backend (FastAPI) | Active |
+| 8002 | Fetcher microservice | **Retired** (§5) — unbound |
+| 8003 | `localist-mcp` | Active |
+| 5173 | Localist UI (SvelteKit/Vite) | Active |
+
+### 14.6 Test Coverage
+
+- `backend/tests/test_mcp_server.py` — direct unit tests for
+  `file_ops`/`url_fetch`/`web_search` plus in-process MCP client session
+  tests (`mcp.shared.memory.create_connected_server_and_client_session`)
+  against the real `FastMCP` instance, no network server required.
+- `backend/tests/test_mcp_tool_dispatcher.py` — `MCPToolDispatcher` unit
+  tests with `_call_mcp_tool` monkeypatched (success/error/connection-
+  failure paths for all three tools, plus the unknown-tool path).
+- `backend/tests/test_tool_dispatcher_phase6.py`'s
+  `TestControllerToolIntegration` class — real subprocess round trips via
+  a `localist-mcp` fixture (`localist_mcp_server` /
+  `localist_mcp_server_no_langsearch_key`), including the Step 3b corpus
+  fallback proof (§4.6.1).
+- Live verification for each phase is recorded in `sessions-log.md` under
+  2026-07-03.
 
 ---
 

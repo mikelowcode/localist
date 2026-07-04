@@ -241,7 +241,8 @@
   .research-panel {
     display: flex;
     flex-direction: column;
-    height: 100%;
+    flex: 1;
+    min-height: 0;
     overflow: hidden;
   }
 
@@ -321,6 +322,7 @@
   /* ── Results ───────────────────────────────── */
   .results-area {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     padding: var(--sp-6) var(--sp-8);
   }

@@ -1,13 +1,15 @@
 """
 Phase 6 integration tests — LORA Tool Dispatcher.
 
-Covers:
-  6.1 — ToolDispatcher interface: dispatch(), unknown tool error
-  6.2 — web_search: fallback infer path, real web_search method path,
-         explicit query list, max-3 enforcement, failure graceful degradation
-  6.3 — file_op: read, write, append, truncation, path traversal sandbox,
-         missing path error, missing file error, unknown action error,
-         parent directory auto-creation
+Originally covered the legacy ToolDispatcher class directly (6.1
+interface, 6.2 web_search, 6.3 file_op) plus 6.4 ControllerAgent wiring.
+ToolDispatcher was deleted in Phase 4 (cleanup, 2026-07-03) once file_op,
+url_fetch, and web_search were all first-class in MCPToolDispatcher —
+6.1/6.2/6.3 were tests of that now-deleted class and were removed with it.
+Direct unit coverage of MCPToolDispatcher and the localist-mcp MCP server
+now lives in test_mcp_tool_dispatcher.py and test_mcp_server.py
+respectively (Phases 1-3). What remains here is 6.4 only:
+
   6.4 — ControllerAgent wiring:
          [TOOL RESULTS] slot in prebuilt prompt when tool fires
          Slot ordering: [TOOL RESULTS] < [INSTRUCTION]
@@ -16,37 +18,32 @@ Covers:
          Quality filter: ERROR/repr/short strings excluded from slot 6
          Ingest path (P1) produces no tool results even when tool keyword present
            unless compound detection fires
+         file_op / web_search real MCP round trips (Phase 1 follow-up, Phase 3)
 
-All ToolDispatcher tests use tmp_path for file_op. Runtime calls use MagicMock.
 ControllerAgent tests use a real SQLite DB via tmp_path.
 """
 
+import json
+import logging
+import os
+import socket
+import subprocess
+import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
-from tool_dispatcher import ToolDispatcher, _MAX_FILE_READ_CHARS, _MAX_WEB_QUERIES
-from prompt_builder import ToolResult, PromptBuilder
 from controller_agent import ControllerAgent, TaskStatus, AgentResult
+from mcp_tool_dispatcher import MCPToolDispatcher
 from memory_manager import MemoryManager
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-
-@pytest.fixture()
-def tmp_root(tmp_path: Path) -> Path:
-    return tmp_path
-
-
-@pytest.fixture()
-def td(tmp_root: Path) -> ToolDispatcher:
-    rt = MagicMock(spec=["infer"])
-    rt.infer.return_value = "• Fallback result."
-    return ToolDispatcher(runtime=rt, project_root=tmp_root)
-
 
 @pytest.fixture()
 def db_path(tmp_path: Path) -> Path:
@@ -58,6 +55,127 @@ def db_path(tmp_path: Path) -> Path:
 @pytest.fixture()
 def mm(db_path: Path) -> MemoryManager:
     return MemoryManager(db_path=db_path)
+
+
+@pytest.fixture()
+def localist_mcp_server(tmp_path: Path):
+    """
+    Start a real localist-mcp (FastAPI + FastMCP) server as a subprocess,
+    sandboxed to tmp_path, for the duration of one test. Torn down after.
+
+    Used by test_file_op_results_appear_in_prompt to exercise the real MCP
+    round trip instead of assuming synchronous in-process file_op — see
+    sessions-log.md, 2026-07-03, Phase 1 follow-up.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    backend_dir = Path(__file__).resolve().parent.parent
+    env = {**os.environ, "LOCALIST_MCP_PROJECT_ROOT": str(tmp_path),
+           "LOCALIST_LOG_LEVEL": "WARNING"}
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "mcp_server.main:app",
+         "--host", "127.0.0.1", "--port", str(port)],
+        cwd     = str(backend_dir),
+        env     = env,
+        stdout  = subprocess.DEVNULL,
+        stderr  = subprocess.DEVNULL,
+    )
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        deadline = time.time() + 15
+        healthy  = False
+        while time.time() < deadline:
+            try:
+                if requests.get(f"{base_url}/health", timeout=1.0).status_code == 200:
+                    healthy = True
+                    break
+            except requests.RequestException:
+                pass
+            time.sleep(0.2)
+
+        if not healthy:
+            proc.terminate()
+            proc.wait(timeout=5)
+            pytest.fail("localist-mcp test server did not become healthy in time.")
+
+        yield base_url
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+@pytest.fixture()
+def localist_mcp_server_no_langsearch_key(tmp_path: Path):
+    """
+    Same as localist_mcp_server, but LANGSEARCH_API_KEY is forced empty in
+    the subprocess's environment — a separate fixture rather than a
+    parameter on the existing one so the file_op fixture stays untouched.
+
+    Set to "" rather than popped: mcp_server/main.py calls load_dotenv() on
+    import (needed so the real service picks up LANGSEARCH_API_KEY from
+    backend/.env when launched normally), and load_dotenv()'s default
+    override=False only skips keys already present in the environment —
+    an *absent* key would get silently reloaded from backend/.env in this
+    subprocess, defeating the point of this fixture. An empty string is
+    "present," so it survives, and web_search.py's `if not api_key` check
+    treats "" the same as absent.
+
+    Used by test_web_search_missing_key_triggers_corpus_fallback (Phase 3)
+    to prove controller_agent.py's Step 3b corpus fallback — see
+    sessions-log.md, 2026-07-03, Phase 3.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    backend_dir = Path(__file__).resolve().parent.parent
+    env = {**os.environ, "LOCALIST_MCP_PROJECT_ROOT": str(tmp_path),
+           "LOCALIST_LOG_LEVEL": "WARNING"}
+    env["LANGSEARCH_API_KEY"] = ""
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "mcp_server.main:app",
+         "--host", "127.0.0.1", "--port", str(port)],
+        cwd     = str(backend_dir),
+        env     = env,
+        stdout  = subprocess.DEVNULL,
+        stderr  = subprocess.DEVNULL,
+    )
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        deadline = time.time() + 15
+        healthy  = False
+        while time.time() < deadline:
+            try:
+                if requests.get(f"{base_url}/health", timeout=1.0).status_code == 200:
+                    healthy = True
+                    break
+            except requests.RequestException:
+                pass
+            time.sleep(0.2)
+
+        if not healthy:
+            proc.terminate()
+            proc.wait(timeout=5)
+            pytest.fail("localist-mcp test server did not become healthy in time.")
+
+        yield base_url
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
 
 
 def make_conv_agent(answer="Test answer."):
@@ -79,305 +197,57 @@ def make_conv_agent(answer="Test answer."):
 
 
 # ---------------------------------------------------------------------------
-# 6.1 — ToolDispatcher interface
-# ---------------------------------------------------------------------------
-
-class TestToolDispatcherInterface:
-
-    def test_dispatch_returns_list(self, td):
-        results = td.dispatch(["web_search"], "What is LORA?")
-        assert isinstance(results, list)
-
-    def test_dispatch_returns_tool_result_instances(self, td):
-        results = td.dispatch(["web_search"], "What is LORA?")
-        assert all(isinstance(r, ToolResult) for r in results)
-
-    def test_unknown_tool_returns_error(self, td):
-        results = td.dispatch(["unknown_tool"], "test")
-        assert len(results) == 1
-        assert results[0].tool_name  == "unknown_tool"
-        assert results[0].result.startswith("ERROR:")
-
-    def test_multiple_tools_dispatched_in_order(self, tmp_root):
-        rt = MagicMock(spec=["infer"])
-        rt.infer.return_value = "• Search result."
-        td = ToolDispatcher(runtime=rt, project_root=tmp_root)
-
-        # Write a file to read
-        (tmp_root / "notes.md").write_text("Note content.", encoding="utf-8")
-
-        results = td.dispatch(
-            tools_to_call = ["web_search", "file_op"],
-            instruction   = "search and read",
-            context       = {
-                "file_op_action": "read",
-                "file_op_path":   "notes.md",
-            },
-        )
-        assert len(results) == 2
-        assert results[0].tool_name == "web_search"
-        assert results[1].tool_name == "file_op"
-
-    def test_empty_tools_list_returns_empty(self, td):
-        results = td.dispatch([], "test")
-        assert results == []
-
-
-# ---------------------------------------------------------------------------
-# 6.2 — web_search tool
-# ---------------------------------------------------------------------------
-
-class TestWebSearch:
-
-    def test_fallback_infer_path(self, tmp_root):
-        rt = MagicMock(spec=["infer"])   # no web_search method
-        rt.infer.return_value = "• oMLX 0.4.2 released."
-        td = ToolDispatcher(runtime=rt, project_root=tmp_root)
-
-        results = td.dispatch(["web_search"], "latest oMLX release")
-        assert results[0].tool_name == "web_search"
-        assert "oMLX" in results[0].result
-        assert rt.infer.called
-
-    def test_langsearch_api_called_when_key_set(self, tmp_root):
-        rt = MagicMock()
-        fake_response = MagicMock()
-        fake_response.json.return_value = {
-            "data": {
-                "webPages": {
-                    "value": [
-                        {
-                            "name": "oMLX Release",
-                            "snippet": "Latest oMLX release notes.",
-                            "displayUrl": "example.com/omlx",
-                            "summary": None,
-                        }
-                    ]
-                }
-            }
-        }
-        fake_response.raise_for_status = MagicMock()
-        td = ToolDispatcher(runtime=rt, project_root=tmp_root)
-
-        with patch.dict("os.environ", {"LANGSEARCH_API_KEY": "test-key"}):
-            with patch("requests.post", return_value=fake_response) as mock_post:
-                results = td.dispatch(["web_search"], "latest oMLX release")
-
-        assert mock_post.called
-        assert "oMLX Release" in results[0].result
-        assert not rt.infer.called
-
-    def test_explicit_queries_from_context(self, tmp_root):
-        rt = MagicMock(spec=["infer"])
-        rt.infer.return_value = "Result."
-        td = ToolDispatcher(runtime=rt, project_root=tmp_root)
-
-        results = td.dispatch(
-            tools_to_call = ["web_search"],
-            instruction   = "search",
-            context       = {
-                "web_search_queries": ["query A", "query B", "query C"]
-            },
-        )
-        assert len(results) == 3
-        assert rt.infer.call_count == 3
-
-    def test_max_queries_enforced(self, tmp_root):
-        rt = MagicMock(spec=["infer"])
-        rt.infer.return_value = "Result."
-        td = ToolDispatcher(runtime=rt, project_root=tmp_root)
-
-        results = td.dispatch(
-            tools_to_call = ["web_search"],
-            instruction   = "search",
-            context       = {
-                "web_search_queries": [
-                    "q1", "q2", "q3", "q4", "q5"
-                ]
-            },
-        )
-        assert len(results) == _MAX_WEB_QUERIES
-        assert rt.infer.call_count == _MAX_WEB_QUERIES
-
-    def test_query_derived_from_instruction(self, tmp_root):
-        rt = MagicMock(spec=["infer"])
-        rt.infer.return_value = "Result."
-        td = ToolDispatcher(runtime=rt, project_root=tmp_root)
-
-        td.dispatch(["web_search"], "What are the latest oMLX changes?")
-        # One infer call with query derived from instruction
-        assert rt.infer.call_count == 1
-        call_prompt = rt.infer.call_args.kwargs.get("prompt") or \
-                      rt.infer.call_args.args[0]
-        assert "oMLX" in call_prompt or "latest" in call_prompt.lower()
-
-    def test_inference_failure_returns_error_result(self, tmp_root):
-        rt = MagicMock(spec=["infer"])
-        rt.infer.side_effect = Exception("model offline")
-        td = ToolDispatcher(runtime=rt, project_root=tmp_root)
-
-        results = td.dispatch(["web_search"], "test query")
-        assert len(results) == 1
-        assert results[0].result.startswith("ERROR:")
-
-    def test_fallback_uses_correct_max_tokens(self, tmp_root):
-        rt = MagicMock(spec=["infer"])
-        rt.infer.return_value = "Result."
-        td = ToolDispatcher(runtime=rt, project_root=tmp_root)
-        td.dispatch(["web_search"], "test")
-
-        call_kwargs = rt.infer.call_args.kwargs
-        assert call_kwargs.get("max_tokens", 0) <= 120
-
-
-# ---------------------------------------------------------------------------
-# 6.3 — file_op tool
-# ---------------------------------------------------------------------------
-
-class TestFileOp:
-
-    def test_read_existing_file(self, td, tmp_root):
-        f = tmp_root / "notes.md"
-        f.write_text("Hello, LORA.", encoding="utf-8")
-
-        results = td.dispatch(
-            ["file_op"], "read notes",
-            context={"file_op_action": "read", "file_op_path": "notes.md"},
-        )
-        assert "Hello, LORA." in results[0].result
-
-    def test_read_nonexistent_file_returns_error(self, td):
-        results = td.dispatch(
-            ["file_op"], "read missing",
-            context={"file_op_action": "read", "file_op_path": "ghost.md"},
-        )
-        assert results[0].result.startswith("ERROR:")
-        assert "not found" in results[0].result
-
-    def test_write_creates_file(self, td, tmp_root):
-        results = td.dispatch(
-            ["file_op"], "write output",
-            context={
-                "file_op_action":  "write",
-                "file_op_path":    "out/result.md",
-                "file_op_content": "# Result\nContent here.",
-            },
-        )
-        assert "OK:" in results[0].result
-        assert (tmp_root / "out" / "result.md").exists()
-        assert "Content here." in (tmp_root / "out" / "result.md").read_text()
-
-    def test_write_creates_parent_directories(self, td, tmp_root):
-        td.dispatch(
-            ["file_op"], "write nested",
-            context={
-                "file_op_action":  "write",
-                "file_op_path":    "a/b/c/deep.md",
-                "file_op_content": "Deep content.",
-            },
-        )
-        assert (tmp_root / "a" / "b" / "c" / "deep.md").exists()
-
-    def test_append_adds_to_existing_file(self, td, tmp_root):
-        f = tmp_root / "log.txt"
-        f.write_text("Line 1.\n", encoding="utf-8")
-
-        td.dispatch(
-            ["file_op"], "append",
-            context={
-                "file_op_action":  "append",
-                "file_op_path":    "log.txt",
-                "file_op_content": "Line 2.\n",
-            },
-        )
-        assert f.read_text() == "Line 1.\nLine 2.\n"
-
-    def test_append_creates_file_if_absent(self, td, tmp_root):
-        td.dispatch(
-            ["file_op"], "append to new",
-            context={
-                "file_op_action":  "append",
-                "file_op_path":    "new_log.txt",
-                "file_op_content": "First line.\n",
-            },
-        )
-        assert (tmp_root / "new_log.txt").read_text() == "First line.\n"
-
-    def test_read_truncates_large_file(self, td, tmp_root):
-        big = tmp_root / "big.txt"
-        big.write_text("A" * (_MAX_FILE_READ_CHARS + 1000), encoding="utf-8")
-
-        results = td.dispatch(
-            ["file_op"], "read big",
-            context={"file_op_action": "read", "file_op_path": "big.txt"},
-        )
-        assert "[truncated]" in results[0].result
-        # Result must not exceed budget (with small suffix tolerance)
-        assert len(results[0].result) <= _MAX_FILE_READ_CHARS + 30
-
-    def test_read_does_not_truncate_small_file(self, td, tmp_root):
-        small = tmp_root / "small.txt"
-        content = "Short content."
-        small.write_text(content, encoding="utf-8")
-
-        results = td.dispatch(
-            ["file_op"], "read small",
-            context={"file_op_action": "read", "file_op_path": "small.txt"},
-        )
-        assert "[truncated]" not in results[0].result
-        assert content in results[0].result
-
-    def test_path_traversal_blocked(self, td):
-        results = td.dispatch(
-            ["file_op"], "read secret",
-            context={
-                "file_op_action": "read",
-                "file_op_path":   "../../etc/passwd",
-            },
-        )
-        assert results[0].result.startswith("ERROR:")
-        assert "traversal" in results[0].result
-
-    def test_missing_file_op_path_returns_error(self, td):
-        results = td.dispatch(
-            ["file_op"], "read something",
-            context={"file_op_action": "read"},   # no file_op_path
-        )
-        assert results[0].result.startswith("ERROR:")
-
-    def test_unknown_action_returns_error(self, td, tmp_root):
-        results = td.dispatch(
-            ["file_op"], "do something weird",
-            context={
-                "file_op_action": "delete",
-                "file_op_path":   "notes.md",
-            },
-        )
-        assert results[0].result.startswith("ERROR:")
-        assert "unknown" in results[0].result.lower()
-
-
-# ---------------------------------------------------------------------------
 # 6.4 — ControllerAgent integration
 # ---------------------------------------------------------------------------
 
 class TestControllerToolIntegration:
 
     def test_tool_results_slot_present_in_prompt(self, mm):
+        """
+        web_search success result flows through to [TOOL RESULTS] slot.
+
+        Originally exercised the runtime.infer() hallucination fallback for
+        a missing LANGSEARCH_API_KEY — that fallback was removed in Phase 3
+        (web_search migration, 2026-07-03; see sessions-log.md), so this now
+        patches MCPToolDispatcher._call_mcp_tool to simulate a successful
+        MCP round trip instead, same idiom as test_mcp_tool_dispatcher.py.
+
+        Also patches _open_session (the MCP follow-up's per-dispatch
+        session-reuse seam, 2026-07-03) so this stays a pure unit test —
+        without it, dispatch() would attempt a real SSE connection before
+        ever reaching the mocked _call_mcp_tool.
+        """
         rt = MagicMock(spec=["infer", "embed"])
         rt.embed.return_value = [0.0] * 768
         rt.infer.side_effect = [
-            "no",    # P5 episodic relevance
-            "• oMLX 0.4.2 released.\n• Supports Gemma 4B quantized.",  # web_search
+            "no",    # pre-dispatch episodic check
             "NONE",  # implicit extraction
         ]
 
+        async def fake_open_session(stack):
+            return object()
+
+        async def fake_call_mcp_tool(session, name, arguments):
+            assert name == "web_search"
+            return json.dumps({
+                "query":        arguments["query"],
+                "result_text":  "• oMLX 0.4.2 released.\n  Supports Gemma 4B quantized.\n  [example.com]",
+                "result_count": 1,
+            }), False
+
         conv = make_conv_agent("Here is what I found.")
         ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
-        ctrl.handle_task({
-            "instruction": "What are the latest oMLX release notes?",
-            "context":     {"project_context": "LORA"},
-        })
+        with patch(
+            "mcp_tool_dispatcher.MCPToolDispatcher._open_session",
+            side_effect=fake_open_session,
+        ), patch(
+            "mcp_tool_dispatcher.MCPToolDispatcher._call_mcp_tool",
+            side_effect=fake_call_mcp_tool,
+        ):
+            ctrl.handle_task({
+                "instruction": "What are the latest oMLX release notes?",
+                "context":     {"project_context": "LORA"},
+            })
 
         prompt = conv._received[0].context["_prebuilt_prompt"]
         assert "[TOOL RESULTS]" in prompt
@@ -502,8 +372,14 @@ class TestControllerToolIntegration:
         routing = wiki.run.call_args[0][0].context["_routing"]
         assert routing["tools_to_call"] == []
 
-    def test_file_op_results_appear_in_prompt(self, mm, tmp_path):
-        """file_op read result flows through to [TOOL RESULTS] slot."""
+    def test_file_op_results_appear_in_prompt(self, mm, tmp_path, localist_mcp_server):
+        """
+        file_op read result flows through to [TOOL RESULTS] slot.
+
+        Since Phase 1 (MCP server + file_op migration, 2026-07-03), file_op is
+        served out-of-process by localist-mcp — this is a real MCP round trip
+        via the localist_mcp_server fixture, not an in-process assumption.
+        """
         notes = tmp_path / "notes.md"
         notes.write_text(
             "LORA memory system uses SQLite for persistence.", encoding="utf-8"
@@ -520,16 +396,115 @@ class TestControllerToolIntegration:
         ctrl = ControllerAgent(
             runtime=rt, agents=[conv], memory_manager=mm
         )
-        ctrl.handle_task({
-            "instruction": "read the file notes.md",
-            "context": {
-                "project_root":   str(tmp_path),
-                "file_op_action": "read",
-                "file_op_path":   "notes.md",
-                "project_context": "LORA",
-            },
-        })
+        with patch("mcp_tool_dispatcher._MCP_SERVER_URL", localist_mcp_server + "/sse"):
+            ctrl.handle_task({
+                "instruction": "read the file notes.md",
+                "context": {
+                    "project_root":   str(tmp_path),
+                    "file_op_action": "read",
+                    "file_op_path":   "notes.md",
+                    "project_context": "LORA",
+                },
+            })
 
         prompt = conv._received[0].context["_prebuilt_prompt"]
         assert "[TOOL RESULTS]" in prompt
         assert "SQLite" in prompt
+
+    def test_web_search_missing_key_triggers_corpus_fallback(
+        self, mm, tmp_path, localist_mcp_server_no_langsearch_key
+    ):
+        """
+        Proves controller_agent.py's Step 3b corpus fallback actually fires
+        when web_search fails due to a missing LANGSEARCH_API_KEY.
+
+        This was flagged as never provably exercised end-to-end before
+        Phase 3 (web_search migration, 2026-07-03) — see sessions-log.md.
+        rt.infer is given exactly the 2 side_effect values ControllerAgent's
+        own internal calls need (pre-dispatch episodic check, implicit
+        extraction); if the removed runtime.infer() hallucination fallback
+        were still being called anywhere on this path, the mock would raise
+        StopIteration instead of the assertions below failing quietly.
+        """
+        doc_path    = tmp_path / "zylophonic-notes.md"
+        doc_content = "Zylophonic quarterly earnings update web search"
+        doc_path.write_text(doc_content, encoding="utf-8")
+        mm.index_document(doc_path, "raw", content=doc_content, embed=False)
+
+        rt = MagicMock(spec=["infer", "embed"])
+        rt.embed.return_value = [0.0] * 768
+        rt.infer.side_effect = [
+            "no",   # pre-dispatch episodic check
+            "NONE", # implicit extraction
+        ]
+
+        conv = make_conv_agent("Here is what I found.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        with patch(
+            "mcp_tool_dispatcher._MCP_SERVER_URL",
+            localist_mcp_server_no_langsearch_key + "/sse",
+        ):
+            ctrl.handle_task({
+                "instruction": "do a web search for Zylophonic quarterly earnings update",
+                "context":     {"project_context": "LORA"},
+            })
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[CONTEXT]" in prompt
+        assert "Zylophonic" in prompt
+        assert rt.infer.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# MCP follow-up (2026-07-03) — session reuse, live over real SSE
+# ---------------------------------------------------------------------------
+
+class TestMCPSessionReuseLive:
+    """
+    Unlike test_mcp_tool_dispatcher.py's TestSessionReuse (which mocks
+    _open_session/_call_mcp_tool), this exercises the real localist-mcp
+    subprocess over real SSE, confirming what a live trace actually shows
+    on the wire: how many "tools/list" requests get sent, and whether any
+    of them get cancelled mid-flight by a session teardown.
+
+    ClientSession.call_tool() internally issues its own "tools/list"
+    request the first time it validates a successful result's output
+    schema against a tool name it hasn't cached yet (see
+    mcp.client.session.ClientSession._validate_tool_result) — this isn't
+    something MCPToolDispatcher calls itself, so there's nothing in
+    mcp_tool_dispatcher.py to delete. Before the session-reuse refactor, a
+    fresh ClientSession was opened per tool call, so this fired — and got
+    cancelled by the immediate session teardown — on every single call.
+    With one session reused per dispatch(), it fires at most once (on the
+    first successful call) and, since the session stays open, completes
+    normally instead of being cancelled.
+    """
+
+    def test_multi_call_dispatch_sends_at_most_one_tools_list_uncancelled(
+        self, tmp_path, localist_mcp_server, caplog
+    ):
+        (tmp_path / "notes.md").write_text("hello from notes", encoding="utf-8")
+
+        dispatcher = MCPToolDispatcher(
+            runtime=None, mcp_server_url=localist_mcp_server + "/sse"
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="mcp.client.sse"):
+            results = dispatcher.dispatch(
+                tools_to_call = ["file_op", "file_op", "file_op"],
+                instruction   = "read notes.md three times",
+                context       = {"file_op_action": "read", "file_op_path": "notes.md"},
+            )
+
+        assert len(results) == 3
+        assert all(r.success is True for r in results)
+        assert all(r.result == "hello from notes" for r in results)
+
+        tools_list_count = caplog.text.count("method='tools/list'")
+        assert tools_list_count <= 1, (
+            f"expected at most one tools/list request for the whole dispatch, "
+            f"saw {tools_list_count}"
+        )
+        assert "CancelledError" not in caplog.text
+        assert "cancel" not in caplog.text.lower()

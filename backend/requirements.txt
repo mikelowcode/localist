@@ -7,6 +7,7 @@ uvicorn[standard]>=0.29.0
 
 # Settings management (.env file support)
 pydantic-settings>=2.2.0
+python-dotenv>=1.0.0
 
 # HTTP client (used by FoundryRuntimeClient)
 requests>=2.31.0
@@ -18,8 +19,13 @@ python-multipart==0.0.32
 # Wiki document parsing (frontmatter + [[link]] extraction)
 PyYAML>=6.0
 
-# Fetcher service — HTML extraction
+# localist-mcp service — HTML extraction (fetch_url tool; ported from the
+# retired standalone Fetcher microservice, Phase 2)
 lxml>=6.1.1
 readability-lxml>=0.8.4.1
 chardet>=7.4.3
 cssselect>=1.4.0
+httpx>=0.28.1
+
+# localist-mcp service — MCP (Model Context Protocol) SDK, SSE transport
+mcp>=1.28.1

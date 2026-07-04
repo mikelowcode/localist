@@ -388,13 +388,15 @@
   .chat-panel {
     display: flex;
     flex-direction: column;
-    height: 100%;
+    flex: 1;
+    min-height: 0;
     overflow: hidden;
   }
 
   /* ── Messages ─────────────────────────────── */
   .messages {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     padding: var(--sp-6) var(--sp-8);
     display: flex;

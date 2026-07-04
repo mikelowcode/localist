@@ -56,7 +56,7 @@ from episodic_extractor import (
     process_implicit_extraction,
     process_working_state_update,
 )
-from tool_dispatcher import ToolDispatcher
+from mcp_tool_dispatcher import MCPToolDispatcher
 from prompt_builder import ToolResult as _ToolResult
 from wiki_doc import load_wiki_doc, parse_wiki_doc
 import session_files as _session_files
@@ -1012,7 +1012,7 @@ class ControllerAgent:
         dispatched_tool_results: list[_ToolResult] = []
         if plan.tools_to_call:
             try:
-                dispatcher = ToolDispatcher(
+                dispatcher = MCPToolDispatcher(
                     runtime      = self._runtime,
                     project_root = task.context.get("project_root"),
                 )

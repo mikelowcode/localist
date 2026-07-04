@@ -223,6 +223,7 @@
   /* Nav */
   nav {
     flex: 1;
+    min-height: 0;
     padding: var(--sp-3) 0;
     overflow-y: auto;
   }

@@ -8,7 +8,7 @@ Localist is inference-engine-agnostic. It ships with oMLX support out of the box
 
 ## Architecture
 
-The frontend (SvelteKit) sends requests over HTTP to the main backend — a FastAPI application on port 8001. The backend's `ControllerAgent` receives each task, runs it through the `Planner` (a priority-ordered rule engine), and dispatches to the appropriate agent: `ConversationalAgent` for answers and `WikiAgent` for document ingestion. When a query requires live web content, `ToolDispatcher` calls the LangSearch API or posts to the fetcher microservice on port 8002, which fetches and extracts clean article text. All inference goes through `OMLXRuntimeClient`, which speaks the OpenAI-compatible HTTP API exposed by oMLX. Episodic memory and vector embeddings are stored in a SQLite database with WAL mode enabled and survive server restarts.
+The frontend (SvelteKit) sends requests over HTTP to the main backend — a FastAPI application on port 8001. The backend's `ControllerAgent` receives each task, runs it through the `Planner` (a priority-ordered rule engine), and dispatches to the appropriate agent: `ConversationalAgent` for answers and `WikiAgent` for document ingestion. When a query requires a tool, `MCPToolDispatcher` opens an MCP session (SSE transport) to **localist-mcp**, a standalone MCP server on port 8003 that exposes `web_search` (LangSearch), `fetch_url` (HTML extraction via `readability-lxml`), and the `file_op` tools (`read_file`/`write_file`/`append_file`). The legacy `ToolDispatcher` and the standalone Fetcher microservice (port 8002) have both been retired — their functionality now lives on localist-mcp. All inference goes through `OMLXRuntimeClient`, which speaks the OpenAI-compatible HTTP API exposed by oMLX. Episodic memory and vector embeddings are stored in a SQLite database with WAL mode enabled and survive server restarts.
 
 ```
 Localist UI  (localist-ui/)
@@ -22,10 +22,13 @@ ControllerAgent  →  Planner  →  RoutingPlan
      ├──► ConversationalAgent  →  PromptBuilder  →  OMLXRuntimeClient
      │         │
      │         ├── MemoryManager (SQLite episodic + RAG)
-     │         └── ToolDispatcher
-     │               ├── LangSearch API  (web_search)
-     │               ├── Fetcher — port 8002  (url_fetch)
-     │               └── FileSystem  (file_op)
+     │         └── MCPToolDispatcher
+     │               │  MCP / SSE
+     │               ▼
+     │         localist-mcp — port 8003  (backend/mcp_server/)
+     │               ├── web_search  (LangSearch API)
+     │               ├── fetch_url   (readability-lxml extraction)
+     │               └── read_file / write_file / append_file
      │
      └──► WikiAgent  →  OMLXRuntimeClient
 ```
@@ -54,21 +57,21 @@ pip install -r requirements.txt
 
 ## Running Localist
 
-Use the **Localist CLI** launcher to start both services with a single command:
+Use the **Localist CLI** launcher to start all three services with a single command:
 
 ```bash
 ./start_localist.sh
 ```
 
-This starts the Localist backend on port 8001 and the fetcher microservice on port 8002, tails both logs to the terminal with `[backend]` and `[fetcher]` prefixes, and shuts both down cleanly on Ctrl+C.
+This starts the Localist backend (port 8001), the localist-mcp server (port 8003), and the frontend (port 5173), tails all three logs to the terminal with `[backend]`, `[mcp]`, and `[frontend]` prefixes, and shuts them all down cleanly on Ctrl+C.
 
-To stop both services from a separate terminal:
+To stop all services from a separate terminal:
 
 ```bash
 ./start_localist.sh --stop
 ```
 
-The fetcher is a standalone FastAPI service. It is only required if you intend to use the `url_fetch` tool (drop a URL into chat). The main backend degrades gracefully if the fetcher is unreachable.
+localist-mcp is a standalone MCP (Model Context Protocol) server exposed over SSE transport. It is required for `web_search`, `fetch_url`, and the `file_op` tools (`read_file`/`write_file`/`append_file`) — the main backend's `MCPToolDispatcher` calls it over an MCP session. The standalone Fetcher microservice (port 8002) has been retired; its extraction logic now lives on localist-mcp as the `fetch_url` tool. See `backend/mcp_server/main.py`.
 
 ---
 
@@ -81,8 +84,9 @@ Copy `backend/.env.example` to `backend/.env` and set values as needed. The only
 | `LOCALIST_RUNTIME_BACKEND` | `omlx` | `omlx` or `foundry` |
 | `LOCALIST_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, or `WARNING` |
 | `LOCALIST_OMLX_URL` | `http://localhost:8000` | oMLX server URL |
-| `LANGSEARCH_API_KEY` | *(none)* | LangSearch API key. Web search is disabled and falls back to an inference stub when absent. |
-| `LOCALIST_FETCHER_URL` | `http://localhost:8002` | Fetcher microservice URL |
+| `LANGSEARCH_API_KEY` | *(none)* | LangSearch API key, read by localist-mcp. Required for `web_search`; without it the tool returns a clean failure (no hallucination fallback) and `ConversationalAgent` falls back to the corpus. |
+| `LOCALIST_MCP_URL` | `http://localhost:8003` | localist-mcp server URL |
+| `LOCALIST_MCP_PROJECT_ROOT` | `backend/` | Sandbox root for localist-mcp's `file_op` tools |
 | `LOCALIST_EMBEDDING_ENGINE_ENABLED` | `true` | Enable local embedding engine for RAG |
 | `LOCALIST_WIKI_DIR` | `./wiki` | Path to wiki document directory |
 | `LOCALIST_RAW_DIR` | `./raw` | Path to raw documents directory |
@@ -107,11 +111,13 @@ Every query passes through `Planner`, a deterministic rule engine with seven pri
 
 ### Tools
 
-**Web search** — fires automatically at P3b when the query looks factual and the local corpus has no strong hit. Calls LangSearch API, returns the top three results with titles, URLs, and truncated body text. Falls back to an inference stub when no API key is configured.
+All tools are served over MCP (SSE transport) by the **localist-mcp** server (port 8003, `backend/mcp_server/`). `MCPToolDispatcher` opens one MCP session per dispatch call and reuses it across every tool invocation made within that call.
 
-**Page fetch** — triggered when a URL appears in the message or the user says "fetch this link", "summarize this URL", etc. Posts to the fetcher microservice, which downloads the page and uses `readability-lxml` to extract clean article text. Returns title, source URL, word count, and body text.
+**Web search** — fires automatically at P3b when the query looks factual and the local corpus has no strong hit. Calls the `web_search` MCP tool (LangSearch API under the hood), returns the top three results with titles, URLs, and truncated body text. When `LANGSEARCH_API_KEY` is unset, the tool returns a clean failure — there is no inference-hallucination fallback — and `ConversationalAgent`'s existing corpus fallback grounds the answer instead.
 
-**File operations** — sandboxed read, write, and append on local files. Triggered by explicit file-operation phrasing.
+**Page fetch** — triggered when a URL appears in the message or the user says "fetch this link", "summarize this URL", etc. Calls the `fetch_url` MCP tool, which downloads the page and uses `readability-lxml` to extract clean article text. Returns title, source URL, word count, and body text. This replaces the retired standalone Fetcher microservice (formerly port 8002).
+
+**File operations** — sandboxed `read_file`/`write_file`/`append_file` MCP tools on local files, rooted at `LOCALIST_MCP_PROJECT_ROOT`. Triggered by explicit file-operation phrasing.
 
 **Wiki ingestion** — processes a raw document into structured wiki pages via `WikiAgent`. Triggered by `raw_path` in request context or ingestion keywords.
 
@@ -158,18 +164,18 @@ localist/
 │   ├── conversational_agent.py      # Primary agent: prompt assembly, RAG, tool result injection
 │   ├── wiki_agent.py                # Document ingestion agent — raw file → structured wiki pages
 │   ├── prompt_builder.py            # 7-slot KV-cache-optimized prompt assembler
-│   ├── tool_dispatcher.py           # Executes web_search, url_fetch, file_op tool calls
+│   ├── mcp_tool_dispatcher.py       # Opens an MCP/SSE session to localist-mcp and dispatches web_search, url_fetch, file_op
 │   ├── memory_manager.py            # SQLite-backed episodic + RAG memory interface
 │   ├── episodic_extractor.py        # Explicit and implicit episode extraction pipeline
 │   ├── embedding_engine.py          # Local mlx embedding engine (768-dim)
 │   ├── omlx_runtime_client.py       # oMLX HTTP transport (OpenAI-compatible)
 │   ├── runtime_factory.py           # Constructs the active runtime from LOCALIST_RUNTIME_BACKEND
 │   ├── base_runtime_client.py       # BaseRuntimeClient protocol definition
-│   ├── fetcher/
-│   │   ├── main.py                  # Fetcher FastAPI app — port 8002
-│   │   ├── client.py                # Async HTTP client (httpx)
-│   │   ├── extractor.py             # readability-lxml extraction pipeline
-│   │   └── models.py                # Pydantic v2 request/response models
+│   ├── mcp_server/
+│   │   ├── main.py                  # localist-mcp FastAPI/FastMCP app — port 8003, SSE transport
+│   │   ├── file_ops.py              # read_file/write_file/append_file, sandboxed to LOCALIST_MCP_PROJECT_ROOT
+│   │   ├── url_fetch.py             # fetch_url MCP tool — readability-lxml extraction (replaces retired Fetcher microservice)
+│   │   └── web_search.py            # web_search MCP tool — LangSearch integration
 │   ├── wiki/
 │   │   ├── lora-persona.md          # LORA persona — loaded into Slot 1b of every prompt
 │   │   ├── users/
@@ -179,8 +185,10 @@ localist/
 │   │   ├── test_planner_phase3.py   # Planner routing unit tests
 │   │   ├── test_controller_phase4.py # ControllerAgent integration tests
 │   │   ├── test_episodic_phase5.py  # Episodic memory extraction tests
-│   │   ├── test_tool_dispatcher_phase6.py  # ToolDispatcher unit tests
-│   │   └── test_integration_phase7.py      # Full pipeline integration tests
+│   │   ├── test_tool_dispatcher_phase6.py  # MCPToolDispatcher unit tests (web_search, url_fetch, file_op)
+│   │   ├── test_integration_phase7.py      # Full pipeline integration tests
+│   │   ├── test_mcp_server.py       # localist-mcp server tests — file_ops, fetch_url, web_search tools
+│   │   └── test_mcp_tool_dispatcher.py     # MCPToolDispatcher session/dispatch tests
 │   ├── lora_memory.db               # SQLite database (episodic + embeddings)
 │   ├── requirements.txt
 │   └── .env                         # Local configuration (not committed)
@@ -203,8 +211,9 @@ Tests are organized by phase and cover each layer independently:
 - **Phase 3** (`test_planner_phase3.py`) — routing rule engine, all priority levels
 - **Phase 4** (`test_controller_phase4.py`) — controller dispatch, RAG injection, prompt assembly
 - **Phase 5** (`test_episodic_phase5.py`) — episodic extraction, supersession, confidence scoring
-- **Phase 6** (`test_tool_dispatcher_phase6.py`) — LangSearch integration, file ops, url_fetch
+- **Phase 6** (`test_tool_dispatcher_phase6.py`) — MCPToolDispatcher: LangSearch integration, file ops, url_fetch
 - **Phase 7** (`test_integration_phase7.py`) — full pipeline from instruction to response
+- MCP migration (`test_mcp_server.py`, `test_mcp_tool_dispatcher.py`) — localist-mcp server tools and dispatcher session handling, covering the retired Fetcher microservice and legacy ToolDispatcher's replacement
 
 All tests use mocks for inference and SQLite; no oMLX server or live API keys are required.
 
@@ -212,8 +221,12 @@ All tests use mocks for inference and SQLite; no oMLX server or live API keys ar
 
 ## Roadmap
 
-- **Localist CLI** — ✅ `./start_localist.sh` launches both services;
-  `--stop` kills them cleanly
+- **Localist CLI** — ✅ `./start_localist.sh` launches all three services
+  (backend, localist-mcp, frontend); `--stop` kills them cleanly
+- **MCP migration** — ✅ tools (`web_search`, `fetch_url`, `file_op`) served
+  over MCP/SSE by the standalone localist-mcp server (port 8003); the
+  legacy `ToolDispatcher` and standalone Fetcher microservice (port 8002)
+  are both retired
 - **Identity continuity** — ✅ LORA correctly identifies itself; identity
   questions route via P3 semantic gate or P6 direct answer backed by
   `lora-persona.md`

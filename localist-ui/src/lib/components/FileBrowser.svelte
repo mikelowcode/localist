@@ -414,7 +414,8 @@
   .file-browser {
     display: grid;
     grid-template-columns: 280px 1fr;
-    height: 100%;
+    flex: 1;
+    min-height: 0;
     overflow: hidden;
   }
 
@@ -422,6 +423,7 @@
   .file-pane {
     display: flex;
     flex-direction: column;
+    min-height: 0;
     border-right: 1px solid var(--border);
     overflow-y: auto;
     background: var(--bg-panel);
@@ -711,6 +713,7 @@
   .content-pane {
     display: flex;
     flex-direction: column;
+    min-height: 0;
     overflow: hidden;
     background: var(--bg);
   }
@@ -775,6 +778,7 @@
 
   .content-body {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
   }
 
