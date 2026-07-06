@@ -1476,12 +1476,13 @@ class ControllerAgent:
                 for s in r.output.get("sources", [])
             ],
             metadata = {
-                "agent":          effective_agent_name,
-                "priority":       plan.priority,
-                "fetch_rag":      plan.fetch_rag,
-                "fetch_episodic": plan.fetch_episodic,
-                "tools_fired":    plan.tools_to_call,
-                "grounded":       r.output.get("grounded", False),
+                "agent":              effective_agent_name,
+                "priority":           plan.priority,
+                "fetch_rag":          plan.fetch_rag,
+                "fetch_episodic":     plan.fetch_episodic,
+                "tools_fired":        plan.tools_to_call,
+                "tool_signal_source": plan.tool_signal_source,
+                "grounded":           r.output.get("grounded", False),
             },
         )
 

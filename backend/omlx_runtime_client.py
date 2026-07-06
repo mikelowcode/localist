@@ -47,6 +47,7 @@ import base64
 import json
 import logging
 import mimetypes
+import threading
 from pathlib import Path
 from typing import Generator
 
@@ -57,6 +58,29 @@ import requests
 from foundry_runtime_client import _iter_sse_chunks
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Concurrency guard
+# ---------------------------------------------------------------------------
+# Exactly one oMLX server (port 8000) serves exactly one Gemma 4B model for
+# this whole process, so exactly one HTTP call to it should be in flight at
+# a time. Module-level (not per-instance) because every OMLXRuntimeClient in
+# the process talks to the same server, and runtime_factory.create_runtime()
+# constructs a single shared instance at startup anyway.
+#
+# infer()/infer_stream() are synchronous — call sites (conversational_agent.py,
+# episodic_extractor.py) invoke them as plain `def` calls, and the FastAPI
+# layer wraps the outer call in asyncio.to_thread(), which runs this code in
+# a worker thread rather than on the event loop. asyncio.Lock can't be
+# acquired correctly from that context, so this is a threading.Lock.
+#
+# _inflight_lock brackets the actual HTTP call + SSE consumption in
+# infer_stream() (infer() delegates to it, so it's covered too). Overlap was
+# confirmed via WSU_DIAG/THROUGHPUT log timestamps showing overlapping call
+# windows on 2026-07-05, across main_dispatch / implicit_extraction /
+# working_state.
+_inflight_lock  = threading.Lock()
+_inflight_count = 0
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -140,6 +164,7 @@ class OMLXRuntimeClient:
         system:      str   = "",
         max_tokens:  int   = 1024,
         temperature: float = 0.2,
+        label:       str   = "",
     ) -> str:
         """
         Request a blocking chat completion from oMLX via SSE accumulation.
@@ -147,6 +172,15 @@ class OMLXRuntimeClient:
         Internally calls infer_stream() and joins all chunks — this ensures
         the streaming and non-streaming paths use exactly the same transport
         code and model parameters, preventing subtle behavioural divergence.
+
+        Parameters
+        ----------
+        label:
+            Optional caller identifier (e.g. "main_dispatch",
+            "implicit_extraction", "working_state") forwarded to
+            infer_stream() so overlap/throughput logging can be correlated
+            back to the call site. Purely diagnostic — has no effect on
+            the request itself.
 
         Returns
         -------
@@ -163,6 +197,7 @@ class OMLXRuntimeClient:
             system      = system,
             max_tokens  = max_tokens,
             temperature = temperature,
+            label       = label,
         ))
         result = "".join(chunks)
         logger.debug("infer() ← %d chars received.", len(result))
@@ -252,6 +287,7 @@ class OMLXRuntimeClient:
         system:      str   = "",
         max_tokens:  int   = 1024,
         temperature: float = 0.2,
+        label:       str   = "",
     ) -> Generator[str, None, None]:
         """
         Request a streaming chat completion from oMLX.
@@ -259,6 +295,20 @@ class OMLXRuntimeClient:
         Yields individual text chunks from the SSE stream as they arrive.
         The FastAPI streaming endpoint consumes this generator and relays
         chunks to the Svelte UI via Server-Sent Events.
+
+        The HTTP call + SSE consumption below is serialized process-wide via
+        _inflight_lock: oMLX serves exactly one model instance, so two
+        overlapping calls compete for the same GPU/model resources and both
+        slow down. _inflight_count logs a RUNTIME_OVERLAP warning whenever a
+        call starts while another is still in flight, correlated by `label`
+        with the THROUGHPUT lines from _log_infer_throughput().
+
+        Parameters
+        ----------
+        label:
+            Optional caller identifier for diagnostic correlation (see
+            RUNTIME_OVERLAP / THROUGHPUT log lines). Has no effect on the
+            request itself.
 
         Yields
         ------
@@ -288,46 +338,57 @@ class OMLXRuntimeClient:
         headers = {"Content-Type": "application/json"}
 
         logger.debug(
-            "infer_stream() → %s  max_tokens=%d  temp=%.2f  prompt_chars=%d",
-            self._chat_endpoint, max_tokens, temperature, len(prompt),
+            "infer_stream() → %s  max_tokens=%d  temp=%.2f  prompt_chars=%d  label=%s",
+            self._chat_endpoint, max_tokens, temperature, len(prompt), label,
         )
 
-        try:
-            response = requests.post(
-                self._chat_endpoint,
-                headers = headers,
-                data    = json.dumps(payload),
-                stream  = True,
-                timeout = self._stream_timeout,
-            )
-        except requests.ConnectionError as exc:
-            raise RuntimeError(
-                f"Cannot reach oMLX at {self._chat_endpoint}. "
-                f"Is the service running?  Detail: {exc}"
-            ) from exc
-        except requests.Timeout:
-            raise RuntimeError(
-                f"oMLX did not respond within {self._stream_timeout}s "
-                f"(endpoint: {self._chat_endpoint})."
-            )
+        global _inflight_count
+        with _inflight_lock:
+            if _inflight_count > 0:
+                logger.warning(
+                    "RUNTIME_OVERLAP detected — call starting while %d call(s) already in flight — label=%s",
+                    _inflight_count, label,
+                )
+            _inflight_count += 1
+            try:
+                try:
+                    response = requests.post(
+                        self._chat_endpoint,
+                        headers = headers,
+                        data    = json.dumps(payload),
+                        stream  = True,
+                        timeout = self._stream_timeout,
+                    )
+                except requests.ConnectionError as exc:
+                    raise RuntimeError(
+                        f"Cannot reach oMLX at {self._chat_endpoint}. "
+                        f"Is the service running?  Detail: {exc}"
+                    ) from exc
+                except requests.Timeout:
+                    raise RuntimeError(
+                        f"oMLX did not respond within {self._stream_timeout}s "
+                        f"(endpoint: {self._chat_endpoint})."
+                    )
 
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"oMLX returned HTTP {response.status_code} "
-                f"from {self._chat_endpoint}: {response.text[:400]}"
-            )
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"oMLX returned HTTP {response.status_code} "
+                        f"from {self._chat_endpoint}: {response.text[:400]}"
+                    )
 
-        # _iter_sse_chunks handles the OpenAI-compatible SSE envelope
-        # ("data: {...}" lines, "data: [DONE]" sentinel) identically for
-        # both Foundry and oMLX.  If oMLX uses a non-standard SSE format,
-        # replace this with a custom iterator.
-        # TODO(omlx): Verify the SSE envelope format matches OpenAI spec.
-        try:
-            yield from _iter_sse_chunks(response)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Error reading oMLX SSE stream: {exc}"
-            ) from exc
+                # _iter_sse_chunks handles the OpenAI-compatible SSE envelope
+                # ("data: {...}" lines, "data: [DONE]" sentinel) identically for
+                # both Foundry and oMLX.  If oMLX uses a non-standard SSE format,
+                # replace this with a custom iterator.
+                # TODO(omlx): Verify the SSE envelope format matches OpenAI spec.
+                try:
+                    yield from _iter_sse_chunks(response)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Error reading oMLX SSE stream: {exc}"
+                    ) from exc
+            finally:
+                _inflight_count -= 1
 
     # -----------------------------------------------------------------------
     # oMLX-specific capability: native file ingestion via MarkItDown

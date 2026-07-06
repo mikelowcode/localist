@@ -533,7 +533,12 @@ class TestControllerWiring:
         assert records[0].source     == "explicit"
         assert records[0].confidence == 1.0
 
-    def test_implicit_hook_fires_on_plain_query(self, db_path):
+    def test_implicit_hook_fires_on_plain_query(self, db_path, monkeypatch):
+        # route() must make zero runtime.infer() calls for this instruction
+        # (P5 is keyword-based, no infer); force the classifier flag to
+        # "off" so the ambient process env can't leak a "shadow"/"active"
+        # value in and steal the single side_effect slot below.
+        monkeypatch.delenv("LOCALIST_TOOL_FALLBACK_CLASSIFIER", raising=False)
         mm = MemoryManager(db_path=db_path)
         rt = MagicMock()
         rt.embed.return_value = [0.0] * 768
@@ -1016,8 +1021,8 @@ class TestBuildWSUSystem:
             runtime        = rt,
         )
         called_max_tokens = rt.infer.call_args.kwargs.get("max_tokens")
-        assert called_max_tokens == 1024, (
-            f"Expected max_tokens=1024, got {called_max_tokens!r}"
+        assert called_max_tokens == 750, (
+            f"Expected max_tokens=750, got {called_max_tokens!r}"
         )
 
     # 7. Verify byte-identical prefix using the ACTUAL on-disk lora-persona.md

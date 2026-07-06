@@ -1,0 +1,215 @@
+instruction,category,run,planner_tools_to_call,planner_priority,gemma_raw_output,gemma_parsed_tool,gemma_parsed_args,classification,control_arm_would_fire
+Go head and look up the weather in Oceanside CA.,semantic_miss,1,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,True
+Go head and look up the weather in Oceanside CA.,semantic_miss,2,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,True
+Go head and look up the weather in Oceanside CA.,semantic_miss,3,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,True
+Go head and look up the weather in Oceanside CA.,semantic_miss,4,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,True
+Go head and look up the weather in Oceanside CA.,semantic_miss,5,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,True
+Could you look into what the weather's like in Oceanside CA right now?,semantic_miss,1,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA right now""}}}",web_search,"{""query"": ""weather in Oceanside CA right now""}",CATCH,True
+Could you look into what the weather's like in Oceanside CA right now?,semantic_miss,2,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA right now""}}}",web_search,"{""query"": ""weather in Oceanside CA right now""}",CATCH,True
+Could you look into what the weather's like in Oceanside CA right now?,semantic_miss,3,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA right now""}}}",web_search,"{""query"": ""weather in Oceanside CA right now""}",CATCH,True
+Could you look into what the weather's like in Oceanside CA right now?,semantic_miss,4,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA right now""}}}",web_search,"{""query"": ""weather in Oceanside CA right now""}",CATCH,True
+Could you look into what the weather's like in Oceanside CA right now?,semantic_miss,5,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA right now""}}}",web_search,"{""query"": ""weather in Oceanside CA right now""}",CATCH,True
+Can you check what the weather is doing in Oceanside CA?,semantic_miss,1,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,False
+Can you check what the weather is doing in Oceanside CA?,semantic_miss,2,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,False
+Can you check what the weather is doing in Oceanside CA?,semantic_miss,3,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,False
+Can you check what the weather is doing in Oceanside CA?,semantic_miss,4,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,False
+Can you check what the weather is doing in Oceanside CA?,semantic_miss,5,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,False
+Find out what's going on with the weather in Oceanside CA.,semantic_miss,1,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,True
+Find out what's going on with the weather in Oceanside CA.,semantic_miss,2,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,True
+Find out what's going on with the weather in Oceanside CA.,semantic_miss,3,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,True
+Find out what's going on with the weather in Oceanside CA.,semantic_miss,4,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,True
+Find out what's going on with the weather in Oceanside CA.,semantic_miss,5,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,True
+See what the weather looks like over in Oceanside CA.,semantic_miss,1,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,False
+See what the weather looks like over in Oceanside CA.,semantic_miss,2,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,False
+See what the weather looks like over in Oceanside CA.,semantic_miss,3,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,False
+See what the weather looks like over in Oceanside CA.,semantic_miss,4,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,False
+See what the weather looks like over in Oceanside CA.,semantic_miss,5,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",CATCH,False
+Look up the latest Oceanside CA weather report.,keyword_clear,1,web_search,3,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""Oceanside CA weather report""}}}",web_search,"{""query"": ""Oceanside CA weather report""}",MATCH,True
+Look up the latest Oceanside CA weather report.,keyword_clear,2,web_search,3,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""latest Oceanside CA weather report""}}}",web_search,"{""query"": ""latest Oceanside CA weather report""}",MATCH,True
+Look up the latest Oceanside CA weather report.,keyword_clear,3,web_search,3,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""Oceanside CA weather report""}}}",web_search,"{""query"": ""Oceanside CA weather report""}",MATCH,True
+Look up the latest Oceanside CA weather report.,keyword_clear,4,web_search,3,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""latest Oceanside CA weather report""}}}",web_search,"{""query"": ""latest Oceanside CA weather report""}",MATCH,True
+Look up the latest Oceanside CA weather report.,keyword_clear,5,web_search,3,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""latest Oceanside CA weather report""}}}",web_search,"{""query"": ""latest Oceanside CA weather report""}",MATCH,True
+What's the weather in Oceanside CA today?,keyword_clear,1,web_search,3,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA today""}}}",web_search,"{""query"": ""weather in Oceanside CA today""}",MATCH,True
+What's the weather in Oceanside CA today?,keyword_clear,2,web_search,3,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA today""}}}",web_search,"{""query"": ""weather in Oceanside CA today""}",MATCH,True
+What's the weather in Oceanside CA today?,keyword_clear,3,web_search,3,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA today""}}}",web_search,"{""query"": ""weather in Oceanside CA today""}",MATCH,True
+What's the weather in Oceanside CA today?,keyword_clear,4,web_search,3,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA today""}}}",web_search,"{""query"": ""weather in Oceanside CA today""}",MATCH,True
+What's the weather in Oceanside CA today?,keyword_clear,5,web_search,3,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA today""}}}",web_search,"{""query"": ""weather in Oceanside CA today""}",MATCH,True
+Get me the news on the weather in Oceanside CA.,keyword_clear,1,web_search,3,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather news Oceanside CA""}}}",web_search,"{""query"": ""weather news Oceanside CA""}",MATCH,True
+Get me the news on the weather in Oceanside CA.,keyword_clear,2,web_search,3,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather news Oceanside CA""}}}",web_search,"{""query"": ""weather news Oceanside CA""}",MATCH,True
+Get me the news on the weather in Oceanside CA.,keyword_clear,3,web_search,3,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather news Oceanside CA""}}}",web_search,"{""query"": ""weather news Oceanside CA""}",MATCH,True
+Get me the news on the weather in Oceanside CA.,keyword_clear,4,web_search,3,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather news Oceanside CA""}}}",web_search,"{""query"": ""weather news Oceanside CA""}",MATCH,True
+Get me the news on the weather in Oceanside CA.,keyword_clear,5,web_search,3,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather news Oceanside CA""}}}",web_search,"{""query"": ""weather news Oceanside CA""}",MATCH,True
+Can you explain what causes a low-pressure weather system?,true_negative,1,,6,"
+{""tool_call"": null}",,,NULL_CORRECT,False
+Can you explain what causes a low-pressure weather system?,true_negative,2,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""causes of a low-pressure weather system""}}}",web_search,"{""query"": ""causes of a low-pressure weather system""}",FALSE_POSITIVE,False
+Can you explain what causes a low-pressure weather system?,true_negative,3,,6,"
+{""tool_call"": null}",,,NULL_CORRECT,False
+Can you explain what causes a low-pressure weather system?,true_negative,4,,6,"
+{""tool_call"": null}",,,NULL_CORRECT,False
+Can you explain what causes a low-pressure weather system?,true_negative,5,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""causes of low-pressure weather system""}}}",web_search,"{""query"": ""causes of low-pressure weather system""}",FALSE_POSITIVE,False
+What's a good synonym for 'rainy'?,true_negative,1,,6,"
+A few good synonyms for 'rainy' include:
+
+*   **Wet**
+*   **Drizzly** (if it's lightly raining)
+*   **Stormy** (if the rain is heavy or accompanied by thunder/lightning)
+*   **Overcast** (referring to the sky condition that often accompanies rain)
+*   **Wintry** (if the rain is associated with colder weather)",,,MALFORMED,False
+What's a good synonym for 'rainy'?,true_negative,2,,6,"
+
+Some good synonyms for 'rainy' include:
+
+*   **Wet** (if referring to the condition)
+*   **Overcast** (if referring to the sky/weather)
+*   **Drizzly** (if it's lightly raining)
+*   **Stormy** (if it's heavy rain or mixed with wind/thunder)
+*   **Gloomy** (if referring to the mood or the weather)
+*   **Wintry** (if the rain is associated with colder seasons)",,,MALFORMED,False
+What's a good synonym for 'rainy'?,true_negative,3,,6,"
+{""tool_call"": null}",,,NULL_CORRECT,False
+What's a good synonym for 'rainy'?,true_negative,4,,6,"
+A few good synonyms for 'rainy' include:
+
+*   **Wet** (if referring to the condition)
+*   **Overcast** (if referring to the sky/weather)
+*   **Drizzly** (if it's lightly raining)
+*   **Stormy** (if the rain is heavy or accompanied by strong winds)
+*   **Gloomy** (if referring to the atmosphere or mood)",,,MALFORMED,False
+What's a good synonym for 'rainy'?,true_negative,5,,6,"
+
+
+
+
+
+
+
+
+
+
+",,,MALFORMED,False
+Summarize the plot of Moby Dick for me.,true_negative,1,,6,"
+Moby Dick is a novel by Herman Melville that centers on the obsessive quest of Captain Ahab, the captain of the whaling ship Pequod. Ahab becomes consumed by his vendetta against Moby Dick, the massive white sperm whale that took Ahab's leg and holds personal significance for him.
+
+The voyage of the Pequod, led by Ahab and his obsessive pursuit of Moby Dick, brings together a diverse and often volatile crew of whalers. The journey itself becomes a microcosm of human obsession, fate, and the vast indifference of nature.
+
+The plot follows the crew's perilous journey across the oceans, where they hunt whales. The tension builds as Ahab drives the pursuit of Moby Dick, often against the advice of his crew. The whale, Moby Dick, is portrayed as a creature of immense power and unknowable malice.
+
+The climax occurs when the Pequod finally encounters Moby Dick. The ensuing battle is epic, tragic, and fatal. Driven by Ahab's singular obsession, the pursuit leads to a violent confrontation where almost the entire crew is lost, including Ahab himself, in the pursuit of vengeance against the whale.
+
+Ultimately, the novel is",,,MALFORMED,False
+Summarize the plot of Moby Dick for me.,true_negative,2,,6,"
+Moby Dick is a novel by Herman Melville that centers on the obsessive quest of Captain Ahab, the vengeful captain of the whaling ship Pequod. Ahab becomes consumed by his desire for revenge against Moby Dick, a massive, intelligent white sperm whale that took Ahab's leg in a previous encounter.
+
+The voyage of the Pequod, accompanied by various crew members, including the narrator Ishmael, becomes a microcosm of humanity's struggle against nature, obsession, and fate. The crew spends the journey whaling, but Ahab's singular focus remains Moby Dick.
+
+The plot builds tension as the ship chases Moby Dick across the vast ocean. The pursuit is fraught with danger, madness, and the crew's divided loyalties. The whale represents unknowable forces—be it nature, God, or fate—and Ahab's obsession drives the narrative toward a tragic climax.
+
+The story culminates in a violent, fatal confrontation between the Pequod and Moby Dick. In the end, Ahab achieves his vengeance, but the pursuit claims almost every life aboard the ship",,,MALFORMED,False
+Summarize the plot of Moby Dick for me.,true_negative,3,,6,"
+Moby Dick is a novel by Herman Melville that centers on the obsessive quest of Captain Ahab, the vengeful captain of the whaling ship Pequod. Ahab becomes consumed by his pursuit of Moby Dick, the massive white sperm whale that took his leg and drives him to madness.
+
+The voyage itself becomes a microcosm of life, obsession, and the struggle against nature. Ahab gathers a loyal, yet diverse, crew—including Ishmael (the narrator), mates, harpooners, and sailors—all bound together by the pursuit of this elusive whale.
+
+The plot follows the Pequod's journey across the vast ocean. While the crew engages in the grueling, dangerous work of whaling, Ahab's monomaniacal focus on Moby Dick intensifies. The whale represents not just a physical adversary, but a symbol of unknowable nature, fate, and the destructive power of obsession.
+
+The climax occurs when the Pequod finally encounters Moby Dick. The pursuit becomes a deadly dance between man and beast. Ahab throws himself into the chase, driven by vengeance. The hunt inevitably leads",,,MALFORMED,False
+Summarize the plot of Moby Dick for me.,true_negative,4,,6,"
+The novel *Moby Dick* follows the whaling voyage of the Pequod, commanded by the obsessive Captain Ahab. Ahab has become consumed by his quest for vengeance against Moby Dick, the massive white sperm whale that took Ahab's leg.
+
+The voyage begins with a crew of whalers, including the narrator Ishmael, who joins the expedition. They set sail into the vast ocean, initially focused on the practical business of whaling. However, the presence of Ahab and his singular obsession quickly dominates the narrative.
+
+The journey becomes a psychological and existential battle. Ahab pursues Moby Dick, a creature that symbolizes his personal vendetta against the forces of nature and fate. The crew members, though initially loyal, are slowly drawn into Ahab's monomania.
+
+The plot builds tension through encounters with various whaling grounds, philosophical discussions, and the relentless pursuit of the whale. The journey is fraught with danger, dwindling supplies, and the psychological toll of Ahab's obsession.
+
+The climax occurs when the Pequod finally encounters Moby Dick. The ensuing chase",,,MALFORMED,False
+Summarize the plot of Moby Dick for me.,true_negative,5,,6,"
+Moby Dick is a novel by Herman Melville that centers on the obsessive quest of Captain Ahab, the captain of the whaling ship Pequod. Ahab becomes consumed by his vendetta against Moby Dick, the massive white sperm whale that took Ahab's leg and symbolizes all the malevolence and indifference of nature.
+
+The voyage itself becomes a microcosm of humanity's struggle against nature, fate, and obsession. Ahab drives the crew—a diverse group of sailors, whalers, and castaways—to the brink of madness and death. They pursue Moby Dick across the vast ocean, driven by Ahab's singular, monomaniacal goal.
+
+The plot builds tension through the journey, the whaling pursuits, and the philosophical musings of the narrator. The climax occurs when the Pequod finally encounters Moby Dick. The pursuit is relentless, and the confrontation is inevitable. In the end, the hunt leads to a tragic, bloody confrontation where almost everyone aboard the Pequod perishes, fulfilling Ahab's obsessive quest and leaving the ocean vast and indifferent to the human drama.
+
+Essentially, it is a story about obsession, vengeance, the insignificance of humanity",,,MALFORMED,False
+You already looked up the Oceanside CA weather — just tell me what you found.,tool_flavored_resolved,1,,6,"
+",,,MALFORMED,False
+You already looked up the Oceanside CA weather — just tell me what you found.,tool_flavored_resolved,2,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""Oceans",,,MALFORMED,False
+You already looked up the Oceanside CA weather — just tell me what you found.,tool_flavored_resolved,3,,6,"
+{""tool_call"": {""name",,,MALFORMED,False
+You already looked up the Oceanside CA weather — just tell me what you found.,tool_flavored_resolved,4,,6,"
+",,,MALFORMED,False
+You already looked up the Oceanside CA weather — just tell me what you found.,tool_flavored_resolved,5,,6,"
+",,,MALFORMED,False
+"Since you've already checked the forecast, what's the weather like in Oceanside CA?",tool_flavored_resolved,1,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",FALSE_POSITIVE,False
+"Since you've already checked the forecast, what's the weather like in Oceanside CA?",tool_flavored_resolved,2,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",FALSE_POSITIVE,False
+"Since you've already checked the forecast, what's the weather like in Oceanside CA?",tool_flavored_resolved,3,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",FALSE_POSITIVE,False
+"Since you've already checked the forecast, what's the weather like in Oceanside CA?",tool_flavored_resolved,4,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",FALSE_POSITIVE,False
+"Since you've already checked the forecast, what's the weather like in Oceanside CA?",tool_flavored_resolved,5,,6,"
+{""tool_call"": {""name"": ""web_search"", ""arguments"": {""query"": ""weather in Oceanside CA""}}}",web_search,"{""query"": ""weather in Oceanside CA""}",FALSE_POSITIVE,False
+"Since you've already checked the forecast, what's the outlook for tomorrow?",tool_flavored_resolved_grounded,1,,6,"
+",,,MALFORMED,False
+"Since you've already checked the forecast, what's the outlook for tomorrow?",tool_flavored_resolved_grounded,2,,6,"
+",,,MALFORMED,False
+"Since you've already checked the forecast, what's the outlook for tomorrow?",tool_flavored_resolved_grounded,3,,6,"
+",,,MALFORMED,False
+"Since you've already checked the forecast, what's the outlook for tomorrow?",tool_flavored_resolved_grounded,4,,6,"
+Based on the search results, the outlook for tomorrow in Oceanside, CA is:",,,MALFORMED,False
+"Since you've already checked the forecast, what's the outlook for tomorrow?",tool_flavored_resolved_grounded,5,,6,"
+",,,MALFORMED,False
+"Based on the search results above, summarize the Oceanside forecast.",tool_flavored_resolved_grounded,1,,6,"
+The weather forecast for Oceanside, CA, indicates partly cloudy to mostly sunny skies this week. Highs will be in the mid-70s (around 74°F to 76°F), and lows will be near 60°F to 61°F. Expect morning marine layers or coastal fog that typically burn off by early afternoon. Winds will be light and variable, picking up to 10-15 mph in the afternoon. There is no rain expected.",,,MALFORMED,False
+"Based on the search results above, summarize the Oceanside forecast.",tool_flavored_resolved_grounded,2,,6,"
+The weather forecast for Oceanside, CA, indicates mostly sunny conditions with highs in the mid-70s (around 74°F to 76°F) and lows near 60°F to 61°F. Expect a persistent morning marine layer or coastal fog that should clear by early afternoon.",,,MALFORMED,False
+"Based on the search results above, summarize the Oceanside forecast.",tool_flavored_resolved_grounded,3,,6,"
+The weather in Oceanside, CA, this week is expected to be mostly sunny with highs in the mid-70s (up to 76°F) and lows around 60-61°F. There is no rain expected. Winds will be light and variable, picking up to 10-1",,,MALFORMED,False
+"Based on the search results above, summarize the Oceanside forecast.",tool_flavored_resolved_grounded,4,,6,"
+The weather forecast for Oceanside, CA, indicates mostly sunny conditions with highs in the mid-70s (up to 76°F) and lows near 60-61°F. There is no rain expected. Winds will be light and variable, picking up to west 10-15 mph in the afternoon.",,,MALFORMED,False
+"Based on the search results above, summarize the Oceanside forecast.",tool_flavored_resolved_grounded,5,,6,"
+The weather forecast for Oceanside, CA, indicates a week of mostly sunny to partly cloudy skies. Highs will be in the mid-70s (up to 76°F), with lows around 60°F to 61°F. There is no rain expected. Mornings may feature a marine layer or coastal fog, but it is expected to burn off by early afternoon. Winds will be light and variable, picking up to 10-15 mph in the afternoon.",,,MALFORMED,False

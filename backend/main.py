@@ -678,11 +678,21 @@ async def post_task_stream(request: TaskRequest) -> StreamingResponse:
 
     Event format:
 
-        data: {"type": "status",  "message": "Planning..."}
-        data: {"type": "token",   "token": "The"}
-        data: {"type": "sources", "sources": [...]}
-        data: {"type": "done",    "task_id": "...", "status": "complete"}
+        data: {"type": "status",        "message": "Planning..."}
+        data: {"type": "token",         "token": "The"}
+        data: {"type": "sources",       "sources": [...]}
+        data: {"type": "done",          "task_id": "...", "status": "complete"}
+        data: {"type": "task_complete", "task_id": "..."}
         data: [DONE]
+
+    'done' fires as soon as the visible answer is ready (may precede
+    background memory writes by up to ~20-30s). 'task_complete' fires only
+    after the full pipeline — including post-answer episodic/working-state
+    hooks — has finished, and always precedes [DONE]. Clients that submit
+    a new task while a prior one's background writes are still running can
+    cause overlapping calls against a single-instance local model backend,
+    so the client should gate the next submission on 'task_complete', not
+    'done'.
     """
     controller = _require_controller()
     runtime    = _require_runtime()
@@ -1275,6 +1285,10 @@ async def _stream_task(
         else:
             logger.exception("Error during planning/dispatch for task %s.", task_id)
             yield _sse({"type": "error", "message": str(exc), "task_id": task_id})
+        # The pipeline (including post-answer hooks) has stopped running one
+        # way or another — signal task_complete so the client can re-enable
+        # input rather than waiting indefinitely.
+        yield _sse({"type": "task_complete", "task_id": task_id})
         yield "data: [DONE]\n\n"
         return
 
@@ -1286,7 +1300,12 @@ async def _stream_task(
             yield _drain_item(item)
 
     if answer_ready_emitted:
-        # sources+done already sent — just close the stream.
+        # sources+done were already sent early; the pipeline (including
+        # post-answer episodic/working-state hooks) has now actually
+        # finished, since we're past `await producer_task`. Signal that
+        # distinctly so the client can tell "answer visible" apart from
+        # "fully done" and re-enable input only now.
+        yield _sse({"type": "task_complete", "task_id": task_id})
         yield "data: [DONE]\n\n"
         return
 
@@ -1296,6 +1315,7 @@ async def _stream_task(
             "message": result.get("error", "Task failed during planning or dispatch."),
             "task_id": task_id,
         })
+        yield _sse({"type": "task_complete", "task_id": task_id})
         yield "data: [DONE]\n\n"
         return
 
@@ -1313,6 +1333,11 @@ async def _stream_task(
         "metadata": result.get("metadata", {}),
         "answer":   result.get("answer", ""),
     })
+    # No on_answer_ready path was taken (e.g. non-conversational agent) —
+    # 'done' above already reflects the fully-resolved pipeline, but emit
+    # task_complete too so the client's completion signal is uniform across
+    # both paths.
+    yield _sse({"type": "task_complete", "task_id": task_id})
     yield "data: [DONE]\n\n"
 
 

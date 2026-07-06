@@ -16,6 +16,7 @@ Reference: §4 of LOCALIST-Architecture.md
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
@@ -71,6 +72,13 @@ class RoutingPlan:
         or "outgoing". resolved_stem is carried alongside node_id so
         downstream consumers skip a second MemoryManager round-trip just
         to recover the display name.
+    tool_signal_source :
+        Provenance of tools_to_call, for per-turn auditability: "keyword"
+        when a deterministic P3/P3b/compound match populated it, "classifier_fallback"
+        when the feature-flagged P6-fallthrough tool-need classifier populated
+        it (active mode only), or None when tools_to_call is empty or was set
+        by a code path that predates this attribution (e.g. P3c never sets
+        tools_to_call, so it stays None there too).
     """
     agent:          str
     fetch_episodic: bool
@@ -81,6 +89,7 @@ class RoutingPlan:
     compound:       bool       = False
     priority:       int        = 6
     graph_query:    tuple[str, int, str] | None = None
+    tool_signal_source: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +326,69 @@ _SEMANTIC_GATE_THRESHOLDS: dict[str, float] = {
 
 
 # ---------------------------------------------------------------------------
+# P6-fallthrough tool-need classifier  (feature-flagged, shadow-first)
+#
+# Fires only when P1, P2, P3/3b/3c, and P4 have all found no match for the
+# turn — i.e. routing is about to fall through past Priority 5 toward
+# Priority 6. Two hard gates run before any model call (see
+# Planner._classify_tool_fallback); the flag below is a third, coarser gate
+# checked before that method is even invoked.
+# ---------------------------------------------------------------------------
+
+# Read at call time (not cached at import/construction) so tests and ops
+# tooling can flip modes without reconstructing the Planner instance.
+_TOOL_FALLBACK_ENV_VAR: str = "LOCALIST_TOOL_FALLBACK_CLASSIFIER"
+
+_TOOL_FALLBACK_VALID_MODES: frozenset[str] = frozenset({"off", "shadow", "active"})
+
+# The only values the classifier prompt is allowed to resolve to. Anything
+# else — empty string, prose, garbage — parses to None, identical to "none".
+_TOOL_FALLBACK_TOOL_NAMES: frozenset[str] = frozenset({
+    "web_search", "file_op", "url_fetch",
+})
+
+_TOOL_FALLBACK_SYSTEM_PROMPT: str = (
+    "You are a routing classifier, not a conversational assistant. Given a "
+    "user instruction, decide whether answering it requires calling an "
+    "external tool. Respond with exactly one word and nothing else: "
+    "web_search, file_op, url_fetch, or none."
+)
+
+
+# ---------------------------------------------------------------------------
+# lookup_request resolved-context guard  (feature-flagged, shadow-first)
+#
+# Trigger: diagnostics/score_referential_followup_lookup_request.py found
+# that 9/10 referential/follow-up phrases ("What do you make of all that?",
+# "What does that mean?", etc.) clear the lookup_request 0.60 gate — they
+# score 0.60-0.70, in the same band as genuine lookup_request true positives
+# (Cat C, 0.649-0.778). These phrases are not lookup requests; they are
+# continuation questions about something already surfaced this session,
+# almost always the immediately preceding turn's tool result. The diagnostic
+# also confirmed explicit_search_action stays well clear of its own 0.72
+# gate for this whole category (max 0.6247), so this guard targets
+# lookup_request specifically and leaves explicit_search_action untouched.
+#
+# The signal that the guard uses is the SAME state already tracked for the
+# P6-fallthrough classifier's Gate 1: self._last_turn_tools_fired, updated
+# every turn by record_tools_fired(). When the prior turn already fired a
+# tool, a lookup_request-only gate crossing this turn is read as "referring
+# back to that result" rather than "asking for a new lookup" — so it is not,
+# by itself, sufficient to add web_search. A literal _WEB_SEARCH_KEYWORDS
+# match or an independent explicit_search_action gate crossing are each
+# untouched under all conditions; this guard only ever removes the
+# lookup_request-alone justification for web_search.
+# ---------------------------------------------------------------------------
+
+# Read at call time (not cached at import/construction) — same rationale as
+# _TOOL_FALLBACK_ENV_VAR: tests and ops tooling can flip modes without
+# reconstructing the Planner instance.
+_LOOKUP_GUARD_ENV_VAR: str = "LOCALIST_LOOKUP_REQUEST_RESOLVED_CONTEXT_GUARD"
+
+_LOOKUP_GUARD_VALID_MODES: frozenset[str] = frozenset({"off", "shadow", "active"})
+
+
+# ---------------------------------------------------------------------------
 # Graph-query extraction and name resolution  (P3c, Phase C Step 3a)
 #
 # extract_graph_query() and resolve_graph_target() are pure, stateless
@@ -472,6 +544,9 @@ class Planner:
       3b. Factual query      — keyword + corpus miss → web_search
       4.  Corpus signal      — deterministic score threshold check
       5.  Episodic relevance — single bounded inference call (added in 3.3)
+      -.  Tool-fallback classifier — feature-flagged, shadow-first bounded
+          inference call; only reached when P1–P5 all found no match
+          (§ P6-fallthrough tool-need classifier). Off by default.
       6.  Direct answer      — fallback (added in 3.4)
 
     The Planner never calls agents, never writes to the database,
@@ -480,7 +555,9 @@ class Planner:
     Parameters
     ----------
     runtime :
-        RuntimeClient. Used only for the Priority 5 inference call.
+        RuntimeClient. Used for the Priority 5 inference call, and — only
+        when LOCALIST_TOOL_FALLBACK_CLASSIFIER is "shadow" or "active" —
+        the P6-fallthrough tool-need classifier's bounded inference call.
         Not used in Priorities 1–4 or 6.
     memory_manager :
         Optional MemoryManager. Required for Priority 4 corpus scoring.
@@ -509,6 +586,14 @@ class Planner:
         #   be float lists.
         self._episodic_injected: bool = False
         self._episodic_cache_pairs: list[tuple[list[float], bool]] = []
+
+        # Gate 1 state for the P6-fallthrough tool-need classifier — the
+        # tools_to_call resolved by the most recently completed route() call.
+        # Updated automatically at the end of every route() invocation (see
+        # record_tools_fired()), mirroring the _episodic_injected pattern:
+        # Planner is a single long-lived instance for the process, so this
+        # is in-memory only, not persisted across restarts.
+        self._last_turn_tools_fired: list[str] = []
 
         # Diagnostic Slot 1 — flat list of (group_name, vector) pairs, one per
         # template string across all groups in _SEARCH_INTENT_TEMPLATES.
@@ -550,6 +635,22 @@ class Planner:
         self._episodic_injected = True
         logger.debug("Planner: episodic_injected flag set for this session.")
 
+    def record_tools_fired(self, tools: list[str]) -> None:
+        """
+        Record the tools_to_call resolved for the turn that just finished
+        routing, so the next route() call's Gate 1 check (P6-fallthrough
+        tool-need classifier) can see it deterministically.
+
+        Called automatically by route() after every turn — this is not
+        something callers need to invoke manually in production. It is
+        exposed publicly so tests can seed a "prior turn" fixture directly.
+        """
+        self._last_turn_tools_fired = list(tools)
+        logger.debug(
+            "Planner: record_tools_fired — last_turn_tools_fired=%r.",
+            self._last_turn_tools_fired,
+        )
+
     def _detect_compound(
         self,
         lowered: str,
@@ -590,6 +691,7 @@ class Planner:
                 fetch_rag      = False,
                 tools_to_call  = ["web_search"],
                 compound       = True,
+                tool_signal_source = "keyword",
             )
 
         return None
@@ -601,6 +703,13 @@ class Planner:
     ) -> RoutingPlan:
         """
         Evaluate priorities 1–6 in order and return the first matching plan.
+
+        Thin wrapper around _route_impl(): records the resolved plan's
+        tools_to_call after every call (record_tools_fired()) so the next
+        turn's P6-fallthrough tool-need classifier Gate 1 check has a
+        deterministic, in-memory view of "did the immediately preceding
+        turn already fire a tool" — no new dependency, no context/DB
+        plumbing required.
 
         Parameters
         ----------
@@ -614,6 +723,16 @@ class Planner:
         RoutingPlan
             Never raises. Guaranteed to return a valid plan.
         """
+        plan = self._route_impl(instruction, context)
+        self.record_tools_fired(plan.tools_to_call)
+        return plan
+
+    def _route_impl(
+        self,
+        instruction: str,
+        context:     dict[str, Any],
+    ) -> RoutingPlan:
+        """Priority evaluation body for route() — see route() for the public contract."""
         lowered = instruction.lower()
 
         # Compound detection — must run before priority evaluation
@@ -664,6 +783,14 @@ class Planner:
 
         # Priority 5 — Episodic relevance (single bounded inference call)
         plan = self._priority5_episodic(instruction)
+        if plan is not None:
+            return plan
+
+        # P6-fallthrough tool-need classifier — feature-flagged, shadow-first.
+        # Only reached when P1, P2, P3/3b/3c, P4, and P5 have all found no
+        # match. Off by default: _maybe_tool_fallback_classifier() returns
+        # None immediately without calling _classify_tool_fallback() at all.
+        plan = self._maybe_tool_fallback_classifier(instruction, context)
         if plan is not None:
             return plan
 
@@ -804,6 +931,20 @@ class Planner:
 
         return (best_group, best_score, group_scores)
 
+    @staticmethod
+    def _resolved_context_guard_mode() -> str:
+        """
+        Read LOCALIST_LOOKUP_REQUEST_RESOLVED_CONTEXT_GUARD from the
+        environment.
+
+        Read at call time (not cached) so tests and ops tooling can flip
+        modes without reconstructing the Planner. Any value other than
+        "off" / "shadow" / "active" (including unset) is treated as "off" —
+        fail-safe to zero behavior change. Mirrors _tool_fallback_mode().
+        """
+        mode = os.environ.get(_LOOKUP_GUARD_ENV_VAR, "off").strip().lower()
+        return mode if mode in _LOOKUP_GUARD_VALID_MODES else "off"
+
     def _priority3_tool(self, lowered: str) -> RoutingPlan | None:
         """
         Match condition: web search keyword OR file operation keyword present
@@ -812,6 +953,16 @@ class Planner:
         Populates tools_to_call with "web_search" or "file_op" as
         appropriate. Sets compound=True when a tool is scheduled alongside
         a response agent, since the tool must run before the agent call.
+
+        lookup_request resolved-context guard (feature-flagged, see module
+        docstring above _LOOKUP_GUARD_ENV_VAR): when lookup_request is the
+        *only* reason web_search would be added (no literal keyword, no
+        independent explicit_search_action gate crossing) AND the prior
+        turn already fired a tool (self._last_turn_tools_fired non-empty),
+        "active" mode withholds web_search for this turn so routing falls
+        through toward P3b/P4/P5/(P6-fallthrough classifier)/P6 instead.
+        "shadow" mode evaluates and logs the same decision but still adds
+        web_search, identical to "off".
 
         Returns a RoutingPlan or None if no match.
         """
@@ -826,12 +977,14 @@ class Planner:
 
         semantic_result = self._semantic_search_intent(lowered)
         semantic_triggered = False
+        fired_groups: list[str] = []
         if semantic_result is not None:
             best_group, best_score, all_scores = semantic_result
-            semantic_triggered = any(
-                all_scores.get(group, 0.0) >= threshold
-                for group, threshold in _SEMANTIC_GATE_THRESHOLDS.items()
-            )
+            fired_groups = [
+                group for group, threshold in _SEMANTIC_GATE_THRESHOLDS.items()
+                if all_scores.get(group, 0.0) >= threshold
+            ]
+            semantic_triggered = bool(fired_groups)
             logger.debug(
                 "Planner: Priority 3 — semantic signal best=%r(%.3f) all=%s "
                 "gate_fired=%s.",
@@ -839,11 +992,70 @@ class Planner:
             )
 
         if semantic_triggered and "web_search" not in tools:
-            tools.append("web_search")
-            logger.debug(
-                "Planner: Priority 3 — web_search signal detected via semantic "
-                "gate (best_group=%r, best_score=%.3f).", best_group, best_score,
+            # lookup_request resolved-context guard. Only relevant when
+            # lookup_request fired WITHOUT explicit_search_action also
+            # independently clearing its own gate — that second condition
+            # is exactly what fired_groups (not just semantic_triggered)
+            # lets us check, versus the pre-existing best_group/best_score
+            # argmax which can't distinguish "LR alone" from "LR and ESA
+            # both fired". A literal keyword is already ruled out here by
+            # the enclosing "web_search" not in tools check.
+            lookup_request_only = (
+                "lookup_request" in fired_groups
+                and "explicit_search_action" not in fired_groups
             )
+            suppress = False
+            if lookup_request_only:
+                guard_mode = self._resolved_context_guard_mode()
+                if guard_mode != "off":
+                    prior_tools_fired = list(self._last_turn_tools_fired)
+                    would_suppress = bool(prior_tools_fired)
+                    if guard_mode == "shadow":
+                        logger.info(
+                            "Planner: Priority 3 — lookup_request resolved-context "
+                            "guard (shadow) — instruction=%r last_turn_tools_fired=%r "
+                            "lookup_request=%.3f(>=%.2f) would_suppress=%s "
+                            "(RoutingPlan unaffected).",
+                            lowered, prior_tools_fired,
+                            all_scores["lookup_request"],
+                            _SEMANTIC_GATE_THRESHOLDS["lookup_request"],
+                            would_suppress,
+                        )
+                    elif guard_mode == "active" and would_suppress:
+                        suppress = True
+                        logger.info(
+                            "Planner: Priority 3 — lookup_request resolved-context "
+                            "guard (active) — suppressing web_search: "
+                            "prior_turn_tools_fired=%r (non-empty); lookup_request="
+                            "%.3f(>=%.2f) fired alone (literal_keyword_present=False, "
+                            "explicit_search_action_independent=False).",
+                            prior_tools_fired,
+                            all_scores["lookup_request"],
+                            _SEMANTIC_GATE_THRESHOLDS["lookup_request"],
+                        )
+                    elif guard_mode == "active" and not would_suppress:
+                        logger.info(
+                            "Planner: Priority 3 — lookup_request resolved-context "
+                            "guard (active) — evaluated, NOT suppressing: "
+                            "instruction=%r prior_turn_tools_fired=%r (empty); "
+                            "lookup_request=%.3f(>=%.2f) fired alone "
+                            "(literal_keyword_present=False, "
+                            "explicit_search_action_independent=False).",
+                            lowered, prior_tools_fired,
+                            all_scores["lookup_request"],
+                            _SEMANTIC_GATE_THRESHOLDS["lookup_request"],
+                        )
+
+            if not suppress:
+                tools.append("web_search")
+                fired_str = ", ".join(
+                    f"{group}={all_scores[group]:.3f}(>={_SEMANTIC_GATE_THRESHOLDS[group]:.2f})"
+                    for group in fired_groups
+                )
+                logger.debug(
+                    "Planner: Priority 3 — web_search signal detected via semantic "
+                    "gate (fired=[%s]).", fired_str,
+                )
 
         fo_kw = self._any_whole_word(_FILE_OP_KEYWORDS, lowered)
         if fo_kw:
@@ -866,6 +1078,7 @@ class Planner:
                 tools_to_call  = tools,
                 compound       = True,
                 priority       = 3,
+                tool_signal_source = "keyword",
             )
         return None
 
@@ -1023,6 +1236,7 @@ class Planner:
             tools_to_call  = ["web_search"],
             compound       = True,
             priority       = 3,
+            tool_signal_source = "keyword",
         )
 
     # -----------------------------------------------------------------------
@@ -1158,6 +1372,170 @@ class Planner:
 
         logger.debug("Planner: Priority 5 — no episodic keyword matched.")
         return None
+
+    # -----------------------------------------------------------------------
+    # P6-fallthrough tool-need classifier  (feature-flagged, shadow-first)
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _tool_fallback_mode() -> str:
+        """
+        Read LOCALIST_TOOL_FALLBACK_CLASSIFIER from the environment.
+
+        Read at call time (not cached) so tests and ops tooling can flip
+        modes without reconstructing the Planner. Any value other than
+        "off" / "shadow" / "active" (including unset) is treated as "off" —
+        fail-safe to zero behavior change.
+        """
+        mode = os.environ.get(_TOOL_FALLBACK_ENV_VAR, "off").strip().lower()
+        return mode if mode in _TOOL_FALLBACK_VALID_MODES else "off"
+
+    def _classify_tool_fallback(
+        self,
+        instruction: str,
+        context:     dict[str, Any],
+    ) -> str | None:
+        """
+        Bounded single-inference-call classifier: "is a tool needed for this
+        instruction, and which one?" Called only when P1, P2, P3/3b/3c, and
+        P4 have all found no match for this turn (i.e. routing is about to
+        fall through past Priority 5 toward Priority 6) AND the
+        LOCALIST_TOOL_FALLBACK_CLASSIFIER flag is "shadow" or "active" (see
+        _maybe_tool_fallback_classifier — when the flag is "off", this
+        method is never called at all).
+
+        Two hard gates run before any model call:
+
+          Gate 1 — deterministic, not a model judgment: skip if the most
+          recently completed turn's tools_to_call was non-empty (tracked in
+          self._last_turn_tools_fired, updated by route()/record_tools_fired()
+          after every turn). This makes the "tool need was already resolved
+          last turn" failure mode structurally impossible rather than
+          something the model is asked to avoid.
+
+          Gate 2 — dependency check: skip if memory_manager or runtime is
+          unavailable, the same fail-open-to-existing-behavior pattern
+          Priority 4/5 already use when their dependencies are absent.
+
+        The model is asked for exactly one word — one of web_search,
+        file_op, url_fetch, or none — and nothing else. Parsed via strict
+        exact-match (after .strip().lower()) against that known set; any
+        other output (empty, prose, garbage) parses to None, same as "none".
+        No arguments are requested from or derived from the model's output;
+        query/path/url resolution for whichever tool name is returned stays
+        entirely with the existing deterministic derivation logic
+        (MCPToolDispatcher), exactly as it already runs today for P3/P3b
+        tools_to_call matches.
+
+        Returns the parsed tool name, or None (no tool needed, gate skip,
+        or any parse/inference failure). Never raises.
+        """
+        if self._last_turn_tools_fired:
+            logger.info(
+                "Planner: tool-fallback classifier — instruction=%r gate1_pass=False "
+                "(prior turn tools_fired=%r); skipping.",
+                instruction, self._last_turn_tools_fired,
+            )
+            return None
+
+        if self._memory_manager is None or self._runtime is None:
+            logger.info(
+                "Planner: tool-fallback classifier — instruction=%r gate1_pass=True "
+                "gate2_pass=False (memory_manager_present=%s, runtime_present=%s); "
+                "skipping.",
+                instruction,
+                self._memory_manager is not None,
+                self._runtime is not None,
+            )
+            return None
+
+        prompt = (
+            f"User instruction: {instruction}\n\n"
+            "Does answering this require calling an external tool? Respond "
+            "with exactly one word: web_search, file_op, url_fetch, or none."
+        )
+
+        try:
+            raw = self._runtime.infer(
+                prompt,
+                system      = _TOOL_FALLBACK_SYSTEM_PROMPT,
+                max_tokens  = 8,
+                temperature = 0.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Planner: tool-fallback classifier — instruction=%r gate1_pass=True "
+                "gate2_pass=True runtime.infer raised: %s; treating as None.",
+                instruction, exc,
+            )
+            return None
+
+        parsed = raw.strip().lower()
+        tool = parsed if parsed in _TOOL_FALLBACK_TOOL_NAMES else None
+
+        logger.info(
+            "Planner: tool-fallback classifier — instruction=%r gate1_pass=True "
+            "gate2_pass=True raw_output=%r parsed_tool=%r.",
+            instruction, raw, tool,
+        )
+        return tool
+
+    def _maybe_tool_fallback_classifier(
+        self,
+        instruction: str,
+        context:     dict[str, Any],
+    ) -> RoutingPlan | None:
+        """
+        Feature-flag wrapper around _classify_tool_fallback().
+
+          off    (default) — returns None immediately; _classify_tool_fallback
+                              is never called. Zero behavior change, zero
+                              latency change.
+          shadow            — _classify_tool_fallback runs (and logs), but
+                              the result is discarded here: this method
+                              still returns None, so route() proceeds to
+                              _priority6_direct() exactly as it would with
+                              the flag off. For observing real traffic
+                              before the classifier is trusted to touch
+                              routing.
+          active            — a parsed tool name sets tools_to_call on a new
+                              RoutingPlan as P3 would have, tagged
+                              tool_signal_source="classifier_fallback" so
+                              it is never confused with a keyword match in
+                              per-turn metadata. A parsed None (no tool
+                              needed) returns None here too, deferring to
+                              _priority6_direct().
+        """
+        mode = self._tool_fallback_mode()
+        if mode == "off":
+            return None
+
+        tool = self._classify_tool_fallback(instruction, context)
+
+        if mode == "shadow":
+            logger.info(
+                "Planner: tool-fallback classifier — shadow mode, parsed_tool=%r "
+                "discarded; RoutingPlan unaffected.", tool,
+            )
+            return None
+
+        # mode == "active"
+        if tool is None:
+            return None
+
+        logger.info(
+            "Planner: tool-fallback classifier — active mode, tools_to_call=[%r] "
+            "via classifier_fallback.", tool,
+        )
+        return RoutingPlan(
+            agent              = "conversational_agent",
+            fetch_episodic     = False,
+            fetch_rag          = False,
+            tools_to_call      = [tool],
+            compound           = True,
+            priority           = 6,
+            tool_signal_source = "classifier_fallback",
+        )
 
     # -----------------------------------------------------------------------
     # Priority 6 — Direct answer fallback  (§4.2, Priority 6)

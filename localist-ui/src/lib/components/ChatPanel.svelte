@@ -140,7 +140,7 @@
 
   async function handleSubmit() {
     const text = instruction.trim();
-    if (!text || submitting || $tasksStore.streaming) return;
+    if (!text || submitting || $tasksStore.finalizing) return;
 
     submitting = true;
     instruction = '';
@@ -310,7 +310,7 @@
       <button
         class="attach-btn"
         on:click={() => fileInputEl.click()}
-        disabled={$tasksStore.streaming || submitting}
+        disabled={submitting}
         aria-label="Attach a file"
         title="Attach file"
         type="button"
@@ -332,9 +332,9 @@
       <button
         class="send-btn"
         on:click={handleSubmit}
-        disabled={!instruction.trim() || $tasksStore.streaming}
+        disabled={!instruction.trim() || $tasksStore.finalizing}
         aria-label="Send message"
-        title="Send (Enter)"
+        title={$tasksStore.finalizing ? 'Saving previous turn — send available shortly' : 'Send (Enter)'}
       >
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <line x1="22" y1="2" x2="11" y2="13"/>

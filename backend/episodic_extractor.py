@@ -40,6 +40,21 @@ from prompt_builder import PromptBuilder
 
 logger = logging.getLogger(__name__)
 
+
+def _log_infer_throughput(label: str, elapsed_s: float, output_chars: int) -> None:
+    """
+    Log chars/sec throughput for a single inference call.
+
+    Shared across all infer/infer_stream call sites so mid-session
+    throttling can be diagnosed from one consistent log line format.
+    """
+    chars_per_sec = output_chars / elapsed_s if elapsed_s > 0 else 0.0
+    logger.info(
+        "THROUGHPUT %s elapsed_s=%.3f output_chars=%d chars_per_sec=%.2f",
+        label, elapsed_s, output_chars, chars_per_sec,
+    )
+
+
 # Thread-local storage for passing diagnostic metadata from
 # extract_working_state_update() to process_working_state_update()
 # without changing the return type.
@@ -476,18 +491,21 @@ def extract_implicit_episode(
         f"If no durable fact is present, write: NONE"
     )
 
+    _t0 = time.perf_counter()
     try:
         raw = runtime.infer(
             system      = _EXTRACTION_SYSTEM,
             prompt      = user_prompt,
             max_tokens  = 200,
             temperature = 0.1,
+            label       = "implicit_extraction",
         )
     except Exception as exc:
         logger.warning(
             "extract_implicit_episode: inference failed (%s).", exc
         )
         return None
+    _log_infer_throughput("implicit_extraction", time.perf_counter() - _t0, len(raw or ""))
 
     confidence = score_model_extraction(raw)
     if confidence == 0.0:
@@ -776,10 +794,12 @@ def extract_working_state_update(
             prompt      = user_prompt,
             # §9.5 Open Item 4: live SSE inspection measured ~570-600 token
             # reasoning trace on this call; 200 caused deterministic
-            # PARSE_FAILURE (finish_reason="length"). 1024 matches the main
-            # conversational call's budget.
-            max_tokens  = 1024,
+            # PARSE_FAILURE (finish_reason="length"). Previously 1024 to
+            # match the main conversational call's budget; capped to 750
+            # per current directive — see caller for throughput note.
+            max_tokens  = 750,
             temperature = 0.0,
+            label       = "working_state",
         )
         _wsu_diag.infer_elapsed_s  = time.perf_counter() - _t0
         _wsu_diag.raw_response     = raw
@@ -930,6 +950,9 @@ def process_working_state_update(
         _raw      = getattr(_wsu_diag, "raw_response",     "")
         _fail_cat = getattr(_wsu_diag, "failure_category", None)
         _elapsed_str = f"{_elapsed:.3f}" if _elapsed is not None else "N/A"
+
+        if _elapsed is not None:
+            _log_infer_throughput("working_state", _elapsed, len(_raw or ""))
 
         if result is None:
             _outcome = _fail_cat or "PARSE_FAILURE"

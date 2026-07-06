@@ -78,6 +78,7 @@ class BaseRuntimeClient(Protocol):
         system:      str   = "",
         max_tokens:  int   = 1024,
         temperature: float = 0.2,
+        label:       str   = "",
     ) -> str:
         """
         Request a blocking chat completion.
@@ -92,6 +93,10 @@ class BaseRuntimeClient(Protocol):
             Hard cap on generated tokens.
         temperature:
             Sampling temperature (0.0 = deterministic, 1.0 = creative).
+        label:
+            Optional caller identifier for diagnostic correlation (e.g.
+            overlap/throughput logging). Backends that don't need it may
+            accept and ignore it; it must never affect the request itself.
 
         Returns
         -------
@@ -134,6 +139,7 @@ class BaseRuntimeClient(Protocol):
         system:      str   = "",
         max_tokens:  int   = 1024,
         temperature: float = 0.2,
+        label:       str   = "",
     ) -> Generator[str, None, None]:
         """
         Request a streaming chat completion.

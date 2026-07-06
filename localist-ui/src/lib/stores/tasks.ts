@@ -34,13 +34,25 @@ export interface Task {
 export interface TasksState {
   active_task_id: string | null;
   tasks: Record<string, Task>;
+  // True from submit until the visible answer text finishes streaming
+  // ('done' SSE event). Cleared before background memory writes
+  // (episodic/working-state extraction) are done — do not gate the next
+  // submission on this alone; see `finalizing`.
   streaming: boolean;
+  // True from submit until the backend's 'task_complete' SSE event, which
+  // fires only after the full pipeline (including post-answer
+  // episodic/working-state hooks) has finished. This can trail `streaming`
+  // going false by 10-30+ seconds. Gate the next submission on this, not
+  // on `streaming`, to avoid overlapping calls into the single-instance
+  // local model backend.
+  finalizing: boolean;
 }
 
 export const tasksStore = writable<TasksState>({
   active_task_id: null,
   tasks: {},
-  streaming: false
+  streaming: false,
+  finalizing: false
 });
 
 const BASE = '/api';
@@ -86,6 +98,15 @@ function patchTask(task_id: string, patch: Partial<Task>): void {
 // patched), so the caller's submitting flag clears immediately. The reader
 // loop keeps draining in the background until the [DONE] sentinel closes
 // the stream, ensuring no bytes are abandoned mid-connection.
+//
+// `streaming` and `finalizing` both start true and are cleared at
+// different points: `streaming` clears on 'done' (visible answer text is
+// ready), `finalizing` clears on 'task_complete' (the full backend
+// pipeline, including background episodic/working-state writes, has
+// actually finished). The next submission must be gated on `finalizing`,
+// not `streaming` — submitting while the prior turn's background writes
+// are still running causes overlapping calls into the single-instance
+// local model backend.
 export function submitTask(
   instruction: string,
   context: Record<string, unknown> = {},
@@ -100,6 +121,7 @@ export function submitTask(
     ...s,
     active_task_id: id,
     streaming: true,
+    finalizing: true,
     tasks: { ...s.tasks, [id]: task }
   }));
 
@@ -141,7 +163,10 @@ export function submitTask(
             const raw = line.slice(6).trim();
             if (raw === '[DONE]') {
               patchTask(id, { status: 'complete', completed_at: Date.now() });
-              tasksStore.update((s) => ({ ...s, streaming: false }));
+              // task_complete should already have cleared `finalizing` — this
+              // is a fail-safe in case the stream closes without it, so
+              // input never stays disabled indefinitely.
+              tasksStore.update((s) => ({ ...s, streaming: false, finalizing: false }));
               resolve(id);
               return;
             }
@@ -164,14 +189,17 @@ export function submitTask(
             }
           }
         }
-        resolve(id); // stream closed without [DONE]
+        // Stream closed without [DONE] (e.g. connection dropped) — fail-safe
+        // reset so input doesn't stay disabled with nothing left to unblock it.
+        tasksStore.update((s) => ({ ...s, streaming: false, finalizing: false }));
+        resolve(id);
       } catch (err) {
         patchTask(id, {
           status: 'failed',
           error: String(err),
           completed_at: Date.now()
         });
-        tasksStore.update((s) => ({ ...s, streaming: false }));
+        tasksStore.update((s) => ({ ...s, streaming: false, finalizing: false }));
         resolve(id); // always resolve with id, never reject — matches prior behaviour
       }
     })();
@@ -246,7 +274,17 @@ function handleSSEEvent(task_id: string, event: Record<string, unknown>): void {
         error: (event.message as string) ?? 'Unknown error',
         completed_at: Date.now()
       });
-      tasksStore.update((s) => ({ ...s, streaming: false }));
+      // An error means nothing further is coming for this task — no need
+      // to wait for 'task_complete' (which still follows, but redundantly).
+      tasksStore.update((s) => ({ ...s, streaming: false, finalizing: false }));
+      break;
+    }
+    case 'task_complete': {
+      // Fires only after the full backend pipeline — including background
+      // episodic/working-state writes — has finished. This is the real
+      // "safe to submit again" signal; 'done' alone is not (see TasksState
+      // doc comment on `finalizing`).
+      tasksStore.update((s) => ({ ...s, finalizing: false }));
       break;
     }
   }

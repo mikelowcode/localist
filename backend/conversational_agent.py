@@ -66,10 +66,12 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from typing import Any
 
 import session_files as _session_files
 
+from episodic_extractor import _log_infer_throughput
 from prompt_builder import PromptBuilder, RagSource
 
 logger = logging.getLogger(__name__)
@@ -221,21 +223,25 @@ class ConversationalAgent:
             try:
                 if on_token is not None:
                     chunks: list[str] = []
+                    _t0 = time.monotonic()
                     for chunk in self._runtime.infer_stream(
                         prompt      = prebuilt_prompt,
                         system      = prebuilt_system or system,
                         max_tokens  = max_tokens,
                         temperature = temperature,
+                        label       = "main_dispatch",
                     ):
                         on_token(chunk)
                         chunks.append(chunk)
                     answer = "".join(chunks)
+                    _log_infer_throughput("main_dispatch", time.monotonic() - _t0, len(answer))
                 else:
                     answer = self._runtime.infer(
                         prompt      = prebuilt_prompt,
                         system      = prebuilt_system or system,
                         max_tokens  = max_tokens,
                         temperature = temperature,
+                        label       = "main_dispatch",
                     )
             except Exception as exc:
                 logger.error(
@@ -368,21 +374,25 @@ class ConversationalAgent:
         try:
             if on_token is not None:
                 chunks = []
+                _t0 = time.monotonic()
                 for chunk in self._runtime.infer_stream(
                     prompt      = prompt,
                     system      = system,
                     max_tokens  = max_tokens,
                     temperature = temperature,
+                    label       = "main_dispatch",
                 ):
                     on_token(chunk)
                     chunks.append(chunk)
                 answer = "".join(chunks)
+                _log_infer_throughput("main_dispatch", time.monotonic() - _t0, len(answer))
             else:
                 answer = self._runtime.infer(
                     prompt      = prompt,
                     system      = system,
                     max_tokens  = max_tokens,
                     temperature = temperature,
+                    label       = "main_dispatch",
                 )
         except Exception as exc:
             logger.error(

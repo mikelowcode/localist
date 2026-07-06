@@ -207,9 +207,15 @@ class FoundryRuntimeClient:
         system:      str   = "",
         max_tokens:  int   = 1024,
         temperature: float = 0.2,
+        label:       str   = "",
     ) -> str:
         """
         Request a chat completion from Foundry (blocking).
+
+        `label` is accepted for signature parity with OMLXRuntimeClient
+        (whose call sites pass it for overlap/throughput diagnostics) but is
+        unused here — Foundry is not the single-shared-instance backend that
+        diagnostic exists for.
 
         Delegates to infer_stream() and accumulates all chunks so that the
         streaming and non-streaming paths share the same transport code.
@@ -253,9 +259,13 @@ class FoundryRuntimeClient:
         system:      str   = "",
         max_tokens:  int   = 1024,
         temperature: float = 0.2,
+        label:       str   = "",
     ) -> Generator[str, None, None]:
         """
         Request a streaming chat completion from Foundry via SSE.
+
+        `label` is accepted for signature parity with OMLXRuntimeClient but
+        unused here (see infer()).
 
         This is the canonical transport path.  infer() calls this method
         and accumulates its output; the FastAPI streaming endpoint can

@@ -18,7 +18,7 @@
 
   async function handleSubmit() {
     const q = query.trim();
-    if (!q || submitting || streaming) return;
+    if (!q || submitting || $tasksStore.finalizing) return;
     submitting = true;
     query = '';
     currentTask = null;
@@ -74,14 +74,13 @@
         bind:value={query}
         on:keydown={handleKeydown}
         placeholder="Enter a research question…"
-        disabled={streaming || submitting}
         class="query-input"
         aria-label="Research query"
       />
       <button
         class="query-btn"
         on:click={handleSubmit}
-        disabled={!query.trim() || streaming || submitting}
+        disabled={!query.trim() || $tasksStore.finalizing}
       >
         {#if streaming || submitting}
           <span class="spinner" aria-hidden="true" />
