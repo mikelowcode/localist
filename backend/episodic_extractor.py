@@ -377,7 +377,7 @@ def extract_content_from_instruction(
         raw = runtime.infer(
             system      = _EXTRACTION_SYSTEM,
             prompt      = user_prompt,
-            max_tokens  = 200,
+            max_tokens  = 750,
             temperature = 0.1,
         )
     except Exception as exc:
@@ -496,7 +496,7 @@ def extract_implicit_episode(
         raw = runtime.infer(
             system      = _EXTRACTION_SYSTEM,
             prompt      = user_prompt,
-            max_tokens  = 200,
+            max_tokens  = 750,
             temperature = 0.1,
             label       = "implicit_extraction",
         )
