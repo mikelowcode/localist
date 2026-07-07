@@ -36,6 +36,8 @@ from controller_agent import (
     AgentResult,
     SubTask,
     _memory_key,
+    _extract_file_op_content,
+    _file_op_confirmation_line,
 )
 from memory_manager import (
     MemoryManager,
@@ -44,7 +46,7 @@ from memory_manager import (
     GraphEdgeResult,
 )
 from planner import RoutingPlan
-from prompt_builder import PromptBuilder, WorkingMemoryState
+from prompt_builder import PromptBuilder, WorkingMemoryState, ToolResult as _ToolResult
 from wiki_doc import load_wiki_doc, ParsedWikiDoc
 
 
@@ -405,6 +407,228 @@ class TestToolStubPath:
 
         prompt = conv._received[0].context["_prebuilt_prompt"]
         assert "[TOOL RESULTS]" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# _extract_file_op_content / _file_op_confirmation_line — unit tests
+# ---------------------------------------------------------------------------
+
+class TestExtractFileOpContent:
+
+    def test_strips_leading_label_and_trailing_parenthetical(self):
+        answer = (
+            "Haiku about the sea:\n\n"
+            "Blue expanse so wide,\n"
+            "Waves that whisper ancient tales,\n"
+            "Horizon holds sky.\n\n"
+            "(Attempting to save content to haiku.md)"
+        )
+        assert _extract_file_op_content(answer) == (
+            "Blue expanse so wide,\n"
+            "Waves that whisper ancient tales,\n"
+            "Horizon holds sky."
+        )
+
+    def test_no_label_or_parenthetical_passes_through_unchanged(self):
+        answer = "Blue expanse so wide,\nWaves that whisper ancient tales,\nHorizon holds sky."
+        assert _extract_file_op_content(answer) == answer
+
+    def test_label_only_no_trailing_parenthetical(self):
+        answer = "Summary:\n\nThe meeting covered three topics."
+        assert _extract_file_op_content(answer) == "The meeting covered three topics."
+
+    def test_trailing_parenthetical_only_no_label(self):
+        answer = "The meeting covered three topics.\n\n(Saving this to summary.md)"
+        assert _extract_file_op_content(answer) == "The meeting covered three topics."
+
+    def test_content_with_internal_colon_not_mistaken_for_label(self):
+        """A single-line answer with a colon must not be treated as a label
+        line stripped down to nothing — the guard against zeroing out real
+        content should keep it intact."""
+        answer = "Remember: buy milk and walk the dog."
+        assert _extract_file_op_content(answer) == answer
+
+    def test_multiline_answer_with_colon_in_body_not_first_line(self):
+        answer = "Notes:\n\nTODO: buy milk\nTODO: walk the dog"
+        assert _extract_file_op_content(answer) == "TODO: buy milk\nTODO: walk the dog"
+
+    def test_markdown_italicized_trailing_aside_is_stripped(self):
+        """Observed live: the model wrapped its whole aside in markdown
+        italics with a backticked filename, e.g.
+        '*(This haiku has been generated and is ready to be saved as
+        `haiku.md`.)*' — the plain (...) pattern alone doesn't match this
+        because of the leading/trailing '*'."""
+        answer = (
+            "Blue expanse so wide,\n"
+            "Waves crash on the sandy shore,\n"
+            "Salt wind fills the air.\n\n"
+            "*(This haiku has been generated and is ready to be saved as `haiku.md`.)*"
+        )
+        assert _extract_file_op_content(answer) == (
+            "Blue expanse so wide,\n"
+            "Waves crash on the sandy shore,\n"
+            "Salt wind fills the air."
+        )
+
+    def test_parenthetical_that_is_the_whole_answer_is_not_stripped_to_empty(self):
+        """Guard: if stripping the trailing parenthetical would leave nothing,
+        keep the original text instead of writing an empty file."""
+        answer = "(just kidding, no real content here)"
+        assert _extract_file_op_content(answer) == answer
+
+
+class TestFileOpConfirmationLine:
+
+    def test_success_reports_actual_written_filename(self):
+        result = _ToolResult(
+            tool_name="file_op", parameters="", success=True,
+            result="OK: wrote 34 characters to haiku.md",
+        )
+        assert _file_op_confirmation_line(result, "haiku.md") == "\n\n*(Saved to haiku.md)*"
+
+    def test_success_reports_versioned_filename_when_original_existed(self):
+        result = _ToolResult(
+            tool_name="file_op", parameters="", success=True,
+            result="OK: wrote 34 characters to haiku_2.md",
+        )
+        # fallback_path is the pre-versioning plan.file_op_path; the actual
+        # written name (post version-cap fallback) must win when present.
+        assert _file_op_confirmation_line(result, "haiku.md") == "\n\n*(Saved to haiku_2.md)*"
+
+    def test_success_falls_back_to_plan_path_when_message_has_no_filename(self):
+        result = _ToolResult(
+            tool_name="file_op", parameters="", success=True,
+            result="OK: skipped duplicate append for turn_id=abc (already applied)",
+        )
+        assert _file_op_confirmation_line(result, "log.md") == "\n\n*(Saved to log.md)*"
+
+    def test_failure_strips_error_prefix(self):
+        result = _ToolResult(
+            tool_name="file_op", parameters="", success=False,
+            result="ERROR: path traversal outside project_root is not permitted",
+        )
+        assert _file_op_confirmation_line(result, "x.md") == (
+            "\n\n*(Could not save — path traversal outside project_root is not permitted)*"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Deferred file_op dispatch (_execute_plan Step 7b)
+# ---------------------------------------------------------------------------
+
+class TestDeferredFileOpDispatch:
+    """
+    plan.file_op_deferred means Planner detected a file_op-shaped
+    instruction whose content had to be generated by the agent first (see
+    planner.py's P3 content-present-vs-deferred split). These tests bypass
+    real Planner routing (patch.object on ctrl._planner) and patch
+    MCPToolDispatcher wholesale — dispatch()'s own MCP-session behavior is
+    already covered by test_mcp_tool_dispatcher.py; these only verify
+    _execute_plan's new Step 7b wiring (content extraction, dispatch args,
+    and the appended confirmation/failure line).
+    """
+
+    def _make_deferred_plan(self, path: str = "haiku.md", action: str = "write") -> RoutingPlan:
+        return RoutingPlan(
+            agent            = "conversational_agent",
+            fetch_episodic   = False,
+            fetch_rag        = False,
+            priority         = 3,
+            compound         = True,
+            file_op_deferred = True,
+            file_op_path     = path,
+            file_op_action   = action,
+        )
+
+    def test_success_strips_label_paren_for_content_and_appends_confirmation(self, mm):
+        raw_answer = (
+            "Haiku about the sea:\n\n"
+            "Blue expanse so wide,\n"
+            "Waves that whisper ancient tales,\n"
+            "Horizon holds sky.\n\n"
+            "(Attempting to save content to haiku.md)"
+        )
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent(raw_answer)
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = self._make_deferred_plan()
+
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.return_value = [
+            _ToolResult(
+                tool_name  = "file_op",
+                parameters = "action='write' path='haiku.md'",
+                result     = "OK: wrote 74 characters to haiku.md",
+                success    = True,
+            )
+        ]
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch("controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            result = ctrl.handle_task(
+                {"instruction": "write a haiku about the sea and save it as haiku.md"}
+            )
+
+        # The label/parenthetical framing must not leak into the saved content.
+        _, kwargs = mock_dispatcher.dispatch.call_args
+        assert kwargs["context"]["file_op_content"] == (
+            "Blue expanse so wide,\n"
+            "Waves that whisper ancient tales,\n"
+            "Horizon holds sky."
+        )
+        assert kwargs["context"]["file_op_path"]   == "haiku.md"
+        assert kwargs["context"]["file_op_action"] == "write"
+        assert kwargs["tools_to_call"] == ["file_op"]
+
+        # The displayed/persisted answer keeps the model's own text verbatim
+        # plus a deterministic (never model-narrated) confirmation line.
+        assert result["answer"] == raw_answer + "\n\n*(Saved to haiku.md)*"
+
+    def test_failure_appends_deterministic_failure_line(self, mm):
+        raw_answer = "Blue expanse so wide, waves that whisper old secrets, horizon holds the sky."
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent(raw_answer)
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = self._make_deferred_plan(path="../../etc/passwd", action="write")
+
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.return_value = [
+            _ToolResult(
+                tool_name  = "file_op",
+                parameters = "action='write' path='../../etc/passwd'",
+                result     = "ERROR: path traversal outside project_root is not permitted",
+                success    = False,
+            )
+        ]
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch("controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            result = ctrl.handle_task(
+                {"instruction": "write a haiku and save it as ../../etc/passwd"}
+            )
+
+        assert result["answer"] == raw_answer + (
+            "\n\n*(Could not save — path traversal outside project_root is not permitted)*"
+        )
+
+    def test_dispatch_exception_appends_failure_line_without_raising(self, mm):
+        raw_answer = "Blue expanse so wide, waves that whisper old secrets, horizon holds the sky."
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent(raw_answer)
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = self._make_deferred_plan()
+
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.side_effect = RuntimeError("localist-mcp unreachable")
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch("controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            result = ctrl.handle_task(
+                {"instruction": "write a haiku about the sea and save it as haiku.md"}
+            )
+
+        assert result["status"] == "complete"
+        assert result["answer"] == raw_answer + "\n\n*(Could not save — localist-mcp unreachable)*"
 
 
 # ---------------------------------------------------------------------------

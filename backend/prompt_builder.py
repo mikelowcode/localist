@@ -97,6 +97,10 @@ class PromptBuilder:
       Slot 3  [EPISODIC MEMORY] — durable facts; conditional; 150-token ceiling
       Slot 4  [CONTEXT]         — RAG snippets; conditional; 800-token ceiling
       Slot 5  [TOOL RESULTS]    — tool output; conditional; 500-token ceiling
+      Slot 5a [TOOL FAILED]     — failed tool calls; conditional; own
+                                  150-token ceiling, kept separate from Slot 5
+                                  so a verbose successful result can never
+                                  crowd a failure signal out of the prompt
       Slot 5b [GRAPH RESULT]    — graph query result; emitted whenever a graph
                                   query resolved, even with zero edges;
                                   300-token ceiling
@@ -150,6 +154,7 @@ class PromptBuilder:
     _CEIL_PROFILE:  int = 100   # slot 3b; user profile facts
     _CEIL_RAG:      int = 800   # slot 4
     _CEIL_TOOL:     int = 500   # slot 5
+    _CEIL_TOOL_FAILURE: int = 150   # slot 5a; own budget — see _slot5a_tool_failures
     _CEIL_GRAPH:    int = 300   # slot 5b
     _CEIL_WORKING_STATE: int = 100   # slot 6a
     _CEIL_WORKING:       int = 300   # slot 6
@@ -403,6 +408,62 @@ class PromptBuilder:
 
         return "\n".join(lines)
 
+    def _slot5a_tool_failures(
+        self,
+        tool_failures: list[ToolResult] | None,
+    ) -> str:
+        """
+        Return Slot 5a: tool failure block, or "" if None/empty.
+
+        Deliberately separate from Slot 5 ([TOOL RESULTS]) rather than a
+        raw "ERROR: ..." string folded into normal tool-result text — the
+        model gets one consistent, unambiguous failure shape to learn to
+        hedge against instead of an error string it might inconsistently
+        narrate around.
+
+        Format (one line per failure):
+            [TOOL FAILED]
+            {tool_name}({parameters}): FAILED — {reason}
+
+        {reason} is tr.result with a leading "ERROR:" stripped.
+
+        Given its own 150-token ceiling, deliberately separate from Slot
+        5's 500-token budget: a verbose successful tool result should never
+        be able to crowd a failure signal out of the prompt via shared
+        budget exhaustion — the entire point of this slot is that it
+        survives truncation pressure that ordinary Slot 5 entries do not.
+        """
+        if not tool_failures:
+            return ""
+
+        max_chars = self._CEIL_TOOL_FAILURE * 4
+        lines     = ["[TOOL FAILED]"]
+        budget    = max_chars - len("[TOOL FAILED]\n")
+
+        for tr in tool_failures:
+            reason = tr.result.strip()
+            if reason.startswith("ERROR:"):
+                reason = reason[len("ERROR:"):].strip()
+
+            line = f"{tr.tool_name}({tr.parameters}): FAILED — {reason}"
+
+            entry_budget = budget - 1  # 1 for separator newline
+            if entry_budget <= 0:
+                break
+            if len(line) > entry_budget:
+                line = line[:entry_budget] + "… [truncated]"
+
+            lines.append(line)
+            budget -= len(line) + 1
+
+            if budget <= 0:
+                break
+
+        if len(lines) == 1:
+            return ""
+
+        return "\n".join(lines)
+
     def _slot_graph(self, graph_result: GraphQueryResult | None) -> str:
         """
         Return Slot 5b: graph query result, or "" if graph_result is None.
@@ -568,6 +629,7 @@ class PromptBuilder:
         profile_facts:    list[UserProfileFact]   | None = None,
         rag_snippets:     list[RagSource]          | None = None,
         tool_results:     list[ToolResult]         | None = None,
+        tool_failures:    list[ToolResult]         | None = None,
         graph_result:     GraphQueryResult         | None = None,
         working_state:    WorkingMemoryState       | None = None,
         working_memory:   list[Turn]               | None = None,
@@ -599,6 +661,12 @@ class PromptBuilder:
         tool_results :
             ToolResult list in dispatch order (Slot 5). Pass None or []
             to omit.
+        tool_failures :
+            ToolResult list of failed tool calls (Slot 5a, [TOOL FAILED]).
+            Rendered as {tool_name}({parameters}): FAILED — {reason},
+            distinct from Slot 5's success-path formatting. Own 150-token
+            ceiling, independent of Slot 5's 500-token budget. Pass None
+            or [] to omit.
         graph_result :
             GraphQueryResult for the current turn (Slot 5b). When not None,
             always rendered — even with zero links. Pass None to omit.
@@ -631,6 +699,7 @@ class PromptBuilder:
             self._slot3_combined(episodic_summary, profile_facts),
             self._slot4_rag(rag_snippets),
             self._slot5_tools(tool_results),
+            self._slot5a_tool_failures(tool_failures),
             self._slot_graph(graph_result),
             self._slot6a_working_state(working_state),
             self._slot6_working_memory(working_memory),

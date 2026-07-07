@@ -1,11 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import {
-    rawFiles, wikiFiles,
-    rawLoading, wikiLoading,
-    rawError, wikiError,
+    rawFiles, wikiFiles, generatedFiles,
+    rawLoading, wikiLoading, generatedLoading,
+    rawError, wikiError, generatedError,
     ingest, isIngesting,
-    loadRawFiles, loadWikiFiles,
+    loadRawFiles, loadWikiFiles, loadGeneratedFiles,
     uploadFile, ingestFile, resetIngest,
     formatBytes,
     type FileEntry,
@@ -111,6 +111,7 @@
   onMount(() => {
     loadRawFiles();
     loadWikiFiles();
+    loadGeneratedFiles();
   });
 </script>
 
@@ -222,6 +223,68 @@
       {:else}
         <ul class="file-list" role="list">
           {#each $wikiFiles as file (file.path)}
+            <li>
+              <button
+                class="file-item"
+                class:selected={selectedFile?.path === file.path}
+                on:click={() => openFile(file)}
+                aria-pressed={selectedFile?.path === file.path}
+              >
+                <svg class="file-icon" width="13" height="13" viewBox="0 0 24 24"
+                     fill="none" stroke="currentColor" stroke-width="2"
+                     stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <polyline points="14 2 14 8 20 8"/>
+                </svg>
+                <span class="file-name truncate">{file.name}</span>
+                {#if file.size}
+                  <span class="file-size">{formatSize(file.size)}</span>
+                {/if}
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
+
+    <!-- Generated files section -->
+    <div class="file-section">
+      <div class="section-header">
+        <h3 class="section-title">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+          </svg>
+          Generated Files
+        </h3>
+        <span class="section-count">{$generatedFiles.length}</span>
+        <button class="refresh-btn" on:click={loadGeneratedFiles}
+                disabled={$generatedLoading} title="Refresh" aria-label="Refresh generated files">
+          <svg viewBox="0 0 16 16" width="11" height="11" fill="none"
+               stroke="currentColor" stroke-width="1.8">
+            <path d="M2 8a6 6 0 1 0 1-3.2" stroke-linecap="round"/>
+            <path d="M2 4v2h2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+
+      {#if $generatedError}
+        <p class="section-error">{$generatedError}</p>
+      {/if}
+
+      {#if $generatedLoading}
+        <div class="loading-list">
+          {#each [80, 60, 72, 55] as w}
+            <div class="skeleton-row" style="width:{w}%"></div>
+          {/each}
+        </div>
+      {:else if $generatedFiles.length === 0}
+        <p class="empty-section">No generated files yet.</p>
+      {:else}
+        <ul class="file-list" role="list">
+          {#each $generatedFiles as file (file.path)}
             <li>
               <button
                 class="file-item"

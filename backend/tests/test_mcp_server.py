@@ -83,6 +83,26 @@ class TestFileOpsWrite:
         with pytest.raises(ValueError, match="path traversal"):
             file_ops.write_file("../escape.md", "nope")
 
+    def test_write_empty_content_refused(self, tmp_path: Path):
+        file_ops.set_project_root(tmp_path)
+        with pytest.raises(ValueError, match="refusing empty file write"):
+            file_ops.write_file("empty.md", "")
+        assert not (tmp_path / "empty.md").exists()
+
+    def test_write_whitespace_only_content_refused(self, tmp_path: Path):
+        file_ops.set_project_root(tmp_path)
+        with pytest.raises(ValueError, match="refusing empty file write"):
+            file_ops.write_file("whitespace.md", "   \n\t  ")
+        assert not (tmp_path / "whitespace.md").exists()
+
+    def test_write_versions_on_existing_file(self, tmp_path: Path):
+        file_ops.set_project_root(tmp_path)
+        file_ops.write_file("dup.md", "first")
+        result = file_ops.write_file("dup.md", "second")
+        assert result == "OK: wrote 6 characters to dup_2.md"
+        assert (tmp_path / "dup.md").read_text(encoding="utf-8") == "first"
+        assert (tmp_path / "dup_2.md").read_text(encoding="utf-8") == "second"
+
 
 class TestFileOpsAppend:
     def test_append_to_existing_file(self, tmp_path: Path):

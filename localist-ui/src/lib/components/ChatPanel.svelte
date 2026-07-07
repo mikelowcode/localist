@@ -199,6 +199,31 @@
     return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
+  // Priority 3 in planner.py is a generic tool-signal priority (web_search,
+  // file_op, or url_fetch) — not web-search-specific. Pick the label from
+  // whichever tool actually fired instead of hardcoding "Web search".
+  // file_op_deferred counts as a file_op match even though tools_fired is
+  // empty for it (the write happens after generation completes — see
+  // controller_agent.py's _execute_plan Step 7b — so it never lands in
+  // plan.tools_to_call). Falls back to a generic label when none/multiple match.
+  function p3Provenance(p: {
+    tools_fired?:      string[];
+    file_op_deferred?: boolean;
+  }): { label: string; cls: string } {
+    const fired       = p.tools_fired ?? [];
+    const hasWebSearch = fired.includes('web_search');
+    const hasFileOp    = fired.includes('file_op') || !!p.file_op_deferred;
+    const hasUrlFetch  = fired.includes('url_fetch');
+    const matchCount   = [hasWebSearch, hasFileOp, hasUrlFetch].filter(Boolean).length;
+
+    if (matchCount === 1) {
+      if (hasWebSearch) return { label: 'P3 · Web search',     cls: 'prov-web' };
+      if (hasFileOp)    return { label: 'P3 · File operation', cls: 'prov-tool' };
+      if (hasUrlFetch)  return { label: 'P3 · Page fetch',     cls: 'prov-tool' };
+    }
+    return { label: 'P3 · Tool', cls: 'prov-tool' };
+  }
+
   onMount(() => {
     inputEl?.focus();
   });
@@ -252,7 +277,8 @@
                     {:else if p.priority === 2}
                       <span class="prov-chip prov-memory">P2 · Memory write</span>
                     {:else if p.priority === 3}
-                      <span class="prov-chip prov-web">P3 · Web search</span>
+                      {@const p3 = p3Provenance(p)}
+                      <span class="prov-chip {p3.cls}">{p3.label}</span>
                     {:else if p.priority === 4}
                       <span class="prov-chip prov-rag">P4 · Vault</span>
                     {:else if p.priority === 5}
@@ -265,6 +291,9 @@
                     {#each p.tools_fired as tool}
                       <span class="prov-chip prov-tool">⚙ {tool}</span>
                     {/each}
+                  {/if}
+                  {#if p.file_op_deferred && !(p.tools_fired && p.tools_fired.includes('file_op'))}
+                    <span class="prov-chip prov-tool">⚙ file_op</span>
                   {/if}
                   {#if p.fetch_episodic}
                     <span class="prov-chip prov-episodic-mem">◎ episodic</span>

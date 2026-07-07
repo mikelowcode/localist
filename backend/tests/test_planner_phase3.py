@@ -120,6 +120,36 @@ class TestPlannerPriorities:
         plan = p.route("read the file notes.md", context={})
         assert "file_op" in plan.tools_to_call
 
+    def test_p3_file_op_content_present_quoted_dispatches_immediately(self):
+        """Destination phrase + quoted literal content → unchanged old
+        behavior: tools_to_call=["file_op"], not deferred."""
+        p = Planner(runtime=make_runtime())
+        plan = p.route('save it as notes.md: "buy milk"', context={})
+        assert "file_op" in plan.tools_to_call
+        assert plan.file_op_deferred is False
+        assert plan.compound is True
+
+    def test_p3_file_op_content_present_fenced_dispatches_immediately(self):
+        """Destination phrase + fenced literal content → unchanged old
+        behavior: tools_to_call=["file_op"], not deferred."""
+        p = Planner(runtime=make_runtime())
+        plan = p.route("save it as notes.md: ```buy milk```", context={})
+        assert "file_op" in plan.tools_to_call
+        assert plan.file_op_deferred is False
+
+    def test_p3_file_op_generation_required_is_deferred(self):
+        """No literal content in the instruction — content must be composed
+        by the agent first — so file_op is NOT dispatched yet."""
+        p = Planner(runtime=make_runtime())
+        plan = p.route(
+            "write a haiku about the sea and save it as haiku.md", context={}
+        )
+        assert "file_op" not in plan.tools_to_call
+        assert plan.file_op_deferred is True
+        assert plan.file_op_path   == "haiku.md"
+        assert plan.file_op_action == "write"
+        assert plan.compound is True
+
     def test_p4_explicit_wiki_keyword_fires(self):
         p = Planner(runtime=make_runtime())
         plan = p.route("check the wiki for LORA memory system", context={})
@@ -511,24 +541,28 @@ class TestPlannerP3c:
         assert resolved_stem == "lora-persona"
         assert node_id       == node_ids["lora-persona"]
 
-    # 3. file_op guard: "save" triggers inline guard → P3c returns None,
-    #    P3 fires on "save" and returns file_op plan
+    # 3. file_op guard: "create a file" triggers inline guard → P3c returns None,
+    #    P3 fires on "create a file" and returns file_op plan
     def test_file_op_guard_defers_to_p3(self, tmp_path):
         mm, _ = make_mm_with_nodes(tmp_path)
         p = Planner(runtime=make_runtime(), memory_manager=mm)
-        plan = p.route("what links to lora-persona, save the results", context={})
-        # P3c defers; P3 fires
-        assert "file_op" in plan.tools_to_call
+        plan = p.route("what links to lora-persona, create a file with the results", context={})
+        # P3c defers; P3 fires. "the results" isn't literal content present in
+        # the instruction (it's the not-yet-computed graph-query output), so
+        # this is a generation-required file_op — deferred, not dispatched.
+        assert plan.priority == 3
+        assert plan.file_op_deferred is True
+        assert "file_op" not in plan.tools_to_call
         assert plan.graph_query is None
 
     # 4. Ordering regression: graph-query wins over a web_search-only P3 match.
-    #    "today" is a web_search keyword; under the old (wrong) ordering where
+    #    "recent" is a web_search keyword; under the old (wrong) ordering where
     #    P3c ran AFTER P3, P3 would win. P3c's inline guard does NOT block
     #    web_search, so with correct ordering P3c resolves the graph query first.
     def test_p3c_beats_web_search_p3(self, tmp_path):
         mm, node_ids = make_mm_with_nodes(tmp_path)
         p = Planner(runtime=make_runtime(), memory_manager=mm)
-        plan = p.route("what links to lora-persona today", context={})
+        plan = p.route("what links to lora-persona, recent activity", context={})
         assert plan.graph_query is not None
         direction, node_id, resolved_stem = plan.graph_query
         assert direction     == "incoming"

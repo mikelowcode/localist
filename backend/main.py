@@ -78,6 +78,7 @@ can be overridden via environment variables or a .env file:
   LOCALIST_LOG_LEVEL                   Root log level (default INFO)
   LOCALIST_WIKI_DIR                    Absolute path to the wiki directory
   LOCALIST_RAW_DIR                     Absolute path to the raw files directory
+  LOCALIST_GENERATED_DIR               Absolute path to the generated files directory
   LOCALIST_SCHEMA_PATH                 Absolute path to SCHEMA.md
   LOCALIST_TEMPLATES_DIR               Absolute path to the templates directory
   LOCALIST_AUTO_APPLY                  Whether WikiAgent writes to disk immediately (bool)
@@ -156,6 +157,7 @@ class Settings(BaseSettings):
     # Paths — resolved at startup; defaults are relative to project root
     wiki_dir:        str | None = None
     raw_dir:         str | None = None
+    generated_dir:   str | None = None
     schema_path:     str | None = None
     templates_dir:   str | None = None
 
@@ -189,6 +191,7 @@ class AppState:
         # Resolved at startup by lifespan()
         self.wiki_dir:          Path | None = None
         self.raw_dir:           Path | None = None
+        self.generated_dir:     Path | None = None
         self.schema_path:       Path | None = None
         self.templates_dir:     Path | None = None
 
@@ -252,6 +255,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     wiki_dir      = Path(settings.wiki_dir)      if settings.wiki_dir      else project_root / "wiki"
     raw_dir       = Path(settings.raw_dir)       if settings.raw_dir       else project_root / "raw"
+    generated_dir = Path(settings.generated_dir) if settings.generated_dir else project_root / "generated_files"
     schema_path   = Path(settings.schema_path)   if settings.schema_path   else project_root / "SCHEMA.md"
     templates_dir = Path(settings.templates_dir) if settings.templates_dir else project_root / "templates"
     memory_db     = Path(settings.memory_db)     if settings.memory_db     else project_root / "localist_memory.db"
@@ -337,6 +341,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     _state.wiki_dir      = wiki_dir
     _state.raw_dir       = raw_dir
+    _state.generated_dir = generated_dir
     _state.schema_path   = schema_path
     _state.templates_dir = templates_dir
 
@@ -471,12 +476,13 @@ class EpisodesResponse(BaseModel):
 
 
 class FileEntry(BaseModel):
-    """Metadata for a single file in raw/ or wiki/."""
+    """Metadata for a single file in raw/, wiki/, or generated_files/."""
     name:     str    # stem without extension
     filename: str    # filename with extension, e.g. "my-doc.md"
     path:     str    # absolute path — passed as context.raw_path on ingest
     size:     int    # bytes
     modified: str    # ISO-8601 UTC timestamp
+    type:     Literal["raw", "wiki", "generated"]
 
 
 class FilesResponse(BaseModel):
@@ -847,7 +853,7 @@ async def get_memory_episodes(
 # File management endpoints
 # ---------------------------------------------------------------------------
 
-def _file_entry(p: "Path") -> FileEntry:
+def _file_entry(p: "Path", type: Literal["raw", "wiki", "generated"]) -> FileEntry:
     """Build a FileEntry from a Path."""
     stat = p.stat()
     return FileEntry(
@@ -858,6 +864,7 @@ def _file_entry(p: "Path") -> FileEntry:
         modified = datetime.datetime.fromtimestamp(
             stat.st_mtime, tz=datetime.timezone.utc
         ).isoformat(),
+        type     = type,
     )
 
 
@@ -874,7 +881,7 @@ async def get_files_raw() -> FilesResponse:
     if not raw_dir.exists():
         return FilesResponse(files=[])
     files = [
-        _file_entry(p)
+        _file_entry(p, "raw")
         for p in sorted(raw_dir.iterdir())
         if p.is_file() and p.suffix.lower() in {".md", ".txt"}
     ]
@@ -894,9 +901,29 @@ async def get_files_wiki() -> FilesResponse:
     if not wiki_dir.exists():
         return FilesResponse(files=[])
     files = [
-        _file_entry(p)
+        _file_entry(p, "wiki")
         for p in sorted(wiki_dir.iterdir())
         if p.is_file() and p.suffix == ".md"
+    ]
+    return FilesResponse(files=files)
+
+
+@app.get(
+    "/files/generated",
+    response_model = FilesResponse,
+    summary        = "List generated files",
+)
+async def get_files_generated() -> FilesResponse:
+    """Return metadata for every file in the generated_files/ directory."""
+    if _state.generated_dir is None:
+        raise HTTPException(status_code=503, detail="generated_dir not configured.")
+    generated_dir = _state.generated_dir
+    if not generated_dir.exists():
+        return FilesResponse(files=[])
+    files = [
+        _file_entry(p, "generated")
+        for p in sorted(generated_dir.iterdir())
+        if p.is_file() and not p.name.startswith(".")
     ]
     return FilesResponse(files=files)
 
@@ -921,6 +948,8 @@ async def get_file_content(path: str) -> FileContentResponse:
         _state.raw_dir.resolve(),
         _state.wiki_dir.resolve(),
     ]
+    if _state.generated_dir is not None:
+        allowed_roots.append(_state.generated_dir.resolve())
     if not any(str(target).startswith(str(root)) for root in allowed_roots):
         raise HTTPException(
             status_code=403,
@@ -989,7 +1018,7 @@ async def post_file_upload(file: UploadFile = File(...)) -> FileEntry:
                 "MemoryManager.index_document failed for upload %s: %s", filename, exc
             )
 
-    return _file_entry(dest)
+    return _file_entry(dest, "raw")
 
 
 # ---------------------------------------------------------------------------

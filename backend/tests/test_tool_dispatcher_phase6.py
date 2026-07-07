@@ -380,7 +380,8 @@ class TestControllerToolIntegration:
         served out-of-process by localist-mcp — this is a real MCP round trip
         via the localist_mcp_server fixture, not an in-process assumption.
         """
-        notes = tmp_path / "notes.md"
+        notes = tmp_path / "generated_files" / "notes.md"
+        notes.parent.mkdir(parents=True, exist_ok=True)
         notes.write_text(
             "LORA memory system uses SQLite for persistence.", encoding="utf-8"
         )
@@ -484,7 +485,10 @@ class TestMCPSessionReuseLive:
     def test_multi_call_dispatch_sends_at_most_one_tools_list_uncancelled(
         self, tmp_path, localist_mcp_server, caplog
     ):
-        (tmp_path / "notes.md").write_text("hello from notes", encoding="utf-8")
+        (tmp_path / "generated_files").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "generated_files" / "notes.md").write_text(
+            "hello from notes", encoding="utf-8"
+        )
 
         dispatcher = MCPToolDispatcher(
             runtime=None, mcp_server_url=localist_mcp_server + "/sse"

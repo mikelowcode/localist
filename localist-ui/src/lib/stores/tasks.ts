@@ -22,12 +22,13 @@ export interface Task {
   completed_at?: number;
   source?: 'chat' | 'ingest';
   metadata?: {
-    priority?:       number;
-    fetch_rag?:      boolean;
-    fetch_episodic?: boolean;
-    tools_fired?:    string[];
-    agent?:          string;
-    grounded?:       boolean;
+    priority?:         number;
+    fetch_rag?:        boolean;
+    fetch_episodic?:   boolean;
+    tools_fired?:      string[];
+    agent?:            string;
+    grounded?:         boolean;
+    file_op_deferred?: boolean;
   };
 }
 
@@ -158,6 +159,16 @@ export function submitTask(
           const lines = buffer.split('\n');
           buffer = lines.pop() ?? '';
 
+          // A single network read can coalesce several SSE events (e.g. a
+          // burst of 'token' events) into one chunk. Processing all of them
+          // synchronously back-to-back with no yield point forces every
+          // downstream store update/re-render into one uninterrupted JS
+          // task. Yield once per processed line — but only when this chunk
+          // actually has more than one 'data:' line — so the common case
+          // (one event per read) pays no extra overhead.
+          const multipleDataLines =
+            lines.filter((l) => l.startsWith('data: ')).length > 1;
+
           for (const line of lines) {
             if (!line.startsWith('data: ')) continue;
             const raw = line.slice(6).trim();
@@ -186,6 +197,10 @@ export function submitTask(
             // no-ops per the Promise spec.
             if ((event.type as string) === 'done') {
               resolve(id);
+            }
+
+            if (multipleDataLines) {
+              await Promise.resolve();
             }
           }
         }

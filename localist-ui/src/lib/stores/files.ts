@@ -26,6 +26,7 @@ export interface FileEntry {
   path:     string;   // absolute path — used directly as context.raw_path
   size:     number;   // bytes
   modified: string;   // ISO-8601 UTC
+  type:     'raw' | 'wiki' | 'generated';
 }
 
 export type IngestPhase = 'idle' | 'planning' | 'streaming' | 'done' | 'error';
@@ -43,14 +44,17 @@ export interface IngestState {
 // Stores
 // ---------------------------------------------------------------------------
 
-export const rawFiles  = writable<FileEntry[]>([]);
-export const wikiFiles = writable<FileEntry[]>([]);
+export const rawFiles       = writable<FileEntry[]>([]);
+export const wikiFiles      = writable<FileEntry[]>([]);
+export const generatedFiles = writable<FileEntry[]>([]);
 
-export const rawLoading  = writable(false);
-export const wikiLoading = writable(false);
+export const rawLoading       = writable(false);
+export const wikiLoading      = writable(false);
+export const generatedLoading = writable(false);
 
-export const rawError  = writable<string | null>(null);
-export const wikiError = writable<string | null>(null);
+export const rawError       = writable<string | null>(null);
+export const wikiError      = writable<string | null>(null);
+export const generatedError = writable<string | null>(null);
 
 export const ingest = writable<IngestState>({
   phase:      'idle',
@@ -142,6 +146,21 @@ export async function loadWikiFiles(): Promise<void> {
     wikiError.set(err instanceof Error ? err.message : String(err));
   } finally {
     wikiLoading.set(false);
+  }
+}
+
+export async function loadGeneratedFiles(): Promise<void> {
+  generatedLoading.set(true);
+  generatedError.set(null);
+  try {
+    const res = await fetch('/api/files/generated');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data: { files: FileEntry[] } = await res.json();
+    generatedFiles.set(data.files);
+  } catch (err) {
+    generatedError.set(err instanceof Error ? err.message : String(err));
+  } finally {
+    generatedLoading.set(false);
   }
 }
 

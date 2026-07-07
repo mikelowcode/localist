@@ -85,6 +85,65 @@ _WEB_SEARCH_FILLER_PREFIXES: tuple[str, ...] = (
     "search for ", "look up ", "tell me about ",
 )
 
+# file_op action derivation — keyword groups checked in this priority order
+# (append > write > read: append/write are less ambiguous signals than a
+# bare "read"). Checked against the lowercased instruction; only used when
+# context["file_op_action"] is absent.
+_FILE_OP_APPEND_KEYWORDS: tuple[str, ...] = ("append", "add to the file", "add this to")
+_FILE_OP_WRITE_KEYWORDS:  tuple[str, ...] = ("write", "create", "save", "make a file")
+_FILE_OP_READ_KEYWORDS:   tuple[str, ...] = ("read", "open", "show me the file", "what's in the file")
+
+# file_op path derivation — patterns tried in order, first match wins; falls
+# back to a bare filename token anywhere in the instruction. Only used when
+# context["file_op_path"] is absent.
+_FILE_OP_PATH_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"name it (?:.*?\s)?([\w\-]+\.\w+)", re.IGNORECASE),
+    re.compile(r"call it (?:.*?\s)?([\w\-]+\.\w+)", re.IGNORECASE),
+    re.compile(r"save (?:it |this )?as (?:.*?\s)?([\w\-]+\.\w+)", re.IGNORECASE),
+)
+_FILE_OP_PATH_FALLBACK_RE = re.compile(r"\b[\w\-]+\.\w+\b")
+
+# file_op content derivation — patterns tried in order, first match wins.
+# Only used when context["file_op_content"] is absent.
+_FILE_OP_CONTENT_CODEBLOCK_RE = re.compile(r"```(.*?)```", re.DOTALL)
+_FILE_OP_CONTENT_QUOTED_RE    = re.compile(r'"([^"]*)"|\'([^\']*)\'')
+_FILE_OP_CONTENT_PHRASE_RE    = re.compile(
+    r"(?:with the content|containing|that says)\s+(.*)$", re.IGNORECASE
+)
+
+
+def _derive_file_op_action(instruction: str) -> str:
+    lowered = instruction.lower()
+    if any(kw in lowered for kw in _FILE_OP_APPEND_KEYWORDS):
+        return "append"
+    if any(kw in lowered for kw in _FILE_OP_WRITE_KEYWORDS):
+        return "write"
+    if any(kw in lowered for kw in _FILE_OP_READ_KEYWORDS):
+        return "read"
+    return "read"
+
+
+def _derive_file_op_path(instruction: str) -> str:
+    for pattern in _FILE_OP_PATH_PATTERNS:
+        match = pattern.search(instruction)
+        if match:
+            return match.group(1).strip()
+    match = _FILE_OP_PATH_FALLBACK_RE.search(instruction)
+    return match.group(0) if match else ""
+
+
+def _derive_file_op_content(instruction: str) -> str:
+    match = _FILE_OP_CONTENT_CODEBLOCK_RE.search(instruction)
+    if match:
+        return match.group(1).strip()
+    match = _FILE_OP_CONTENT_QUOTED_RE.search(instruction)
+    if match:
+        return match.group(1) if match.group(1) is not None else match.group(2)
+    match = _FILE_OP_CONTENT_PHRASE_RE.search(instruction)
+    if match:
+        return match.group(1).strip()
+    return ""
+
 # FastMCP wraps every raised tool exception as "Error executing tool <name>: <msg>"
 # (mcp/server/fastmcp/tools/base.py). Our tool implementations always raise
 # ValueError("ERROR: ..."), so stripping this wrapper recovers the exact
@@ -178,7 +237,9 @@ class MCPToolDispatcher:
             results: list[ToolResult] = []
             for tool_name in tools_to_call:
                 if tool_name == "file_op":
-                    results.append(await self._run_file_op(session, connect_error, ctx))
+                    results.append(
+                        await self._run_file_op(session, connect_error, instruction, ctx)
+                    )
                 elif tool_name == "url_fetch":
                     results.append(
                         await self._run_url_fetch(session, connect_error, instruction, ctx)
@@ -198,6 +259,12 @@ class MCPToolDispatcher:
                         success    = False,
                     ))
 
+            _succeeded = sum(1 for r in results if r.success)
+            _failed    = len(results) - _succeeded
+            logger.info(
+                "MCPToolDispatcher: dispatch complete — tools=%s succeeded=%d failed=%d",
+                tools_to_call, _succeeded, _failed,
+            )
             return results
 
     async def _open_session(self, stack: AsyncExitStack) -> ClientSession:
@@ -223,11 +290,21 @@ class MCPToolDispatcher:
         self,
         session:       ClientSession | None,
         connect_error: Exception | None,
+        instruction:   str,
         context:       dict[str, Any],
     ) -> ToolResult:
-        action   = context.get("file_op_action", "read")
-        rel_path = context.get("file_op_path", "")
-        content  = context.get("file_op_content", "")
+        action = (
+            context["file_op_action"] if "file_op_action" in context
+            else _derive_file_op_action(instruction)
+        )
+        rel_path = (
+            context["file_op_path"] if "file_op_path" in context
+            else _derive_file_op_path(instruction)
+        )
+        content = (
+            context["file_op_content"] if "file_op_content" in context
+            else _derive_file_op_content(instruction)
+        )
         params_str = f"action={action!r} path={rel_path!r}"
 
         mcp_tool = _FILE_OP_TOOL_MAP.get(action)
@@ -258,6 +335,8 @@ class MCPToolDispatcher:
         arguments: dict[str, Any] = {"path": rel_path}
         if mcp_tool in ("write_file", "append_file"):
             arguments["content"] = content
+        if mcp_tool == "append_file":
+            arguments["turn_id"] = context.get("task_id")
 
         try:
             text, is_error = await self._call_mcp_tool(session, mcp_tool, arguments)

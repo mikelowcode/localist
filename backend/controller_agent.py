@@ -29,6 +29,7 @@ Layer placement
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -209,6 +210,84 @@ def _memory_key(task: Task) -> str:
     today's behavior for that path exactly.
     """
     return task.context.get("session_id") or task.task_id
+
+
+# ---------------------------------------------------------------------------
+# Deferred file_op — content extraction + confirmation line (§4.4 Step 7b)
+# ---------------------------------------------------------------------------
+# Planner sets plan.file_op_deferred when a file_op-shaped instruction's
+# content wasn't literally present at planning time (see planner.py's P3
+# content-present-vs-deferred split) — e.g. "write a haiku about the sea and
+# save it as haiku.md". The agent generates the answer first; these helpers
+# turn that answer into file content and a deterministic result line.
+
+# Leading title-style label line, e.g. "Haiku about the sea:" — a short line
+# ending in a colon, followed by a blank-line separator from the body.
+# Optional surrounding *this*/**this** markdown emphasis is tolerated since
+# models commonly italicize/bold these framing lines.
+_LEADING_LABEL_RE = re.compile(r"\A\*{0,2}[^\n]{1,80}:\*{0,2}\s*\n+")
+# Trailing parenthetical aside on its own line, e.g.
+# "(Attempting to save content to haiku.md)" or, as observed live,
+# "*(This haiku has been generated and is ready to be saved as `haiku.md`.)*"
+# — models commonly italicize the whole aside, hence the optional `\*?`.
+_TRAILING_PAREN_RE = re.compile(r"\n+\*?\([^\n]*\)\*?\Z")
+
+
+def _extract_file_op_content(answer: str) -> str:
+    """
+    Best-effort strip of meta-commentary framing a generated answer before
+    it's saved as file content: a leading title-style label line and/or a
+    trailing parenthetical aside. Each strip only applies if the remainder
+    is still non-empty, so a false-positive match can never zero out real
+    content. Text matching neither shape passes through unchanged.
+
+    Deliberately simple — not a general prose parser. Revisit if live
+    testing turns up answer shapes this doesn't cover.
+    """
+    text = answer.strip()
+
+    trailing = _TRAILING_PAREN_RE.search(text)
+    if trailing:
+        candidate = text[:trailing.start()].strip()
+        if candidate:
+            text = candidate
+
+    leading = _LEADING_LABEL_RE.match(text)
+    if leading:
+        candidate = text[leading.end():].strip()
+        if candidate:
+            text = candidate
+
+    return text
+
+
+# Matches the trailing "... to <name>" in write_file/append_file's "OK: ..."
+# success text (mcp_server/file_ops.py) so the confirmation line reports the
+# actual written filename, which can differ from plan.file_op_path when the
+# versioning fallback kicked in (e.g. "haiku_2.md").
+_FILE_OP_SUCCESS_TARGET_RE = re.compile(r"\bto (\S+)\s*$")
+
+
+def _file_op_confirmation_line(result: "_ToolResult", fallback_path: str | None) -> str:
+    """
+    Deterministic, code-generated result line for a deferred file_op
+    dispatch — appended after the model's answer, never generated or
+    paraphrased by the model, so it can't be fabricated.
+
+    `result.result` is already normalized by
+    mcp_tool_dispatcher._normalize_mcp_error_text on failure (stripped of
+    the FastMCP "Error executing tool ...:" wrapper down to "ERROR: ...");
+    reused as-is here rather than building a second error-formatting path.
+    """
+    if result.success:
+        match = _FILE_OP_SUCCESS_TARGET_RE.search(result.result)
+        filename = match.group(1) if match else (fallback_path or "file")
+        return f"\n\n*(Saved to {filename})*"
+
+    reason = result.result
+    if reason.startswith("ERROR:"):
+        reason = reason[len("ERROR:"):].strip()
+    return f"\n\n*(Could not save — {reason})*"
 
 
 # ---------------------------------------------------------------------------
@@ -1016,6 +1095,15 @@ class ControllerAgent:
                     runtime      = self._runtime,
                     project_root = task.context.get("project_root"),
                 )
+                if "task_id" not in task.context:
+                    task.context["task_id"] = task.task_id
+                elif task.context["task_id"] != task.task_id:
+                    logger.warning(
+                        "_execute_plan: task.context already contains "
+                        "task_id=%r (differs from task.task_id=%r) — "
+                        "leaving context task_id unchanged.",
+                        task.context["task_id"], task.task_id,
+                    )
                 dispatched_tool_results = dispatcher.dispatch(
                     tools_to_call = plan.tools_to_call,
                     instruction   = task.instruction,
@@ -1136,28 +1224,21 @@ class ControllerAgent:
 
         # -- Step 5b: User profile injection ---------------------------------
         profile_facts: list[UserProfileFact] = []
-        _should_inject_profile = (
-            plan.fetch_episodic          # P5 route
-            or plan.fetch_rag            # P4 corpus route
-            or bool(episodic_bullets)    # episodic bullets fired
-            or bool(rag_sources)         # corpus fallback fired (web_search failed)
-        )
-        if _should_inject_profile:
-            try:
-                self._load_user_profile()
-                if self._profile_lines:
-                    instr_vec = self._embed(task.instruction)
-                    profile_facts = self._score_profile_facts(instr_vec)
-                    if profile_facts:
-                        logger.info(
-                            "_execute_plan: user profile injection — "
-                            "%d fact(s) selected.", len(profile_facts),
-                        )
-            except Exception as exc:
-                logger.warning(
-                    "_execute_plan: user profile scoring failed (%s) — "
-                    "continuing without profile facts.", exc,
-                )
+        try:
+            self._load_user_profile()
+            if self._profile_lines:
+                instr_vec = self._embed(task.instruction)
+                profile_facts = self._score_profile_facts(instr_vec)
+                if profile_facts:
+                    logger.info(
+                        "_execute_plan: user profile injection — "
+                        "%d fact(s) selected.", len(profile_facts),
+                    )
+        except Exception as exc:
+            logger.warning(
+                "_execute_plan: user profile scoring failed (%s) — "
+                "continuing without profile facts.", exc,
+            )
 
         # -- Step 5c: Graph query fetch ---------------------------------------
         graph_result: GraphQueryResult | None = None
@@ -1256,6 +1337,10 @@ class ControllerAgent:
                 and not r.result.startswith("<")
                 and len(r.result.strip()) >= 5
             ] or None,
+            tool_failures    = [
+                r for r in dispatched_tool_results
+                if r.result.startswith("ERROR:")
+            ] or None,
             graph_result     = graph_result             or None,
             working_state    = working_state,
             working_memory   = working_turns            or None,
@@ -1334,6 +1419,62 @@ class ControllerAgent:
         logger.info("TIMING dispatch_start t=%.4f", time.monotonic())
         results = self._dispatch([subtask], memory, mem_key)
         logger.info("TIMING dispatch_end t=%.4f", time.monotonic())
+
+        # -- Step 7b: Deferred file_op dispatch ------------------------------
+        # plan.file_op_deferred means the content to save didn't exist at
+        # planning time — the agent had to generate it first (see
+        # planner.py's P3 content-present-vs-deferred split). Generation just
+        # finished above, so extract the content from the answer, dispatch
+        # the write via the same MCPToolDispatcher path the pre-generation
+        # (content-present) case uses, and append a deterministic result
+        # line. This must happen before on_answer_ready below — that's what
+        # sends the 'done' SSE event carrying the final answer text/text the
+        # client corrects its streamed display to (tasks.ts's 'done' handler
+        # patches the visible answer whenever it differs from the
+        # accumulated token stream) — the live on_token stream itself has
+        # already finished by the time _dispatch() above returns, so the
+        # confirmation line can only ever be added here, after the fact, not
+        # streamed token-by-token.
+        if (
+            plan.file_op_deferred
+            and results
+            and results[0].status == TaskStatus.COMPLETE
+        ):
+            raw_answer = results[0].output.get("answer", "")
+            content    = _extract_file_op_content(raw_answer)
+            try:
+                dispatcher = MCPToolDispatcher(
+                    runtime      = self._runtime,
+                    project_root = task.context.get("project_root"),
+                )
+                fo_context = {
+                    **task.context,
+                    "task_id":         task.context.get("task_id", task.task_id),
+                    "file_op_action":  plan.file_op_action,
+                    "file_op_path":    plan.file_op_path,
+                    "file_op_content": content,
+                }
+                fo_result = dispatcher.dispatch(
+                    tools_to_call = ["file_op"],
+                    instruction   = task.instruction,
+                    context       = fo_context,
+                )[0]
+                results[0].output["answer"] = raw_answer + _file_op_confirmation_line(
+                    fo_result, plan.file_op_path
+                )
+                logger.info(
+                    "_execute_plan: deferred file_op dispatched — "
+                    "action=%s path=%s success=%s.",
+                    plan.file_op_action, plan.file_op_path, fo_result.success,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "_execute_plan: deferred file_op dispatch raised (%s) — "
+                    "appending failure line.", exc,
+                )
+                results[0].output["answer"] = raw_answer + (
+                    f"\n\n*(Could not save — {exc})*"
+                )
 
         # Early-completion signal — fire before memory hooks so the streaming
         # endpoint can emit 'sources'/'done' and unblock the client immediately
@@ -1483,6 +1624,7 @@ class ControllerAgent:
                 "tools_fired":        plan.tools_to_call,
                 "tool_signal_source": plan.tool_signal_source,
                 "grounded":           r.output.get("grounded", False),
+                "file_op_deferred":   plan.file_op_deferred,
             },
         )
 

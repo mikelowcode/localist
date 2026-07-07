@@ -79,9 +79,9 @@ def write_file(path: str, content: str) -> str:
 
 
 @mcp.tool()
-def append_file(path: str, content: str) -> str:
+def append_file(path: str, content: str, turn_id: str | None = None) -> str:
     """Append content to a UTF-8 text file. path is resolved relative to project_root and sandboxed."""
-    return file_ops.append_file(path, content)
+    return file_ops.append_file(path, content, turn_id)
 
 
 @mcp.tool()
