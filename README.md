@@ -86,7 +86,8 @@ Copy `backend/.env.example` to `backend/.env` and set values as needed. The only
 | `LOCALIST_OMLX_URL` | `http://localhost:8000` | oMLX server URL |
 | `LANGSEARCH_API_KEY` | *(none)* | LangSearch API key, read by localist-mcp. Required for `web_search`; without it the tool returns a clean failure (no hallucination fallback) and `ConversationalAgent` falls back to the corpus. |
 | `LOCALIST_MCP_URL` | `http://localhost:8003` | localist-mcp server URL |
-| `LOCALIST_MCP_PROJECT_ROOT` | `backend/` | Sandbox root for localist-mcp's `file_op` tools |
+| `LOCALIST_MCP_PROJECT_ROOT` | `backend/` | Base path for localist-mcp's `file_op` tools; writes/reads are sandboxed to a `generated_files/` subdirectory of this path |
+| `LOCALIST_GENERATED_DIR` | `backend/generated_files` | Path the main backend lists under the Files tab's "Generated Files" pane (`GET /files/generated`) — should match where `file_op` actually writes |
 | `LOCALIST_EMBEDDING_ENGINE_ENABLED` | `true` | Enable local embedding engine for RAG |
 | `LOCALIST_WIKI_DIR` | `./wiki` | Path to wiki document directory |
 | `LOCALIST_RAW_DIR` | `./raw` | Path to raw documents directory |
@@ -117,7 +118,7 @@ All tools are served over MCP (SSE transport) by the **localist-mcp** server (po
 
 **Page fetch** — triggered when a URL appears in the message or the user says "fetch this link", "summarize this URL", etc. Calls the `fetch_url` MCP tool, which downloads the page and uses `readability-lxml` to extract clean article text. Returns title, source URL, word count, and body text. This replaces the retired standalone Fetcher microservice (formerly port 8002).
 
-**File operations** — sandboxed `read_file`/`write_file`/`append_file` MCP tools on local files, rooted at `LOCALIST_MCP_PROJECT_ROOT`. Triggered by explicit file-operation phrasing.
+**File operations** — sandboxed `read_file`/`write_file`/`append_file` MCP tools, rooted at `LOCALIST_MCP_PROJECT_ROOT/generated_files/`. Triggered by explicit file-operation phrasing (`"write a file"`, `"save it as X.md"`, `"append to X.md"`, etc.). `write_file` refuses empty/whitespace-only content rather than silently creating a 0-byte file, and versions on filename collision (`notes.md` → `notes_2.md`, up to 10 versions) instead of overwriting. When the content to save doesn't yet exist in the instruction — e.g. *"write a haiku about the sea and save it as haiku.md"* — the Planner defers the file write until after the answer is generated, then dispatches it and appends a deterministic `*(Saved to haiku.md)*` / `*(Could not save — {reason})*` confirmation line to the response. Files written this way, and any other `file_op` output, are listed in the Localist UI's Files tab under "Generated Files."
 
 **Wiki ingestion** — processes a raw document into structured wiki pages via `WikiAgent`. Triggered by `raw_path` in request context or ingestion keywords.
 
@@ -145,7 +146,10 @@ The prompt builder assembles a fixed 7-slot layout optimized for KV-cache effici
    relevance-scored user profile facts (two independent sub-budgets:
    150 tokens episodic, 100 tokens profile)
 4. **RAG / context** — retrieved corpus passages
-5. **Tool results** — output from `web_search`, `url_fetch`, `file_op`
+5. **Tool results** — output from `web_search`, `url_fetch`, `file_op` (a
+   failed tool call renders in its own budget-isolated block rather than
+   being silently dropped, so the model can see and hedge on a failure
+   instead of fabricating success)
 6. **Working memory** — recent conversation turns
 7. **Instruction** — the current user message
 
@@ -192,7 +196,7 @@ localist/
 │   ├── lora_memory.db               # SQLite database (episodic + embeddings)
 │   ├── requirements.txt
 │   └── .env                         # Local configuration (not committed)
-└── lora-ui/                         # Localist UI
+└── localist-ui/                     # Localist UI
 ```
 
 ---
@@ -232,6 +236,12 @@ All tests use mocks for inference and SQLite; no oMLX server or live API keys ar
   `lora-persona.md`
 - **User profile** — ✅ `wiki/users/michael.md`; line-level embedding
   and cosine-scored injection into Slot 3b
+- **Generate-then-save file operations** — ✅ a `file_op` instruction whose
+  content isn't literally present (e.g. "write a haiku and save it as
+  X.md") defers the write until the answer is generated, then dispatches
+  it and appends a deterministic saved/failed confirmation line;
+  `write_file` refuses empty content and versions on collision instead of
+  overwriting
 - **Graph retrieval layer** — planned; concept relationship reasoning
   via SQLite node/edge tables and hybrid graph + RAG retrieval
 - **Localist UI redesign** — functional but minimal; planned rework for
