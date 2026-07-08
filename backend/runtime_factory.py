@@ -67,7 +67,7 @@ def _make_foundry(kwargs: dict[str, Any]) -> BaseRuntimeClient:
     """Construct a FoundryRuntimeClient from flattened settings kwargs."""
     from foundry_runtime_client import FoundryRuntimeClient
     return FoundryRuntimeClient(
-        chat_model      = kwargs.get("chat_model",      "Phi-4-mini-instruct-generic-gpu:5"),
+        chat_model      = kwargs.get("chat_model") or "Phi-4-mini-instruct-generic-gpu:5",
         embedding_model = kwargs.get("embedding_model", "text-embedding-3-small"),
         base_url        = kwargs.get("foundry_url"),        # None → auto-resolve from CLI
         request_timeout = kwargs.get("request_timeout", 30.0),
@@ -79,9 +79,20 @@ def _make_omlx(kwargs: dict[str, Any]) -> BaseRuntimeClient:
     """Construct an OMLXRuntimeClient from flattened settings kwargs."""
     from omlx_runtime_client import OMLXRuntimeClient
     return OMLXRuntimeClient(
-        chat_model      = kwargs.get("chat_model",      "gemma-4-e4b-it-4bit"),
+        chat_model      = kwargs.get("chat_model") or "gemma-4-e4b-it-4bit",
         embedding_model = "",
         base_url        = kwargs.get("omlx_url",        "http://127.0.0.1:8000"),
+        request_timeout = kwargs.get("request_timeout", 30.0),
+        stream_timeout  = kwargs.get("stream_timeout",  60.0),
+    )
+
+
+def _make_ollama(kwargs: dict[str, Any]) -> BaseRuntimeClient:
+    """Construct an OllamaRuntimeClient from flattened settings kwargs."""
+    from ollama_runtime_client import OllamaRuntimeClient
+    return OllamaRuntimeClient(
+        chat_model      = kwargs.get("chat_model") or "gemma4:e4b-mlx",
+        base_url        = kwargs.get("ollama_url",      "http://localhost:11434"),
         request_timeout = kwargs.get("request_timeout", 30.0),
         stream_timeout  = kwargs.get("stream_timeout",  60.0),
     )
@@ -92,6 +103,7 @@ def _make_omlx(kwargs: dict[str, Any]) -> BaseRuntimeClient:
 _REGISTRY: dict[str, Any] = {
     "foundry": _make_foundry,
     "omlx":    _make_omlx,
+    "ollama":  _make_ollama,
 }
 
 

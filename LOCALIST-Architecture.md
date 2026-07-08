@@ -24,6 +24,7 @@
 13. [Localist CLI (start_localist.sh)](#13-localist-cli-start_localistsh)
 14. [localist-mcp / MCP Tool Layer](#14-localist-mcp--mcp-tool-layer)
 15. [P6-Fallthrough Tool-Need Classifier & lookup_request Resolved-Context Guard](#15-p6-fallthrough-tool-need-classifier--lookup_request-resolved-context-guard)
+16. [Runtime Backend Layer (BaseRuntimeClient)](#16-runtime-backend-layer-baseruntimeclient)
 
 ---
 
@@ -4236,7 +4237,9 @@ instruction-splitting logic, and no new gating behavior follows from this
 one turn. Logged so it counts toward Open Item 3's "revisit if live false
 negatives are observed" criterion — this is one such occurrence, not yet a
 pattern. Revisit if additional compound or near-threshold instructions are
-observed scoring in the 0.60–0.68 band for `explicit_search_action`.
+observed scoring in the 0.60–0.72 band for `explicit_search_action` (updated
+from the original 0.60–0.68 band to track the 0.68 → 0.72 raise on
+2026-06-28 — see Update 2026-06-28 above).
 
 **Open Item 5 — `web_search` SUCCESS with irrelevant results; no fallback mechanism (2026-06-28).** A live turn asking "Tell me about Localist Framework?" scored `lookup_request=0.670` (≥ 0.65 gating threshold), routing correctly to `web_search` via Priority 3. LangSearch returned 3 real results and the call SUCCEEDED — no error, no `success=False`, so the Step 3b corpus fallback introduced in §4.6.1 did not fire. The returned results were entirely irrelevant: generic uses of "localism" and "localist" in unrelated academic and ML contexts, not information about this project. The model's response reflected the irrelevant web content.
 
@@ -5537,6 +5540,141 @@ Note on current flag state: since this closure, `LOCALIST_TOOL_FALLBACK_CLASSIFI
 Guard-specific trial data (n=3, at the `lookup_request`-alone boundary): one genuine referential follow-up ("What do you make of that?" after a gold-price search, `lookup_request=0.629`, gate cleared) was correctly suppressed — confirmed true positive. Two attempts at adjacent-but-different-topic phrasing — "What do you think of Gold vs Silver in a portfolio?" after a silver-price search (`lookup_request=0.572`) and "What do you make of the new Siri AI?" after a general Apple-news search (`lookup_request=0.596`) — never reached the guard's suppression-vs-decline branch at all: both fell just under the 0.60 `lookup_request` gate. This reveals a separate, pre-existing semantic-gate coverage gap on comparative/advisory phrasing (§10.4), not a defect in this guard. The second case is also, on inspection, not a clean topic-adjacency test: the prior search result already contained the follow-up's specific content directly ("Apple unveiled the next generation of Apple Intelligence and Siri AI during WWDC 26"), so suppression would have been defensible there regardless — worth correcting for the record, since this exact scenario had earlier been discussed as illustrative before it was actually run live.
 
 This does not close or deprioritize the referential no-op problem. It confirms the failure mode hasn't yet been observed live, and that real adjacent-but-different-topic phrasing may cluster closer to the `lookup_request` gate boundary than the original synthetic diagnostic's hand-picked examples did — the diagnostic's 9/10-cross-gate finding above is unchanged and not in question; what's newly in question is how often wrong-topic phrasing also clears that same gate in real usage, and the trial so far suggests less often than assumed. **n=3 is not enough volume to revise this item's priority**, per the trial record. The item remains OPEN and re-scoped: before investing in a sharper signal (embedding similarity between the current instruction and the prior tool query/result; narrowing the guard's scope to specific prior-tool types or a shorter turn window — both sketched, neither built) more live trial volume is needed to establish whether this failure mode manifests at a rate worth engineering against, versus being a smaller real-world risk than the original synthetic diagnostic suggested. Both flags are left `active` together for continued organic data collection during normal use — a live-trial state, distinct from both `shadow` and from this guard remaining `off`.
+
+**Update 2026-07-08 — guard removed. Item CLOSED (by removal, not by a sharper signal).**
+
+**Originally:** the guard suppressed `web_search` whenever any tool was scheduled on the immediately preceding turn, regardless of that tool's success or failure, added as a fix for an over-eager web-search trigger.
+
+**Decision (2026-07-08):** a live false negative showed the guard blocking a legitimate consecutive tool request — a `lookup_request`-classified turn following a FAILED `url_fetch` (a 403). A read-only diagnostic pass confirmed the guard was a pure boolean on prior-turn tool-scheduling state with no success/failure awareness at all — not a threshold-calibration issue, since the guard never had a numeric threshold of its own. The decision was to remove the suppression entirely rather than refine it, on the principle that users should not be blocked from legitimate back-to-back tool use.
+
+**Fix:** removed the suppression block, `_resolved_context_guard_mode()`, `_LOOKUP_GUARD_ENV_VAR`, and all mode handling from `planner.py` (128 lines → net 8 insertions / 120 deletions). Removed `LOCALIST_LOOKUP_REQUEST_RESOLVED_CONTEXT_GUARD` from `backend/.env`. `web_search` now fires purely off the `explicit_search_action` (0.72) / `lookup_request` (0.60) semantic gates, with no prior-turn tool-state involved. `record_tools_fired()`/`_last_turn_tools_fired` were retained unchanged — confirmed independent of this guard, since both are still used by §15.1's P6-fallthrough tool-fallback classifier's Gate 1.
+
+**Live-verified:** reproduced the original failing transcript against the fixed `Planner` — the previously-suppressed turn and its verbatim repeat both now correctly fire `web_search`, with no divergence between them.
+
+**Test suite:** 593 → 576 passed (delta of 17 matches the deleted `test_planner_lookup_request_resolved_context_guard.py` file exactly, confirmed by direct count of its collected tests); the same 2 pre-existing, unrelated, network-dependent failures (§14.6) unchanged both before and after.
+
+---
+
+## 16. Runtime Backend Layer (BaseRuntimeClient)
+
+### 16.1 Available Backends
+
+`base_runtime_client.py` defines the `BaseRuntimeClient` Protocol (`infer`, `embed`,
+`infer_stream`) that every concrete runtime client satisfies structurally, without inheritance.
+`runtime_factory.py`'s `create_runtime()` is the single entry point that constructs the active
+backend at process startup, selected via `LOCALIST_RUNTIME_BACKEND`. Concurrency posture is
+swap-only: exactly one backend is active per process; dual-runtime/concurrent-backend operation is
+explicitly out of scope for all three backends below.
+
+Three backends are registered in `_REGISTRY` today:
+
+- **`FoundryRuntimeClient`** (`foundry_runtime_client.py`) — Azure AI Foundry, local execution,
+  ephemeral-port resolution via `foundry service status`.
+- **`OMLXRuntimeClient`** (`omlx_runtime_client.py`) — oMLX local inference, fixed port 8000,
+  OpenAI-compatible SSE streaming, native MarkItDown file ingestion (`infer_with_file()`, an
+  oMLX-only capability not part of the Protocol).
+- **`OllamaRuntimeClient`** (`ollama_runtime_client.py`, added 2026-07-08) — Ollama local
+  inference, fixed port 11434, native NDJSON streaming (not OpenAI-compatible SSE). See §16.2.
+
+### 16.2 OllamaRuntimeClient — Added 2026-07-08
+
+**Scoping decisions (made before any code was written).** Full interchangeable-backend tier, same
+as Foundry/oMLX — not an offload-style secondary backend as sketched in earlier dual-runtime
+planning (the Apfel spec). Concurrency: swap-only, no dual-runtime logic added. `embed()`: stubbed
+to always raise `NotImplementedError`, not left as a "not configured yet" placeholder the way
+oMLX's empty-`embedding_model` case is — this backend has no path to an embedding model at all
+under this scope, so its constructor doesn't even accept an `embedding_model` parameter. Chat
+model left as an unfilled constructor default pending live confirmation rather than guessed up
+front.
+
+**Live verification before writing the Claude Code prompt.** Base URL confirmed as Ollama's actual
+default (`http://localhost:11434` — no port conflict with 8000/8001/8003/5173). `GET /api/tags`
+response shape confirmed via live `curl`: `{"models": [{"model": "...", "name": "...", ...}]}` — a
+`models`/`model` shape, not oMLX's `{"data": [{"id": "..."}]}`. `POST /api/chat` streaming
+confirmed via live `curl` to be NDJSON (one raw JSON object per line, terminated on `"done":
+true`), not an SSE `data: {...}` envelope — meaning `foundry_runtime_client.py`'s
+`_iter_sse_chunks` could not be reused; `ollama_runtime_client.py` implements its own
+`_iter_ndjson_chunks`.
+
+**Model selection — a live correction, not an assumption.** Initial framing considered Gemma 3
+variants (the assistant's most recent reliable training knowledge). The user corrected this:
+Ollama's model library now lists native Gemma 4 MLX-format models, and `gemma4:e4b-mlx` was chosen
+specifically to match the oMLX baseline's `gemma-4-e4b-it-4bit` architecture class (E4B
+effective-parameter size, 4-bit-class quantization) — not picked arbitrarily. This surfaced that
+both Gemma 4 and Ollama's native MLX backend support post-date the assistant's reliable training
+data; the live-verification step above, rather than the assistant's own knowledge of what Ollama
+supports, is why the final choice held up.
+
+**Implementation.** New file `backend/ollama_runtime_client.py`, structurally mirroring
+`omlx_runtime_client.py` (docstring conventions, method ordering, `__repr__`,
+`_assert_protocol_conformance()`). One flagged deviation from the `_make_omlx` registration
+pattern: `_make_ollama` (`runtime_factory.py`) does not pass an `embedding_model` kwarg at all,
+since `OllamaRuntimeClient.__init__` has no such parameter — `embed()` here is a permanent stub,
+not an unconfigured state, so there is nothing to configure.
+
+**Two mount-staleness false alarms surfaced and resolved during this work, not implementation
+defects:**
+
+- The assistant initially flagged the `label: str = ""` parameter (present in
+  `BaseRuntimeClient`, `FoundryRuntimeClient`, and `OMLXRuntimeClient`, and carried into
+  `OllamaRuntimeClient`) as a possibly-hallucinated, unverified claim — based on a stale
+  project-knowledge mount that didn't contain it. A live `grep` against the actual repo confirmed
+  `label` is genuinely present in all three; the original implementation report was correct
+  throughout, and the mount, not the code, was stale.
+- Separately, the assistant's mount showed `env_prefix="LORA_"` in `main.py`; a live `grep`
+  confirmed the actual prefix is `env_prefix="LOCALIST_"`. Caught and corrected before any `.env`
+  edit was made.
+
+**Full live-verification chain, in order:** `GET /api/tags` reachable → backend startup with
+`LOCALIST_RUNTIME_BACKEND=ollama` (clean init log chain, no errors) → health-check equivalent
+confirmed via startup log (`chat_found=True embed_found=None`) → `POST /task` non-streaming, real
+content, correct answer ("7 times 6 is 42") → `POST /task/stream` SSE relay, correct
+token-by-token streaming, clean `[DONE]` termination. One call returning empty content
+(`warmup.py`'s cache-warm call, `max_tokens=16`) was investigated and confirmed expected —
+`run_cache_warmup()` deliberately discards completion content by design (KV-prefill exercise only),
+not a bug in the new client.
+
+**Test suite:** 595 tests collected/passed before this change, 595 passed after (file-scoped count
+via a direct `.venv` pytest run, not carried forward from an earlier baseline). No new dedicated
+test file was in scope for this addition.
+
+**Open items — both closed 2026-07-08. OllamaRuntimeClient has no known open items as of this
+update.**
+
+**1. `LOCALIST_CHAT_MODEL` coupling. CLOSED 2026-07-08.**
+
+*Originally:* `main.py`'s `Settings.chat_model` defaulted to the Foundry-specific string
+`"Phi-4-mini-instruct-generic-gpu:5"` and was always passed explicitly to `create_runtime()`, so
+`runtime_factory.py`'s per-backend `kwargs.get("chat_model", default)` fallback never triggered —
+the key was never absent.
+
+*Fix:* `Settings.chat_model` changed to `str | None = None`; `runtime_factory.py`'s
+`_make_foundry`/`_make_omlx`/`_make_ollama` changed from `kwargs.get("chat_model", default)` to
+`kwargs.get("chat_model") or default`, so `None`/empty string now correctly falls through to each
+backend's own default.
+
+*Live-verified:* with `LOCALIST_CHAT_MODEL` unset and `LOCALIST_RUNTIME_BACKEND=ollama`, the
+constructed `OllamaRuntimeClient` reports `chat_model="gemma4:e4b-mlx"` (not the Foundry string,
+not `None`). Foundry/oMLX fallback and explicit-override passthrough also spot-checked with no
+regression.
+
+*Test suite:* 595 passed (before and after).
+
+**2. Missing `LOCALIST_OLLAMA_URL`. CLOSED 2026-07-08.**
+
+*Originally:* `Settings` had `foundry_url` and `omlx_url` fields but no `ollama_url` field;
+`create_runtime()` had no `ollama_url` kwarg wired in for the `ollama` backend.
+
+*Fix:* added `ollama_url: str = "http://localhost:11434"` to `Settings`, documented
+`LOCALIST_OLLAMA_URL` in the module docstring's environment variable list, and passed
+`ollama_url=settings.ollama_url` into the `create_runtime()` call.
+
+*Live-verified:* with `runtime_backend="ollama"` and `ollama_url` overridden to
+`http://localhost:19999`, `health_check()` returns `base_url: 'http://localhost:19999'` — the
+override, not the hardcoded `11434` default — confirmed even with nothing listening on that port,
+since `health_check()` never raises.
+
+*Test suite:* 595 passed (before and after).
 
 ---
 

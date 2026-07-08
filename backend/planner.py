@@ -396,39 +396,6 @@ _TOOL_FALLBACK_SYSTEM_PROMPT: str = (
 
 
 # ---------------------------------------------------------------------------
-# lookup_request resolved-context guard  (feature-flagged, shadow-first)
-#
-# Trigger: diagnostics/score_referential_followup_lookup_request.py found
-# that 9/10 referential/follow-up phrases ("What do you make of all that?",
-# "What does that mean?", etc.) clear the lookup_request 0.60 gate — they
-# score 0.60-0.70, in the same band as genuine lookup_request true positives
-# (Cat C, 0.649-0.778). These phrases are not lookup requests; they are
-# continuation questions about something already surfaced this session,
-# almost always the immediately preceding turn's tool result. The diagnostic
-# also confirmed explicit_search_action stays well clear of its own 0.72
-# gate for this whole category (max 0.6247), so this guard targets
-# lookup_request specifically and leaves explicit_search_action untouched.
-#
-# The signal that the guard uses is the SAME state already tracked for the
-# P6-fallthrough classifier's Gate 1: self._last_turn_tools_fired, updated
-# every turn by record_tools_fired(). When the prior turn already fired a
-# tool, a lookup_request-only gate crossing this turn is read as "referring
-# back to that result" rather than "asking for a new lookup" — so it is not,
-# by itself, sufficient to add web_search. A literal _WEB_SEARCH_KEYWORDS
-# match or an independent explicit_search_action gate crossing are each
-# untouched under all conditions; this guard only ever removes the
-# lookup_request-alone justification for web_search.
-# ---------------------------------------------------------------------------
-
-# Read at call time (not cached at import/construction) — same rationale as
-# _TOOL_FALLBACK_ENV_VAR: tests and ops tooling can flip modes without
-# reconstructing the Planner instance.
-_LOOKUP_GUARD_ENV_VAR: str = "LOCALIST_LOOKUP_REQUEST_RESOLVED_CONTEXT_GUARD"
-
-_LOOKUP_GUARD_VALID_MODES: frozenset[str] = frozenset({"off", "shadow", "active"})
-
-
-# ---------------------------------------------------------------------------
 # Graph-query extraction and name resolution  (P3c, Phase C Step 3a)
 #
 # extract_graph_query() and resolve_graph_target() are pure, stateless
@@ -972,20 +939,6 @@ class Planner:
 
         return (best_group, best_score, group_scores)
 
-    @staticmethod
-    def _resolved_context_guard_mode() -> str:
-        """
-        Read LOCALIST_LOOKUP_REQUEST_RESOLVED_CONTEXT_GUARD from the
-        environment.
-
-        Read at call time (not cached) so tests and ops tooling can flip
-        modes without reconstructing the Planner. Any value other than
-        "off" / "shadow" / "active" (including unset) is treated as "off" —
-        fail-safe to zero behavior change. Mirrors _tool_fallback_mode().
-        """
-        mode = os.environ.get(_LOOKUP_GUARD_ENV_VAR, "off").strip().lower()
-        return mode if mode in _LOOKUP_GUARD_VALID_MODES else "off"
-
     def _priority3_tool(
         self, lowered: str, instruction: str | None = None
     ) -> RoutingPlan | None:
@@ -1025,16 +978,6 @@ class Planner:
         instruction (as route() does) only improves case fidelity of the
         derived file_op_path/file_op_action in the deferred branch.
 
-        lookup_request resolved-context guard (feature-flagged, see module
-        docstring above _LOOKUP_GUARD_ENV_VAR): when lookup_request is the
-        *only* reason web_search would be added (no literal keyword, no
-        independent explicit_search_action gate crossing) AND the prior
-        turn already fired a tool (self._last_turn_tools_fired non-empty),
-        "active" mode withholds web_search for this turn so routing falls
-        through toward P3b/P4/P5/(P6-fallthrough classifier)/P6 instead.
-        "shadow" mode evaluates and logs the same decision but still adds
-        web_search, identical to "off".
-
         Returns a RoutingPlan or None if no match.
         """
         tools: list[str] = []
@@ -1063,70 +1006,15 @@ class Planner:
             )
 
         if semantic_triggered and "web_search" not in tools:
-            # lookup_request resolved-context guard. Only relevant when
-            # lookup_request fired WITHOUT explicit_search_action also
-            # independently clearing its own gate — that second condition
-            # is exactly what fired_groups (not just semantic_triggered)
-            # lets us check, versus the pre-existing best_group/best_score
-            # argmax which can't distinguish "LR alone" from "LR and ESA
-            # both fired". A literal keyword is already ruled out here by
-            # the enclosing "web_search" not in tools check.
-            lookup_request_only = (
-                "lookup_request" in fired_groups
-                and "explicit_search_action" not in fired_groups
+            tools.append("web_search")
+            fired_str = ", ".join(
+                f"{group}={all_scores[group]:.3f}(>={_SEMANTIC_GATE_THRESHOLDS[group]:.2f})"
+                for group in fired_groups
             )
-            suppress = False
-            if lookup_request_only:
-                guard_mode = self._resolved_context_guard_mode()
-                if guard_mode != "off":
-                    prior_tools_fired = list(self._last_turn_tools_fired)
-                    would_suppress = bool(prior_tools_fired)
-                    if guard_mode == "shadow":
-                        logger.info(
-                            "Planner: Priority 3 — lookup_request resolved-context "
-                            "guard (shadow) — instruction=%r last_turn_tools_fired=%r "
-                            "lookup_request=%.3f(>=%.2f) would_suppress=%s "
-                            "(RoutingPlan unaffected).",
-                            lowered, prior_tools_fired,
-                            all_scores["lookup_request"],
-                            _SEMANTIC_GATE_THRESHOLDS["lookup_request"],
-                            would_suppress,
-                        )
-                    elif guard_mode == "active" and would_suppress:
-                        suppress = True
-                        logger.info(
-                            "Planner: Priority 3 — lookup_request resolved-context "
-                            "guard (active) — suppressing web_search: "
-                            "prior_turn_tools_fired=%r (non-empty); lookup_request="
-                            "%.3f(>=%.2f) fired alone (literal_keyword_present=False, "
-                            "explicit_search_action_independent=False).",
-                            prior_tools_fired,
-                            all_scores["lookup_request"],
-                            _SEMANTIC_GATE_THRESHOLDS["lookup_request"],
-                        )
-                    elif guard_mode == "active" and not would_suppress:
-                        logger.info(
-                            "Planner: Priority 3 — lookup_request resolved-context "
-                            "guard (active) — evaluated, NOT suppressing: "
-                            "instruction=%r prior_turn_tools_fired=%r (empty); "
-                            "lookup_request=%.3f(>=%.2f) fired alone "
-                            "(literal_keyword_present=False, "
-                            "explicit_search_action_independent=False).",
-                            lowered, prior_tools_fired,
-                            all_scores["lookup_request"],
-                            _SEMANTIC_GATE_THRESHOLDS["lookup_request"],
-                        )
-
-            if not suppress:
-                tools.append("web_search")
-                fired_str = ", ".join(
-                    f"{group}={all_scores[group]:.3f}(>={_SEMANTIC_GATE_THRESHOLDS[group]:.2f})"
-                    for group in fired_groups
-                )
-                logger.debug(
-                    "Planner: Priority 3 — web_search signal detected via semantic "
-                    "gate (fired=[%s]).", fired_str,
-                )
+            logger.debug(
+                "Planner: Priority 3 — web_search signal detected via semantic "
+                "gate (fired=[%s]).", fired_str,
+            )
 
         raw = instruction if instruction is not None else lowered
 

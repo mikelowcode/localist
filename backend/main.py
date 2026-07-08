@@ -75,6 +75,7 @@ can be overridden via environment variables or a .env file:
   LOCALIST_CHAT_MODEL                  Chat model ID (interpreted by the active backend)
   LOCALIST_FOUNDRY_URL                 Override auto-resolved Foundry base URL (foundry only)
   LOCALIST_OMLX_URL                    oMLX server base URL (omlx only, default http://localhost:8000)
+  LOCALIST_OLLAMA_URL                  Ollama server base URL (ollama only, default http://localhost:11434)
   LOCALIST_LOG_LEVEL                   Root log level (default INFO)
   LOCALIST_WIKI_DIR                    Absolute path to the wiki directory
   LOCALIST_RAW_DIR                     Absolute path to the raw files directory
@@ -142,13 +143,16 @@ class Settings(BaseSettings):
 
     # Model ID — chat only; embeddings are handled by EmbeddingEngine (MLX-LM),
     # not by the runtime backend.
-    chat_model:       str = "Phi-4-mini-instruct-generic-gpu:5"
+    chat_model:       str | None = None
 
     # Foundry network (foundry backend only)
     foundry_url:      str | None = None
 
     # oMLX network (omlx backend only)
     omlx_url:         str = "http://localhost:8000"
+
+    # Ollama network (ollama backend only)
+    ollama_url:       str = "http://localhost:11434"
 
     # Shared network timeouts
     stream_timeout:   float = 60.0
@@ -229,6 +233,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         chat_model      = settings.chat_model,
         foundry_url     = settings.foundry_url,
         omlx_url        = settings.omlx_url,
+        ollama_url      = settings.ollama_url,
         request_timeout = settings.request_timeout,
         stream_timeout  = settings.stream_timeout,
     )
@@ -281,7 +286,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
     else:
         logger.info(
-            "EmbeddingEngine disabled (LORA_EMBEDDING_ENGINE_ENABLED=false) — "
+            "EmbeddingEngine disabled (LOCALIST_EMBEDDING_ENGINE_ENABLED=false) — "
             "MemoryManager will run in keyword-only mode."
         )
 

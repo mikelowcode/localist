@@ -2,13 +2,13 @@
 
 Localist Framework is a local-first, agentic general assistant running entirely on macOS Apple Silicon. The system maintains persistent memory across sessions, fetches and reads live web content, searches indexed documents, and routes every query through a deterministic priority engine before a single token of inference is spent.
 
-Localist is inference-engine-agnostic. It ships with oMLX support out of the box and is designed to support MLX-LM, Ollama, LM Studio, and other local runtimes.
+Localist is inference-engine-agnostic. It ships with oMLX, Ollama, and Azure AI Foundry support out of the box, swappable via a single config variable; MLX-LM, LM Studio, and other local runtimes can be added the same way. The Ollama backend also supports Ollama Cloud models (e.g. `gemma4:31b-cloud`), which proxy chat completions through Ollama's cloud API over the same local daemon — the one case where inference leaves the device; embeddings always run locally via `EmbeddingEngine` regardless of which chat backend is active.
 
 ---
 
 ## Architecture
 
-The frontend (SvelteKit) sends requests over HTTP to the main backend — a FastAPI application on port 8001. The backend's `ControllerAgent` receives each task, runs it through the `Planner` (a priority-ordered rule engine), and dispatches to the appropriate agent: `ConversationalAgent` for answers and `WikiAgent` for document ingestion. When a query requires a tool, `MCPToolDispatcher` opens an MCP session (SSE transport) to **localist-mcp**, a standalone MCP server on port 8003 that exposes `web_search` (LangSearch), `fetch_url` (HTML extraction via `readability-lxml`), and the `file_op` tools (`read_file`/`write_file`/`append_file`). The legacy `ToolDispatcher` and the standalone Fetcher microservice (port 8002) have both been retired — their functionality now lives on localist-mcp. All inference goes through `OMLXRuntimeClient`, which speaks the OpenAI-compatible HTTP API exposed by oMLX. Episodic memory and vector embeddings are stored in a SQLite database with WAL mode enabled and survive server restarts.
+The frontend (SvelteKit) sends requests over HTTP to the main backend — a FastAPI application on port 8001. The backend's `ControllerAgent` receives each task, runs it through the `Planner` (a priority-ordered rule engine), and dispatches to the appropriate agent: `ConversationalAgent` for answers and `WikiAgent` for document ingestion. When a query requires a tool, `MCPToolDispatcher` opens an MCP session (SSE transport) to **localist-mcp**, a standalone MCP server on port 8003 that exposes `web_search` (LangSearch), `fetch_url` (HTML extraction via `readability-lxml`), and the `file_op` tools (`read_file`/`write_file`/`append_file`). The legacy `ToolDispatcher` and the standalone Fetcher microservice (port 8002) have both been retired — their functionality now lives on localist-mcp. All inference goes through a `BaseRuntimeClient`-conforming runtime, selected at startup via `LOCALIST_RUNTIME_BACKEND` and constructed by `runtime_factory.py`: `OMLXRuntimeClient` (OpenAI-compatible HTTP API), `OllamaRuntimeClient` (Ollama's native `/api/chat`, NDJSON streaming — works for both local Ollama models and Ollama Cloud models proxied through the same local daemon), or `FoundryRuntimeClient` (Azure AI Foundry). Swapping backends is a config change, not a code change. Vector embeddings are always local via `EmbeddingEngine`, independent of the active chat backend. Episodic memory and vector embeddings are stored in a SQLite database with WAL mode enabled and survive server restarts.
 
 ```
 Localist UI  (localist-ui/)
@@ -19,7 +19,7 @@ FastAPI — port 8001  (backend/main.py)
      ▼
 ControllerAgent  →  Planner  →  RoutingPlan
      │
-     ├──► ConversationalAgent  →  PromptBuilder  →  OMLXRuntimeClient
+     ├──► ConversationalAgent  →  PromptBuilder  →  Runtime (oMLX / Ollama / Foundry)
      │         │
      │         ├── MemoryManager (SQLite episodic + RAG)
      │         └── MCPToolDispatcher
@@ -30,7 +30,7 @@ ControllerAgent  →  Planner  →  RoutingPlan
      │               ├── fetch_url   (readability-lxml extraction)
      │               └── read_file / write_file / append_file
      │
-     └──► WikiAgent  →  OMLXRuntimeClient
+     └──► WikiAgent  →  Runtime (oMLX / Ollama / Foundry)
 ```
 
 ---
@@ -39,7 +39,10 @@ ControllerAgent  →  Planner  →  RoutingPlan
 
 - macOS Apple Silicon
 - Python 3.13
-- oMLX running `gemma-4-e4b-it-4bit` on port 8000
+- A runtime backend — one of:
+  - oMLX running a chat model (default `gemma-4-e4b-it-4bit`) on port 8000
+  - [Ollama](https://ollama.com) running locally (default port 11434) with a model pulled (`ollama pull <model>`) — including Ollama Cloud models, via `ollama signin` + `ollama pull <model>-cloud`
+  - Azure AI Foundry (`LOCALIST_RUNTIME_BACKEND=foundry`)
 - Node.js (for Localist UI)
 
 ---
@@ -81,9 +84,11 @@ Copy `backend/.env.example` to `backend/.env` and set values as needed. The only
 
 | Variable | Default | Description |
 |---|---|---|
-| `LOCALIST_RUNTIME_BACKEND` | `omlx` | `omlx` or `foundry` |
+| `LOCALIST_RUNTIME_BACKEND` | `foundry` | `foundry`, `omlx`, or `ollama` — selects the active `BaseRuntimeClient` implementation |
+| `LOCALIST_CHAT_MODEL` | *(none)* | Chat model ID, interpreted by whichever backend is active (e.g. `gemma-4-e4b-it-4bit` for omlx, `gemma4:e4b-mlx` or a `-cloud` model for ollama) |
 | `LOCALIST_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, or `WARNING` |
-| `LOCALIST_OMLX_URL` | `http://localhost:8000` | oMLX server URL |
+| `LOCALIST_OMLX_URL` | `http://localhost:8000` | oMLX server URL (omlx backend only) |
+| `LOCALIST_OLLAMA_URL` | `http://localhost:11434` | Ollama server URL — used for both local and Ollama Cloud models, which proxy through the same local daemon (ollama backend only) |
 | `LANGSEARCH_API_KEY` | *(none)* | LangSearch API key, read by localist-mcp. Required for `web_search`; without it the tool returns a clean failure (no hallucination fallback) and `ConversationalAgent` falls back to the corpus. |
 | `LOCALIST_MCP_URL` | `http://localhost:8003` | localist-mcp server URL |
 | `LOCALIST_MCP_PROJECT_ROOT` | `backend/` | Base path for localist-mcp's `file_op` tools; writes/reads are sandboxed to a `generated_files/` subdirectory of this path |
@@ -173,6 +178,7 @@ localist/
 │   ├── episodic_extractor.py        # Explicit and implicit episode extraction pipeline
 │   ├── embedding_engine.py          # Local mlx embedding engine (768-dim)
 │   ├── omlx_runtime_client.py       # oMLX HTTP transport (OpenAI-compatible)
+│   ├── ollama_runtime_client.py     # Ollama HTTP transport (native /api/chat, NDJSON streaming); also serves Ollama Cloud models
 │   ├── runtime_factory.py           # Constructs the active runtime from LOCALIST_RUNTIME_BACKEND
 │   ├── base_runtime_client.py       # BaseRuntimeClient protocol definition
 │   ├── mcp_server/
@@ -242,8 +248,15 @@ All tests use mocks for inference and SQLite; no oMLX server or live API keys ar
   it and appends a deterministic saved/failed confirmation line;
   `write_file` refuses empty content and versions on collision instead of
   overwriting
-- **Graph retrieval layer** — planned; concept relationship reasoning
-  via SQLite node/edge tables and hybrid graph + RAG retrieval
+- ** Graph retrieval layer — ✅ concept relationship reasoning via SQLite 
+  node/edge tables (schema v6) and hybrid graph + RAG retrieval; 
+  build-trigger mechanism and ambient (implicit) graph usage still open
+- **Ollama runtime backend** — ✅ `OllamaRuntimeClient`, interchangeable
+  with oMLX/Foundry via `LOCALIST_RUNTIME_BACKEND=ollama`; supports both
+  local Ollama models and Ollama Cloud models (proxied through the same
+  local daemon at `localhost:11434`) with no code change between the two;
+  embeddings stay 100% local via `EmbeddingEngine` regardless of which
+  chat backend is selected
 - **Localist UI redesign** — functional but minimal; planned rework for
   memory inspection, episode browsing, and tool result display
 - **macOS app packaging** — bundle as a native `.app` via PyInstaller +
