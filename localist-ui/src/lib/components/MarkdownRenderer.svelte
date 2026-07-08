@@ -23,6 +23,8 @@
    *   streaming — when true, appends a blinking cursor after the last node
    */
 
+  import { onDestroy } from 'svelte';
+
   export let content:   string  = '';
   export let streaming: boolean = false;
 
@@ -241,7 +243,48 @@
   // Reactive HTML
   // ---------------------------------------------------------------------------
 
-  $: html = blocksToHtml(parse(content ?? ''));
+  // While streaming, re-parsing the full accumulated answer on every single
+  // token is O(n) per token / O(n^2) over a stream (see sessions-log.md,
+  // 2026-07-06 diagnostic). Throttle to at most once per PARSE_THROTTLE_MS
+  // while streaming — still progressive, just capped — and always force one
+  // final parse the moment streaming ends, so the displayed content can
+  // never be stale or truncated behind a pending throttle window.
+  const PARSE_THROTTLE_MS = 75;
+
+  let html = '';
+  let lastParseAt = -Infinity;
+  let pendingTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function runParse(text: string): void {
+    html = blocksToHtml(parse(text));
+    lastParseAt = Date.now();
+  }
+
+  function clearPending(): void {
+    if (pendingTimer) {
+      clearTimeout(pendingTimer);
+      pendingTimer = null;
+    }
+  }
+
+  $: {
+    if (!streaming) {
+      clearPending();
+      runParse(content ?? '');
+    } else {
+      const elapsed = Date.now() - lastParseAt;
+      if (elapsed >= PARSE_THROTTLE_MS) {
+        runParse(content ?? '');
+      } else if (!pendingTimer) {
+        pendingTimer = setTimeout(() => {
+          pendingTimer = null;
+          runParse(content ?? '');
+        }, PARSE_THROTTLE_MS - elapsed);
+      }
+    }
+  }
+
+  onDestroy(clearPending);
 </script>
 
 <div
