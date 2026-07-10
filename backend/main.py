@@ -124,8 +124,9 @@ from embedding_engine import EmbeddingEngine
 from memory_manager import MemoryManager
 from runtime_factory import create_runtime
 import session_files
+import wiki_maintenance_log
 from warmup import run_cache_warmup as _run_cache_warmup
-from wiki_agent import WikiAgent
+from wiki_agent import WikiAgent, sweep_expired_snapshots
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -344,6 +345,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.warning("Wiki reconciliation failed at startup (non-fatal): %s", exc)
     else:
         logger.info("Wiki reconciliation skipped — wiki_dir does not exist yet (%s).", wiki_dir)
+
+    if wiki_dir.exists():
+        try:
+            pruned = sweep_expired_snapshots(wiki_dir)
+            for p in pruned:
+                wiki_maintenance_log.log_snapshot_pruned(p.name, str(p))
+            logger.info("Wiki snapshot TTL sweep at startup — pruned=%d", len(pruned))
+        except Exception as exc:
+            logger.warning("Wiki snapshot TTL sweep failed at startup (non-fatal): %s", exc)
+    else:
+        logger.info("Wiki snapshot TTL sweep skipped — wiki_dir does not exist yet (%s).", wiki_dir)
 
     # -- Agents --------------------------------------------------------------
 

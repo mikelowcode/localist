@@ -1166,3 +1166,25 @@ class TestWikiMaintenanceLog:
 
         # Must not raise.
         wiki_maintenance_log.log_orphan_removed("some-page", "/tmp/some-page.md")
+
+    def test_log_snapshot_pruned_writes_expected_line(self, tmp_path, monkeypatch):
+        log_path = tmp_path / "wiki_maintenance.log"
+        monkeypatch.setattr(wiki_maintenance_log, "_LOG_PATH", log_path)
+
+        wiki_maintenance_log.log_snapshot_pruned(
+            "existing-page.v1.20200101T000000.md", "/tmp/existing-page.v1.20200101T000000.md"
+        )
+
+        log_line = log_path.read_text(encoding="utf-8").strip()
+        assert "snapshot_pruned" in log_line
+        assert "name=existing-page.v1.20200101T000000.md" in log_line
+        assert "path=/tmp/existing-page.v1.20200101T000000.md" in log_line
+
+    def test_log_snapshot_pruned_failure_does_not_raise(self, tmp_path, monkeypatch):
+        blocking_file = tmp_path / "not_a_directory"
+        blocking_file.write_text("blocks mkdir", encoding="utf-8")
+        bad_log_path = blocking_file / "wiki_maintenance.log"
+        monkeypatch.setattr(wiki_maintenance_log, "_LOG_PATH", bad_log_path)
+
+        # Must not raise.
+        wiki_maintenance_log.log_snapshot_pruned("some-page.v1.md", "/tmp/some-page.v1.md")

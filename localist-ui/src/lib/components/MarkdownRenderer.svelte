@@ -64,6 +64,7 @@
   // ---------------------------------------------------------------------------
 
   type Block =
+    | { type: 'h1';      text: string }
     | { type: 'h2';      text: string }
     | { type: 'h3';      text: string }
     | { type: 'h4';      text: string }
@@ -116,7 +117,10 @@
         blocks.push({ type: 'h2', text: trimmed.slice(3).trim() });
         i++; continue;
       }
-      // Skip h1 — model never emits it inside a section body
+      if (trimmed.startsWith('# ')) {
+        blocks.push({ type: 'h1', text: trimmed.slice(2).trim() });
+        i++; continue;
+      }
 
       // ── Horizontal rule ─────────────────────────────────────────────
       if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
@@ -176,6 +180,18 @@
       }
       if (pLines.length > 0) {
         blocks.push({ type: 'p', lines: pLines });
+      } else {
+        // The guard regex above matches some prefixes with no
+        // corresponding block handler (e.g. "===", or "---text" that
+        // isn't a clean horizontal rule) — without this, `i` never
+        // advances for such a line and the outer while loop spins
+        // forever, freezing the tab (see the h1 case fixed above, which
+        // hit this exact trap before h1 got its own branch). Treat any
+        // line that reaches here unconsumed as a one-line paragraph so
+        // the parser always makes forward progress.
+        pLines.push(lines[i].trim());
+        i++;
+        blocks.push({ type: 'p', lines: pLines });
       }
     }
 
@@ -201,6 +217,9 @@
     let html = '';
     for (const block of blocks) {
       switch (block.type) {
+        case 'h1':
+          html += `<h1>${inlineFormat(escape(block.text))}</h1>`;
+          break;
         case 'h2':
           html += `<h2>${inlineFormat(escape(block.text))}</h2>`;
           break;
@@ -307,6 +326,16 @@
   }
 
   /* Tighten heading margins inside chat bubbles / section cards */
+  .md-render :global(h1) {
+    font-size: var(--text-lg);
+    font-weight: 700;
+    color: var(--text-primary);
+    margin-top: var(--sp-4);
+    margin-bottom: var(--sp-2);
+    padding-bottom: var(--sp-1);
+    border-bottom: 1px solid var(--border-soft);
+  }
+
   .md-render :global(h2) {
     font-size: var(--text-md);
     font-weight: 600;

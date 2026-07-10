@@ -27,18 +27,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 _LOG_PATH = _PROJECT_ROOT / "logs" / "wiki_maintenance.log"
 
 
-def log_orphan_removed(name: str, path: str) -> None:
-    """
-    Append one line recording an orphaned document_index row removal.
-
-    Line format (tab-separated):
-        <ISO 8601 UTC timestamp>\torphan_removed\tname=<name>\tpath=<path>
-
-    A write failure here must never break the caller's reconciliation flow —
-    any exception is caught, logged as a warning, and swallowed.
-    """
-    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    line = f"{timestamp}\torphan_removed\tname={name}\tpath={path}\n"
+def _append_line(line: str, entry_kind: str) -> None:
+    """Shared append/flush logic for all entry kinds — write failures here
+    must never break the caller's flow; any exception is caught, logged as
+    a warning, and swallowed."""
     try:
         _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         f = open(_LOG_PATH, mode="a", encoding="utf-8")
@@ -48,4 +40,28 @@ def log_orphan_removed(name: str, path: str) -> None:
         finally:
             f.close()
     except Exception as exc:
-        logger.warning("wiki_maintenance_log: failed to write orphan-removed entry — %s", exc)
+        logger.warning("wiki_maintenance_log: failed to write %s entry — %s", entry_kind, exc)
+
+
+def log_orphan_removed(name: str, path: str) -> None:
+    """
+    Append one line recording an orphaned document_index row removal.
+
+    Line format (tab-separated):
+        <ISO 8601 UTC timestamp>\torphan_removed\tname=<name>\tpath=<path>
+    """
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _append_line(f"{timestamp}\torphan_removed\tname={name}\tpath={path}\n", "orphan-removed")
+
+
+def log_snapshot_pruned(name: str, path: str) -> None:
+    """
+    Append one line recording an expired (>30 days) wiki page snapshot
+    removal from wiki/.snapshots/, performed by the startup TTL sweep in
+    main.py's lifespan().
+
+    Line format (tab-separated):
+        <ISO 8601 UTC timestamp>\tsnapshot_pruned\tname=<name>\tpath=<path>
+    """
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _append_line(f"{timestamp}\tsnapshot_pruned\tname={name}\tpath={path}\n", "snapshot-pruned")

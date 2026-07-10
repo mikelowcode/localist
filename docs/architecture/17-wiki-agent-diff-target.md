@@ -200,14 +200,63 @@ conversations left untouched).
 
 ### 17.8 Open items
 
-- **Wiki write safety net.** `backend/wiki/` is gitignored — no rollback path exists for any write
-  today (diff-apply or fresh ingest). This is now higher-priority than when first flagged: §17.7's
-  live testing produced a real, if briefly-lived, on-disk corruption caught only because a human was
-  watching the click happen. Candidate fixes (pre-write snapshot/backup step in
-  `_apply_changes()`/`apply_pending_diff()`, or bringing `wiki/` under git tracking after all) not
-  yet scoped.
+- **Wiki write safety net — CLOSED, see §17.9.**
 - **Bullet/diff-marker collision on context lines.** See §17.7 point 3 — confirmed, fails safely
   (409, no corruption), intentionally left unfixed for now.
 - **Multi-diff turns.** The model has only ever proposed one diff per instruction to date; the
   `pending_diffs` data shape accommodates a list, but the UI only renders/exercises the single-diff
   case.
+
+### 17.9 Wiki write safety net — Added 2026-07-10 (closes the item above)
+
+Candidate fixes weighed: pre-write snapshot/backup step vs. bringing `wiki/` under git tracking.
+Snapshot chosen — no git dependency, no lock/merge concerns if anything else touches the directory,
+rollback is just "copy the last snapshot back."
+
+**Design.** `wiki_dir / ".snapshots"` (subdirectory of the already-gitignored `wiki/`, no new
+ignore rule needed; not surfaced in the UI or API). Naming:
+`{page_name}.v{N}.{YYYYMMDDTHHMMSS}.md`, `N` = existing-snapshot-count-for-that-page + 1. 30-day
+TTL via two independent cleanup paths, since prune-on-write alone only fires for pages that get
+edited again and would leave orphaned snapshots for abandoned pages indefinitely:
+
+- **Prune-on-write** — `_snapshot_page()`/`_prune_page_snapshots()`, called from both existing
+  overwrite paths (`_apply_changes()`'s diffs loop, and `apply_pending_diff()` — the latter beyond
+  the original prompt's literal wiring instructions, extended deliberately since it's the actual
+  UI-driven path that caused §17.7's corruption). Non-fatal try/except, matching `_write_journal()`'s
+  style.
+- **Startup sweep** — `sweep_expired_snapshots()`, wired into `lifespan()` alongside the existing
+  disk→DB wiki-reconciliation block, same non-fatal pattern.
+
+TTL is runtime-overridable via `LOCALIST_WIKI_SNAPSHOT_TTL_SECONDS` (uncached env read, default
+2,592,000s / 30 days) — following `planner.py`'s `_tool_fallback_mode()` convention for standalone
+tunables, since no precedent exists for this class of env var in `Settings`/`.env.example`.
+
+All snapshot removals — both prune-on-write and startup-sweep — write to `wiki_maintenance.log` via
+`wiki_maintenance_log.log_snapshot_pruned()`, one shared audit trail regardless of trigger.
+(Prune-on-write was initially wired to the plain application logger only; the asymmetry was caught
+during live verification below and unified same-day.) `_snapshot_page()` logs at INFO on both
+success and failure — the success line was added after live verification found no way to confirm a
+snapshot fired from backend logs alone, short of a filesystem check.
+
+**Live verification — 2026-07-10, four steps against the running backend
+(ports 8001/8003/5173), `LOCALIST_WIKI_SNAPSHOT_TTL_SECONDS=30` for test speed:**
+
+1. Real diff-apply against `localist-build-order` → `Snapshotted 'localist-build-order' ->
+   .../localist-build-order.v1.<ts>.md` logged at INFO; file confirmed on disk with correct
+   pre-patch content.
+2. Second apply 34s later → prune-on-write removed `v1`, left only `v2`. (Surfaced the
+   audit-log asymmetry above — prune-on-write hadn't yet been wired to `wiki_maintenance.log`
+   at this point; flagged rather than fabricating a log line, fixed same day.)
+3. Manually backdated snapshot + restart, no intervening write to that page → startup sweep
+   pruned it plus the now-expired `v2` from step 2 (`pruned=2`), both logged to
+   `wiki_maintenance.log` with `snapshot_pruned` entries.
+4. TTL override unset, restart confirmed effective TTL reverted to 30 days via direct runtime
+   check, not assumption.
+
+Two harmless test-artifact lines appended to `localist-build-order.md`'s Revision History by the
+live-fire diff-applies in steps 1–2 were reverted by hand afterward (byte-for-byte match against
+the pre-verification content).
+
+**Test suite:** 578 → 653 passed, 0 failed, across four incremental sessions (snapshot + sweep
+core; success-logging + TTL env override; audit-log parity for prune-on-write). No existing test
+modified or removed at any step.

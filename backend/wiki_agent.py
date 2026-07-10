@@ -106,8 +106,10 @@ deliberate architectural removals. The last is a bug fix.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import textwrap
+import time
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -117,6 +119,7 @@ from pydantic import BaseModel, Field
 
 from build_graph import build_graph
 from prompt_builder import PromptBuilder
+import wiki_maintenance_log
 from wiki_doc import parse_wiki_doc
 
 from controller_agent import (
@@ -139,6 +142,38 @@ _MAX_WIKI_CHARS   = 6_000
 _RELEVANT_PAGES_N = 4
 _SUMMARY_LINES    = 3
 _MAX_SCHEMA_LINES = 120
+
+
+# ---------------------------------------------------------------------------
+# Pre-write snapshot safety net (§17.8)
+# ---------------------------------------------------------------------------
+
+_SNAPSHOT_DIR_NAME = ".snapshots"
+_SNAPSHOT_TTL_DEFAULT_SECONDS = 30 * 24 * 60 * 60  # 30 days
+_SNAPSHOT_TTL_ENV_VAR = "LOCALIST_WIKI_SNAPSHOT_TTL_SECONDS"
+
+
+def _snapshot_ttl_seconds() -> int:
+    """
+    Read LOCALIST_WIKI_SNAPSHOT_TTL_SECONDS from the environment.
+
+    Read at call time (not cached) — same convention as Planner's
+    _tool_fallback_mode() — so tests and ops tooling can exercise the
+    prune-on-write and startup-sweep paths with a short TTL instead of
+    requiring a real 30-day-old file. Falls back to the 30-day default on
+    missing or invalid values.
+    """
+    raw = os.environ.get(_SNAPSHOT_TTL_ENV_VAR)
+    if raw is None:
+        return _SNAPSHOT_TTL_DEFAULT_SECONDS
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "[wiki_agent] Invalid %s=%r — falling back to default TTL of %d seconds.",
+            _SNAPSHOT_TTL_ENV_VAR, raw, _SNAPSHOT_TTL_DEFAULT_SECONDS,
+        )
+        return _SNAPSHOT_TTL_DEFAULT_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +246,27 @@ def read_text_file(path: Path) -> str:
 def write_text_file(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def sweep_expired_snapshots(wiki_dir: Path) -> list[Path]:
+    """
+    Remove every snapshot file under wiki_dir/.snapshots older than the
+    effective TTL (see _snapshot_ttl_seconds()), regardless of page. Called
+    once at startup (main.py's lifespan()) to catch snapshots belonging to
+    pages that haven't been edited again since — WikiAgent._prune_page_snapshots()
+    only prunes a page's own snapshots when that same page is next written.
+    Returns the paths removed, for the caller to log.
+    """
+    snapshots_dir = wiki_dir / _SNAPSHOT_DIR_NAME
+    if not snapshots_dir.exists():
+        return []
+    cutoff = time.time() - _snapshot_ttl_seconds()
+    pruned: list[Path] = []
+    for p in snapshots_dir.glob("*.md"):
+        if p.is_file() and p.stat().st_mtime < cutoff:
+            p.unlink()
+            pruned.append(p)
+    return pruned
 
 
 def is_text_file(path: Path) -> bool:
@@ -1462,6 +1518,8 @@ class WikiAgent:
                 error      = f"Page not found: {page_name}",
             )
 
+        self._snapshot_page(page_name, wiki_dir)
+
         original = read_text_file(page_path)
         try:
             updated = apply_unified_diff(original, diff)
@@ -1567,6 +1625,51 @@ class WikiAgent:
         return filtered
 
     @staticmethod
+    def _snapshot_page(page_name: str, wiki_dir: Path) -> None:
+        """
+        Copy the current on-disk content of an existing page to
+        wiki_dir/.snapshots/ before it gets overwritten. Non-fatal — a
+        snapshot failure must never block the real write, matching the
+        pattern used for journal writes (see _write_journal()).
+
+        Naming: {page_name}.v{N}.{YYYYMMDDTHHMMSS}.md, UTC timestamp,
+        N = count of existing snapshots for this page_name + 1.
+        """
+        try:
+            content = read_text_file(wiki_dir / f"{page_name}.md")
+            snapshots_dir = wiki_dir / _SNAPSHOT_DIR_NAME
+            snapshots_dir.mkdir(parents=True, exist_ok=True)
+            n = len(list(snapshots_dir.glob(f"{page_name}.v*.md"))) + 1
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            snapshot_path = snapshots_dir / f"{page_name}.v{n}.{timestamp}.md"
+            write_text_file(snapshot_path, content)
+        except Exception as exc:
+            logger.warning("[wiki_agent] Snapshot failed for '%s': %s", page_name, exc)
+            return
+
+        logger.info("[wiki_agent] Snapshotted '%s' -> %s", page_name, snapshot_path)
+
+        try:
+            WikiAgent._prune_page_snapshots(page_name, wiki_dir)
+        except Exception as exc:
+            logger.warning("[wiki_agent] Snapshot prune failed for '%s': %s", page_name, exc)
+
+    @staticmethod
+    def _prune_page_snapshots(page_name: str, wiki_dir: Path) -> None:
+        """Remove this page's own snapshots older than the effective TTL
+        (see _snapshot_ttl_seconds()). Runs after every successful
+        _snapshot_page() call; complements the startup-wide
+        sweep_expired_snapshots() for pages that get edited again before
+        the TTL elapses. Writes the same wiki_maintenance_log audit entry
+        as the startup sweep so both prune paths share one audit trail."""
+        snapshots_dir = wiki_dir / _SNAPSHOT_DIR_NAME
+        cutoff = time.time() - _snapshot_ttl_seconds()
+        for p in snapshots_dir.glob(f"{page_name}.v*.md"):
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                wiki_maintenance_log.log_snapshot_pruned(p.name, str(p))
+
+    @staticmethod
     def _apply_changes(
         actions:  Actions,
         wiki_dir: Path,
@@ -1591,6 +1694,7 @@ class WikiAgent:
                 logger.warning("[wiki_agent] Diff target missing: %s", entry.page_name)
                 diff_errors.append(entry.page_name)
                 continue
+            WikiAgent._snapshot_page(entry.page_name, wiki_dir)
             original = read_text_file(path)
             try:
                 updated = apply_unified_diff(original, entry.diff)

@@ -22,8 +22,10 @@ import pytest
 
 from unittest.mock import patch
 
+import wiki_maintenance_log
 from wiki_agent import (
     Actions,
+    ApplyDiff,
     CreatePage,
     WikiAgent,
     _validate_links,
@@ -32,8 +34,22 @@ from wiki_agent import (
     build_user_prompt,
     build_slim_prompt,
     parse_model_xml,
+    sweep_expired_snapshots,
 )
 from controller_agent import SubTask, TaskStatus
+
+
+@pytest.fixture(autouse=True)
+def _isolate_wiki_maintenance_log(tmp_path, monkeypatch):
+    """
+    _prune_page_snapshots() now writes to wiki_maintenance_log on every
+    prune (see §17.8 audit-log parity), so any test that ages a snapshot
+    past the TTL and triggers a prune would otherwise append to the real
+    backend/logs/wiki_maintenance.log. Point it at a tmp_path file for
+    every test in this module — matches the _isolate_log fixture already
+    used for the same reason in test_memory_phase1.py.
+    """
+    monkeypatch.setattr(wiki_maintenance_log, "_LOG_PATH", tmp_path / "wiki_maintenance.log")
 
 
 # ---------------------------------------------------------------------------
@@ -941,3 +957,290 @@ def test_apply_unified_diff_genuine_mismatch_raises():
 
     with pytest.raises(ValueError, match="not found anywhere in the file"):
         apply_unified_diff(original, diff_text)
+
+
+# ---------------------------------------------------------------------------
+# §17.8 — pre-write snapshot safety net
+# ---------------------------------------------------------------------------
+
+import os
+import time
+
+
+def test_snapshot_page_creates_versioned_file_with_correct_content(tmp_path: Path):
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+    (wiki_dir / "existing-page.md").write_text(_PAGE_CONTENT, encoding="utf-8")
+
+    WikiAgent._snapshot_page("existing-page", wiki_dir)
+
+    snapshots = list((wiki_dir / ".snapshots").glob("existing-page.v*.md"))
+    assert len(snapshots) == 1
+    assert snapshots[0].name.startswith("existing-page.v1.")
+    assert snapshots[0].name.endswith(".md")
+    assert snapshots[0].read_text(encoding="utf-8") == _PAGE_CONTENT
+
+
+def test_snapshot_page_increments_version_number(tmp_path: Path):
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+    page_path = wiki_dir / "existing-page.md"
+    page_path.write_text("v1 content", encoding="utf-8")
+
+    WikiAgent._snapshot_page("existing-page", wiki_dir)
+    page_path.write_text("v2 content", encoding="utf-8")
+    WikiAgent._snapshot_page("existing-page", wiki_dir)
+
+    snapshots = sorted((wiki_dir / ".snapshots").glob("existing-page.v*.md"))
+    assert len(snapshots) == 2
+    assert snapshots[0].name.startswith("existing-page.v1.")
+    assert snapshots[1].name.startswith("existing-page.v2.")
+    assert snapshots[0].read_text(encoding="utf-8") == "v1 content"
+    assert snapshots[1].read_text(encoding="utf-8") == "v2 content"
+
+
+def test_snapshot_page_versioning_is_per_page_name(tmp_path: Path):
+    """A second, differently-named page's snapshots must not affect this
+    page's version counter."""
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+    (wiki_dir / "page-a.md").write_text("a", encoding="utf-8")
+    (wiki_dir / "page-b.md").write_text("b", encoding="utf-8")
+
+    WikiAgent._snapshot_page("page-a", wiki_dir)
+    WikiAgent._snapshot_page("page-b", wiki_dir)
+
+    snapshots_dir = wiki_dir / ".snapshots"
+    assert list(snapshots_dir.glob("page-a.v*.md"))[0].name.startswith("page-a.v1.")
+    assert list(snapshots_dir.glob("page-b.v*.md"))[0].name.startswith("page-b.v1.")
+
+
+def test_snapshot_page_non_fatal_when_source_page_missing(tmp_path: Path, caplog):
+    """_snapshot_page() must not raise even if the page it's snapshotting
+    doesn't exist on disk — matches the non-fatal pattern used elsewhere in
+    this module (e.g. _write_journal())."""
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+
+    with caplog.at_level(logging.WARNING, logger="wiki_agent"):
+        WikiAgent._snapshot_page("nonexistent-page", wiki_dir)
+
+    assert "Snapshot failed" in caplog.text
+    assert not (wiki_dir / ".snapshots").exists()
+
+
+def test_apply_changes_snapshots_before_patching_existing_page(tmp_path: Path):
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+    page_path = wiki_dir / "existing-page.md"
+    page_path.write_text(_PAGE_CONTENT, encoding="utf-8")
+
+    actions = Actions(
+        new_pages=[],
+        diffs=[ApplyDiff(
+            page_name="existing-page",
+            diff="@@ -3,1 +3,1 @@\n-Old summary.\n+New summary.\n",
+        )],
+    )
+
+    applied, written, skipped, diff_errors = WikiAgent._apply_changes(actions, wiki_dir)
+
+    assert applied is True
+    assert written == ["existing-page"]
+    snapshots = list((wiki_dir / ".snapshots").glob("existing-page.v*.md"))
+    assert len(snapshots) == 1
+    # The snapshot holds the pre-patch content, not the patched result.
+    assert snapshots[0].read_text(encoding="utf-8") == _PAGE_CONTENT
+    assert page_path.read_text(encoding="utf-8") != _PAGE_CONTENT
+
+
+def test_apply_pending_diff_snapshots_before_patching(tmp_path: Path):
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+    page_path = wiki_dir / "existing-page.md"
+    page_path.write_text(_PAGE_CONTENT, encoding="utf-8")
+
+    agent = WikiAgent(runtime=_FakeRuntime(""), project_root=tmp_path)
+    diff_text = "@@ -3,1 +3,1 @@\n-Old summary.\n+New summary.\n"
+
+    result = agent.apply_pending_diff("existing-page", diff_text, wiki_dir)
+
+    assert result.status == TaskStatus.COMPLETE
+    snapshots = list((wiki_dir / ".snapshots").glob("existing-page.v*.md"))
+    assert len(snapshots) == 1
+    assert snapshots[0].read_text(encoding="utf-8") == _PAGE_CONTENT
+
+
+def test_prune_page_snapshots_removes_only_expired_files(tmp_path: Path):
+    wiki_dir = tmp_path / "wiki"
+    snapshots_dir = wiki_dir / ".snapshots"
+    snapshots_dir.mkdir(parents=True)
+
+    old = snapshots_dir / "existing-page.v1.20200101T000000.md"
+    old.write_text("old", encoding="utf-8")
+    recent = snapshots_dir / "existing-page.v2.20260101T000000.md"
+    recent.write_text("recent", encoding="utf-8")
+
+    thirty_one_days_ago = time.time() - (31 * 24 * 60 * 60)
+    os.utime(old, (thirty_one_days_ago, thirty_one_days_ago))
+
+    WikiAgent._prune_page_snapshots("existing-page", wiki_dir)
+
+    remaining = list(snapshots_dir.glob("existing-page.v*.md"))
+    assert remaining == [recent]
+
+
+def test_prune_page_snapshots_writes_wiki_maintenance_log_entry(tmp_path: Path):
+    """_prune_page_snapshots() (the prune-on-write path) must land in the
+    same audit trail as sweep_expired_snapshots() (the startup path) — see
+    §17.8 audit-log parity. Format matches
+    test_log_snapshot_pruned_writes_expected_line in test_memory_phase1.py."""
+    wiki_dir = tmp_path / "wiki"
+    snapshots_dir = wiki_dir / ".snapshots"
+    snapshots_dir.mkdir(parents=True)
+
+    old = snapshots_dir / "existing-page.v1.20200101T000000.md"
+    old.write_text("old", encoding="utf-8")
+    old_path = str(old)
+
+    thirty_one_days_ago = time.time() - (31 * 24 * 60 * 60)
+    os.utime(old, (thirty_one_days_ago, thirty_one_days_ago))
+
+    WikiAgent._prune_page_snapshots("existing-page", wiki_dir)
+
+    log_path = wiki_maintenance_log._LOG_PATH
+    assert log_path.exists()
+    log_line = log_path.read_text(encoding="utf-8").strip()
+    assert "snapshot_pruned" in log_line
+    assert "name=existing-page.v1.20200101T000000.md" in log_line
+    assert f"path={old_path}" in log_line
+
+
+def test_prune_page_snapshots_boundary_kept_at_exactly_30_days(tmp_path: Path):
+    """A snapshot just inside the 30-day window is kept — the prune
+    condition is strictly-older-than, not older-than-or-equal."""
+    wiki_dir = tmp_path / "wiki"
+    snapshots_dir = wiki_dir / ".snapshots"
+    snapshots_dir.mkdir(parents=True)
+
+    boundary = snapshots_dir / "existing-page.v1.20260101T000000.md"
+    boundary.write_text("boundary", encoding="utf-8")
+
+    just_inside_window = time.time() - (30 * 24 * 60 * 60) + 5
+    os.utime(boundary, (just_inside_window, just_inside_window))
+
+    WikiAgent._prune_page_snapshots("existing-page", wiki_dir)
+
+    assert boundary.exists()
+
+
+def test_prune_page_snapshots_only_touches_its_own_page(tmp_path: Path):
+    wiki_dir = tmp_path / "wiki"
+    snapshots_dir = wiki_dir / ".snapshots"
+    snapshots_dir.mkdir(parents=True)
+
+    other_old = snapshots_dir / "other-page.v1.20200101T000000.md"
+    other_old.write_text("other", encoding="utf-8")
+    thirty_one_days_ago = time.time() - (31 * 24 * 60 * 60)
+    os.utime(other_old, (thirty_one_days_ago, thirty_one_days_ago))
+
+    WikiAgent._prune_page_snapshots("existing-page", wiki_dir)
+
+    assert other_old.exists()
+
+
+def test_sweep_expired_snapshots_removes_across_all_pages(tmp_path: Path):
+    wiki_dir = tmp_path / "wiki"
+    snapshots_dir = wiki_dir / ".snapshots"
+    snapshots_dir.mkdir(parents=True)
+
+    old_a = snapshots_dir / "page-a.v1.20200101T000000.md"
+    old_a.write_text("a", encoding="utf-8")
+    old_b = snapshots_dir / "page-b.v1.20200101T000000.md"
+    old_b.write_text("b", encoding="utf-8")
+    recent = snapshots_dir / "page-a.v2.20260101T000000.md"
+    recent.write_text("recent", encoding="utf-8")
+
+    thirty_one_days_ago = time.time() - (31 * 24 * 60 * 60)
+    os.utime(old_a, (thirty_one_days_ago, thirty_one_days_ago))
+    os.utime(old_b, (thirty_one_days_ago, thirty_one_days_ago))
+
+    pruned = sweep_expired_snapshots(wiki_dir)
+
+    assert sorted(p.name for p in pruned) == [
+        "page-a.v1.20200101T000000.md",
+        "page-b.v1.20200101T000000.md",
+    ]
+    assert not old_a.exists()
+    assert not old_b.exists()
+    assert recent.exists()
+
+
+def test_sweep_expired_snapshots_no_snapshots_dir_returns_empty(tmp_path: Path):
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+
+    assert sweep_expired_snapshots(wiki_dir) == []
+
+
+# ---------------------------------------------------------------------------
+# §17.8 follow-up — success logging + env-var-overridable TTL
+# ---------------------------------------------------------------------------
+
+def test_snapshot_page_logs_success_at_info_level(tmp_path: Path, caplog):
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+    (wiki_dir / "existing-page.md").write_text(_PAGE_CONTENT, encoding="utf-8")
+
+    with caplog.at_level(logging.INFO, logger="wiki_agent"):
+        WikiAgent._snapshot_page("existing-page", wiki_dir)
+
+    assert "Snapshotted 'existing-page'" in caplog.text
+    snapshot_path = next((wiki_dir / ".snapshots").glob("existing-page.v*.md"))
+    assert str(snapshot_path) in caplog.text
+
+
+def test_prune_page_snapshots_respects_env_var_ttl_override(tmp_path: Path, monkeypatch):
+    """With the TTL overridden down to a few seconds, a snapshot older than
+    that (but nowhere near the real 30-day default) must be pruned."""
+    monkeypatch.setenv("LOCALIST_WIKI_SNAPSHOT_TTL_SECONDS", "5")
+
+    wiki_dir = tmp_path / "wiki"
+    snapshots_dir = wiki_dir / ".snapshots"
+    snapshots_dir.mkdir(parents=True)
+
+    old = snapshots_dir / "existing-page.v1.20260101T000000.md"
+    old.write_text("old", encoding="utf-8")
+    recent = snapshots_dir / "existing-page.v2.20260101T000001.md"
+    recent.write_text("recent", encoding="utf-8")
+
+    ten_seconds_ago = time.time() - 10
+    os.utime(old, (ten_seconds_ago, ten_seconds_ago))
+
+    WikiAgent._prune_page_snapshots("existing-page", wiki_dir)
+
+    remaining = list(snapshots_dir.glob("existing-page.v*.md"))
+    assert remaining == [recent]
+
+
+def test_sweep_expired_snapshots_respects_env_var_ttl_override(tmp_path: Path, monkeypatch):
+    """Same override, exercised through the startup-sweep entry point."""
+    monkeypatch.setenv("LOCALIST_WIKI_SNAPSHOT_TTL_SECONDS", "5")
+
+    wiki_dir = tmp_path / "wiki"
+    snapshots_dir = wiki_dir / ".snapshots"
+    snapshots_dir.mkdir(parents=True)
+
+    old = snapshots_dir / "page-a.v1.20260101T000000.md"
+    old.write_text("old", encoding="utf-8")
+    recent = snapshots_dir / "page-b.v1.20260101T000001.md"
+    recent.write_text("recent", encoding="utf-8")
+
+    ten_seconds_ago = time.time() - 10
+    os.utime(old, (ten_seconds_ago, ten_seconds_ago))
+
+    pruned = sweep_expired_snapshots(wiki_dir)
+
+    assert [p.name for p in pruned] == ["page-a.v1.20260101T000000.md"]
+    assert not old.exists()
+    assert recent.exists()
