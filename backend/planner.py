@@ -112,6 +112,14 @@ class RoutingPlan:
         "write" or "append" — the file_op action for a deferred file_op,
         resolved the same way _derive_file_op_action() resolves it at
         dispatch time. None unless file_op_deferred is True.
+    diff_target :
+        Resolved wiki page stem (e.g. "localist-software-stack") when
+        Priority 1b matched a diff-only wiki-update instruction and target
+        resolution succeeded. None in every other case, including a P1b
+        keyword match whose target resolution failed or was ambiguous
+        (that case routes to conversational_agent for clarification
+        instead — see Planner._priority1b_diff()). ControllerAgent wires
+        this into the wiki_agent SubTask.context as "diff_target".
     """
     agent:          str
     fetch_episodic: bool
@@ -126,6 +134,7 @@ class RoutingPlan:
     file_op_deferred: bool       = False
     file_op_path:     str | None = None
     file_op_action:   str | None = None
+    diff_target:      str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +148,27 @@ _INGEST_KEYWORDS: frozenset[str] = frozenset({
     "add to wiki",
     "index this",
 })
+
+# Priority 1b — diff-only wiki update trigger keywords (checked against
+# lowercased instruction). Deliberately narrow and explicit, matching this
+# module's existing "deterministic, no false-positive-risk" style for
+# keyword sets (see _WEB_SEARCH_KEYWORDS comment). Only matched when
+# Priority 1 (ingest) did not already fire.
+_DIFF_KEYWORDS: frozenset[str] = frozenset({
+    "update the wiki",
+    "update page",
+    "revise page",
+    "modify page",
+    "apply a diff to",
+})
+
+# Longest-first ordering for lead-phrase stripping in extract_diff_query(),
+# mirroring _BACKLINK_LEAD_PHRASES/_OUTGOING_LEAD_PHRASES below — a shorter
+# phrase must never shadow a longer, more specific one that is also a
+# prefix of the instruction.
+_DIFF_LEAD_PHRASES: tuple[str, ...] = tuple(
+    sorted(_DIFF_KEYWORDS, key=len, reverse=True)
+)
 
 # Priority 2 — explicit memory command keywords
 _MEMORY_KEYWORDS: frozenset[str] = frozenset({
@@ -486,6 +516,29 @@ def extract_graph_query(instruction: str) -> tuple[str, str] | None:
     return None
 
 
+def extract_diff_query(instruction: str) -> str | None:
+    """
+    Attempt to extract the page-naming remainder from `instruction` for a
+    Priority 1b diff-only wiki-update instruction. Returns None if no
+    _DIFF_KEYWORDS lead phrase matches.
+
+    Mirrors extract_graph_query()'s Pattern B/C lead-phrase stripping:
+    normalize (lowercase, strip, drop trailing punctuation), then check
+    _DIFF_LEAD_PHRASES longest-first so a shorter phrase never shadows a
+    longer, more specific one. The returned remainder is passed directly to
+    resolve_graph_target() with no further cleanup — that pipeline's Tier 1
+    substring match handles a remainder that also carries trailing
+    free-text description (e.g. "page x to reflect the new backend"),
+    since the target stem still appears as a substring of the normalized
+    remainder.
+    """
+    normalized = instruction.strip().lower().rstrip("?.")
+    for phrase in _DIFF_LEAD_PHRASES:
+        if normalized.startswith(phrase):
+            return normalized[len(phrase):].strip()
+    return None
+
+
 def resolve_graph_target(
     remainder:       str,
     candidate_stems: list[str],
@@ -544,6 +597,8 @@ class Planner:
 
     Priority order (first match wins):
       1.  Ingest signal      — deterministic keyword/context check
+      1b. Diff-only update   — deterministic keyword check + graph-stem
+                               resolution; only reached when P1 didn't match
       2.  Memory command     — deterministic keyword check
       3c. Graph-query        — structural link lookup; wins over web_search
                                but defers to file_op/url_fetch (inline guard)
@@ -753,6 +808,14 @@ class Planner:
         if plan is not None:
             return plan
 
+        # Priority 1b — Diff-only wiki update (must run before Priority 2 so
+        # both "write to storage" intents — ingest and diff — stay
+        # deterministic and ahead of memory commands; only reached when
+        # Priority 1 did not already match)
+        plan = self._priority1b_diff(instruction, lowered)
+        if plan is not None:
+            return plan
+
         # Priority 2 — Explicit memory command
         plan = self._priority2_memory(lowered)
         if plan is not None:
@@ -837,6 +900,85 @@ class Planner:
                 priority       = 1,
             )
         return None
+
+    # -----------------------------------------------------------------------
+    # Priority 1b — Diff-only wiki update
+    # -----------------------------------------------------------------------
+
+    def _priority1b_diff(
+        self,
+        instruction: str,
+        lowered:     str,
+    ) -> RoutingPlan | None:
+        """
+        Priority 1b — diff-only wiki update ("update page X to reflect Y",
+        with no raw file involved). Only reached when Priority 1 (ingest)
+        did not already match, so an ingest instruction that happens to
+        also contain a diff keyword still takes the ingest path unchanged.
+
+        Resolves the target page name via the same resolve_graph_target()
+        three-tier pipeline Priority 3c uses, fed by
+        memory_manager.list_graph_node_stems(). On successful resolution,
+        routes to wiki_agent with diff_target set. On a keyword match with
+        failed/ambiguous resolution (or no MemoryManager to resolve
+        against), routes to conversational_agent with no tools/retrieval so
+        the model can ask the user which page they mean — the turn is
+        claimed either way; it deliberately does NOT fall through to P2+
+        on an unresolved target. Both P1 and P1b are "write to storage"
+        intents and stay on the same deterministic, early footing ahead of
+        P2 memory commands (Michael's decision, 2026-07-09).
+
+        Returns None only when no _DIFF_KEYWORDS lead phrase is present.
+        """
+        remainder = extract_diff_query(instruction)
+        if remainder is None:
+            return None
+
+        if self._memory_manager is None:
+            logger.debug(
+                "Planner: Priority 1b matched keyword but no MemoryManager — "
+                "routing to conversational_agent for clarification."
+            )
+            return RoutingPlan(
+                agent          = "conversational_agent",
+                fetch_episodic = False,
+                fetch_rag      = False,
+                priority       = 1,
+            )
+
+        try:
+            candidate_stems = self._memory_manager.list_graph_node_stems()
+        except Exception as exc:
+            logger.warning(
+                "Planner: Priority 1b — list_graph_node_stems failed: %s", exc
+            )
+            candidate_stems = []
+
+        resolved_stem = resolve_graph_target(remainder, candidate_stems)
+
+        if resolved_stem is None:
+            logger.debug(
+                "Planner: Priority 1b — target resolution failed for %r; "
+                "routing to conversational_agent for clarification.",
+                remainder,
+            )
+            return RoutingPlan(
+                agent          = "conversational_agent",
+                fetch_episodic = False,
+                fetch_rag      = False,
+                priority       = 1,
+            )
+
+        logger.debug(
+            "Planner: Priority 1b matched — diff_target=%r.", resolved_stem
+        )
+        return RoutingPlan(
+            agent          = "wiki_agent",
+            fetch_episodic = False,
+            fetch_rag      = False,
+            priority       = 1,
+            diff_target    = resolved_stem,
+        )
 
     # -----------------------------------------------------------------------
     # Priority 2 — Explicit memory command  (§4.2, Priority 2)

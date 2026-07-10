@@ -30,6 +30,7 @@ from memory_manager import (
     VALID_EPISODE_TYPES,
     _query_hash,
 )
+import wiki_maintenance_log
 
 
 # ---------------------------------------------------------------------------
@@ -1068,3 +1069,100 @@ class TestWorkingStateStore:
         assert version_after == 7
         assert "working_state" in tables_after
         assert "turn_summaries_json" not in cols_after
+
+
+# ---------------------------------------------------------------------------
+# reconcile_wiki() + wiki_maintenance_log
+# ---------------------------------------------------------------------------
+
+class TestReconcileWiki:
+
+    @pytest.fixture(autouse=True)
+    def _isolate_log(self, tmp_path, monkeypatch):
+        """Point the audit log at a tmp_path file so tests never touch logs/."""
+        log_path = tmp_path / "wiki_maintenance.log"
+        monkeypatch.setattr(wiki_maintenance_log, "_LOG_PATH", log_path)
+        self.log_path = log_path
+
+    @pytest.fixture()
+    def wiki_dir(self, tmp_path):
+        d = tmp_path / "wiki"
+        d.mkdir()
+        return d
+
+    def test_picks_up_hand_edited_file_new_content(self, mm, wiki_dir):
+        page = wiki_dir / "onboarding-notes.md"
+        page.write_text("original content", encoding="utf-8")
+        mm.reconcile_wiki(wiki_dir)
+
+        [doc] = mm.get_all_documents(doc_type="wiki")
+        assert doc.content == "original content"
+
+        # Hand-edit the file on disk (outside of index_document()).
+        page.write_text("edited content, hand-modified", encoding="utf-8")
+        summary = mm.reconcile_wiki(wiki_dir)
+
+        assert summary["reindexed"] == 1
+        [doc] = mm.get_all_documents(doc_type="wiki")
+        assert doc.content == "edited content, hand-modified"
+
+    def test_unchanged_file_row_untouched(self, mm, wiki_dir):
+        page = wiki_dir / "stable-page.md"
+        page.write_text("stable content", encoding="utf-8")
+        mm.reconcile_wiki(wiki_dir)
+
+        [before] = mm.get_all_documents(doc_type="wiki")
+
+        summary = mm.reconcile_wiki(wiki_dir)
+
+        # index_directory() counts every file it walks, but index_document()
+        # is a no-op on hash match — content is untouched.
+        [after] = mm.get_all_documents(doc_type="wiki")
+        assert after.content == before.content == "stable content"
+        assert summary["orphans_removed"] == 0
+
+    def test_removes_orphaned_row_and_writes_audit_log(self, mm, wiki_dir):
+        page = wiki_dir / "onboarding-notes.md"
+        page.write_text("temporary page", encoding="utf-8")
+        mm.reconcile_wiki(wiki_dir)
+        assert mm.document_count(doc_type="wiki") == 1
+
+        page_path = str(page.resolve())
+        page.unlink()
+
+        summary = mm.reconcile_wiki(wiki_dir)
+
+        assert summary["orphans_removed"] == 1
+        assert summary["orphan_names"] == ["onboarding-notes"]
+        assert mm.document_count(doc_type="wiki") == 0
+
+        assert self.log_path.exists()
+        log_line = self.log_path.read_text(encoding="utf-8").strip()
+        assert "orphan_removed" in log_line
+        assert "name=onboarding-notes" in log_line
+        assert f"path={page_path}" in log_line
+
+    def test_empty_wiki_dir_returns_zero_counts_no_log_write(self, mm, wiki_dir):
+        summary = mm.reconcile_wiki(wiki_dir)
+
+        assert summary == {
+            "reindexed": 0,
+            "orphans_removed": 0,
+            "orphan_names": [],
+        }
+        assert not self.log_path.exists()
+
+
+class TestWikiMaintenanceLog:
+
+    def test_log_orphan_removed_failure_does_not_raise(self, tmp_path, monkeypatch):
+        # Point _LOG_PATH at a location where the parent can never be
+        # created as a directory (it already exists as a plain file),
+        # simulating an unwritable path.
+        blocking_file = tmp_path / "not_a_directory"
+        blocking_file.write_text("blocks mkdir", encoding="utf-8")
+        bad_log_path = blocking_file / "wiki_maintenance.log"
+        monkeypatch.setattr(wiki_maintenance_log, "_LOG_PATH", bad_log_path)
+
+        # Must not raise.
+        wiki_maintenance_log.log_orphan_removed("some-page", "/tmp/some-page.md")

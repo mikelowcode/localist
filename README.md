@@ -103,11 +103,12 @@ Copy `backend/.env.example` to `backend/.env` and set values as needed. The only
 
 ### Routing
 
-Every query passes through `Planner`, a deterministic rule engine with seven priority levels evaluated in order. No inference is used for routing decisions.
+Every query passes through `Planner`, a deterministic rule engine with priority levels evaluated in order. No inference is used for routing decisions.
 
 | Priority | Trigger | Route |
 |---|---|---|
 | P1 | `raw_path` in context, or ingest keyword | `WikiAgent` |
+| P1b | Diff keyword (`update page`, `revise page`, etc.) + resolvable target page | `WikiAgent` with `diff_target` set (no raw file) — falls back to `ConversationalAgent` for clarification if the target page can't be resolved |
 | P2 | Memory keyword (`remember`, `forget`, `prefer`) | `ConversationalAgent` + write episode |
 | P3 | Tool signal: web search keyword, URL present, file keyword | `ConversationalAgent` + tool call |
 | P3b | Factual question keyword + corpus score below threshold | `ConversationalAgent` + `web_search` |
@@ -126,6 +127,8 @@ All tools are served over MCP (SSE transport) by the **localist-mcp** server (po
 **File operations** — sandboxed `read_file`/`write_file`/`append_file` MCP tools, rooted at `LOCALIST_MCP_PROJECT_ROOT/generated_files/`. Triggered by explicit file-operation phrasing (`"write a file"`, `"save it as X.md"`, `"append to X.md"`, etc.). `write_file` refuses empty/whitespace-only content rather than silently creating a 0-byte file, and versions on filename collision (`notes.md` → `notes_2.md`, up to 10 versions) instead of overwriting. When the content to save doesn't yet exist in the instruction — e.g. *"write a haiku about the sea and save it as haiku.md"* — the Planner defers the file write until after the answer is generated, then dispatches it and appends a deterministic `*(Saved to haiku.md)*` / `*(Could not save — {reason})*` confirmation line to the response. Files written this way, and any other `file_op` output, are listed in the Localist UI's Files tab under "Generated Files."
 
 **Wiki ingestion** — processes a raw document into structured wiki pages via `WikiAgent`. Triggered by `raw_path` in request context or ingestion keywords.
+
+**Wiki diff updates** — proposes a targeted diff against an *existing* wiki page with no raw file involved, via `WikiAgent`'s `diff_target` path (P1b, e.g. *"update page localist-software-stack to reflect X"*). The proposed diff renders in the Localist UI as a reviewable block with Apply/Discard actions — nothing is written until the user explicitly clicks Apply, which calls `POST /wiki/apply-diff`. The apply step re-matches the diff against the page's current on-disk content (not by line number — by content, so a stale or hand-edited page fails the apply cleanly with a 409 instead of corrupting anything) and, on success, reindexes the page and rebuilds the wiki link graph. See `docs/architecture/17-wiki-agent-diff-target.md`.
 
 ### Memory
 
@@ -257,6 +260,15 @@ All tests use mocks for inference and SQLite; no oMLX server or live API keys ar
   local daemon at `localhost:11434`) with no code change between the two;
   embeddings stay 100% local via `EmbeddingEngine` regardless of which
   chat backend is selected
+- **Wiki diff updates** — ✅ `WikiAgent.diff_target` path (P1b routing) proposes
+  a targeted diff against an existing wiki page with no raw file required;
+  review-then-apply UI (`POST /wiki/apply-diff`) lets the user approve before
+  anything writes; `apply_unified_diff` matches hunks by content rather than
+  model-authored line numbers, live-verified end to end including a caught
+  and repaired on-disk corruption during testing. Open: `wiki/` is gitignored
+  with no rollback mechanism for any write (diff or ingest) — candidate fixes
+  not yet scoped; a bullet/diff-marker collision on unchanged context lines
+  fails safely (409) but isn't generalized-away yet
 - **Localist UI redesign** — functional but minimal; planned rework for
   memory inspection, episode browsing, and tool result display
 - **macOS app packaging** — bundle as a native `.app` via PyInstaller +

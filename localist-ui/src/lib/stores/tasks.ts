@@ -9,6 +9,12 @@ export interface Source {
   relevance_score: number;
 }
 
+export interface PendingDiff {
+  page_name: string;
+  diff: string;
+  status: 'pending' | 'applied';
+}
+
 export interface Task {
   task_id: string;
   instruction: string;
@@ -29,6 +35,7 @@ export interface Task {
     agent?:            string;
     grounded?:         boolean;
     file_op_deferred?: boolean;
+    pending_diffs?:    PendingDiff[];
   };
 }
 
@@ -89,6 +96,39 @@ function patchTask(task_id: string, patch: Partial<Task>): void {
       tasks: {
         ...s.tasks,
         [task_id]: { ...existing, ...patch }
+      }
+    };
+  });
+}
+
+// ── Mark one pending_diffs entry as applied ──────────────────
+// Updates tasksStore's copy of a Task's metadata after a successful
+// POST /wiki/apply-diff. This exists alongside (not instead of) a direct
+// chatHistoryStore update in ChatPanel.svelte: ChatPanel's own reactive
+// sync block re-copies activeTask.metadata onto the matching chat turn on
+// every tasksStore change (while that task is still active), so without
+// this update a later re-sync would silently revert an applied diff back
+// to "pending". No-op if the task isn't tracked here (e.g. a historical
+// conversation with no live task) — chatHistoryStore is the source of
+// truth for rendering in that case.
+export function markDiffApplied(task_id: string, page_name: string): void {
+  tasksStore.update((s) => {
+    const t = s.tasks[task_id];
+    const diffs = t?.metadata?.pending_diffs;
+    if (!t || !diffs) return s;
+    return {
+      ...s,
+      tasks: {
+        ...s.tasks,
+        [task_id]: {
+          ...t,
+          metadata: {
+            ...t.metadata,
+            pending_diffs: diffs.map((d) =>
+              d.page_name === page_name ? { ...d, status: 'applied' as const } : d
+            )
+          }
+        }
       }
     };
   });

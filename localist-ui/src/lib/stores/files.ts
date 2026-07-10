@@ -15,6 +15,7 @@ import { writable, derived, get } from 'svelte/store';
 import { goto } from '$app/navigation';
 import { tasksStore } from './tasks';
 import type { Task } from './tasks';
+import { currentConversationId } from './conversation';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -217,6 +218,7 @@ export async function ingestFile(entry: FileEntry): Promise<void> {
           raw_path:   entry.path,
           auto_apply: true,
         },
+        conversation_id: get(currentConversationId),
       }),
     });
   } catch (err) {

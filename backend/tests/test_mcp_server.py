@@ -3,7 +3,8 @@ Phase 1 tests — localist-mcp server (mcp_server/).
 Phase 2 adds fetch_url coverage (mcp_server/url_fetch.py) — ports the
 retired standalone Fetcher microservice's /extract path in-process.
 Phase 3 adds web_search coverage (mcp_server/web_search.py) — ports the
-LangSearch integration in-process, no runtime.infer() fallback.
+LangSearch integration in-process, no runtime.infer() fallback. A second
+provider (Brave) was later added behind the SEARCH_PROVIDER env var switch.
 
 Covers:
   - file_ops.read_file / write_file / append_file: sandboxing, truncation,
@@ -13,7 +14,9 @@ Covers:
     ported from fetcher/models.py's ErrorResponse.error_code
   - web_search.web_search: results found (bullet formatting matches the
     legacy shape exactly), empty results, missing API key (clean error, no
-    inference call), network/timeout error
+    inference call), network/timeout error — for both the LangSearch
+    provider (default / SEARCH_PROVIDER=langsearch) and the Brave provider
+    (SEARCH_PROVIDER=brave), plus the unknown-provider error
   - All tools as registered on the FastMCP instance, exercised through
     an in-process MCP client session (mcp.shared.memory) — no network server
     required.
@@ -313,6 +316,122 @@ class TestWebSearchErrors:
         monkeypatch.setenv("LANGSEARCH_API_KEY", "test-key")
         response = _langsearch_response([], status_code=500)
         with patch.object(httpx.AsyncClient, "post", AsyncMock(return_value=response)):
+            with pytest.raises(ValueError, match="ERROR: web_search failed —"):
+                asyncio.run(web_search.web_search("q"))
+
+
+# ---------------------------------------------------------------------------
+# web_search.web_search — SEARCH_PROVIDER dispatch (langsearch default,
+# explicit langsearch, brave, unknown provider)
+# ---------------------------------------------------------------------------
+
+class TestWebSearchProviderDispatch:
+    def test_provider_unset_defaults_to_langsearch(self, monkeypatch):
+        monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
+        monkeypatch.setenv("LANGSEARCH_API_KEY", "test-key")
+        response = _langsearch_response([{"name": "T", "snippet": "s", "url": "https://e.com"}])
+        with patch.object(httpx.AsyncClient, "post", AsyncMock(return_value=response)) as fake_post:
+            result = asyncio.run(web_search.web_search("q"))
+        fake_post.assert_called_once()
+        assert result["result_count"] == 1
+
+    def test_provider_explicit_langsearch_hits_langsearch(self, monkeypatch):
+        monkeypatch.setenv("SEARCH_PROVIDER", "langsearch")
+        monkeypatch.setenv("LANGSEARCH_API_KEY", "test-key")
+        response = _langsearch_response([{"name": "T", "snippet": "s", "url": "https://e.com"}])
+        with patch.object(httpx.AsyncClient, "post", AsyncMock(return_value=response)) as fake_post:
+            result = asyncio.run(web_search.web_search("q"))
+        fake_post.assert_called_once()
+        assert result["result_count"] == 1
+
+    def test_provider_case_insensitive(self, monkeypatch):
+        monkeypatch.setenv("SEARCH_PROVIDER", "LangSearch")
+        monkeypatch.setenv("LANGSEARCH_API_KEY", "test-key")
+        response = _langsearch_response([])
+        with patch.object(httpx.AsyncClient, "post", AsyncMock(return_value=response)):
+            result = asyncio.run(web_search.web_search("q"))
+        assert result["result_text"] == "No results found."
+
+    def test_unknown_provider_raises(self, monkeypatch):
+        monkeypatch.setenv("SEARCH_PROVIDER", "bing")
+        with pytest.raises(ValueError, match="ERROR: unknown SEARCH_PROVIDER 'bing'"):
+            asyncio.run(web_search.web_search("q"))
+
+
+# ---------------------------------------------------------------------------
+# web_search._web_search_brave — direct unit tests
+# ---------------------------------------------------------------------------
+
+def _brave_response(results: list[dict], status_code: int = 200) -> httpx.Response:
+    request = httpx.Request("GET", web_search._BRAVE_ENDPOINT)
+    return httpx.Response(
+        status_code,
+        json    = {"web": {"results": results}},
+        request = request,
+    )
+
+
+class TestWebSearchBraveSuccess:
+    def test_results_formatted_matching_bullet_shape(self, monkeypatch):
+        monkeypatch.setenv("SEARCH_PROVIDER", "brave")
+        monkeypatch.setenv("BRAVE_API_KEY", "test-key")
+        results = [
+            {
+                "title":       "oMLX Release Notes",
+                "description": "x" * 350,  # forces truncation
+                "url":         "https://example.com/omlx",
+            }
+        ]
+        response = _brave_response(results)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(web_search.web_search("oMLX release notes"))
+
+        assert result["query"] == "oMLX release notes"
+        assert result["result_count"] == 1
+        text = result["result_text"]
+        assert text.startswith("• oMLX Release Notes\n  ")
+        assert text.endswith("[https://example.com/omlx]")
+        body_line = text.splitlines()[1]
+        assert len(body_line.strip()) <= 300
+
+    def test_empty_results_returns_success_not_error(self, monkeypatch):
+        monkeypatch.setenv("SEARCH_PROVIDER", "brave")
+        monkeypatch.setenv("BRAVE_API_KEY", "test-key")
+        response = _brave_response([])
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(web_search.web_search("nothing found query"))
+        assert result["result_text"] == "No results found."
+        assert result["result_count"] == 0
+
+
+class TestWebSearchBraveErrors:
+    def test_missing_api_key_raises_clean_error_without_network_call(self, monkeypatch):
+        monkeypatch.setenv("SEARCH_PROVIDER", "brave")
+        monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+        fake_get = AsyncMock()
+        with patch.object(httpx.AsyncClient, "get", fake_get):
+            with pytest.raises(ValueError, match="BRAVE_API_KEY not configured"):
+                asyncio.run(web_search.web_search("anything"))
+        fake_get.assert_not_called()
+
+    def test_empty_string_api_key_treated_as_missing(self, monkeypatch):
+        monkeypatch.setenv("SEARCH_PROVIDER", "brave")
+        monkeypatch.setenv("BRAVE_API_KEY", "")
+        with pytest.raises(ValueError, match="BRAVE_API_KEY not configured"):
+            asyncio.run(web_search.web_search("anything"))
+
+    def test_connection_error_wraps_as_clean_error(self, monkeypatch):
+        monkeypatch.setenv("SEARCH_PROVIDER", "brave")
+        monkeypatch.setenv("BRAVE_API_KEY", "test-key")
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(side_effect=httpx.ConnectError("refused"))):
+            with pytest.raises(ValueError, match="ERROR: web_search failed —"):
+                asyncio.run(web_search.web_search("q"))
+
+    def test_http_error_status_wraps_as_clean_error(self, monkeypatch):
+        monkeypatch.setenv("SEARCH_PROVIDER", "brave")
+        monkeypatch.setenv("BRAVE_API_KEY", "test-key")
+        response = _brave_response([], status_code=500)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
             with pytest.raises(ValueError, match="ERROR: web_search failed —"):
                 asyncio.run(web_search.web_search("q"))
 

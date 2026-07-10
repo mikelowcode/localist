@@ -337,6 +337,79 @@ class TestAddChatTurn:
 
 
 # ---------------------------------------------------------------------------
+# TestMarkDiffApplied — review-then-apply wiki diff UI's persisted state
+# transition (scope-review-then-apply-diff-ui.md)
+# ---------------------------------------------------------------------------
+
+class TestMarkDiffApplied:
+
+    @pytest.fixture()
+    def mm(self, tmp_path) -> MemoryManager:
+        return MemoryManager(db_path=tmp_path / "mark_diff_applied.db")
+
+    def _metadata(self, mm: MemoryManager, task_id: str) -> dict:
+        conn = sqlite3.connect(str(mm._db_path))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT metadata_json FROM chat_turns WHERE task_id = ? AND role = 'assistant'",
+            (task_id,),
+        ).fetchone()
+        conn.close()
+        return json.loads(row["metadata_json"])
+
+    def test_marks_matching_entry_applied_and_returns_true(self, mm):
+        mm.add_chat_turn(
+            task_id="task-1", role="assistant", content="Proposed a diff.",
+            conversation_id="conv-1",
+            metadata={"pending_diffs": [{"page_name": "some-page", "diff": "@@ ... @@", "status": "pending"}]},
+        )
+
+        result = mm.mark_diff_applied("task-1", "some-page")
+
+        assert result is True
+        assert self._metadata(mm, "task-1")["pending_diffs"] == [
+            {"page_name": "some-page", "diff": "@@ ... @@", "status": "applied"}
+        ]
+
+    def test_no_matching_task_id_returns_false(self, mm):
+        result = mm.mark_diff_applied("nonexistent-task", "some-page")
+        assert result is False
+
+    def test_row_without_pending_diffs_returns_false(self, mm):
+        mm.add_chat_turn(
+            task_id="task-2", role="assistant", content="A plain answer.",
+            conversation_id="conv-2", metadata={"agent": "conversational_agent"},
+        )
+        result = mm.mark_diff_applied("task-2", "some-page")
+        assert result is False
+
+    def test_no_matching_page_name_returns_false_and_leaves_metadata_unchanged(self, mm):
+        mm.add_chat_turn(
+            task_id="task-3", role="assistant", content="Proposed a diff.",
+            conversation_id="conv-3",
+            metadata={"pending_diffs": [{"page_name": "other-page", "diff": "d", "status": "pending"}]},
+        )
+
+        result = mm.mark_diff_applied("task-3", "some-page")
+
+        assert result is False
+        assert self._metadata(mm, "task-3")["pending_diffs"][0]["status"] == "pending"
+
+    def test_only_matches_assistant_role_not_user(self, mm):
+        # A user row incidentally sharing the same task_id must not match —
+        # pending_diffs only ever lives on the assistant row.
+        mm.add_chat_turn(task_id="task-4", role="user", content="update the page", conversation_id="conv-4")
+        mm.add_chat_turn(
+            task_id="task-4", role="assistant", content="Proposed a diff.",
+            conversation_id="conv-4",
+            metadata={"pending_diffs": [{"page_name": "some-page", "diff": "d", "status": "pending"}]},
+        )
+
+        result = mm.mark_diff_applied("task-4", "some-page")
+        assert result is True
+
+
+# ---------------------------------------------------------------------------
 # TestChatHistorySettings — eviction preset read/write
 # (memory_manager.MemoryManager.get/set_chat_history_eviction_preset)
 # ---------------------------------------------------------------------------

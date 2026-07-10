@@ -973,3 +973,58 @@ changed. See §10.4 Open Item 3 — Update 2026-06-26 for the full fix record.
 
 *Status:* CLOSED. The removal is complete and live-verified.
 
+**Open Item 13 — `document_index` drift from hand-edited/deleted wiki files. CLOSED 2026-07-08.**
+
+*Originally:* no mechanism detected when a wiki `.md` file was hand-edited or deleted outside
+the WikiAgent write path (`index_document()`'s call in `wiki_agent.py` only fires on
+WikiAgent-driven writes). Hand-edits left `document_index` serving stale content, stale
+embeddings, and stale `retrieval_cache` entries indefinitely. Deleted files left orphaned
+`document_index` rows with no detection. Discovered via a live case: a manually-edited
+`wiki/users/michael.md` kept surfacing stale `[USER PROFILE]` facts in Slot 3b, because
+`query_corpus()` reads from `document_index`, never from disk directly, and nothing had
+re-synced the row.
+
+*Decision:* same two-part reasoning as Open Item 7 — a startup check as the safety net for
+drift from any source (hand edits, restores, between-session drift), composing existing
+idempotent primitives (`index_directory()`'s content-hash gating, `get_all_documents()`,
+`remove_document()`) rather than new indexing logic. Pruning of stale-but-still-present
+content was explicitly scoped out and deferred — named as a separate, unscoped design
+question requiring its own staleness criteria, not resolved by this item.
+
+Orphan removal is destructive (a real `DELETE` via `remove_document()`), which runs against
+the project's "never silently drop" principle — resolved by adding a dedicated audit log
+rather than relying on application logging alone. `sessions-log.md` was considered and
+rejected as the audit target: it is a hand/Claude-Code-narrated dev journal, not a
+runtime-written artifact, and using it here would blur that distinction.
+
+*Fix (two files, one Claude Code prompt):*
+- `memory_manager.py` — new `reconcile_wiki(wiki_dir) -> dict` method, placed after
+  `remove_document()`. Composes `index_directory(doc_type="wiki", embed=True)` for resync and
+  `get_all_documents(doc_type="wiki")` + `remove_document()` for orphan cleanup. Returns
+  `{"reindexed", "orphans_removed", "orphan_names"}`. No additional locking — relies on the
+  per-call locks already inside the two composed methods.
+- `wiki_maintenance_log.py` (new) — `log_orphan_removed(name, path)` appends a
+  tab-separated, UTC-timestamped line to `logs/wiki_maintenance.log`, creating the directory
+  if needed. Write failures are caught and logged via the standard logger, never raised —
+  matches the non-fatal posture of the rest of this mechanism.
+- `main.py` — `lifespan()` calls `reconcile_wiki()` immediately after the existing
+  graph-rebuild block, same non-fatal try/except and existence-check pattern as that block
+  (Open Item 7 precedent, reused verbatim in shape).
+
+*Live-verified:* pending live confirmation of an orphan-removal event; mechanism is
+unit-test-verified only as of 2026-07-08. Michael plans to confirm `logs/wiki_maintenance.log`
+during an upcoming session with a real orphan event.
+
+*Test suite:* 583 total, 581 passed, 2 pre-existing failures unrelated to this change
+(`test_controller_phase4.py::TestToolStubPath::test_tool_stub_does_not_add_tool_results_slot`
+and `test_tool_dispatcher_phase6.py::TestControllerToolIntegration::
+test_tool_dispatch_failure_graceful` — both hit live `web_search`/LangSearch network results,
+confirmed pre-existing on unmodified `main` via `git stash`). New tests:
+`TestReconcileWiki` (hand-edit resync, no-op on unchanged file, orphan removal +
+audit-log line, empty-dir zero counts) and `TestWikiMaintenanceLog` (write failure doesn't
+raise), both isolated via `tmp_path`/`monkeypatch`.
+
+*Note:* pruning (staleness criteria, `raw/` scope, soft-flag-vs-hard-delete) remains a
+separate, unscoped open question — not resolved by this item, not filed as its own numbered
+item yet, referenced here only as a pointer for whoever picks it up next.
+

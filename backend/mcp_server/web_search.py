@@ -17,6 +17,14 @@ Async (httpx) rather than sync (requests) — brings this tool in line with
 fetch_url's async style from Phase 2 and removes a sync HTTP call that was
 previously blocking inside what may be an async context. The
 request/response contract itself is unchanged.
+
+Provider switch: a second provider (Brave) was added alongside LangSearch.
+Exactly one provider is active per process, selected by the
+SEARCH_PROVIDER env var (default "langsearch"). The env var is read lazily
+inside web_search() rather than cached at import time, since this process
+does not inherit backend/main.py's own load_dotenv() call (see
+mcp_server/main.py's module docstring) — reading at call time keeps this
+correct regardless of when/whether .env has been loaded.
 """
 
 from __future__ import annotations
@@ -31,8 +39,11 @@ logger = logging.getLogger(__name__)
 _LANGSEARCH_ENDPOINT: str = "https://api.langsearch.com/v1/web-search"
 _LANGSEARCH_COUNT: int = 3
 
+_BRAVE_ENDPOINT: str = "https://api.search.brave.com/res/v1/web/search"
+_BRAVE_COUNT: int = 3
 
-async def web_search(query: str) -> dict:
+
+async def _web_search_langsearch(query: str) -> dict:
     """
     Run one web_search query via the LangSearch API.
 
@@ -90,3 +101,86 @@ async def web_search(query: str) -> dict:
         query, len(pages), len(result_text),
     )
     return {"query": query, "result_text": result_text, "result_count": len(pages)}
+
+
+async def _web_search_brave(query: str) -> dict:
+    """
+    Run one web_search query via the Brave Search API.
+
+    Raises
+    ------
+    ValueError
+        "ERROR: BRAVE_API_KEY not configured" if the key is unset/empty
+        (no inference fallback — see module docstring), or
+        "ERROR: web_search failed — <exc>" on any network/HTTP/parsing error.
+    """
+    api_key = os.environ.get("BRAVE_API_KEY", "")
+
+    if not api_key:
+        raise ValueError("ERROR: BRAVE_API_KEY not configured")
+
+    headers = {
+        "X-Subscription-Token": api_key,
+        "Accept":               "application/json",
+    }
+    params = {
+        "q":     query,
+        "count": _BRAVE_COUNT,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(_BRAVE_ENDPOINT, headers=headers, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        logger.warning("web_search: Brave failed for query=%r: %s", query, exc)
+        raise ValueError(f"ERROR: web_search failed — {exc}") from exc
+
+    results = data.get("web", {}).get("results", [])
+
+    if not results:
+        return {"query": query, "result_text": "No results found.", "result_count": 0}
+
+    lines: list[str] = []
+    for result in results[:_BRAVE_COUNT]:
+        title = result.get("title", "").strip()
+        body  = result.get("description", "").strip()
+        url   = result.get("url", "").strip()
+        # Truncate body to keep Slot 6 within budget
+        body  = body[:300].rsplit(" ", 1)[0] if len(body) > 300 else body
+        lines.append(f"• {title}\n  {body}\n  [{url}]")
+
+    result_text = "\n\n".join(lines)
+    logger.info(
+        "web_search: Brave complete for query=%r results=%d result_chars=%d.",
+        query, len(results), len(result_text),
+    )
+    return {"query": query, "result_text": result_text, "result_count": len(results)}
+
+
+async def web_search(query: str) -> dict:
+    """
+    Run one web_search query via the configured search provider.
+
+    Dispatches to _web_search_langsearch or _web_search_brave based on the
+    SEARCH_PROVIDER env var (default "langsearch"), read lazily on every
+    call — see module docstring.
+
+    Raises
+    ------
+    ValueError
+        Provider-specific missing-API-key or request-failure errors (see
+        _web_search_langsearch / _web_search_brave), or
+        "ERROR: unknown SEARCH_PROVIDER <value>" if SEARCH_PROVIDER is set
+        to anything other than "langsearch" or "brave" — no silent
+        fallback between providers.
+    """
+    provider = os.environ.get("SEARCH_PROVIDER", "langsearch").lower()
+
+    if provider == "langsearch":
+        return await _web_search_langsearch(query)
+    if provider == "brave":
+        return await _web_search_brave(query)
+
+    raise ValueError(f"ERROR: unknown SEARCH_PROVIDER {provider!r}")

@@ -118,7 +118,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from base_runtime_client import BaseRuntimeClient
 from build_graph import build_graph
-from controller_agent import ControllerAgent
+from controller_agent import ControllerAgent, TaskStatus
 from conversational_agent import ConversationalAgent
 from embedding_engine import EmbeddingEngine
 from memory_manager import MemoryManager
@@ -189,6 +189,7 @@ class AppState:
     def __init__(self) -> None:
         self.runtime:           BaseRuntimeClient | None = None
         self.controller:        ControllerAgent   | None = None
+        self.wiki_agent:        WikiAgent         | None = None
         self.memory_manager:    MemoryManager     | None = None
         self.embedding_engine:  EmbeddingEngine   | None = None
         self.settings:          Settings          | None = None
@@ -329,6 +330,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("Graph build skipped — wiki_dir does not exist yet (%s).", wiki_dir)
 
+    if wiki_dir.exists():
+        try:
+            reconcile_summary = memory_manager.reconcile_wiki(wiki_dir)
+            logger.info(
+                "Wiki reconciled at startup — reindexed=%d orphans_removed=%d%s",
+                reconcile_summary["reindexed"],
+                reconcile_summary["orphans_removed"],
+                f" ({', '.join(reconcile_summary['orphan_names'])})"
+                    if reconcile_summary["orphan_names"] else "",
+            )
+        except Exception as exc:
+            logger.warning("Wiki reconciliation failed at startup (non-fatal): %s", exc)
+    else:
+        logger.info("Wiki reconciliation skipped — wiki_dir does not exist yet (%s).", wiki_dir)
+
     # -- Agents --------------------------------------------------------------
 
     wiki_agent = WikiAgent(
@@ -336,6 +352,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         project_root   = project_root,
         memory_manager = memory_manager,
     )
+    _state.wiki_agent = wiki_agent
     conversational_agent = ConversationalAgent(
         runtime        = runtime,
         memory_manager = memory_manager,
@@ -546,6 +563,27 @@ class ConversationListResponse(BaseModel):
     conversations: list[ConversationSummary]
 
 
+class ApplyDiffRequest(BaseModel):
+    """
+    Payload accepted by POST /wiki/apply-diff.
+
+    task_id identifies the chat turn whose persisted metadata.pending_diffs
+    entry should be marked "applied" on success (see
+    MemoryManager.mark_diff_applied()) — the round-tripped page_name/diff
+    are what actually gets written; task_id only updates the durable
+    review-then-apply UI state.
+    """
+    task_id:   str = Field(..., min_length=1)
+    page_name: str = Field(..., min_length=1)
+    diff:      str = Field(..., min_length=1)
+
+
+class ApplyDiffResponse(BaseModel):
+    """Response body for POST /wiki/apply-diff (success only — failures raise HTTPException)."""
+    success:   bool = True
+    page_name: str
+
+
 # ---------------------------------------------------------------------------
 # Dependency helpers
 # ---------------------------------------------------------------------------
@@ -560,6 +598,12 @@ def _require_runtime() -> BaseRuntimeClient:
     if _state.runtime is None:
         raise HTTPException(status_code=503, detail="Runtime not initialised.")
     return _state.runtime
+
+
+def _require_wiki_agent() -> WikiAgent:
+    if _state.wiki_agent is None:
+        raise HTTPException(status_code=503, detail="WikiAgent not initialised.")
+    return _state.wiki_agent
 
 
 def _require_memory_manager() -> MemoryManager:
@@ -1024,6 +1068,57 @@ async def post_file_upload(file: UploadFile = File(...)) -> FileEntry:
             )
 
     return _file_entry(dest, "raw")
+
+
+# ---------------------------------------------------------------------------
+# Review-then-apply wiki diffs
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/wiki/apply-diff",
+    response_model = ApplyDiffResponse,
+    summary        = "Apply a previously-proposed wiki diff",
+)
+async def post_wiki_apply_diff(body: ApplyDiffRequest) -> ApplyDiffResponse:
+    """
+    Write a diff WikiAgent previously proposed (surfaced to the chat UI via
+    a turn's metadata.pending_diffs) directly to disk — no fresh model
+    call, no re-routing through the Planner.
+
+    Content-based matching in apply_unified_diff() is the staleness check:
+    if the target page changed on disk since the diff was proposed, the
+    match legitimately fails and this raises 409 rather than corrupting
+    the page. A missing target page raises 404.
+
+    On success, best-effort marks the originating chat turn's persisted
+    pending_diffs entry as "applied" (MemoryManager.mark_diff_applied())
+    so a page reload reflects the write; failure to do so is logged but
+    does not fail the request — the disk write already succeeded.
+    """
+    wiki_agent = _require_wiki_agent()
+    if _state.wiki_dir is None:
+        raise HTTPException(status_code=503, detail="wiki_dir not configured.")
+
+    result = await asyncio.to_thread(
+        wiki_agent.apply_pending_diff, body.page_name, body.diff, _state.wiki_dir,
+    )
+
+    if result.status != TaskStatus.COMPLETE:
+        status_code = 404 if result.output.get("error_kind") == "not_found" else 409
+        raise HTTPException(status_code=status_code, detail=result.error)
+
+    if _state.memory_manager is not None:
+        try:
+            await asyncio.to_thread(
+                _state.memory_manager.mark_diff_applied, body.task_id, body.page_name,
+            )
+        except Exception as exc:
+            logger.warning(
+                "mark_diff_applied failed for task_id=%s page_name=%s: %s",
+                body.task_id, body.page_name, exc,
+            )
+
+    return ApplyDiffResponse(success=True, page_name=body.page_name)
 
 
 # ---------------------------------------------------------------------------

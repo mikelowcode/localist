@@ -600,6 +600,88 @@ class TestPlannerP3c:
 
 
 # ---------------------------------------------------------------------------
+# Priority 1b — diff-only wiki update (standalone diff instructions scope doc)
+# ---------------------------------------------------------------------------
+
+class TestPlannerP1bDiff:
+
+    # 1. Keyword + resolvable target → wiki_agent + diff_target set.
+    def test_resolvable_target_routes_to_wiki_agent_with_diff_target(self, tmp_path):
+        mm, _ = make_mm_with_nodes(tmp_path)
+        p = Planner(runtime=make_runtime(), memory_manager=mm)
+        plan = p.route(
+            "update page localist-software-stack.md to reflect the new "
+            "Ollama runtime backend and MCP tool layer",
+            context={},
+        )
+        assert plan.agent          == "wiki_agent"
+        assert plan.diff_target    == "localist-software-stack"
+        assert plan.fetch_rag      is False
+        assert plan.fetch_episodic is False
+
+    # 2. Keyword + ambiguous target → clarification path, not P2+.
+    def test_ambiguous_target_routes_to_conversational_agent_for_clarification(self, tmp_path):
+        mm, _ = make_mm_with_nodes(tmp_path)
+        p = Planner(runtime=make_runtime(infer_return="no"), memory_manager=mm)
+        plan = p.route("update page localist", context={})
+        assert plan.diff_target is None
+        assert plan.agent       == "conversational_agent"
+        assert plan.tools_to_call == []
+        assert plan.fetch_rag      is False
+        assert plan.fetch_episodic is False
+
+    # 3. No _DIFF_KEYWORDS lead phrase → P1b does not fire; P1-P6 ordering
+    #    unaffected (regression guard).
+    def test_no_diff_keyword_falls_through_to_other_priorities(self, tmp_path):
+        mm, node_ids = make_mm_with_nodes(tmp_path)
+        p = Planner(runtime=make_runtime(), memory_manager=mm)
+
+        # P3c (graph-query) still fires — P1b doesn't swallow it.
+        plan = p.route("what links to lora-persona", context={})
+        assert plan.diff_target is None
+        assert plan.graph_query is not None
+
+        # P2 (memory command) still fires — P1b doesn't swallow it.
+        p2 = Planner(runtime=make_runtime(), memory_manager=mm)
+        plan2 = p2.route("remember that I prefer dark mode", context={})
+        assert plan2.diff_target   is None
+        assert plan2.write_episode is True
+
+    # 4. P1 (ingest) beats P1b when both would match.
+    def test_p1_ingest_beats_p1b(self, tmp_path):
+        mm, _ = make_mm_with_nodes(tmp_path)
+        p = Planner(runtime=make_runtime(), memory_manager=mm)
+        plan = p.route(
+            "ingest this file, update page localist-software-stack.md",
+            context={},
+        )
+        assert plan.agent       == "wiki_agent"
+        assert plan.diff_target is None
+
+    # 5. P1b beats P2 — a diff instruction that also contains a memory
+    #    keyword still routes via P1b, not P2.
+    def test_p1b_beats_p2(self, tmp_path):
+        mm, _ = make_mm_with_nodes(tmp_path)
+        p = Planner(runtime=make_runtime(), memory_manager=mm)
+        plan = p.route(
+            "update page localist-software-stack.md, remember that I like it",
+            context={},
+        )
+        assert plan.agent         == "wiki_agent"
+        assert plan.diff_target   == "localist-software-stack"
+        assert plan.write_episode is False
+
+    # 6. No MemoryManager: keyword match but nothing to resolve against →
+    #    clarification path, same as an ambiguous/failed resolution.
+    def test_no_memory_manager_routes_to_conversational_agent_for_clarification(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("update page localist-software-stack.md", context={})
+        assert plan.diff_target is None
+        assert plan.agent       == "conversational_agent"
+        assert plan.tools_to_call == []
+
+
+# ---------------------------------------------------------------------------
 # Diagnostic Slot 1 — _semantic_search_intent tests
 # ---------------------------------------------------------------------------
 

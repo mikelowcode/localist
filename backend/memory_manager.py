@@ -139,6 +139,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+import wiki_maintenance_log
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -958,6 +960,63 @@ class MemoryManager:
             finally:
                 conn.close()
 
+    def mark_diff_applied(self, task_id: str, page_name: str) -> bool:
+        """
+        Mark one entry in a chat_turn's persisted metadata_json
+        pending_diffs list as applied, in place — the review-then-apply
+        wiki-diff UI's only persisted state transition (Discard is
+        deliberately ephemeral/client-only; no backend call happens for it).
+        Called after POST /wiki/apply-diff succeeds, so a page reload shows
+        "applied" rather than re-offering Apply on a diff already written
+        to disk.
+
+        Looks up the most recent assistant chat_turn row for `task_id`
+        (there is exactly one per task_id — see main.py's _persist_chat_turn
+        call sites), and sets pending_diffs[i]["status"] = "applied" for
+        every entry whose page_name matches.
+
+        Returns True if a matching row and pending_diffs entry were found
+        and updated, False otherwise (no matching row, no pending_diffs key,
+        or no matching page_name — non-fatal either way; the disk write
+        itself already happened independently of this call).
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    """
+                    SELECT id, metadata_json FROM chat_turns
+                    WHERE task_id = ? AND role = 'assistant'
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (task_id,),
+                ).fetchone()
+                if row is None:
+                    return False
+
+                metadata = json.loads(row["metadata_json"])
+                diffs = metadata.get("pending_diffs")
+                if not diffs:
+                    return False
+
+                found = False
+                for entry in diffs:
+                    if entry.get("page_name") == page_name:
+                        entry["status"] = "applied"
+                        found = True
+
+                if not found:
+                    return False
+
+                conn.execute(
+                    "UPDATE chat_turns SET metadata_json = ? WHERE id = ?",
+                    (json.dumps(metadata), row["id"]),
+                )
+                conn.commit()
+                return True
+            finally:
+                conn.close()
+
     def get_chat_turns(
         self,
         query:           str | None = None,
@@ -1387,6 +1446,44 @@ class MemoryManager:
                 logger.info("remove_document: removed %s.", path.name)
             finally:
                 conn.close()
+
+    def reconcile_wiki(self, wiki_dir: Path) -> dict:
+        """
+        Reconcile document_index against the wiki/ directory on disk.
+
+        Composes index_directory() and remove_document() — does not
+        duplicate their logic:
+
+        1. Re-index wiki_dir via index_directory().  Already idempotent via
+           content_hash — unchanged files are a no-op, changed/new files are
+           updated/inserted (retrieval cache invalidation is handled inside
+           index_directory() / index_document() as a side effect).
+        2. Orphan detection: for every "wiki" row whose on-disk path no
+           longer exists (file deleted or renamed since the last run),
+           remove the row and append an entry to the wiki maintenance
+           audit log.
+
+        Returns
+        -------
+        dict with keys:
+            reindexed       : int        — count from index_directory()
+            orphans_removed : int
+            orphan_names    : list[str]
+        """
+        reindexed = self.index_directory(wiki_dir, doc_type="wiki", embed=True)
+
+        orphan_names: list[str] = []
+        for doc in self.get_all_documents(doc_type="wiki"):
+            if not Path(doc.path).exists():
+                self.remove_document(doc.path)
+                orphan_names.append(doc.name)
+                wiki_maintenance_log.log_orphan_removed(doc.name, str(doc.path))
+
+        return {
+            "reindexed":       reindexed,
+            "orphans_removed": len(orphan_names),
+            "orphan_names":    orphan_names,
+        }
 
     # -----------------------------------------------------------------------
     # Link graph  (build_graph.py API)

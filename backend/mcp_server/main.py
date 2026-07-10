@@ -22,11 +22,18 @@ Configuration
                                backend/ (parent of this package) — see
                                mcp_server/file_ops.py.
   LOCALIST_LOG_LEVEL           Root log level (default INFO).
-  LANGSEARCH_API_KEY           Required for web_search — see
+  SEARCH_PROVIDER               Which web_search provider is active:
+                               "langsearch" (default) or "brave". See
+                               mcp_server/web_search.py.
+  LANGSEARCH_API_KEY           Required for web_search when
+                               SEARCH_PROVIDER=langsearch — see
                                mcp_server/web_search.py. Loaded from
                                backend/.env below, same as backend/main.py —
                                this is a separate process, so it does not
                                inherit backend/main.py's own load_dotenv().
+  BRAVE_API_KEY                Required for web_search when
+                               SEARCH_PROVIDER=brave — see
+                               mcp_server/web_search.py.
 
 Start
 -----
@@ -92,7 +99,7 @@ async def fetch_url(url: str, timeout: float = 10.0) -> dict:
 
 @mcp.tool()
 async def web_search(query: str) -> dict:
-    """Run one web search query via LangSearch. Requires LANGSEARCH_API_KEY."""
+    """Run one web search query via the configured search provider (SEARCH_PROVIDER=langsearch|brave)."""
     return await _web_search.web_search(query)
 
 

@@ -33,9 +33,15 @@ Architectural contract
 
 SubTask.context schema
 ----------------------
-Required keys
+Required keys (exactly one of the following two — raw_path wins if both
+are present; see WikiAgent.run())
     raw_path : str | Path
         Absolute path to the raw file to ingest (.md or .txt).
+    diff_target : str
+        Stem of an existing wiki page (e.g. "localist-software-stack") to
+        propose a minimal unified diff against. subtask.instruction is
+        used as the free-text description of the desired change. No raw
+        file is read on this path — see WikiAgent._run_diff_only().
 
 Optional keys
     wiki_dir : str | Path
@@ -61,8 +67,13 @@ AgentResult.output schema (on success)
         Each dict: {page_name, diff}
     applied : bool
         True when changes were written to disk in this call.
-    raw_filename : str
-        Basename of the ingested raw file.
+    raw_filename : str | None
+        Basename of the ingested raw file. None on the diff_target path
+        (there is no raw file) — never repurposed to mean "target page".
+    diff_target : str | None
+        The resolved target page stem when this call took the diff-only
+        path (WikiAgent._run_diff_only()). None on the raw_path ingest
+        path.
     wiki_page_count : int
         Number of wiki pages in the index at call time.
 
@@ -138,6 +149,20 @@ SYSTEM_PROMPT = (
     "You are a deterministic wiki agent. Your ONLY job is to output a single "
     "valid XML document. You MUST NOT output prose, comments, explanations, or "
     "Markdown fences. Your entire response must be the XML block and nothing else."
+)
+
+# System prompt for the diff-only path (WikiAgent._run_diff_only()) — no raw
+# file is involved, and create_page is not a legal action here (the target
+# page already exists), so the model is told that explicitly rather than
+# relying on prompt-body instructions alone to prevent it from defaulting to
+# create_page.
+DIFF_SYSTEM_PROMPT = (
+    "You are a deterministic wiki agent. Your ONLY job is to output a single "
+    "valid XML document proposing a unified diff against ONE existing wiki "
+    "page. Only <action name=\"apply_diff\"> is legal on this path — the "
+    "target page already exists, so you MUST NOT use create_page. You MUST "
+    "NOT output prose, comments, explanations, or Markdown fences. Your "
+    "entire response must be the XML block and nothing else."
 )
 
 _PROMPT_BUILDER = PromptBuilder()
@@ -432,6 +457,92 @@ OUTPUT RULES (read before generating):
     return textwrap.dedent(prompt).strip()
 
 
+def build_diff_prompt(
+    schema_text:  str,
+    templates:    dict[str, str],
+    page_name:    str,
+    page_content: str,
+    instruction:  str,
+) -> str:
+    """
+    Prompt for the diff-only path (WikiAgent._run_diff_only()).
+
+    Unlike build_user_prompt()/build_slim_prompt(), this omits the wiki-wide
+    context and the "RAW FILE TO INGEST" section entirely — the target page's
+    full current content is the only content in scope, and the user's free-
+    text instruction (not a raw file) describes the desired change. Only
+    apply_diff is a legal action here; create_page is explicitly disallowed
+    in both this prompt body and DIFF_SYSTEM_PROMPT.
+    """
+    template_block = "".join(
+        f"### TEMPLATE: {key}\n\n{content}\n"
+        for key, content in templates.items()
+    )
+
+    schema_lines   = schema_text.splitlines()
+    schema_snippet = "\n".join(schema_lines[:_MAX_SCHEMA_LINES])
+    if len(schema_lines) > _MAX_SCHEMA_LINES:
+        schema_snippet += "\n... [schema truncated for context budget]"
+
+    prompt = f"""\
+# SCHEMA (rules you must follow)
+{schema_snippet}
+
+# PAGE TEMPLATES
+{template_block}
+
+# TARGET WIKI PAGE: {page_name}
+
+{page_content}
+
+# YOUR TASK
+The user wants the TARGET WIKI PAGE above updated. Their instruction:
+
+{textwrap.dedent(instruction).strip()}
+
+1. Propose exactly one minimal unified diff against the TARGET WIKI PAGE
+   content shown above, using the <action name="apply_diff"> action. Do
+   NOT propose a create_page action — this page already exists.
+2. Removed/added/context lines must reproduce the TARGET WIKI PAGE content
+   verbatim. The @@ line-number header is used only as a hint, not a
+   guarantee, so it is more important that the actual line content is an
+   exact, verbatim match than that the header numbers are precise.
+3. If a line you are removing or adding begins with a markdown list bullet
+   (e.g. "- " or "* "), your diff line MUST start with exactly one diff
+   marker character (-, +, or a space for context) followed by the ENTIRE
+   original line INCLUDING its bullet. Do not merge the bullet's dash with
+   the diff marker into a single "-" — a removed bulleted line must read
+   "--" then a space then the text (marker, then bullet, then space, then
+   text), never a single "-" followed directly by the text.
+4. If no change is actually needed, output an empty <actions></actions>
+   block rather than fabricating a no-op diff.
+
+# EXAMPLE OUTPUT (follow this structure exactly)
+<actions>
+  <action name="apply_diff">
+    <page_name>{page_name}</page_name>
+    <diff>
+@@ -12,3 +12,4 @@
+ unchanged context line
+-old line to remove
++new line to add
++another new line
+@@ -20,1 +21,1 @@
+-- **Old Bulleted Item:** description text.
++- **New Bulleted Item:** description text.
+    </diff>
+  </action>
+</actions>
+
+OUTPUT RULES (read before generating):
+- Output ONLY the <actions> XML block. Nothing before it. Nothing after it.
+- No prose, no code fences, no explanations outside the XML.
+- Only apply_diff actions are valid on this path; any create_page action
+  will be discarded.\
+"""
+    return textwrap.dedent(prompt).strip()
+
+
 # ---------------------------------------------------------------------------
 # XML parser
 # ---------------------------------------------------------------------------
@@ -455,22 +566,36 @@ def _extract_actions_xml(text: str) -> str | None:
 
 def _shield_content_blocks(xml_text: str) -> tuple[str, list[str]]:
     """
-    Replace <content>...</content> blocks with safe placeholders before
-    XML parsing to prevent Markdown syntax inside them from tripping ET.
+    Replace <content>...</content> AND <diff>...</diff> blocks with safe
+    placeholders before XML parsing, so raw Markdown/prose/diff-syntax
+    characters inside them — including bare "&", "<", ">" (e.g. a real page
+    line like "Local Tools & Libraries" appearing as unchanged diff context;
+    confirmed live, gemma4:31b-cloud, 2026-07-09 — see
+    diagnostics/diag_wiki_agent_diff_only.py) — never reach ET.fromstring()
+    unescaped. Both tag kinds share one placeholder list/counter since a
+    single response can contain either or both.
     """
-    contents: list[str] = []
+    blocks: list[str] = []
 
-    def _replacer(m: re.Match) -> str:
-        contents.append(m.group(1))
-        return f"<content>__CONTENT_{len(contents) - 1}__</content>"
+    def _make_replacer(tag: str):
+        def _replacer(m: re.Match) -> str:
+            blocks.append(m.group(1))
+            return f"<{tag}>__CONTENT_{len(blocks) - 1}__</{tag}>"
+        return _replacer
 
     shielded = re.sub(
         r"<content>(.*?)</content>",
-        _replacer,
+        _make_replacer("content"),
         xml_text,
         flags=re.DOTALL,
     )
-    return shielded, contents
+    shielded = re.sub(
+        r"<diff>(.*?)</diff>",
+        _make_replacer("diff"),
+        shielded,
+        flags=re.DOTALL,
+    )
+    return shielded, blocks
 
 
 def parse_model_xml(raw_output: str) -> Actions:
@@ -519,9 +644,13 @@ def parse_model_xml(raw_output: str) -> Actions:
             new_pages.append(entry)
 
         elif action_name == "apply_diff":
+            raw_diff = action.findtext("diff") or ""
+            if raw_diff.startswith("__CONTENT_") and raw_diff.endswith("__"):
+                idx = int(raw_diff[10:-2])
+                raw_diff = contents[idx] if idx < len(contents) else ""
             entry = {
                 "page_name": (action.findtext("page_name") or "").strip(),
-                "diff":      action.findtext("diff") or "",
+                "diff":      raw_diff.strip(),
             }
             if not entry["page_name"] or not entry["diff"]:
                 logger.warning(
@@ -553,46 +682,176 @@ def apply_unified_diff(original: str, diff_text: str) -> str:
     ``difflib.restore(diff_lines, 2)``, which is designed for *ndiff* format,
     not unified diff format.  This implementation correctly parses @@ hunks.
 
+    BUG FIX (2026-07-09, confirmed live via diagnostics/diag_wiki_agent_diff_
+    only.py against gemma4:31b-cloud): hunks are now located by *content*
+    (via _locate_hunk()), not by trusting the model-authored ``@@ -N,M``
+    header as a literal position. Models are unreliable at counting exact
+    1-indexed line numbers in a prompt-sized file, but reliably reproduce the
+    actual text being replaced — the live failure had a hunk header claiming
+    line 21 while the removed/context lines it emitted actually lived at a
+    different offset entirely, so a position-trusting apply silently
+    compared against unrelated content. orig_start is now used only as a
+    disambiguation hint (see _locate_hunk()) when a hunk's content matches
+    more than one position in the file.
+
+    BUG FIX (2026-07-09, same live session, second distinct finding): a
+    removed/added line that itself begins with a markdown bullet ("- ")
+    collides with the unified-diff marker character, which is also "-"/"+".
+    The model sometimes collapses the two into one dash (writing
+    "-**Bold Text**..." instead of "-- **Bold Text**..."), silently dropping
+    the bullet from the extracted before/after text. When the primary
+    (as-authored) interpretation doesn't match anywhere, this function
+    retries once assuming every removed/added line in the hunk is missing a
+    "- " bullet prefix (see _extract_hunk_lines()) before giving up.
+
+    BUG FIX (2026-07-09, same live session, third distinct finding —
+    confirmed live via the review-then-apply UI's POST /wiki/apply-diff):
+    the model's LAST emitted "+" line of a diff frequently has no trailing
+    newline (it's the last line of the text block it generated), even when
+    that line replaces a line that is nowhere near the end of the real
+    file. Splicing such a line into `result_lines` mid-file then joins it
+    directly onto the next line with no line break at all — live example:
+    a one-line replacement mid-document glued itself onto the following
+    "### Mapped Pages" heading with zero separation. Every line except the
+    file's own last line is normalized to end with "\n" after all hunks are
+    applied, regardless of which hunk's `after` lines were missing one.
+
     Raises
     ------
     ValueError
-        If the diff contains no @@ hunks, or if context lines don't match.
+        If the diff contains no @@ hunks, or if a hunk's content does not
+        match anywhere in the file (under either interpretation).
     """
     hunks = _parse_unified_hunks(diff_text)
     if not hunks:
         raise ValueError("Diff contains no recognisable @@ hunks.")
 
     result_lines = original.splitlines(keepends=True)
-    offset = 0
 
     for orig_start, hunk_lines in hunks:
-        idx = orig_start - 1 + offset
+        before, after = _extract_hunk_lines(hunk_lines)
 
-        before: list[str] = []
-        after:  list[str] = []
-
-        for line in hunk_lines:
-            if line.startswith("-"):
-                before.append(line[1:])
-            elif line.startswith("+"):
-                after.append(line[1:])
-            else:
-                ctx = line[1:] if line.startswith(" ") else line
-                before.append(ctx)
-                after.append(ctx)
-
-        actual = result_lines[idx : idx + len(before)]
-        if actual != before:
-            raise ValueError(
-                f"Diff hunk at original line {orig_start} does not match file content.\n"
-                f"Expected: {''.join(before)!r}\n"
-                f"Got:      {''.join(actual)!r}"
+        # Recomputed against the *current* state of result_lines on every
+        # hunk — deliberately not offset-tracked across hunks, since each
+        # hunk's position is now found by content, not carried arithmetic.
+        try:
+            idx = _locate_hunk(result_lines, before, orig_start)
+        except ValueError as primary_exc:
+            recovered_before, recovered_after = _extract_hunk_lines(
+                hunk_lines, recover_bullet_marker=True
+            )
+            if recovered_before == before:
+                # Recovery changes nothing (no -/+ lines, or none of them
+                # were bullet-collision candidates) — re-raise the
+                # original, more informative error rather than a second,
+                # identical failure.
+                raise
+            try:
+                idx = _locate_hunk(result_lines, recovered_before, orig_start)
+            except ValueError:
+                raise primary_exc from None
+            before, after = recovered_before, recovered_after
+            logger.debug(
+                "apply_unified_diff: recovered from bullet-marker/diff-marker "
+                "collision at hunk originally headed '@@ -%d'.", orig_start,
             )
 
         result_lines[idx : idx + len(before)] = after
-        offset += len(after) - len(before)
+
+    # Normalize: only the file's actual last line may lack a trailing "\n".
+    # A spliced-in "after" line that came from the model's diff text may be
+    # missing one even mid-file (see third bug-fix note above) — restore it
+    # so the following line isn't silently glued onto it.
+    for i in range(len(result_lines) - 1):
+        if not result_lines[i].endswith("\n"):
+            result_lines[i] += "\n"
 
     return "".join(result_lines)
+
+
+def _extract_hunk_lines(
+    hunk_lines:           list[str],
+    recover_bullet_marker: bool = False,
+) -> tuple[list[str], list[str]]:
+    """
+    Split one hunk's raw lines into (before, after) — the removed+context
+    lines and the added+context lines, in file order.
+
+    recover_bullet_marker=True re-derives before/after under the hypothesis
+    that the model collapsed a markdown bullet's "- " into its own "-"/"+"
+    diff marker (see apply_unified_diff()'s second 2026-07-09 bug-fix note):
+    every removed/added line gets "- " prepended back. Context lines are
+    never touched by either mode — the marker/bullet collision is only
+    possible on removed/added lines, since context lines use a distinct
+    " " marker that doesn't collide with "-".
+    """
+    before: list[str] = []
+    after:  list[str] = []
+
+    for line in hunk_lines:
+        if line.startswith("-"):
+            content = line[1:]
+            before.append(("- " + content) if recover_bullet_marker else content)
+        elif line.startswith("+"):
+            content = line[1:]
+            after.append(("- " + content) if recover_bullet_marker else content)
+        else:
+            ctx = line[1:] if line.startswith(" ") else line
+            before.append(ctx)
+            after.append(ctx)
+
+    return before, after
+
+
+def _locate_hunk(
+    result_lines: list[str],
+    before:       list[str],
+    orig_start:   int,
+) -> int:
+    """
+    Locate the position of `before` (context + removed lines, in that order)
+    within `result_lines` by content, not by trusting the model-authored
+    `@@ -orig_start` header as a literal position. `orig_start` is used only
+    as a disambiguation hint when `before` matches at more than one position
+    — most `before` blocks (a full sentence of real prose) are unique in a
+    wiki page, so this is a rare path, but it needs a deterministic tiebreak
+    rather than silently taking the first match in file order.
+
+    A hunk with no context/removed lines (pure insertion — `before == []`)
+    has no content to search for; falls back to the hinted position,
+    clamped to the valid range, since there's nothing else to go on.
+
+    Raises
+    ------
+    ValueError
+        If `before` is non-empty and matches nowhere in `result_lines` — a
+        genuine content mismatch (e.g. the page changed since the model
+        read it), not a position problem.
+    """
+    if not before:
+        return max(0, min(orig_start - 1, len(result_lines)))
+
+    matches = [
+        i for i in range(len(result_lines) - len(before) + 1)
+        if result_lines[i : i + len(before)] == before
+    ]
+
+    if not matches:
+        raise ValueError(
+            "Diff hunk does not match file content — the following block "
+            "was not found anywhere in the file.\n"
+            f"Expected: {''.join(before)!r}"
+        )
+
+    if len(matches) == 1:
+        return matches[0]
+
+    # Ambiguous — before content appears at more than one position.
+    # Deterministic tiebreak: prefer whichever match sits closest to the
+    # model's stated (possibly wrong) line number, rather than silently
+    # picking the first occurrence in file order.
+    hinted = orig_start - 1
+    return min(matches, key=lambda i: abs(i - hinted))
 
 
 def _parse_unified_hunks(diff_text: str) -> list[tuple[int, list[str]]]:
@@ -692,6 +951,7 @@ _WIKI_KEYWORDS: frozenset[str] = frozenset({
     "ingest", "wiki", "research note", "research_note",
     "create page", "update page", "raw file", "document",
     "knowledge base", "summarise", "summarize", "extract concepts",
+    "diff", "revise page", "modify page",
 })
 
 
@@ -751,10 +1011,20 @@ class WikiAgent:
 
     def run(self, subtask: SubTask) -> AgentResult:
         """
-        Ingest one raw file and return proposed (or applied) wiki actions.
+        Ingest one raw file, or propose a diff against one existing wiki
+        page, and return proposed (or applied) wiki actions.
 
-        Pipeline
+        Dispatch
         --------
+        - "raw_path" in context             → ingest path (below).
+        - "diff_target" in context, no
+          "raw_path"                        → _run_diff_only().
+        - both present                      → raw_path wins; diff_target
+                                               is ignored (logged at debug).
+        - neither present                   → fails, same as always.
+
+        Ingest pipeline
+        ----------------
         1. Resolve and validate paths from subtask.context.
         2. Load schema, templates, wiki index, and raw document.
         3. Build wiki_context (always — informs model regardless of path).
@@ -762,14 +1032,21 @@ class WikiAgent:
              - infer_with_file() if runtime supports it (oMLX 0.4.2+)
              - infer() with full string prompt otherwise (Foundry + others)
         5. Parse the model's XML response into Actions.
-        6. Optionally journal the result.
-        7. Optionally write changes to disk (auto_apply=True only).
-        8. Index newly written pages in MemoryManager (if available).
-        9. Return an AgentResult.
+        6. Journal / apply / index / return — see _finalize().
 
         No stdin.  No sys.exit().  No interactive prompts.
         """
         ctx = subtask.context
+
+        if "raw_path" not in ctx and ctx.get("diff_target") is not None:
+            return self._run_diff_only(subtask)
+
+        if "raw_path" in ctx and ctx.get("diff_target") is not None:
+            logger.debug(
+                "[%s] Both raw_path and diff_target present in context; "
+                "raw_path wins — diff_target=%r ignored.",
+                self.name, ctx["diff_target"],
+            )
 
         # -- 1. Resolve paths ------------------------------------------------
 
@@ -900,7 +1177,145 @@ class WikiAgent:
         except ValueError as exc:
             return self._fail(subtask, f"XML parse error: {exc}")
 
-        # -- 6b. Validate [[...]] link targets --------------------------------
+        return self._finalize(
+            subtask      = subtask,
+            actions      = actions,
+            wiki_pages   = wiki_pages,
+            journal_path = journal_path,
+            auto_apply   = auto_apply,
+            wiki_dir     = wiki_dir,
+            raw_filename = raw_path.name,
+            diff_target  = None,
+        )
+
+    # -----------------------------------------------------------------------
+    # Diff-only path — apply a diff to an existing page, no raw file
+    # -----------------------------------------------------------------------
+
+    def _run_diff_only(self, subtask: SubTask) -> AgentResult:
+        """
+        Propose (and optionally apply) a diff against one existing wiki page,
+        driven by subtask.instruction rather than a raw file. See the
+        "diff_target" entry in the module docstring's SubTask.context schema.
+
+        Pipeline mirrors run()'s ingest path minus everything that only makes
+        sense for a raw file: no raw_content load, no build_wiki_context()
+        (the target page's full content is already the entire context), and
+        only apply_diff is a legal model action (create_page actions are
+        discarded with a warning if the model emits one anyway).
+        """
+        ctx = subtask.context
+        diff_target = ctx["diff_target"]
+
+        wiki_dir      = Path(ctx.get("wiki_dir",      self._project_root / "wiki"))
+        schema_path   = Path(ctx.get("schema_path",   self._project_root / "SCHEMA.md"))
+        templates_dir = Path(ctx.get("templates_dir", self._project_root / "templates"))
+        journal_path  = Path(ctx["journal_path"]) if "journal_path" in ctx else None
+        auto_apply    = bool(ctx.get("auto_apply",  False))
+        max_tokens    = int(ctx.get("max_tokens",   2048))
+        temperature   = float(ctx.get("temperature", 0.2))
+
+        missing = [
+            label for label, p in [
+                ("SCHEMA.md",  schema_path),
+                ("templates/", templates_dir),
+                ("wiki/",      wiki_dir),
+            ]
+            if not p.exists()
+        ]
+        if missing:
+            return self._fail(subtask, f"Required paths not found: {missing}")
+
+        logger.info(
+            "[%s] Diff-only run — target=%r auto_apply=%s",
+            self.name, diff_target, auto_apply,
+        )
+
+        try:
+            schema_text = read_text_file(schema_path)
+            templates   = self._load_templates(templates_dir)
+
+            if self._memory_manager is not None:
+                wiki_pages = self._load_wiki_pages_from_index(wiki_dir)
+            else:
+                wiki_pages = self._load_wiki_pages(wiki_dir)
+        except Exception as exc:
+            return self._fail(subtask, f"File load error: {exc}")
+
+        if diff_target not in wiki_pages:
+            return self._fail(subtask, f"diff_target page not found: {diff_target}")
+
+        diff_prompt = build_diff_prompt(
+            schema_text  = schema_text,
+            templates    = templates,
+            page_name    = diff_target,
+            page_content = wiki_pages[diff_target],
+            instruction  = subtask.instruction,
+        )
+        logger.debug(
+            "[%s] diff_prompt_chars=%d  target=%s",
+            self.name, len(diff_prompt), diff_target,
+        )
+
+        try:
+            raw_output = self._runtime.infer(
+                system      = DIFF_SYSTEM_PROMPT,
+                prompt      = diff_prompt,
+                max_tokens  = max_tokens,
+                temperature = temperature,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return self._fail(subtask, f"Inference error: {exc}")
+
+        try:
+            actions = parse_model_xml(raw_output)
+        except ValueError as exc:
+            return self._fail(subtask, f"XML parse error: {exc}")
+
+        if actions.new_pages:
+            logger.warning(
+                "[%s] Diff-only run for target=%r received %d create_page "
+                "action(s); discarding — only apply_diff is valid on this "
+                "path.",
+                self.name, diff_target, len(actions.new_pages),
+            )
+            actions = Actions(new_pages=[], diffs=actions.diffs)
+
+        return self._finalize(
+            subtask      = subtask,
+            actions      = actions,
+            wiki_pages   = wiki_pages,
+            journal_path = journal_path,
+            auto_apply   = auto_apply,
+            wiki_dir     = wiki_dir,
+            raw_filename = None,
+            diff_target  = diff_target,
+        )
+
+    # -----------------------------------------------------------------------
+    # Shared post-inference tail — journal / apply / index / build result
+    # -----------------------------------------------------------------------
+
+    def _finalize(
+        self,
+        subtask:      SubTask,
+        actions:      Actions,
+        wiki_pages:   dict[str, str],
+        journal_path: Path | None,
+        auto_apply:   bool,
+        wiki_dir:     Path,
+        raw_filename: str | None,
+        diff_target:  str | None,
+    ) -> AgentResult:
+        """
+        Shared tail for both run() (ingest) and _run_diff_only(): validate
+        links, journal, optionally apply to disk + reindex + rebuild the
+        graph, and build the AgentResult. Exactly one of raw_filename/
+        diff_target is expected to be non-None (the other stays None to
+        record which path produced this result — see the module docstring's
+        AgentResult.output schema).
+        """
+        # -- Validate [[...]] link targets ------------------------------------
 
         unresolved_links = _validate_links(actions, wiki_pages)
         if unresolved_links:
@@ -911,12 +1326,12 @@ class WikiAgent:
                         self.name, page_name, target,
                     )
 
-        # -- 7. Optionally journal the result --------------------------------
+        # -- Optionally journal the result ------------------------------------
 
         if journal_path is not None:
             self._write_journal(actions, journal_path)
 
-        # -- 8. Optionally apply changes to disk -----------------------------
+        # -- Optionally apply changes to disk ----------------------------------
 
         applied    = False
         skipped:   list[str] = []
@@ -927,52 +1342,16 @@ class WikiAgent:
             applied, written, skipped, diff_errs = self._apply_changes(
                 actions, wiki_dir
             )
+            self._reindex_and_rebuild_graph(wiki_dir, written)
 
-            # -- 9. Update MemoryManager index for every written page --------
-            #
-            # Called here, after disk writes are confirmed, so the index only
-            # ever reflects pages that actually exist on disk.  Each call is
-            # idempotent (content-hash checked inside index_document), so
-            # re-indexing an unchanged page is a no-op.
-
-            if self._memory_manager is not None and written:
-                for page_name in written:
-                    page_path = wiki_dir / f"{page_name}.md"
-                    if page_path.exists():
-                        try:
-                            self._memory_manager.index_document(
-                                path     = page_path,
-                                doc_type = "wiki",
-                                embed    = True,
-                            )
-                            logger.debug(
-                                "[%s] Indexed '%s' in MemoryManager.", self.name, page_name
-                            )
-                        except Exception as exc:
-                            # Non-fatal — disk write succeeded; index can be
-                            # rebuilt by calling index_directory() later.
-                            logger.warning(
-                                "[%s] MemoryManager.index_document failed for '%s': %s",
-                                self.name, page_name, exc,
-                            )
-
-                try:
-                    graph_summary = build_graph(wiki_dir, self._memory_manager)
-                    logger.info(
-                        "[%s] Graph rebuilt after write — nodes=%d edges=%d resolved=%d unresolved=%d",
-                        self.name, graph_summary["nodes"], graph_summary["edges"],
-                        graph_summary["resolved"], graph_summary["unresolved"],
-                    )
-                except Exception as exc:
-                    logger.warning("[%s] Graph rebuild failed after write (non-fatal): %s", self.name, exc)
-
-        # -- 10. Build and return AgentResult --------------------------------
+        # -- Build and return AgentResult --------------------------------------
 
         output: dict[str, Any] = {
             "new_pages":        [p.model_dump() for p in actions.new_pages],
             "diffs":            [d.model_dump() for d in actions.diffs],
             "applied":          applied,
-            "raw_filename":     raw_path.name,
+            "raw_filename":     raw_filename,
+            "diff_target":      diff_target,
             "wiki_page_count":  len(wiki_pages),
             "unresolved_links": unresolved_links,
         }
@@ -995,6 +1374,119 @@ class WikiAgent:
             agent_name = self.name,
             status     = TaskStatus.COMPLETE,
             output     = output,
+        )
+
+    def _reindex_and_rebuild_graph(
+        self,
+        wiki_dir:      Path,
+        written_pages: list[str],
+    ) -> None:
+        """
+        Shared post-write tail: reindex each written page in MemoryManager
+        (if present) and rebuild the concept graph. Used by both
+        _finalize()'s auto_apply path and apply_pending_diff() — the
+        review-then-apply UI's single-diff write has the same disk-state
+        implications as an ingest-time auto_apply write and must keep the
+        index/graph equally current. No-op if there's no MemoryManager or
+        nothing was written.
+        """
+        if self._memory_manager is None or not written_pages:
+            return
+
+        for page_name in written_pages:
+            page_path = wiki_dir / f"{page_name}.md"
+            if page_path.exists():
+                try:
+                    self._memory_manager.index_document(
+                        path     = page_path,
+                        doc_type = "wiki",
+                        embed    = True,
+                    )
+                    logger.debug(
+                        "[%s] Indexed '%s' in MemoryManager.", self.name, page_name
+                    )
+                except Exception as exc:
+                    # Non-fatal — disk write succeeded; index can be
+                    # rebuilt by calling index_directory() later.
+                    logger.warning(
+                        "[%s] MemoryManager.index_document failed for '%s': %s",
+                        self.name, page_name, exc,
+                    )
+
+        try:
+            graph_summary = build_graph(wiki_dir, self._memory_manager)
+            logger.info(
+                "[%s] Graph rebuilt after write — nodes=%d edges=%d resolved=%d unresolved=%d",
+                self.name, graph_summary["nodes"], graph_summary["edges"],
+                graph_summary["resolved"], graph_summary["unresolved"],
+            )
+        except Exception as exc:
+            logger.warning("[%s] Graph rebuild failed after write (non-fatal): %s", self.name, exc)
+
+    # -----------------------------------------------------------------------
+    # Review-then-apply UI — apply a single previously-proposed diff
+    # -----------------------------------------------------------------------
+
+    def apply_pending_diff(
+        self,
+        page_name: str,
+        diff:      str,
+        wiki_dir:  Path,
+    ) -> AgentResult:
+        """
+        Apply one previously-proposed diff directly to an existing wiki
+        page — the review-then-apply UI's Apply action (see
+        scope-review-then-apply-diff-ui.md). No fresh model call, no
+        SubTask/Actions wrapper: the diff text round-trips back from the
+        client exactly as WikiAgent originally proposed it.
+
+        Content-based matching inside apply_unified_diff() (see its
+        2026-07-09 bug fixes) is the staleness check: if the page changed
+        on disk since the diff was proposed — someone hand-edited it, or a
+        second diff landed first — the match legitimately fails and this
+        returns a FAILED AgentResult rather than corrupting the page.
+        output["error_kind"] distinguishes "not_found" (page doesn't exist)
+        from "stale" (content mismatch) so callers (main.py's
+        POST /wiki/apply-diff) can map to the right HTTP status without
+        string-matching the error message.
+        """
+        subtask_id = f"apply-diff:{page_name}"
+        page_path = wiki_dir / f"{page_name}.md"
+
+        if not page_path.exists():
+            return AgentResult(
+                subtask_id = subtask_id,
+                agent_name = self.name,
+                status     = TaskStatus.FAILED,
+                output     = {"error_kind": "not_found"},
+                error      = f"Page not found: {page_name}",
+            )
+
+        original = read_text_file(page_path)
+        try:
+            updated = apply_unified_diff(original, diff)
+        except ValueError as exc:
+            return AgentResult(
+                subtask_id = subtask_id,
+                agent_name = self.name,
+                status     = TaskStatus.FAILED,
+                output     = {"error_kind": "stale"},
+                error      = (
+                    "Diff no longer applies cleanly — the page may have "
+                    f"changed since it was proposed: {exc}"
+                ),
+            )
+
+        write_text_file(page_path, updated)
+        logger.info("[%s] apply_pending_diff: wrote '%s'.", self.name, page_name)
+
+        self._reindex_and_rebuild_graph(wiki_dir, [page_name])
+
+        return AgentResult(
+            subtask_id = subtask_id,
+            agent_name = self.name,
+            status     = TaskStatus.COMPLETE,
+            output     = {"page_name": page_name, "written": True},
         )
 
     # -----------------------------------------------------------------------

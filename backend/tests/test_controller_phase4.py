@@ -266,6 +266,128 @@ class TestIngestPath:
 
 
 # ---------------------------------------------------------------------------
+# Wiki diff review path — ControllerAgent._build_wiki_diff_result()
+# (scope-review-then-apply-diff-ui.md)
+# ---------------------------------------------------------------------------
+
+class TestWikiDiffResultPath:
+
+    @staticmethod
+    def _plan(priority: int = 1) -> RoutingPlan:
+        return RoutingPlan(
+            agent          = "wiki_agent",
+            fetch_episodic = False,
+            fetch_rag      = False,
+            priority       = priority,
+            diff_target    = "some-page",
+        )
+
+    @staticmethod
+    def _diff_result(
+        applied: bool = False,
+        diffs=None,
+        status: TaskStatus = TaskStatus.COMPLETE,
+    ) -> AgentResult:
+        return AgentResult(
+            subtask_id = "wiki-0",
+            agent_name = "wiki_agent",
+            status     = status,
+            output     = {
+                "new_pages": [],
+                "diffs": diffs if diffs is not None else [
+                    {"page_name": "some-page", "diff": "@@ -1,1 +1,1 @@\n-old\n+new\n"}
+                ],
+                "applied": applied,
+            },
+        )
+
+    def test_pending_diff_populates_metadata(self, mm):
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        task = Task(task_id="t1", instruction="update page some-page")
+
+        result = ctrl._build_wiki_diff_result(
+            task, self._plan(), "wiki_agent", [self._diff_result(applied=False)]
+        )
+
+        assert result is not None
+        assert result.metadata["pending_diffs"] == [
+            {"page_name": "some-page", "diff": "@@ -1,1 +1,1 @@\n-old\n+new\n", "status": "pending"}
+        ]
+        assert result.metadata["priority"] == 1
+        assert "Proposed" in result.answer
+        assert "some-page" in result.answer
+
+    def test_applied_diff_has_applied_status_and_answer(self, mm):
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        task = Task(task_id="t1", instruction="x")
+
+        result = ctrl._build_wiki_diff_result(
+            task, self._plan(), "wiki_agent", [self._diff_result(applied=True)]
+        )
+
+        assert result.metadata["pending_diffs"][0]["status"] == "applied"
+        assert "Applied" in result.answer
+
+    def test_empty_diffs_returns_none(self, mm):
+        """Regression guard: a pure ingest (new pages only, no diffs) must
+        still fall through to the generic synthesizer, unaffected."""
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        task = Task(task_id="t1", instruction="x")
+
+        result = ctrl._build_wiki_diff_result(task, self._plan(), "wiki_agent", [self._diff_result(diffs=[])])
+        assert result is None
+
+    def test_non_wiki_agent_returns_none(self, mm):
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        task = Task(task_id="t1", instruction="x")
+
+        result = ctrl._build_wiki_diff_result(
+            task, self._plan(), "conversational_agent", [self._diff_result()]
+        )
+        assert result is None
+
+    def test_multi_result_returns_none(self, mm):
+        """Compound dispatch (>1 result) is out of scope for this pass."""
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        task = Task(task_id="t1", instruction="x")
+
+        result = ctrl._build_wiki_diff_result(
+            task, self._plan(), "wiki_agent", [self._diff_result(), self._diff_result()]
+        )
+        assert result is None
+
+    def test_failed_result_returns_none(self, mm):
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        task = Task(task_id="t1", instruction="x")
+
+        result = ctrl._build_wiki_diff_result(
+            task, self._plan(), "wiki_agent", [self._diff_result(status=TaskStatus.FAILED)]
+        )
+        assert result is None
+
+    def test_end_to_end_ingest_with_diffs_bypasses_synthesizer(self, mm):
+        """Full pipeline: P1 routes to wiki_agent, whose output carries a
+        diff — handle_task()'s result must carry pending_diffs, and the
+        generic synthesizer's inference call must never fire (proves the
+        branch actually short-circuits self._synthesizer.synthesize())."""
+        rt = make_runtime()
+        wiki = MagicMock()
+        wiki.name = "wiki_agent"
+        wiki.can_handle.return_value = True
+        wiki.run.return_value = self._diff_result(applied=False)
+        ctrl = ControllerAgent(runtime=rt, agents=[wiki], memory_manager=mm)
+
+        result = ctrl.handle_task({
+            "instruction": "ingest this document",
+            "context":     {"raw_path": "/data/notes.md"},
+        })
+
+        assert result["status"] == "complete"
+        assert result["metadata"]["pending_diffs"][0]["page_name"] == "some-page"
+        rt.infer.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Episodic write path (Priority 2)
 # ---------------------------------------------------------------------------
 
@@ -398,12 +520,29 @@ class TestToolStubPath:
         assert "web_search" in routing["tools_to_call"]
 
     def test_tool_stub_does_not_add_tool_results_slot(self, mm):
-        """Tool results slot absent until Phase 6 wires real dispatchers."""
+        """
+        MCPToolDispatcher is fully wired (Phase 6) and does fire for
+        web_search-shaped instructions like this one — so this test now
+        forces localist-mcp to be unreachable via the _open_session test
+        seam (see its docstring in mcp_tool_dispatcher.py) to exercise the
+        graceful-failure path: no [TOOL RESULTS] slot, not a hallucinated
+        result. Without this mock, dispatch() would attempt a real SSE
+        connection to _MCP_SERVER_URL — succeeding (and adding real search
+        content to the prompt) whenever a live localist-mcp happens to be
+        reachable, e.g. via start_localist.sh.
+        """
         rt   = make_runtime(infer_return="no")
         conv = make_conv_agent()
         ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
 
-        ctrl.handle_task({"instruction": "What are the latest oMLX changes?"})
+        async def fake_open_session_unreachable(stack):
+            raise ConnectionError("mock: localist-mcp unreachable")
+
+        with patch(
+            "mcp_tool_dispatcher.MCPToolDispatcher._open_session",
+            side_effect=fake_open_session_unreachable,
+        ):
+            ctrl.handle_task({"instruction": "What are the latest oMLX changes?"})
 
         prompt = conv._received[0].context["_prebuilt_prompt"]
         assert "[TOOL RESULTS]" not in prompt
@@ -739,6 +878,45 @@ class TestLoadPersonaWikiDoc:
         assert "---" not in ctrl._persona_cache
         assert "You are LORA" in ctrl._persona_cache
         assert "You are helpful" in ctrl._persona_cache
+
+    def test_web_search_description_names_langsearch_by_default(self, monkeypatch):
+        """SEARCH_PROVIDER unset → persona's "Web search" line keeps LangSearch."""
+        monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
+        content = "Web search fires automatically. It returns real results from LangSearch."
+        mm = MagicMock()
+        mm.query_corpus.return_value = [
+            _mock_doc("/wiki/lora-persona.md", content)
+        ]
+
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        ctrl._load_persona()
+
+        assert "It returns real results from LangSearch." in ctrl._persona_cache
+
+    def test_web_search_description_names_brave_when_configured(self, monkeypatch):
+        """SEARCH_PROVIDER=brave → persona's LangSearch mention is swapped."""
+        monkeypatch.setenv("SEARCH_PROVIDER", "brave")
+        content = "Web search fires automatically. It returns real results from LangSearch."
+        mm = MagicMock()
+        mm.query_corpus.return_value = [
+            _mock_doc("/wiki/lora-persona.md", content)
+        ]
+
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        ctrl._load_persona()
+
+        assert "It returns real results from Brave Search." in ctrl._persona_cache
+        assert "LangSearch" not in ctrl._persona_cache
+
+    def test_unknown_search_provider_raises_before_corpus_fetch(self, monkeypatch):
+        """Bad SEARCH_PROVIDER fails loud rather than silently dropping persona."""
+        monkeypatch.setenv("SEARCH_PROVIDER", "bing")
+        mm = MagicMock()
+
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        with pytest.raises(ValueError, match="ERROR: unknown SEARCH_PROVIDER 'bing'"):
+            ctrl._load_persona()
+        mm.query_corpus.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

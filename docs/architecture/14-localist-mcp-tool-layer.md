@@ -45,13 +45,53 @@ ported): `connection_error`, `timeout`, `http_client_error`,
 `http_server_error`, `extraction_failed`. Timeout is clamped to 1.0–30.0s,
 same bounds the Fetcher's `ExtractRequest` validator used.
 
-**`web_search`** requires `LANGSEARCH_API_KEY` (from `backend/.env` —
-`localist-mcp` calls `load_dotenv()` itself, since it's a separate process
-from the main backend and does not inherit its dotenv load). A missing or
-empty key raises immediately with no network call and no inference
-fallback (§4.6.1). LangSearch request/response handling is unchanged from
-the original `ToolDispatcher` implementation, just async (`httpx`, not
-`requests`).
+**`web_search`** (updated 2026-07-09 — provider abstraction added).
+`mcp_server/web_search.py` now has two private implementations,
+`_web_search_langsearch()` and `_web_search_brave()`, both
+`(query: str) -> dict` with the identical `{query, result_text,
+result_count}` return contract, behind a public `web_search()` dispatcher
+that reads `SEARCH_PROVIDER` (from `backend/.env`, default `"langsearch"`)
+and routes to exactly one of them per call — never both, never a silent
+fallback between them. `SEARCH_PROVIDER` is read lazily inside
+`web_search()` on every call rather than cached at import time, since —
+like `LANGSEARCH_API_KEY` — this is a separate process from the main
+backend and does not inherit its dotenv load. An unrecognized
+`SEARCH_PROVIDER` value raises `ValueError("ERROR: unknown SEARCH_PROVIDER
+'<value>'")` rather than defaulting quietly — the same fail-loud,
+no-inference-fallback contract §4.6.1 already established for a missing
+API key (Phase 3's locked decision) applies identically to the provider
+choice itself.
+
+The MCP tool's public signature and schema (`web_search(query: str) ->
+dict`, §14.2's table row above) is unchanged by this addition — the
+provider switch is invisible to `MCPToolDispatcher`, `planner.py`, and
+LORA itself, by design: exactly one provider is ever active/exposed as
+the `web_search` tool at a time, so nothing downstream of the MCP
+boundary needed to change.
+
+Each provider's request/response contract:
+
+- **LangSearch** (default) — requires `LANGSEARCH_API_KEY`. A missing or
+  empty key raises immediately with no network call and no inference
+  fallback (§4.6.1). Request/response handling is unchanged from the
+  original `ToolDispatcher` implementation, just async (`httpx`, not
+  `requests`): `POST https://api.langsearch.com/v1/web-search`,
+  `Authorization: Bearer <key>`, body
+  `{query, summary: true, count: 3, freshness: "noLimit"}`; parses
+  `data.webPages.value[]`, preferring `summary` over `snippet` for each
+  result's body.
+- **Brave Search** — requires `BRAVE_API_KEY`, same missing/empty-key
+  fail-loud contract. `GET https://api.search.brave.com/res/v1/web/search`,
+  headers `{X-Subscription-Token: <key>, Accept: application/json}`, query
+  params `{q: query, count: 3}`; parses `web.results[]`, using `title`,
+  `description`, `url`.
+
+Both providers format their up-to-3 results identically — `"•
+{title}\n  {body}\n  [{url}]"` joined with `"\n\n"`, body truncated to 300
+chars on a word boundary — and return the same `"No results found."` /
+`result_count: 0` shape when the provider returns zero results, so
+`result_text`'s shape at every downstream consumer (`MCPToolDispatcher`,
+Slot 5) is identical regardless of which provider is active.
 
 All three failure-capable tools raise on error rather than returning a
 success-shaped result — this is what lets the MCP protocol layer set
@@ -158,9 +198,19 @@ LOCALIST_MCP_PROJECT_ROOT    file_op sandbox root, read by localist-mcp
                               itself (server side).
                               Default: backend/ (parent of mcp_server/)
 
-LANGSEARCH_API_KEY           Required for web_search. Read from
-                              backend/.env via localist-mcp's own
-                              load_dotenv() call.
+SEARCH_PROVIDER              Selects the active web_search provider:
+                              "langsearch" (default) or "brave". Read
+                              lazily by web_search.py's dispatcher on
+                              every call, not cached at import time.
+
+LANGSEARCH_API_KEY           Required for web_search when
+                              SEARCH_PROVIDER=langsearch (the default).
+                              Read from backend/.env via localist-mcp's
+                              own load_dotenv() call.
+
+BRAVE_API_KEY                Required for web_search when
+                              SEARCH_PROVIDER=brave. Same load_dotenv()
+                              path as LANGSEARCH_API_KEY.
 
 LOCALIST_LOG_LEVEL           localist-mcp's root log level. Default: INFO.
 ```
@@ -183,6 +233,11 @@ LOCALIST_LOG_LEVEL           localist-mcp's root log level. Default: INFO.
   `file_ops`/`url_fetch`/`web_search` plus in-process MCP client session
   tests (`mcp.shared.memory.create_connected_server_and_client_session`)
   against the real `FastMCP` instance, no network server required.
+  Provider abstraction (2026-07-09): `TestWebSearchProviderDispatch`
+  covers `SEARCH_PROVIDER` unset/explicit `"langsearch"`/case-insensitivity/
+  unknown-value-raises; `TestWebSearchBraveSuccess`/`TestWebSearchBraveErrors`
+  mirror the existing LangSearch test classes for `_web_search_brave()`,
+  same `httpx.AsyncClient` mocking idiom (`.get` instead of `.post`).
 - `backend/tests/test_mcp_tool_dispatcher.py` — `MCPToolDispatcher` unit
   tests with `_call_mcp_tool` monkeypatched (success/error/connection-
   failure paths for all three tools, plus the unknown-tool path).
@@ -190,7 +245,18 @@ LOCALIST_LOG_LEVEL           localist-mcp's root log level. Default: INFO.
   `TestControllerToolIntegration` class — real subprocess round trips via
   a `localist-mcp` fixture (`localist_mcp_server` /
   `localist_mcp_server_no_langsearch_key`), including the Step 3b corpus
-  fallback proof (§4.6.1).
+  fallback proof (§4.6.1). `localist_mcp_server_no_langsearch_key` now
+  also pins `SEARCH_PROVIDER=langsearch` in the subprocess's env
+  (2026-07-09) — see `docs/architecture/06-build-order-checklist.md`'s
+  2026-07-09 session entry for why (a pre-existing test-isolation bug,
+  not part of the provider swap itself).
+- `backend/tests/conftest.py` (new, 2026-07-09) — autouse fixture
+  stripping `SEARCH_PROVIDER`/`BRAVE_API_KEY`/`LANGSEARCH_API_KEY` from
+  `os.environ` before every test in the backend suite, so
+  `mcp_server/main.py`'s import-time `load_dotenv()` can never leak
+  `backend/.env`'s real values into an unrelated test. See
+  `docs/architecture/06-build-order-checklist.md`'s 2026-07-09 entry for
+  the full incident.
 - Live verification for each phase is recorded in `sessions-log.md` under
   2026-07-03.
 

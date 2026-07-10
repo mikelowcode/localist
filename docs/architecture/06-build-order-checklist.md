@@ -8,8 +8,9 @@ No item is begun until all items above it are complete and tested.
 > Priority 3b, persona rewrite, episodic memory bug fixes, Localist rebrand,
 > Localist UI overhaul (provenance bar, episodic memory panel, full rebrand),
 > Fetcher service restored (lxml, readability-lxml pinned in requirements.txt),
-> and Graph Retrieval Layer Phase A/B (wiki_doc.py shared parsing helper,
-> graph schema v3 migration, offline link-graph builder, WikiAgent link validation).
+> Graph Retrieval Layer Phase A/B (wiki_doc.py shared parsing helper,
+> graph schema v3 migration, offline link-graph builder, WikiAgent link validation),
+> and web search provider abstraction (Brave Search, behind SEARCH_PROVIDER).
 > Test suite: **224 tests, 0 failures** across 9 test files.
 >
 > **Files added/modified (all phases):**
@@ -88,6 +89,63 @@ No item is begun until all items above it are complete and tested.
 > - `memory_manager.py`: `graph_nodes` and `graph_edges` tables added as v2→v3 migration (`_SCHEMA_VERSION = 3`); four new public methods: `upsert_graph_node()`, `upsert_graph_edge()`, `clear_graph_for_doc()`, `clear_graph_edges()`; 6 new tests in `TestGraphSchema` class in `tests/test_memory_phase1.py`
 > - `build_graph.py` added: offline two-pass link-graph builder; same normalization rule as `_validate_links()`; same-page-same-target duplicate links collapse to one edge row per `(source_doc_path, target_path)` pair; whole-corpus `clear_graph_edges()` between passes; `doc_path` uses absolute resolved paths matching `document_index.path` convention; 10 tests in `tests/test_build_graph.py` (new)
 > - Validation run against real 5-document corpus: 5 nodes, 11 edges, 8 resolved, 3 unresolved — see §8.7
+>
+> *Web search provider abstraction (Brave Search) — 2026-07-09:*
+> - `mcp_server/web_search.py`: existing LangSearch implementation renamed to
+>   `_web_search_langsearch()` (behavior/error strings/logging unchanged);
+>   `_web_search_brave()` added with the same `(query: str) -> dict` contract
+>   (`{query, result_text, result_count}`); new `web_search()` dispatcher reads
+>   `SEARCH_PROVIDER` (default `"langsearch"`) and routes to exactly one
+>   provider per call — no fallback between them, unrecognized values raise
+>   `ValueError("ERROR: unknown SEARCH_PROVIDER '<value>'")`
+> - `mcp_server/main.py`: `web_search` MCP tool docstring and the module's
+>   Configuration section made provider-agnostic (`SEARCH_PROVIDER`,
+>   `BRAVE_API_KEY` documented alongside `LANGSEARCH_API_KEY`); tool
+>   signature/schema unchanged — the switch is invisible to the
+>   planner/dispatcher/LORA by design
+> - `backend/.env.example` / `backend/.env`: `SEARCH_PROVIDER` and
+>   `BRAVE_API_KEY` added alongside the existing `LANGSEARCH_API_KEY`
+> - `backend/tests/test_mcp_server.py`: provider-dispatch tests added
+>   (`TestWebSearchProviderDispatch`, `TestWebSearchBraveSuccess`/`Errors`)
+> - Persona fix: `wiki/lora-persona.md`'s "Web search" tool description
+>   hardcoded "It returns real results from LangSearch" — false, and a
+>   Honor Code violation (misrepresenting its own source), whenever
+>   `SEARCH_PROVIDER=brave`. No template/placeholder mechanism exists
+>   anywhere in the prompt-assembly path for injecting dynamic values into
+>   persona text (`PromptBuilder._slot1_system()` appends persona text raw;
+>   §3's persona contract is explicitly "no placeholder"), so rather than
+>   inventing new templating machinery, `controller_agent.py`'s
+>   `_load_persona()` now does a single targeted string substitution at
+>   persona-cache time: the literal `"LangSearch"` substring is swapped for
+>   a `SEARCH_PROVIDER`-derived label via a new `_web_search_provider_label()`
+>   helper. An unrecognized `SEARCH_PROVIDER` raises before the corpus
+>   fetch, so it fails loud rather than being caught by the existing
+>   broad except-clause and silently downgrading to "proceeding without
+>   persona." Tests added to `TestLoadPersonaWikiDoc` in
+>   `tests/test_controller_phase4.py`.
+> - Test-isolation fix (a pre-existing bug, not part of the provider swap
+>   itself): `mcp_server/main.py`'s import-time `load_dotenv()` leaks the
+>   real `SEARCH_PROVIDER`/`BRAVE_API_KEY`/`LANGSEARCH_API_KEY` from
+>   `backend/.env` into the pytest process the moment anything imports
+>   `mcp_server.main`, silently overriding provider dispatch in unrelated
+>   tests — and, combined with a live `localist-mcp` reachable locally
+>   (`start_localist.sh`) plus a real, working `BRAVE_API_KEY`, causing
+>   genuine live network calls to the Brave Search API during
+>   `pytest tests/`. Affected 5 tests across `tests/test_controller_phase4.py`
+>   and `tests/test_tool_dispatcher_phase6.py`, two of which were previously
+>   silent/vacuous (`if "[TOOL RESULTS]" in prompt:` guards masking the
+>   missing assertion, rather than failing outright). Fixed via a new
+>   `backend/tests/conftest.py` autouse fixture (`monkeypatch.delenv` for all
+>   three vars before every test) plus explicit
+>   `MCPToolDispatcher._open_session`/`_call_mcp_tool` mocking in the
+>   affected tests, and pinning `SEARCH_PROVIDER=langsearch` in the
+>   `localist_mcp_server_no_langsearch_key` real-subprocess fixture. Suite:
+>   13 failed / 583 passed → 0 failed / 596 passed; re-verified hermetic via
+>   a hard outbound-socket block (non-loopback `socket.connect` raises
+>   `OSError`) — still 596/596 passed.
+> - Live end-to-end verification against the real Brave API (free tier,
+>   confirmed 50 req/sec limit matches account docs) via canary queries
+>   through the running backend + localist-mcp + Ollama stack.
 
 ---
 

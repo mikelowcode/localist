@@ -128,6 +128,13 @@ def localist_mcp_server_no_langsearch_key(tmp_path: Path):
     "present," so it survives, and web_search.py's `if not api_key` check
     treats "" the same as absent.
 
+    SEARCH_PROVIDER is pinned to "langsearch" for the same reason: this
+    fixture's whole point is to force web_search to fail, and backend/.env
+    may legitimately have SEARCH_PROVIDER=brave with a real, working
+    BRAVE_API_KEY configured for local Brave testing — in which case an
+    *unpinned* subprocess would happily dispatch to Brave and succeed
+    instead of failing, since only the LangSearch key is forced empty here.
+
     Used by test_web_search_missing_key_triggers_corpus_fallback (Phase 3)
     to prove controller_agent.py's Step 3b corpus fallback — see
     sessions-log.md, 2026-07-03, Phase 3.
@@ -140,6 +147,7 @@ def localist_mcp_server_no_langsearch_key(tmp_path: Path):
     env = {**os.environ, "LOCALIST_MCP_PROJECT_ROOT": str(tmp_path),
            "LOCALIST_LOG_LEVEL": "WARNING"}
     env["LANGSEARCH_API_KEY"] = ""
+    env["SEARCH_PROVIDER"]    = "langsearch"
 
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "mcp_server.main:app",
@@ -254,93 +262,152 @@ class TestControllerToolIntegration:
         assert "oMLX" in prompt
 
     def test_slot_order_user_before_tool_results(self, mm):
+        """
+        Mocks the MCP transport seam (same idiom as
+        test_tool_results_slot_present_in_prompt above) rather than relying
+        on nothing being reachable at mcp_tool_dispatcher._MCP_SERVER_URL —
+        that assumption is false whenever a real localist-mcp is running
+        locally (e.g. via start_localist.sh) or in any CI environment with
+        a stray process on that port, and previously left this test's
+        assertion inside an `if "[TOOL RESULTS]" in prompt:` guard that
+        could pass vacuously without ever checking slot order.
+        """
         rt = MagicMock(spec=["infer", "embed"])
         rt.embed.return_value = [0.0] * 768
-        rt.infer.side_effect = [
-            "no",
-            "• Search result with enough content to pass quality filter.",
-            "NONE",
-        ]
+        rt.infer.side_effect = ["no", "NONE"]
+
+        async def fake_open_session(stack):
+            return object()
+
+        async def fake_call_mcp_tool(session, name, arguments):
+            return json.dumps({
+                "query":        arguments["query"],
+                "result_text":  "• Search result with enough content to pass quality filter.",
+                "result_count": 1,
+            }), False
 
         conv = make_conv_agent()
         ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
-        ctrl.handle_task({
-            "instruction": "What are the latest changes?",
-            "context":     {"project_context": "LORA"},
-        })
+        with patch(
+            "mcp_tool_dispatcher.MCPToolDispatcher._open_session",
+            side_effect=fake_open_session,
+        ), patch(
+            "mcp_tool_dispatcher.MCPToolDispatcher._call_mcp_tool",
+            side_effect=fake_call_mcp_tool,
+        ):
+            ctrl.handle_task({
+                "instruction": "What are the latest changes?",
+                "context":     {"project_context": "LORA"},
+            })
 
         prompt = conv._received[0].context["_prebuilt_prompt"]
-        if "[TOOL RESULTS]" in prompt:
-            assert prompt.index("[TOOL RESULTS]") < prompt.index("[INSTRUCTION]")
+        assert "[TOOL RESULTS]" in prompt
+        assert prompt.index("[TOOL RESULTS]") < prompt.index("[INSTRUCTION]")
 
     def test_tool_slot_ceiling_enforced(self, mm):
-        """Slot 6 must not exceed 500 tokens (2000 chars) in the prompt."""
+        """
+        Slot 6 must not exceed 500 tokens (2000 chars) in the prompt.
+
+        Mocks the MCP transport seam (see test_slot_order_user_before_tool_results
+        above) instead of relying on nothing being reachable on
+        _MCP_SERVER_URL, for the same reason.
+        """
         rt = MagicMock(spec=["infer", "embed"])
         rt.embed.return_value = [0.0] * 768
-        # Return a very long result from web_search
-        rt.infer.side_effect = [
-            "no",
-            "• " + "A" * 3000,  # far exceeds 500-token slot ceiling
-            "NONE",
-        ]
+        rt.infer.side_effect = ["no", "NONE"]
+
+        async def fake_open_session(stack):
+            return object()
+
+        async def fake_call_mcp_tool(session, name, arguments):
+            return json.dumps({
+                "query":        arguments["query"],
+                "result_text":  "• " + "A" * 3000,  # far exceeds 500-token slot ceiling
+                "result_count": 1,
+            }), False
 
         conv = make_conv_agent()
         ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
-        ctrl.handle_task({
-            "instruction": "What are the latest changes?",
-            "context":     {"project_context": "LORA"},
-        })
+        with patch(
+            "mcp_tool_dispatcher.MCPToolDispatcher._open_session",
+            side_effect=fake_open_session,
+        ), patch(
+            "mcp_tool_dispatcher.MCPToolDispatcher._call_mcp_tool",
+            side_effect=fake_call_mcp_tool,
+        ):
+            ctrl.handle_task({
+                "instruction": "What are the latest changes?",
+                "context":     {"project_context": "LORA"},
+            })
 
         prompt = conv._received[0].context["_prebuilt_prompt"]
-        if "[TOOL RESULTS]" in prompt:
-            start = prompt.index("[TOOL RESULTS]")
-            # Find the next slot label after TOOL RESULTS (or end of string)
-            next_slot = len(prompt)
-            for label in ["[INSTRUCTION]", "[WORKING MEMORY]", "[WORKING STATE]",
-                          "[EPISODIC MEMORY]", "[CONTEXT]"]:
-                pos = prompt.find(label, start + 1)
-                if pos != -1:
-                    next_slot = min(next_slot, pos)
-            tool_section = prompt[start:next_slot]
-            assert len(tool_section) // 4 <= 505  # 500 + small label tolerance
+        assert "[TOOL RESULTS]" in prompt
+        start = prompt.index("[TOOL RESULTS]")
+        # Find the next slot label after TOOL RESULTS (or end of string)
+        next_slot = len(prompt)
+        for label in ["[INSTRUCTION]", "[WORKING MEMORY]", "[WORKING STATE]",
+                      "[EPISODIC MEMORY]", "[CONTEXT]"]:
+            pos = prompt.find(label, start + 1)
+            if pos != -1:
+                next_slot = min(next_slot, pos)
+        tool_section = prompt[start:next_slot]
+        assert len(tool_section) // 4 <= 505  # 500 + small label tolerance
 
     def test_tool_dispatch_failure_graceful(self, mm):
-        """If tool dispatch raises, task still completes; [TOOL RESULTS] absent."""
+        """
+        If localist-mcp is unreachable, task still completes; [TOOL RESULTS]
+        absent. Mocks _open_session to raise (the documented test seam for
+        simulating an unreachable MCP server — see its docstring in
+        mcp_tool_dispatcher.py) rather than relying on nothing actually
+        listening on _MCP_SERVER_URL, which is false whenever a real
+        localist-mcp happens to be running locally or in CI.
+        """
         rt = MagicMock(spec=["infer", "embed"])
         rt.embed.return_value = [0.0] * 768
-        rt.infer.side_effect = [
-            "no",
-            Exception("tool crashed"),
-            "NONE",
-        ]
+        rt.infer.side_effect = ["no", "NONE"]
+
+        async def fake_open_session_unreachable(stack):
+            raise ConnectionError("mock: localist-mcp unreachable")
 
         conv = make_conv_agent("Graceful answer.")
         ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
-        result = ctrl.handle_task({
-            "instruction": "What are the latest changes?",
-            "context":     {"project_context": "LORA"},
-        })
+        with patch(
+            "mcp_tool_dispatcher.MCPToolDispatcher._open_session",
+            side_effect=fake_open_session_unreachable,
+        ):
+            result = ctrl.handle_task({
+                "instruction": "What are the latest changes?",
+                "context":     {"project_context": "LORA"},
+            })
 
         assert result["status"] == "complete"
         prompt = conv._received[0].context["_prebuilt_prompt"]
         assert "[TOOL RESULTS]" not in prompt
 
     def test_quality_filter_excludes_error_results(self, mm):
-        """Tool results beginning with ERROR: must not appear in slot 6."""
+        """
+        Tool results beginning with ERROR: must not appear in slot 6. Mocks
+        _open_session to raise (see test_tool_dispatch_failure_graceful
+        above) so the ERROR: result is deterministic rather than depending
+        on _MCP_SERVER_URL being unreachable.
+        """
         rt = MagicMock(spec=["infer", "embed"])
         rt.embed.return_value = [0.0] * 768
-        rt.infer.side_effect = [
-            "no",
-            Exception("search failed"),  # causes ERROR: result
-            "NONE",
-        ]
+        rt.infer.side_effect = ["no", "NONE"]
+
+        async def fake_open_session_unreachable(stack):
+            raise ConnectionError("mock: localist-mcp unreachable")
 
         conv = make_conv_agent()
         ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
-        ctrl.handle_task({
-            "instruction": "What are the latest changes?",
-            "context":     {"project_context": "LORA"},
-        })
+        with patch(
+            "mcp_tool_dispatcher.MCPToolDispatcher._open_session",
+            side_effect=fake_open_session_unreachable,
+        ):
+            ctrl.handle_task({
+                "instruction": "What are the latest changes?",
+                "context":     {"project_context": "LORA"},
+            })
 
         prompt = conv._received[0].context["_prebuilt_prompt"]
         assert "ERROR:" not in prompt

@@ -29,6 +29,7 @@ Layer placement
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 import uuid
@@ -65,6 +66,33 @@ import session_files as _session_files
 logger = logging.getLogger(__name__)
 
 _PROMPT_BUILDER = PromptBuilder()
+
+# Display labels for the persona's "Web search" tool description, keyed by
+# the same SEARCH_PROVIDER value mcp_server/web_search.py's provider
+# dispatch reads. Kept in sync with that module's provider set by hand —
+# this process and localist-mcp are separate deployables (see CLAUDE.md),
+# so this doesn't import mcp_server directly.
+_WEB_SEARCH_PROVIDER_LABELS: dict[str, str] = {
+    "langsearch": "LangSearch",
+    "brave":      "Brave Search",
+}
+
+
+def _web_search_provider_label() -> str:
+    """
+    Resolve SEARCH_PROVIDER to the display name substituted into the
+    persona's "Web search" tool description (wiki/lora-persona.md).
+
+    Raises ValueError("ERROR: unknown SEARCH_PROVIDER <value>") for an
+    unrecognized value — same fail-loud contract as
+    mcp_server/web_search.py's provider dispatcher; no vague fallback
+    label is ever rendered into the prompt.
+    """
+    provider = os.environ.get("SEARCH_PROVIDER", "langsearch").lower()
+    try:
+        return _WEB_SEARCH_PROVIDER_LABELS[provider]
+    except KeyError:
+        raise ValueError(f"ERROR: unknown SEARCH_PROVIDER {provider!r}") from None
 
 
 # ---------------------------------------------------------------------------
@@ -708,11 +736,21 @@ class ControllerAgent:
         Load the LORA persona document from the wiki corpus.
         Result is cached in self._persona_cache after first successful load.
         Returns None when MemoryManager is absent or corpus has no persona doc.
+
+        The persona's "Web search" tool description names its provider by
+        name (e.g. "It returns real results from LangSearch."); that literal
+        substring is swapped for the SEARCH_PROVIDER-derived label once here,
+        at cache time, rather than baked into the static wiki doc — see
+        _web_search_provider_label(). An unrecognized SEARCH_PROVIDER raises
+        before the corpus fetch below, so it propagates as a real error
+        instead of being caught by the broad except clause and silently
+        downgrading to "proceeding without persona".
         """
         if self._persona_cache is not None:
             return self._persona_cache
         if self._memory_manager is None:
             return None
+        provider_label = _web_search_provider_label()
         try:
             docs = self._memory_manager.query_corpus(
                 "LORA persona identity research assistant",
@@ -726,12 +764,14 @@ class ControllerAgent:
             )
             if persona_doc is not None:
                 parsed = parse_wiki_doc(persona_doc.content)
-                self._persona_cache = parsed.body[:2000]
+                body = parsed.body[:2000]
+                self._persona_cache = body.replace("LangSearch", provider_label)
                 logger.debug(
                     "_load_persona: persona loaded and cached — "
-                    "path=%s  chars=%d",
+                    "path=%s  chars=%d  web_search_provider=%s",
                     persona_doc.path,
                     len(self._persona_cache),
+                    provider_label,
                 )
             else:
                 logger.warning(
@@ -1408,6 +1448,13 @@ class ControllerAgent:
         }
         if on_token is not None:
             subtask_context["_on_token"] = on_token
+        if plan.diff_target is not None:
+            # Priority 1b (diff-only wiki update) — resolved target page
+            # stem, consumed by WikiAgent.run()'s dispatch branch as
+            # ctx["diff_target"]. Set here (not spread from task.context)
+            # because the frontend/original request never carries this key
+            # — only the Planner's graph-stem resolution produces it.
+            subtask_context["diff_target"] = plan.diff_target
 
         subtask = SubTask(
             subtask_id  = f"{task.task_id}-0",
@@ -1556,6 +1603,9 @@ class ControllerAgent:
         final_result = self._build_conversational_result(task, plan, effective_agent_name, results)
         if final_result is not None:
             return final_result
+        wiki_diff_result = self._build_wiki_diff_result(task, plan, effective_agent_name, results)
+        if wiki_diff_result is not None:
+            return wiki_diff_result
         return self._synthesizer.synthesize(task, results, memory)
 
     def _execute(self, task: Task, memory: _AnyMemory) -> ControllerResult:
@@ -1625,6 +1675,92 @@ class ControllerAgent:
                 "tool_signal_source": plan.tool_signal_source,
                 "grounded":           r.output.get("grounded", False),
                 "file_op_deferred":   plan.file_op_deferred,
+            },
+        )
+
+    def _build_wiki_diff_result(
+        self,
+        task:                 Task,
+        plan:                 "RoutingPlan",
+        effective_agent_name: str,
+        results:              list[AgentResult],
+    ) -> "ControllerResult | None":
+        """
+        Build a ControllerResult directly from a single wiki_agent
+        AgentResult that carries a non-empty output["diffs"], bypassing the
+        generic ResultSynthesizer — mirrors _build_conversational_result()'s
+        special-case pattern for the same reason: the raw diff(s) proposed
+        by WikiAgent._run_diff_only() (or an ingest run's apply_diff
+        actions) must reach the frontend as structured data
+        (metadata["pending_diffs"]) for the review-then-apply UI, not get
+        summarized away into prose by a second inference call (see
+        scope-review-then-apply-diff-ui.md).
+
+        Each pending_diffs entry carries status "applied" (already written
+        to disk — e.g. a diagnostic/auto_apply=True run) or "pending"
+        (needs a user click — the only case chat-originated instructions
+        produce today, since there is deliberately no auto_apply-from-chat
+        toggle). This status also round-trips through chat_turns'
+        persisted metadata_json (see MemoryManager.mark_diff_applied()),
+        so a page reload shows the correct state rather than re-offering
+        Apply on an already-written diff.
+
+        metadata also carries priority/fetch_rag/fetch_episodic/tools_fired
+        from `plan`, matching _build_conversational_result()'s shape — the
+        chat UI's provenance chip reads these regardless of which agent
+        produced the turn; without them it silently mislabels every
+        wiki-diff turn as "P6 · Inference" (confirmed live, 2026-07-09).
+
+        Returns None (deferring to the generic synthesizer) when:
+          - effective_agent_name != "wiki_agent"
+          - more than one result (compound dispatch — out of scope for now)
+          - the single result failed
+          - output["diffs"] is empty (nothing to review — e.g. a pure
+            ingest that only created new pages)
+        """
+        if effective_agent_name != "wiki_agent" or len(results) != 1:
+            return None
+
+        result = results[0]
+        if result.status != TaskStatus.COMPLETE:
+            return None
+
+        diffs = result.output.get("diffs") or []
+        if not diffs:
+            return None
+
+        applied       = bool(result.output.get("applied", False))
+        status        = "applied" if applied else "pending"
+        pending_diffs = [
+            {"page_name": d["page_name"], "diff": d["diff"], "status": status}
+            for d in diffs
+        ]
+
+        new_pages  = result.output.get("new_pages", [])
+        page_names = ", ".join(d["page_name"] for d in diffs)
+
+        if applied:
+            answer = f"Applied {len(diffs)} diff(s) to {page_names}."
+        else:
+            answer = (
+                f"Proposed {len(diffs)} diff(s) against {page_names} — "
+                "review below and click Apply to write to disk."
+            )
+        if new_pages:
+            answer += f" Also proposed {len(new_pages)} new page(s)."
+
+        return ControllerResult(
+            task_id  = task.task_id,
+            status   = TaskStatus.COMPLETE,
+            answer   = answer,
+            sources  = [],
+            metadata = {
+                "agent":          effective_agent_name,
+                "priority":       plan.priority,
+                "fetch_rag":      plan.fetch_rag,
+                "fetch_episodic": plan.fetch_episodic,
+                "tools_fired":    plan.tools_to_call,
+                "pending_diffs":  pending_diffs,
             },
         )
 
