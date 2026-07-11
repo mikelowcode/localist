@@ -22,23 +22,25 @@ export interface EpisodeItem {
 }
 
 export interface EpisodesState {
-  episodes:    EpisodeItem[];
-  loading:     boolean;
-  error:       string | null;
-  offset:      number;
-  limit:       number;
-  total:       number;
-  typeFilter:  string;   // "" = all types
+  episodes:     EpisodeItem[];
+  loading:      boolean;
+  error:        string | null;
+  offset:       number;
+  limit:        number;
+  total:        number;
+  typeFilter:   string;   // "" = all types
+  statusFilter: string;   // "active" | "pending" | ... — see main.py's GET /memory/episodes
 }
 
 const _initial: EpisodesState = {
-  episodes:   [],
-  loading:    false,
-  error:      null,
-  offset:     0,
-  limit:      50,
-  total:      0,
-  typeFilter: '',
+  episodes:     [],
+  loading:      false,
+  error:        null,
+  offset:       0,
+  limit:        50,
+  total:        0,
+  typeFilter:   '',
+  statusFilter: 'active',
 };
 
 export const episodesStore = writable<EpisodesState>(_initial);
@@ -77,13 +79,15 @@ export const TYPE_COLORS: Record<string, { bg: string; color: string; border: st
 
 export async function loadEpisodes(opts: {
   typeFilter?: string;
+  statusFilter?: string;
   offset?: number;
   limit?: number;
 } = {}): Promise<void> {
   episodesStore.update((s) => ({ ...s, loading: true, error: null }));
 
+  const statusFilter = opts.statusFilter ?? 'active';
   const params = new URLSearchParams();
-  params.set('status', 'active');
+  params.set('status', statusFilter);
   params.set('limit',  String(opts.limit  ?? 50));
   params.set('offset', String(opts.offset ?? 0));
   if (opts.typeFilter) params.set('episode_type', opts.typeFilter);
@@ -96,11 +100,12 @@ export async function loadEpisodes(opts: {
 
     episodesStore.update((s) => ({
       ...s,
-      loading:  false,
-      episodes: data.episodes,
-      total:    data.total,
-      offset:   data.offset,
-      limit:    data.limit,
+      loading:      false,
+      episodes:     data.episodes,
+      total:        data.total,
+      offset:       data.offset,
+      limit:        data.limit,
+      statusFilter,
     }));
   } catch (err) {
     episodesStore.update((s) => ({
@@ -113,4 +118,47 @@ export async function loadEpisodes(opts: {
 
 export function resetEpisodes(): void {
   episodesStore.set(_initial);
+}
+
+// ---------------------------------------------------------------------------
+// Pending count — independent of episodesStore's currently-applied filter.
+// Feeds both the Memory tab's own "Pending (N)" chip and the Sidebar badge,
+// so it must stay decoupled from whatever filter the tab currently shows.
+// ---------------------------------------------------------------------------
+
+export const pendingCount = writable<number>(0);
+
+export async function refreshPendingCount(): Promise<void> {
+  const params = new URLSearchParams();
+  params.set('status', 'pending');
+  params.set('limit', '1');   // only `total` is needed, not the row data
+
+  try {
+    const res = await fetch(`/api/memory/episodes?${params}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data: { total: number } = await res.json();
+    pendingCount.set(data.total);
+  } catch {
+    // Non-fatal — a badge count isn't worth its own error UI. Leave the
+    // previous value in place rather than resetting to 0 on a transient
+    // network blip.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Approve / reject — write-approval gate actions
+// ---------------------------------------------------------------------------
+
+export async function approveEpisode(id: number): Promise<boolean> {
+  const res = await fetch(`/api/memory/episodes/${id}/approve`, { method: 'POST' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data: { episode_id: number; status: string; updated: boolean } = await res.json();
+  return data.updated;
+}
+
+export async function rejectEpisode(id: number): Promise<boolean> {
+  const res = await fetch(`/api/memory/episodes/${id}/reject`, { method: 'POST' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data: { episode_id: number; status: string; updated: boolean } = await res.json();
+  return data.updated;
 }

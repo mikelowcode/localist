@@ -1,7 +1,9 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
   import { startNewConversation } from '$lib/stores/conversation';
+  import { pendingCount, refreshPendingCount } from '$lib/stores/episodes';
 
   interface NavItem {
     href: string;
@@ -67,6 +69,12 @@
     await goto(`/conversation/${id}`);
     loadConversations();
   }
+
+  // Populates the Memory nav badge on initial app load, independent of
+  // whether the user has ever opened the Memory tab this session.
+  onMount(() => {
+    refreshPendingCount();
+  });
 </script>
 
 <aside class="sidebar" aria-label="Main navigation">
@@ -113,6 +121,9 @@
               {/if}
             </span>
             <span class="nav-label">{item.label}</span>
+            {#if item.label === 'Memory' && $pendingCount > 0}
+              <span class="badge badge-warning nav-badge">{$pendingCount}</span>
+            {/if}
             {#if isActive}
               <span class="active-bar" aria-hidden="true" />
             {/if}
@@ -279,6 +290,12 @@
 
   .nav-label {
     flex: 1;
+  }
+
+  .nav-badge {
+    flex-shrink: 0;
+    padding: 1px 6px;
+    font-size: 10px;
   }
 
   /* Conversation sub-list */

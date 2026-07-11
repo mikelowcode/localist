@@ -3,6 +3,10 @@
   import {
     episodesStore,
     loadEpisodes,
+    pendingCount,
+    refreshPendingCount,
+    approveEpisode,
+    rejectEpisode,
     EPISODE_TYPES,
     TYPE_LABELS,
     TYPE_COLORS,
@@ -15,10 +19,21 @@
   $: error     = state.error;
 
   let typeFilter = '';
+  let statusFilter = 'active';
 
+  // Type chips (All | Preference | ...) always operate within the "active"
+  // status — their pre-existing meaning is unchanged. Pending is a separate
+  // filter dimension (see applyPendingFilter) with its own toggle.
   function applyFilter(type: string) {
     typeFilter = type;
-    loadEpisodes({ typeFilter: type, offset: 0 });
+    statusFilter = 'active';
+    loadEpisodes({ typeFilter: type, statusFilter: 'active', offset: 0 });
+  }
+
+  function applyPendingFilter() {
+    typeFilter = '';
+    statusFilter = 'pending';
+    loadEpisodes({ typeFilter: '', statusFilter: 'pending', offset: 0 });
   }
 
   function formatDate(ts: number): string {
@@ -36,8 +51,54 @@
     return `background:${col.bg};color:${col.color};border-color:${col.border};`;
   }
 
+  // Per-card approve/reject in-flight + error state, keyed by episode id.
+  // Kept local rather than on episodesStore — a failed action on one card
+  // must not disturb the rest of the list. `action` records which button
+  // was clicked so only that button's label changes to the "…ing" form
+  // while busy (both buttons are disabled either way).
+  interface ActionState { busy: boolean; action: 'approve' | 'reject' | null; error: string | null; }
+  let actionState: Record<number, ActionState> = {};
+
+  async function runAction(
+    ep: EpisodeItem,
+    action: 'approve' | 'reject',
+    call: (id: number) => Promise<boolean>,
+  ) {
+    actionState = { ...actionState, [ep.id]: { busy: true, action, error: null } };
+    try {
+      const updated = await call(ep.id);
+      if (!updated) {
+        actionState = {
+          ...actionState,
+          [ep.id]: { busy: false, action: null, error: `Could not ${action} — try refreshing.` },
+        };
+        return;
+      }
+      // Optimistic local removal — no longer pending, so if the Pending
+      // filter is active it should disappear immediately rather than
+      // waiting on a full loadEpisodes() round-trip.
+      episodesStore.update((s) => ({
+        ...s,
+        episodes: s.episodes.filter((e) => e.id !== ep.id),
+      }));
+      refreshPendingCount();
+    } catch (err) {
+      actionState = {
+        ...actionState,
+        [ep.id]: {
+          busy: false, action: null,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      };
+    }
+  }
+
+  const handleApprove = (ep: EpisodeItem) => runAction(ep, 'approve', approveEpisode);
+  const handleReject  = (ep: EpisodeItem) => runAction(ep, 'reject', rejectEpisode);
+
   onMount(() => {
     loadEpisodes({ typeFilter: '' });
+    refreshPendingCount();
   });
 </script>
 
@@ -47,7 +108,7 @@
     <h2 class="panel-title">Episodic Memory</h2>
     <button
       class="refresh-btn"
-      on:click={() => loadEpisodes({ typeFilter, offset: 0 })}
+      on:click={() => loadEpisodes({ typeFilter, statusFilter, offset: 0 })}
       disabled={loading}
       aria-label="Refresh episodes"
       title="Refresh"
@@ -66,17 +127,23 @@
   <div class="filter-row">
     <button
       class="filter-chip"
-      class:active={typeFilter === ''}
+      class:active={statusFilter === 'active' && typeFilter === ''}
       on:click={() => applyFilter('')}
     >All</button>
     {#each EPISODE_TYPES as type}
       <button
         class="filter-chip"
-        class:active={typeFilter === type}
-        style={typeFilter === type ? chipStyle(type) : ''}
+        class:active={statusFilter === 'active' && typeFilter === type}
+        style={statusFilter === 'active' && typeFilter === type ? chipStyle(type) : ''}
         on:click={() => applyFilter(type)}
       >{TYPE_LABELS[type]}</button>
     {/each}
+    <span class="filter-separator" aria-hidden="true" />
+    <button
+      class="filter-chip filter-chip-pending"
+      class:active={statusFilter === 'pending'}
+      on:click={applyPendingFilter}
+    >Pending ({$pendingCount})</button>
   </div>
 
   <!-- Content -->
@@ -128,6 +195,23 @@
               via {ep.source}
             </span>
           </div>
+          {#if ep.status === 'pending'}
+            <div class="episode-actions">
+              <button
+                class="episode-action-btn episode-action-approve"
+                on:click={() => handleApprove(ep)}
+                disabled={actionState[ep.id]?.busy}
+              >{actionState[ep.id]?.action === 'approve' ? 'Approving…' : 'Approve'}</button>
+              <button
+                class="episode-action-btn episode-action-reject"
+                on:click={() => handleReject(ep)}
+                disabled={actionState[ep.id]?.busy}
+              >{actionState[ep.id]?.action === 'reject' ? 'Rejecting…' : 'Reject'}</button>
+            </div>
+            {#if actionState[ep.id]?.error}
+              <p class="episode-action-error">{actionState[ep.id]?.error}</p>
+            {/if}
+          {/if}
         </div>
       {/each}
     {/if}
@@ -208,6 +292,24 @@
     color: var(--text-primary);
     border-color: var(--accent-mid);
     background: var(--accent-dim);
+  }
+
+  /* Vertical divider between the type-filter chips and the Pending toggle —
+     they're different filter dimensions (type vs. status), not more items
+     in the same row of choices. */
+  .filter-separator {
+    align-self: stretch;
+    width: 1px;
+    margin: 0 var(--sp-1);
+    background: var(--border-soft);
+  }
+
+  /* Pending uses warning (amber) rather than accent — it's the one chip
+     that means "needs your review", distinct from the neutral type chips. */
+  .filter-chip-pending.active {
+    color: var(--warning);
+    border-color: var(--warning);
+    background: var(--warning-dim);
   }
 
   /* Episode list */
@@ -306,5 +408,44 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     max-width: 180px;
+  }
+
+  /* Pending-card approve/reject actions */
+  .episode-actions {
+    display: flex;
+    gap: var(--sp-2);
+  }
+
+  .episode-action-btn {
+    font-size: var(--text-xs);
+    font-weight: 500;
+    font-family: inherit;
+    padding: var(--sp-1) var(--sp-3);
+    border-radius: var(--radius);
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease), opacity var(--dur-fast) var(--ease);
+  }
+  .episode-action-btn:disabled { opacity: 0.5; cursor: default; }
+
+  .episode-action-approve {
+    background: var(--success-dim);
+    color: var(--success);
+    border-color: var(--success-dim);
+  }
+  .episode-action-approve:hover:not(:disabled) { background: #3ecf8e33; }
+
+  .episode-action-reject {
+    background: var(--error-dim);
+    color: var(--error);
+    border-color: var(--error-dim);
+  }
+  .episode-action-reject:hover:not(:disabled) { background: #e0525233; }
+
+  .episode-action-error {
+    font-size: var(--text-xs);
+    font-family: var(--font-mono);
+    color: var(--error);
+    margin: 0;
   }
 </style>

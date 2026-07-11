@@ -96,6 +96,7 @@ Copy `backend/.env.example` to `backend/.env` and set values as needed. The only
 | `LOCALIST_EMBEDDING_ENGINE_ENABLED` | `true` | Enable local embedding engine for RAG |
 | `LOCALIST_WIKI_DIR` | `./wiki` | Path to wiki document directory |
 | `LOCALIST_RAW_DIR` | `./raw` | Path to raw documents directory |
+| `LOCALIST_EPISODIC_WRITE_APPROVAL` | `false` | When `true`, `model_extracted` (implicit) episodes are staged with `status='pending'` instead of going live immediately, and must be approved or rejected via `POST /memory/episodes/{id}/approve`/`.../reject` before they're eligible for retrieval. Explicit ("remember that...") episodes are never gated. |
 
 ---
 
@@ -134,11 +135,21 @@ All tools are served over MCP (SSE transport) by the **localist-mcp** server (po
 
 Localist maintains two memory stores in SQLite:
 
-**Episodic memory** stores typed facts extracted from conversation — preferences, corrections, decisions, workflows, naming conventions, project facts, and task completions. Each episode has a subject, content, type, confidence score, and status. Supersession (updating rather than duplicating) is handled by matching on subject and type. Episodes are never hard-deleted; status transitions manage lifecycle.
+**Episodic memory** stores typed facts extracted from conversation — preferences, corrections, decisions, workflows, naming conventions, project facts, and task completions. Each episode has a subject, content, type, confidence score, and status (`pending` → `active` → `superseded`/`retracted`; episodes are never hard-deleted). Supersession (updating rather than duplicating) is handled by matching on subject and type, and only fires for `active` writes — a staged (`pending`) write never supersedes, or is superseded by, anything until it's approved.
 
 Extraction runs on two paths:
-- **Explicit**: the user says "remember that" or "my preference is" — the episode is stored immediately at confidence 1.0, subject derived from the normalized content string.
+- **Explicit**: the user says "remember that" or "my preference is" — the episode is stored immediately at confidence 1.0, `status='active'`, subject derived from the normalized content string. Explicit writes always bypass the write-approval gate below — that's already direct user consent.
 - **Implicit**: after every response, the controller checks whether the exchange contains memorable content and extracts an episode at confidence 0.6–0.9 if so.
+
+**Retrieval** uses three modes on `EpisodicMemoryReader`: `by_subject` (exact match), `by_recency` (type-filtered session priming — scoped to preference/correction/decision/workflow — cached per `project_context` on `ControllerAgent` and invalidated on the next write), and `by_similarity`/`best_match` (real cosine similarity against embeddings stored on every `insert()`, falling back to keyword overlap for un-embedded rows). `by_similarity` runs across every episode type, which is what makes `project_fact`/`task_completion`/`naming_convention` episodes reachable at all — `by_recency` alone never surfaces them.
+
+**Retraction** ("forget that...") resolves the target episode via `best_match()` — semantic similarity against the retraction phrase, not an exact string match against the stored `subject` — since a model-extracted retraction query rarely matches the original subject's wording verbatim. Falls back to an exact `(subject, episode_type)` match across all valid types when no embedding is available.
+
+**Content safety**: every `insert()` scans `subject` and `content` through `content_safety.py` — a lightweight, non-ML pattern matcher for prompt-injection phrases, credential/secret-looking text, and invisible Unicode — before writing. Flagged content is rejected and logged rather than stored, since episode content is replayed back into every future prompt.
+
+**Write-approval gate** (`LOCALIST_EPISODIC_WRITE_APPROVAL`, default off): when enabled, implicit (`model_extracted`) episodes are staged with `status='pending'` instead of going live immediately. `POST /memory/episodes/{id}/approve` or `.../reject` resolves them; only `active` episodes are retrievable or appear in `MEMORY.md`. The Localist UI Memory tab surfaces a "Pending (N)" filter with inline Approve/Reject actions and a sidebar badge, so pending items are visible without opening the tab.
+
+A human-readable snapshot of active episodic memory auto-regenerates at `wiki/MEMORY.md` on every write — one scrollable file, grouped by date, showing type, confidence, project context, source, and content. `backfill_episode_embeddings.py` is a one-off script for embedding pre-existing episode rows and rebuilding `MEMORY.md` for data written before embedding support existed.
 
 **Corpus (RAG)** stores vector embeddings of wiki pages and ingested documents. `ConversationalAgent` queries the corpus when `fetch_rag=True` in the routing plan and injects matching passages into the prompt. Embeddings use `mlx-community/embeddinggemma-300m-4bit` (768-dimensional, local).
 
@@ -179,6 +190,8 @@ localist/
 │   ├── mcp_tool_dispatcher.py       # Opens an MCP/SSE session to localist-mcp and dispatches web_search, url_fetch, file_op
 │   ├── memory_manager.py            # SQLite-backed episodic + RAG memory interface
 │   ├── episodic_extractor.py        # Explicit and implicit episode extraction pipeline
+│   ├── content_safety.py            # Pattern-based scanner (prompt injection / credentials / invisible Unicode) run before every episode write
+│   ├── backfill_episode_embeddings.py  # One-off: embeds pre-existing episode rows, rebuilds wiki/MEMORY.md
 │   ├── embedding_engine.py          # Local mlx embedding engine (768-dim)
 │   ├── omlx_runtime_client.py       # oMLX HTTP transport (OpenAI-compatible)
 │   ├── ollama_runtime_client.py     # Ollama HTTP transport (native /api/chat, NDJSON streaming); also serves Ollama Cloud models
@@ -193,16 +206,20 @@ localist/
 │   │   ├── lora-persona.md          # LORA persona — loaded into Slot 1b of every prompt
 │   │   ├── users/
 │   │   │   └── michael.md           # User profile — line-level embeddings, Slot 3b injection
+│   │   ├── MEMORY.md                # Auto-regenerated human-readable snapshot of active episodic memory
 │   │   └── *.md                     # Indexed wiki pages
 │   ├── tests/
 │   │   ├── test_planner_phase3.py   # Planner routing unit tests
 │   │   ├── test_controller_phase4.py # ControllerAgent integration tests
+│   │   ├── test_memory_phase1.py    # Episodic memory substrate: writer/reader lifecycle, similarity retrieval, write-approval gate, content safety
 │   │   ├── test_episodic_phase5.py  # Episodic memory extraction tests
+│   │   ├── test_content_safety.py   # content_safety.py pattern coverage
+│   │   ├── test_main_memory_episodes.py  # GET/POST /memory/episodes REST endpoint tests
 │   │   ├── test_tool_dispatcher_phase6.py  # MCPToolDispatcher unit tests (web_search, url_fetch, file_op)
 │   │   ├── test_integration_phase7.py      # Full pipeline integration tests
 │   │   ├── test_mcp_server.py       # localist-mcp server tests — file_ops, fetch_url, web_search tools
 │   │   └── test_mcp_tool_dispatcher.py     # MCPToolDispatcher session/dispatch tests
-│   ├── lora_memory.db               # SQLite database (episodic + embeddings)
+│   ├── localist_memory.db           # SQLite database (episodic + embeddings)
 │   ├── requirements.txt
 │   └── .env                         # Local configuration (not committed)
 └── localist-ui/                     # Localist UI
@@ -221,11 +238,14 @@ python -m pytest tests/ -v
 ```
 
 Tests are organized by phase and cover each layer independently:
+- **Phase 1** (`test_memory_phase1.py`) — episodic memory substrate: writer/reader lifecycle, all three retrieval modes, cosine-similarity scoring, write-approval gate (`pending`/`approve`/`reject`), content safety scanning
 - **Phase 3** (`test_planner_phase3.py`) — routing rule engine, all priority levels
-- **Phase 4** (`test_controller_phase4.py`) — controller dispatch, RAG injection, prompt assembly
-- **Phase 5** (`test_episodic_phase5.py`) — episodic extraction, supersession, confidence scoring
+- **Phase 4** (`test_controller_phase4.py`) — controller dispatch, RAG injection, prompt assembly, `by_recency()` cache invalidation
+- **Phase 5** (`test_episodic_phase5.py`) — episodic extraction, supersession, confidence scoring, semantic-match retraction
 - **Phase 6** (`test_tool_dispatcher_phase6.py`) — MCPToolDispatcher: LangSearch integration, file ops, url_fetch
 - **Phase 7** (`test_integration_phase7.py`) — full pipeline from instruction to response
+- Content safety (`test_content_safety.py`) — `content_safety.py` pattern coverage (prompt injection, credentials, invisible Unicode)
+- Memory REST API (`test_main_memory_episodes.py`) — `GET`/`POST /memory/episodes` endpoints, including approve/reject
 - MCP migration (`test_mcp_server.py`, `test_mcp_tool_dispatcher.py`) — localist-mcp server tools and dispatcher session handling, covering the retired Fetcher microservice and legacy ToolDispatcher's replacement
 
 All tests use mocks for inference and SQLite; no oMLX server or live API keys are required.
@@ -269,7 +289,22 @@ All tests use mocks for inference and SQLite; no oMLX server or live API keys ar
   with no rollback mechanism for any write (diff or ingest) — candidate fixes
   not yet scoped; a bullet/diff-marker collision on unchanged context lines
   fails safely (409) but isn't generalized-away yet
-- **Localist UI redesign** — functional but minimal; planned rework for
-  memory inspection, episode browsing, and tool result display
+- **Episodic memory hardening** — ✅ `by_similarity()`/`best_match()` now
+  do real cosine retrieval against stored embeddings instead of a
+  keyword-only path that was never actually wired into live retrieval;
+  `by_recency()` results cached per `project_context` on `ControllerAgent`
+  and invalidated on the next write; retraction resolves the target
+  episode by semantic match (`best_match()`, precise `retract_by_id()`)
+  instead of an exact subject string, with a keyword-only fallback; every
+  `insert()` is scanned by `content_safety.py` for prompt-injection,
+  credential-looking, and invisible-Unicode content before being stored;
+  `wiki/MEMORY.md` auto-regenerates a human-readable snapshot on every
+  write; `LOCALIST_EPISODIC_WRITE_APPROVAL` stages implicit
+  (`model_extracted`) writes behind a pending → approve/reject step
+  (`POST /memory/episodes/{id}/approve|reject`), live-verified end to end
+- **Localist UI redesign** — Memory tab now supports a "Pending" filter
+  with inline Approve/Reject actions and a sidebar notification badge
+  (see Episodic memory hardening above); broader rework for general
+  episode browsing and tool result display still open
 - **macOS app packaging** — bundle as a native `.app` via PyInstaller +
   Tauri so Localist Framework can run without a terminal

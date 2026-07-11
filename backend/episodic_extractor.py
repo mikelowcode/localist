@@ -33,9 +33,10 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
-from memory_manager import EpisodicMemoryWriter, WorkingStateStore, WorkingStateRecord, VALID_EPISODE_TYPES
+from memory_manager import EpisodicMemoryWriter, EpisodicMemoryReader, WorkingStateStore, WorkingStateRecord, VALID_EPISODE_TYPES
 from prompt_builder import PromptBuilder
 
 logger = logging.getLogger(__name__)
@@ -258,7 +259,10 @@ def detect_explicit_signal(instruction: str) -> ExtractionSignal | None:
                 "detect_explicit_signal: retraction matched %r.", phrase
             )
             return ExtractionSignal(
-                episode_type   = "preference",   # placeholder; retract() ignores type
+                # Placeholder — never read downstream. process_explicit_signal()'s
+                # retraction branch loops over VALID_EPISODE_TYPES instead of
+                # trusting a single guessed type, so this value has no effect.
+                episode_type   = "preference",
                 is_retraction  = True,
                 trigger_phrase = phrase,
             )
@@ -558,6 +562,8 @@ def process_explicit_signal(
     db_path:         Any,   # Path
     task_id:         str | None = None,
     project_context: str        = "general",
+    embed_fn:        "Callable[[str], list[float]] | None" = None,
+    memory_md_path:  "Path | None" = None,
 ) -> ExtractionResult | None:
     """
     Full explicit extraction pipeline: detect → extract → write → return.
@@ -582,6 +588,14 @@ def process_explicit_signal(
         Optional task_id for provenance.
     project_context :
         Project scope for retrieval. Defaults to "general".
+    embed_fn :
+        Optional embedding function forwarded to EpisodicMemoryWriter so the
+        new episode is embedded for later cosine-based recall via
+        EpisodicMemoryReader.by_similarity(). None keeps the previous
+        keyword-only behaviour.
+    memory_md_path :
+        Optional path forwarded to EpisodicMemoryWriter so the human-readable
+        MEMORY.md snapshot is regenerated after this write.
 
     Returns
     -------
@@ -592,13 +606,14 @@ def process_explicit_signal(
     if signal is None:
         return None
 
-    writer = EpisodicMemoryWriter(db_path=db_path)
+    writer = EpisodicMemoryWriter(
+        db_path=db_path, embed_fn=embed_fn, memory_md_path=memory_md_path,
+    )
 
     # Retraction path
-    # Use the model to extract the subject being retracted so that
-    # writer.retract() (which does exact subject matching) can find the
-    # previously stored record. Fall back to the instruction text if the
-    # model returns NONE or inference fails.
+    # Use the model to extract the subject being retracted so that the
+    # semantic match below has clean query text. Fall back to the raw
+    # instruction if the model returns NONE or inference fails.
     if signal.is_retraction:
         extracted_subject, _ = extract_content_from_instruction(
             instruction  = instruction,
@@ -606,11 +621,52 @@ def process_explicit_signal(
             runtime      = runtime,
         )
         subject = (extracted_subject or instruction.strip())[:80]
-        count = writer.retract(subject=subject, episode_type="preference")
-        logger.info(
-            "process_explicit_signal: retraction — %d record(s) retracted "
-            "for subject=%r.", count, subject,
-        )
+
+        # Semantic-match retraction: exact string matching against `subject`
+        # (a truncated, model-normalized content string set at insert time)
+        # is fragile — the retraction phrase's extracted wording rarely
+        # matches the original verbatim. best_match() finds the single
+        # closest active episode by cosine similarity (falling back to
+        # keyword overlap when no embed_fn is available), so retraction
+        # still works when the wording differs completely — e.g. "forget
+        # what I said about search engines" vs. a stored subject of "The
+        # user prefers Brave Search over LangSearch." min_score=0.55 is
+        # intentionally more conservative than the 0.45 thresholds used for
+        # recall elsewhere (_score_profile_facts, the episodic
+        # semantic-recall merge in controller_agent.py) — a false-positive
+        # retraction silently destroys the wrong memory, whereas a
+        # false-negative in recall is just a miss.
+        reader = EpisodicMemoryReader(db_path=db_path, embed_fn=embed_fn)
+        match = reader.best_match(subject, min_score=0.55)
+
+        if match is not None:
+            score, record = match
+            count = writer.retract_by_id(record.id)
+            logger.info(
+                "process_explicit_signal: semantic retraction matched "
+                "episode id=%d subject=%r type=%r score=%.3f — "
+                "%d record(s) retracted.",
+                record.id, record.subject, record.episode_type, score, count,
+            )
+        else:
+            logger.warning(
+                "process_explicit_signal: semantic retraction found no "
+                "match above threshold for query=%r — falling back to "
+                "exact (subject, episode_type) match across all valid "
+                "types.", subject,
+            )
+            # retract() is a no-op UPDATE when (subject, episode_type)
+            # doesn't match an active row, so trying every valid type is
+            # safe. At most one type can be active for a given subject at a
+            # time (insert()'s supersede-on-conflict logic), so this can
+            # never retract more than one episode per subject.
+            count = 0
+            for episode_type in VALID_EPISODE_TYPES:
+                count += writer.retract(subject=subject, episode_type=episode_type)
+            logger.info(
+                "process_explicit_signal: fallback retraction — %d "
+                "record(s) retracted for subject=%r.", count, subject,
+            )
         return None
 
     # Content extraction
@@ -628,7 +684,7 @@ def process_explicit_signal(
     # Falls back to the raw instruction if content is unexpectedly empty.
     subject = (content[:80] if content else instruction.strip()[:80])
 
-    writer.insert(
+    row_id = writer.insert(
         episode_type    = signal.episode_type,
         subject         = subject,
         content         = content,
@@ -637,6 +693,16 @@ def process_explicit_signal(
         task_id         = task_id,
         project_context = project_context,
     )
+    if row_id is None:
+        # Rejected by content_safety.scan_content() — insert() already
+        # logged the matched category at WARNING. Degrade to "nothing was
+        # remembered" rather than raising, same as the other no-op paths
+        # in this function (no signal, model said NONE).
+        logger.info(
+            "process_explicit_signal: episode rejected by content safety "
+            "scanner — subject=%r not written.", subject,
+        )
+        return None
 
     logger.info(
         "process_explicit_signal: wrote %s episode (confidence=1.0) "
@@ -655,12 +721,15 @@ def process_explicit_signal(
 
 
 def process_implicit_extraction(
-    instruction:     str,
-    response:        str,
-    runtime:         Any,
-    db_path:         Any,   # Path
-    task_id:         str | None = None,
-    project_context: str        = "general",
+    instruction:      str,
+    response:         str,
+    runtime:          Any,
+    db_path:          Any,   # Path
+    task_id:          str | None = None,
+    project_context:  str        = "general",
+    embed_fn:         "Callable[[str], list[float]] | None" = None,
+    memory_md_path:   "Path | None" = None,
+    require_approval: bool = False,
 ) -> ExtractionResult | None:
     """
     Full implicit extraction pipeline: extract from turn pair → write → return.
@@ -685,6 +754,26 @@ def process_implicit_extraction(
         Optional task_id for provenance.
     project_context :
         Project scope. Defaults to "general".
+    embed_fn :
+        Optional embedding function forwarded to EpisodicMemoryWriter — see
+        process_explicit_signal() for the full rationale. This is the path
+        that writes the "project_fact" / "task_completion" / etc. episodes
+        seen in the Memory UI tab, so it is the path that most needs
+        embeddings in order to be recalled later by by_similarity().
+    memory_md_path :
+        Optional path forwarded to EpisodicMemoryWriter for the MEMORY.md
+        snapshot regeneration.
+    require_approval :
+        When True (LOCALIST_EPISODIC_WRITE_APPROVAL), the episode is
+        written with initial_status="pending" instead of going live
+        immediately — it must be approved via
+        EpisodicMemoryWriter.approve() (e.g. through the
+        POST /memory/episodes/{id}/approve endpoint) before it's eligible
+        for by_recency()/by_similarity() or appears in MEMORY.md. Mirrors
+        Hermes Agent's write_approval setting, scoped to model_extracted
+        writes only — explicit user-said "remember that..." episodes
+        (process_explicit_signal()) are never gated, since that's already
+        direct user consent. Defaults to False (unchanged behaviour).
 
     Returns
     -------
@@ -705,8 +794,11 @@ def process_implicit_extraction(
 
     subject = content[:80]
 
-    writer = EpisodicMemoryWriter(db_path=db_path)
-    writer.insert(
+    writer = EpisodicMemoryWriter(
+        db_path=db_path, embed_fn=embed_fn, memory_md_path=memory_md_path,
+    )
+    initial_status = "pending" if require_approval else "active"
+    row_id = writer.insert(
         episode_type    = episode_type,
         subject         = subject,
         content         = content,
@@ -714,13 +806,34 @@ def process_implicit_extraction(
         confidence      = confidence,
         task_id         = task_id,
         project_context = project_context,
+        initial_status  = initial_status,
     )
+    if row_id is None:
+        # Rejected by content_safety.scan_content() — insert() already
+        # logged the matched category at WARNING. This is the path that
+        # extracts from raw, unreviewed turn text (user instruction +
+        # agent response), so it's the most exposed to a fetched page or
+        # adversarial input getting paraphrased into something injection-
+        # or credential-shaped. Degrade to "nothing was remembered" rather
+        # than raising.
+        logger.info(
+            "process_implicit_extraction: episode rejected by content "
+            "safety scanner — subject=%r not written.", subject,
+        )
+        return None
 
-    logger.info(
-        "process_implicit_extraction: wrote %s episode "
-        "(confidence=%.2f) subject=%r.",
-        episode_type, confidence, subject,
-    )
+    if require_approval:
+        logger.info(
+            "process_implicit_extraction: staged %s episode for approval "
+            "(confidence=%.2f) subject=%r.",
+            episode_type, confidence, subject,
+        )
+    else:
+        logger.info(
+            "process_implicit_extraction: wrote %s episode "
+            "(confidence=%.2f) subject=%r.",
+            episode_type, confidence, subject,
+        )
 
     return ExtractionResult(
         episode_type    = episode_type,

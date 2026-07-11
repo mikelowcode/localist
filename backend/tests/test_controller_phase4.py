@@ -45,6 +45,7 @@ from memory_manager import (
     EpisodicMemoryReader,
     GraphEdgeResult,
 )
+from episodic_extractor import ExtractionResult
 from planner import RoutingPlan
 from prompt_builder import PromptBuilder, WorkingMemoryState, ToolResult as _ToolResult
 from wiki_doc import load_wiki_doc, ParsedWikiDoc
@@ -466,6 +467,97 @@ class TestEpisodicRetrievalPath:
 
         routing = conv._received[0].context["_routing"]
         assert routing["fetch_episodic"] is True
+
+
+# ---------------------------------------------------------------------------
+# Recency cache (by_recency() cached per project_context, invalidated on write)
+# ---------------------------------------------------------------------------
+
+class TestRecencyCache:
+    """
+    ControllerAgent._recency_cache — by_recency() depends only on
+    project_context (not the instruction), so its result is reused across
+    consecutive fetch_episodic turns until an episodic write invalidates
+    the cache. RoutingPlans are injected directly via patch.object on
+    ctrl._planner.route (same pattern as TestGraphQueryFetch) so each
+    turn's fetch_episodic/write_episode flags are precise and don't depend
+    on real Planner keyword routing.
+    """
+
+    @staticmethod
+    def _episodic_plan() -> RoutingPlan:
+        return RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = True,
+            fetch_rag      = False,
+            write_episode  = False,
+            priority       = 5,
+        )
+
+    @staticmethod
+    def _write_plan() -> RoutingPlan:
+        return RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = False,
+            write_episode  = True,
+            priority       = 2,
+        )
+
+    def test_by_recency_reused_across_turns_without_write(self, db_path, mm):
+        rt   = make_runtime(infer_return="Test answer.")
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = self._episodic_plan()
+
+        # process_implicit_extraction is pinned to None here — the post-
+        # response implicit hook runs on every turn where write_episode is
+        # False (real code, not part of what this test targets), and
+        # "my preferences" incidentally substring-matches the implicit
+        # signal gate's "my preference" trigger. Left unpatched, the real
+        # pipeline would write a genuine (if spurious) episode and clear
+        # the cache as a side effect, defeating the point of this test.
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch.object(EpisodicMemoryReader, "by_recency", return_value=[]) as by_recency_mock, \
+             patch("controller_agent.process_implicit_extraction", return_value=None):
+            ctrl.handle_task({"instruction": "What are my preferences?"})
+            ctrl.handle_task({"instruction": "Remind me of my preferences again."})
+
+        # Second turn is a cache hit — by_recency() must not run again.
+        assert by_recency_mock.call_count == 1
+
+    def test_by_recency_requeried_after_write_invalidates_cache(self, db_path, mm):
+        rt   = make_runtime(infer_return="Test answer.")
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        episodic_plan = self._episodic_plan()
+        write_plan    = self._write_plan()
+        extraction    = ExtractionResult(
+            episode_type = "preference",
+            subject      = "output format",
+            content      = "User prefers step-by-step instructions.",
+            source       = "explicit",
+            confidence   = 1.0,
+        )
+
+        with patch.object(
+            ctrl._planner, "route",
+            side_effect=[episodic_plan, write_plan, episodic_plan],
+        ), patch.object(
+            EpisodicMemoryReader, "by_recency", return_value=[],
+        ) as by_recency_mock, patch(
+            "controller_agent.process_explicit_signal", return_value=extraction,
+        ), patch(
+            "controller_agent.process_implicit_extraction", return_value=None,
+        ):
+            ctrl.handle_task({"instruction": "What are my preferences?"})
+            ctrl.handle_task({"instruction": "remember that I prefer step-by-step instructions"})
+            ctrl.handle_task({"instruction": "What are my preferences now?"})
+
+        # Turn 1: cache miss (queried, cached). Turn 2: write invalidates
+        # the cache (fetch_episodic=False, so by_recency isn't called this
+        # turn regardless). Turn 3: cache miss again — must re-query.
+        assert by_recency_mock.call_count == 2
 
 
 # ---------------------------------------------------------------------------

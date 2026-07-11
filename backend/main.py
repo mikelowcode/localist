@@ -118,10 +118,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from base_runtime_client import BaseRuntimeClient
 from build_graph import build_graph
-from controller_agent import ControllerAgent, TaskStatus
+from controller_agent import ControllerAgent, TaskStatus, _MEMORY_MD_PATH
 from conversational_agent import ConversationalAgent
 from embedding_engine import EmbeddingEngine
-from memory_manager import MemoryManager
+from memory_manager import MemoryManager, EpisodicMemoryWriter
 from runtime_factory import create_runtime
 import session_files
 import wiki_maintenance_log
@@ -175,6 +175,13 @@ class Settings(BaseSettings):
 
     # Agent behaviour
     auto_apply:      bool = False
+
+    # Episodic memory — write-approval gate for model_extracted (implicit)
+    # episodes. When True, those writes are staged as "pending" instead of
+    # going live immediately, and must be approved via
+    # POST /memory/episodes/{id}/approve (or rejected via .../reject).
+    # Explicit (user-said "remember that...") episodes are never gated.
+    episodic_write_approval: bool = False
 
     # Logging
     log_level:       str = "INFO"
@@ -381,11 +388,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # -- Controller ----------------------------------------------------------
 
+    logger.info(
+        "Episodic write-approval gate: %s",
+        "ON" if settings.episodic_write_approval else "OFF",
+    )
+
     controller = ControllerAgent(
-        runtime        = runtime,
-        agents         = [wiki_agent, conversational_agent],
-        memory_manager = memory_manager,
-        embed_fn       = embed_fn,
+        runtime                 = runtime,
+        agents                  = [wiki_agent, conversational_agent],
+        memory_manager          = memory_manager,
+        embed_fn                = embed_fn,
+        episodic_write_approval = settings.episodic_write_approval,
     )
     _state.controller = controller
     _run_cache_warmup(controller, runtime, templates_dir)
@@ -507,6 +520,19 @@ class EpisodesResponse(BaseModel):
     total:    int
     offset:   int
     limit:    int
+
+
+class EpisodeApprovalResponse(BaseModel):
+    """
+    Response body for POST /memory/episodes/{id}/approve and .../reject.
+
+    updated=False (rather than a 404/409) means the id doesn't exist or
+    wasn't in "pending" status (already resolved, or never staged) —
+    kept idempotent and simple for a single-user local app.
+    """
+    episode_id: int
+    status:     Literal["active", "retracted"]
+    updated:    bool
 
 
 class FileEntry(BaseModel):
@@ -883,7 +909,10 @@ async def get_memory_episodes(
 
     Query parameters
     ----------------
-    status          : "active" (default) | "retracted" | "all"
+    status          : "active" (default) | "pending" | "superseded" |
+                      "retracted" | "all". "pending" surfaces episodes
+                      staged by the episodic_write_approval gate awaiting
+                      POST /memory/episodes/{id}/approve or .../reject.
     project_context : filter by project context string
     episode_type    : filter by episode type
     limit           : max results (default 50, max 200)
@@ -901,12 +930,80 @@ async def get_memory_episodes(
         limit           = limit,
         offset          = offset,
     )
+    # Total is the full matching-row count (mm.count_episodes()), not
+    # len(rows) — the latter is silently capped by `limit` and would make
+    # e.g. ?status=pending&limit=1 (used for a pending-count badge) always
+    # report 0 or 1 regardless of how many pending episodes actually exist.
+    total: int = await asyncio.to_thread(
+        mm.count_episodes,
+        status          = status,
+        project_context = project_context,
+        episode_type    = episode_type,
+    )
 
     return EpisodesResponse(
         episodes = [EpisodeItem(**row) for row in rows],
-        total    = len(rows),
+        total    = total,
         offset   = offset,
         limit    = limit,
+    )
+
+
+@app.post(
+    "/memory/episodes/{episode_id}/approve",
+    response_model = EpisodeApprovalResponse,
+    summary        = "Approve a pending episode (write-approval gate)",
+)
+async def approve_memory_episode(episode_id: int) -> EpisodeApprovalResponse:
+    """
+    Transition a pending episode to active — the "yes" path of the
+    episodic_write_approval gate. Once active, the episode is eligible for
+    by_recency()/by_similarity() and appears in MEMORY.md immediately.
+
+    Idempotent: approving an id that's already active/retracted, or that
+    doesn't exist, returns updated=False rather than an error.
+    """
+    mm = _state.memory_manager
+    if mm is None:
+        raise HTTPException(status_code=503, detail="MemoryManager not initialised.")
+
+    writer = EpisodicMemoryWriter(
+        db_path=getattr(mm, "_db_path", None), memory_md_path=_MEMORY_MD_PATH,
+    )
+    count = await asyncio.to_thread(writer.approve, episode_id)
+    return EpisodeApprovalResponse(
+        episode_id = episode_id,
+        status     = "active",
+        updated    = count > 0,
+    )
+
+
+@app.post(
+    "/memory/episodes/{episode_id}/reject",
+    response_model = EpisodeApprovalResponse,
+    summary        = "Reject a pending episode (write-approval gate)",
+)
+async def reject_memory_episode(episode_id: int) -> EpisodeApprovalResponse:
+    """
+    Transition a pending episode to retracted — the "no" path of the
+    episodic_write_approval gate. A rejected episode never becomes live
+    memory.
+
+    Idempotent: rejecting an id that's already active/retracted, or that
+    doesn't exist, returns updated=False rather than an error.
+    """
+    mm = _state.memory_manager
+    if mm is None:
+        raise HTTPException(status_code=503, detail="MemoryManager not initialised.")
+
+    writer = EpisodicMemoryWriter(
+        db_path=getattr(mm, "_db_path", None), memory_md_path=_MEMORY_MD_PATH,
+    )
+    count = await asyncio.to_thread(writer.reject, episode_id)
+    return EpisodeApprovalResponse(
+        episode_id = episode_id,
+        status     = "retracted",
+        updated    = count > 0,
     )
 
 

@@ -127,6 +127,7 @@ Integration points
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import json
 import logging
@@ -139,6 +140,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+import content_safety
 import wiki_maintenance_log
 
 logger = logging.getLogger(__name__)
@@ -2173,6 +2175,51 @@ class MemoryManager:
 
         return [dict(row) for row in rows]
 
+    def count_episodes(
+        self,
+        status:          str = "active",
+        project_context: str | None = None,
+        episode_type:    str | None = None,
+    ) -> int:
+        """
+        Return the total count of episodes matching the same filters as
+        list_episodes(), ignoring limit/offset.
+
+        Exists because GET /memory/episodes's `total` field needs the true
+        matching-row count (e.g. for a pending-count badge that must show
+        the real number even when the caller only wants a 1-row page) —
+        list_episodes() alone can't provide that, since its result is
+        already sliced by LIMIT/OFFSET by the time it returns.
+
+        Parameters
+        ----------
+        status :
+            Filter by status column. "all" returns every status.
+        project_context :
+            Optional filter by project_context column.
+        episode_type :
+            Optional filter by episode_type column.
+        """
+        conditions = []
+        params: list = []
+
+        if status != "all":
+            conditions.append("status = ?")
+            params.append(status)
+        if project_context is not None:
+            conditions.append("project_context = ?")
+            params.append(project_context)
+        if episode_type is not None:
+            conditions.append("episode_type = ?")
+            params.append(episode_type)
+
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        sql = f"SELECT COUNT(*) FROM episodes {where}"
+
+        with sqlite3.connect(str(self._db_path), timeout=10.0) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return conn.execute(sql, params).fetchone()[0]
+
     def __repr__(self) -> str:
         return (
             f"MemoryManager("
@@ -2202,8 +2249,21 @@ VALID_SOURCES: frozenset[str] = frozenset({
     "model_extracted",
 })
 
+# Status lifecycle:
+#   pending   -> active     (EpisodicMemoryWriter.approve())
+#   pending   -> retracted  (EpisodicMemoryWriter.reject())
+#   active    -> superseded (insert() superseding an older same-subject row)
+#   active    -> retracted  (retract() / retract_by_id())
+# "pending" is a staged, not-yet-real episode written when a caller (e.g.
+# process_implicit_extraction() under episodic_write_approval) wants a
+# model-inferred write to wait for manual review before it becomes live
+# memory. All read paths (by_recency(), by_similarity(), best_match(),
+# _write_memory_md()) filter on `status = 'active'`, so pending rows are
+# excluded from retrieval/replay by construction — no separate filtering
+# needed there.
 VALID_STATUSES: frozenset[str] = frozenset({
     "active",
+    "pending",
     "superseded",
     "retracted",
 })
@@ -2230,18 +2290,40 @@ class EpisodicMemoryWriter:
     - The episodes table follows an immutable audit trail: records are never
       deleted. Status transitions (active → superseded, active → retracted)
       are the only mutations.
-    - Embeddings are not written here. The EpisodicMemoryReader handles
-      embedding population as a separate concern.
+    - When an ``embed_fn`` is supplied, every insert() embeds
+      "{subject}. {content}" and stores the resulting vector in the
+      `embedding` BLOB column so EpisodicMemoryReader.by_similarity() can
+      do real cosine matching. Embedding failures are logged and swallowed
+      — the row is still written with embedding=NULL and by_similarity()
+      falls back to keyword scoring for it.
+    - When ``memory_md_path`` is supplied, every insert()/retract() call
+      regenerates a human-readable Markdown snapshot of all active
+      episodes at that path (see _write_memory_md()).
 
     Parameters
     ----------
     db_path :
         Path to the SQLite file. Must be the same file used by MemoryManager.
+    embed_fn :
+        Optional ``Callable[[str], list[float]]`` (e.g. ``EmbeddingEngine.embed``).
+        When None, episodes are written without embeddings and
+        by_similarity() falls back to keyword-only scoring for them.
+    memory_md_path :
+        Optional path to a Markdown file that is regenerated after every
+        write so the user has a single scrollable, human-readable view of
+        active episodic memory. When None, no Markdown file is written.
     """
 
-    def __init__(self, db_path: Path | str) -> None:
-        self._db_path = Path(db_path)
-        self._lock    = threading.Lock()
+    def __init__(
+        self,
+        db_path:        Path | str,
+        embed_fn:       "Callable[[str], list[float]] | None" = None,
+        memory_md_path: Path | str | None = None,
+    ) -> None:
+        self._db_path       = Path(db_path)
+        self._lock          = threading.Lock()
+        self._embed_fn      = embed_fn
+        self._memory_md_path = Path(memory_md_path) if memory_md_path is not None else None
 
     # -----------------------------------------------------------------------
     # Internal helpers
@@ -2294,13 +2376,21 @@ class EpisodicMemoryWriter:
         task_id:         str | None = None,
         conversation_id: str | None = None,
         project_context: str | None = "general",
-    ) -> int:
+        initial_status:  str        = "active",
+    ) -> int | None:
         """
-        Insert a new active episode.
+        Insert a new episode, active by default.
 
         If an active record with the same (subject, episode_type) already
         exists, it is marked 'superseded' before the new record is inserted.
         Both records are retained for audit.
+
+        Before writing, `subject` and `content` are scanned by
+        content_safety.scan_content() — episodes are replayed back into
+        every future [EPISODIC MEMORY] prompt block and MEMORY.md, so
+        content matching a known threat pattern (prompt injection,
+        credential/secret-looking text, invisible Unicode) is rejected
+        rather than stored. See content_safety.py for the pattern list.
 
         Parameters
         ----------
@@ -2323,16 +2413,29 @@ class EpisodicMemoryWriter:
         project_context :
             Scope label (e.g. "general", "lora-app-demo"). Defaults to
             "general" so cross-project episodes are naturally grouped.
+        initial_status :
+            "active" (default) or "pending". "pending" stages the episode
+            for manual review (see EpisodicMemoryWriter.approve()/reject())
+            instead of making it live memory immediately — used by
+            process_implicit_extraction() when episodic_write_approval is
+            enabled. A pending insert does NOT supersede any existing
+            active row with the same (subject, episode_type): an unreviewed
+            model guess should never silently retire a confirmed fact.
+            Superseding happens only once the pending row is approved into
+            'active' status via a subsequent insert (or manually).
 
         Returns
         -------
-        int
-            The row id (``id`` column) of the newly inserted episode.
+        int | None
+            The row id (``id`` column) of the newly inserted episode, or
+            None if `subject`/`content` was rejected by the content safety
+            scanner and nothing was written.
 
         Raises
         ------
         ValueError
-            If episode_type or source is not in its respective valid set.
+            If episode_type, source, or initial_status is not in its
+            respective valid set.
         """
         if episode_type not in VALID_EPISODE_TYPES:
             raise ValueError(
@@ -2344,39 +2447,76 @@ class EpisodicMemoryWriter:
                 f"source {source!r} not in VALID_SOURCES. "
                 f"Valid: {sorted(VALID_SOURCES)}"
             )
+        if initial_status not in {"active", "pending"}:
+            raise ValueError(
+                f"initial_status {initial_status!r} not in {{'active', 'pending'}}."
+            )
         if not (0.0 <= confidence <= 1.0):
             raise ValueError(
                 f"confidence {confidence!r} out of range; must be in [0.0, 1.0]."
             )
 
+        flagged_category = content_safety.scan_content(subject) or content_safety.scan_content(content)
+        if flagged_category is not None:
+            logger.warning(
+                "insert: rejected by content safety scanner — "
+                "category=%r episode_type=%r source=%r.",
+                flagged_category, episode_type, source,
+            )
+            logger.debug(
+                "insert: rejected content — subject=%r content=%r.",
+                subject, content,
+            )
+            return None
+
         now = time.time()
+
+        embedding_blob: bytes | None = None
+        if self._embed_fn is not None:
+            try:
+                vector = self._embed_fn(f"{subject}. {content}")
+                embedding_blob = _pack_embedding(vector)
+            except Exception as exc:
+                logger.warning(
+                    "insert: embed_fn failed for subject=%r (%s) — "
+                    "storing without embedding.", subject, exc,
+                )
 
         with self._lock:
             conn = self._connect()
             try:
-                superseded = self._supersede_existing(conn, subject, episode_type)
-                if superseded:
-                    logger.debug(
-                        "insert: superseded %d existing episode(s) for subject=%r type=%r.",
-                        superseded, subject, episode_type,
-                    )
+                # A pending insert must not supersede an existing active
+                # row for the same (subject, episode_type) — see the
+                # initial_status docstring above. Supersession still runs
+                # for ordinary active inserts exactly as before.
+                if initial_status == "active":
+                    superseded = self._supersede_existing(conn, subject, episode_type)
+                    if superseded:
+                        logger.debug(
+                            "insert: superseded %d existing episode(s) for subject=%r type=%r.",
+                            superseded, subject, episode_type,
+                        )
                 cursor = conn.execute(
                     """
                     INSERT INTO episodes
                         (episode_type, subject, content, confidence, source,
                          task_id, conversation_id, project_context,
-                         status, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+                         status, created_at, embedding)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (episode_type, subject, content, confidence, source,
-                     task_id, conversation_id, project_context, now),
+                     task_id, conversation_id, project_context, initial_status,
+                     now, embedding_blob),
                 )
                 row_id = cursor.lastrowid
                 conn.commit()
                 logger.info(
-                    "insert: episode id=%d type=%r subject=%r source=%r.",
-                    row_id, episode_type, subject, source,
+                    "insert: episode id=%d type=%r subject=%r source=%r "
+                    "status=%r embedded=%s.",
+                    row_id, episode_type, subject, source, initial_status,
+                    embedding_blob is not None,
                 )
+                self._write_memory_md(conn)
                 return row_id
             finally:
                 conn.close()
@@ -2424,9 +2564,238 @@ class EpisodicMemoryWriter:
                     "retract: retracted %d episode(s) for subject=%r type=%r.",
                     count, subject, episode_type,
                 )
+                if count:
+                    self._write_memory_md(conn)
                 return count
             finally:
                 conn.close()
+
+    def retract_by_id(self, episode_id: int) -> int:
+        """
+        Mark a single active episode as retracted by primary key.
+
+        Retracting by id is strictly more precise than retract() (which
+        matches on (subject, episode_type) — subject being a truncated,
+        model-normalized content string, not a stable key). Intended for
+        the semantic-match retraction path in episodic_extractor.py, which
+        identifies the episode to retract via
+        EpisodicMemoryReader.best_match() rather than a string match, so
+        there is no ambiguity to resolve here — just retract the row that
+        was already identified as the best match.
+
+        Parameters
+        ----------
+        episode_id :
+            Primary key of the episode to retract.
+
+        Returns
+        -------
+        int
+            1 if a matching active record was retracted, 0 if the id does
+            not exist or is already inactive.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                cursor = conn.execute(
+                    """
+                    UPDATE episodes
+                    SET    status = 'retracted'
+                    WHERE  id     = ?
+                      AND  status = 'active'
+                    """,
+                    (episode_id,),
+                )
+                count = cursor.rowcount
+                conn.commit()
+                logger.info(
+                    "retract_by_id: retracted %d episode(s) for id=%d.",
+                    count, episode_id,
+                )
+                if count:
+                    self._write_memory_md(conn)
+                return count
+            finally:
+                conn.close()
+
+    def approve(self, episode_id: int) -> int:
+        """
+        Transition a pending episode to active — the write-approval gate's
+        "yes" path (see episodic_write_approval / process_implicit_
+        extraction()'s require_approval param). Once active, the episode is
+        real memory: it's eligible for by_recency()/by_similarity()/
+        best_match() and appears in MEMORY.md immediately.
+
+        Does not run _supersede_existing() — a pending row approved after
+        a newer active fact was written for the same (subject,
+        episode_type) can end up alongside it as a second active row; this
+        edge case is not resolved here (out of scope — see the write-
+        approval task notes).
+
+        Parameters
+        ----------
+        episode_id :
+            Primary key of the episode to approve.
+
+        Returns
+        -------
+        int
+            1 if a matching pending record was approved, 0 if the id does
+            not exist or is not currently pending (already approved,
+            rejected, or was never staged).
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                cursor = conn.execute(
+                    """
+                    UPDATE episodes
+                    SET    status = 'active'
+                    WHERE  id     = ?
+                      AND  status = 'pending'
+                    """,
+                    (episode_id,),
+                )
+                count = cursor.rowcount
+                conn.commit()
+                logger.info(
+                    "approve: approved %d episode(s) for id=%d.",
+                    count, episode_id,
+                )
+                if count:
+                    self._write_memory_md(conn)
+                return count
+            finally:
+                conn.close()
+
+    def reject(self, episode_id: int) -> int:
+        """
+        Transition a pending episode to retracted — the write-approval
+        gate's "no" path. A rejected episode never becomes live memory.
+
+        Parameters
+        ----------
+        episode_id :
+            Primary key of the episode to reject.
+
+        Returns
+        -------
+        int
+            1 if a matching pending record was rejected, 0 if the id does
+            not exist or is not currently pending.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                cursor = conn.execute(
+                    """
+                    UPDATE episodes
+                    SET    status = 'retracted'
+                    WHERE  id     = ?
+                      AND  status = 'pending'
+                    """,
+                    (episode_id,),
+                )
+                count = cursor.rowcount
+                conn.commit()
+                logger.info(
+                    "reject: rejected %d episode(s) for id=%d.",
+                    count, episode_id,
+                )
+                if count:
+                    # A rejected row was pending, never active, so it was
+                    # never in MEMORY.md — regenerating here is a no-op in
+                    # practice, kept only for symmetry with approve()/
+                    # retract_by_id().
+                    self._write_memory_md(conn)
+                return count
+            finally:
+                conn.close()
+
+    # -----------------------------------------------------------------------
+    # Markdown snapshot
+    # -----------------------------------------------------------------------
+
+    def regenerate_memory_md(self) -> None:
+        """
+        Public entry point to (re)build MEMORY.md on demand — opens its own
+        connection and lock, unlike _write_memory_md() which expects to run
+        inside an existing insert()/retract() transaction. Intended for
+        startup (so the file exists even before the next write) and for
+        one-off backfill scripts. No-op if memory_md_path was not supplied.
+        """
+        if self._memory_md_path is None:
+            return
+        with self._lock:
+            conn = self._connect()
+            try:
+                self._write_memory_md(conn)
+            finally:
+                conn.close()
+
+    def _write_memory_md(self, conn: sqlite3.Connection) -> None:
+        """
+        Regenerate the human-readable Markdown snapshot of active episodic
+        memory at ``self._memory_md_path``. No-op if that path is None.
+
+        Reads all `status = 'active'` rows (fresh SELECT — cheap for the
+        episode-count scale this system targets), groups them by the
+        calendar date of `created_at`, newest date first, and within a date
+        newest-first. This mirrors exactly what the Memory UI tab shows
+        today (type badge, content, confidence, project_context, source,
+        date) so the file and the UI never disagree.
+
+        Called with the write lock already held by the caller (insert()/
+        retract()), on the same connection, so this does not re-acquire
+        self._lock or open a second connection.
+        """
+        if self._memory_md_path is None:
+            return
+
+        try:
+            rows = conn.execute(
+                """
+                SELECT * FROM episodes
+                WHERE  status = 'active'
+                ORDER  BY created_at DESC
+                """
+            ).fetchall()
+
+            from collections import OrderedDict
+            groups: "OrderedDict[str, list[sqlite3.Row]]" = OrderedDict()
+            for row in rows:
+                day = datetime.fromtimestamp(row["created_at"]).strftime("%B %-d, %Y")
+                groups.setdefault(day, []).append(row)
+
+            lines: list[str] = [
+                "# Memory",
+                "",
+                "_Auto-generated from Localist's episodic memory store — do not "
+                "edit by hand, changes will be overwritten on the next write. "
+                f"Last updated: {datetime.now().strftime('%B %-d, %Y %H:%M')}._",
+                "",
+            ]
+            if not rows:
+                lines.append("_No active memories yet._")
+            for day, day_rows in groups.items():
+                lines.append(f"## {day}")
+                lines.append("")
+                for row in day_rows:
+                    conf_pct = round(row["confidence"] * 100)
+                    lines.append(
+                        f"- **{row['episode_type']}** ({conf_pct}%, "
+                        f"{row['project_context'] or 'general'}, {row['source']}) — "
+                        f"{row['content']}"
+                    )
+                lines.append("")
+
+            self._memory_md_path.parent.mkdir(parents=True, exist_ok=True)
+            self._memory_md_path.write_text("\n".join(lines), encoding="utf-8")
+        except Exception as exc:
+            logger.warning(
+                "_write_memory_md: failed to write %s (%s) — continuing.",
+                self._memory_md_path, exc,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2489,13 +2858,24 @@ class EpisodicMemoryReader:
 
     Side effect — last_accessed update
         Every record returned by any retrieval method has its `last_accessed`
-        field updated to the current Unix timestamp. This update is written
-        in a single batched UPDATE after the SELECT, inside the same lock.
+        field updated to the current Unix timestamp. by_subject() and
+        by_recency() write this in a single batched UPDATE inside the same
+        lock as their SELECT. by_similarity() and best_match() score via
+        the read-only _score_all_active() helper first, then apply the
+        batched UPDATE in a separate, immediately-following lock scope
+        (see _touch_records()) — same net effect, not one atomic
+        transaction.
 
     Parameters
     ----------
     db_path :
         Path to the SQLite file. Must be the same file used by MemoryManager.
+    embed_fn :
+        Optional ``Callable[[str], list[float]]`` (e.g. ``EmbeddingEngine.embed``).
+        When supplied, by_similarity() embeds the query and does real cosine
+        comparison against any row that has a stored embedding, falling back
+        to keyword overlap for un-embedded rows. When None, by_similarity()
+        runs keyword-only, as before.
     """
 
     # Types pulled for session priming (Mode 2).
@@ -2503,9 +2883,14 @@ class EpisodicMemoryReader:
         "preference", "correction", "decision", "workflow"
     )
 
-    def __init__(self, db_path: Path | str) -> None:
-        self._db_path = Path(db_path)
-        self._lock    = threading.Lock()
+    def __init__(
+        self,
+        db_path:  Path | str,
+        embed_fn: "Callable[[str], list[float]] | None" = None,
+    ) -> None:
+        self._db_path  = Path(db_path)
+        self._lock     = threading.Lock()
+        self._embed_fn = embed_fn
 
     # -----------------------------------------------------------------------
     # Internal helpers
@@ -2648,44 +3033,48 @@ class EpisodicMemoryReader:
             finally:
                 conn.close()
 
-    def by_similarity(
-        self,
-        query:      str,
-        top_n:      int   = 5,
-        min_score:  float = 0.0,
-    ) -> list[EpisodeRecord]:
+    def _score_all_active(self, query: str) -> list[tuple[float, EpisodeRecord]]:
         """
-        Mode 3 — Semantic similarity.
+        Shared scoring core for by_similarity() and best_match().
 
-        Scores all active episodes against `query`. If embeddings are
-        present on any episode, cosine similarity is used for those rows.
-        Rows without embeddings fall back to keyword overlap scoring.
-        The combined list is sorted by score DESC and the top `top_n`
-        records are returned.
+        Scores every active episode against `query`, across every
+        episode_type (unlike by_recency(), which is scoped to
+        _PRIME_TYPES) — this is what makes project_fact / task_completion /
+        naming_convention episodes reachable at all.
 
-        Note: this class does not hold an embed_fn. Embedding-based scoring
-        therefore compares the query's keyword tokens against the episode's
-        stored embedding ONLY when a query embedding is available externally.
-        In this standalone implementation (no embed_fn injected), all scoring
-        falls back to keyword overlap. If embedding support is needed in
-        future, subclass or extend with an embed_fn parameter.
+        If an embed_fn was injected at construction time, the query is
+        embedded once and compared via true cosine similarity against every
+        row that has a stored embedding (see EpisodicMemoryWriter.insert(),
+        which populates the `embedding` column when it also holds an
+        embed_fn). Rows without a stored embedding — or the whole query, if
+        no embed_fn is available — fall back to keyword (Jaccard) overlap.
+
+        Returns every active episode with its score, sorted descending.
+        Callers are responsible for any min_score filtering, top_n
+        slicing, and last_accessed side effects — this method only reads,
+        never writes.
 
         Parameters
         ----------
         query :
             Free-text search string.
-        top_n :
-            Maximum records to return. Default 5.
-        min_score :
-            Minimum score threshold. Records below this are excluded.
-            Default 0.0 (no filtering).
 
         Returns
         -------
-        list[EpisodeRecord]
-            Sorted by relevance score descending. May be empty.
+        list[tuple[float, EpisodeRecord]]
+            All active episodes, sorted by score descending. May be empty.
         """
         query_tokens = _tokenize(query)
+
+        query_vec: list[float] | None = None
+        if self._embed_fn is not None:
+            try:
+                query_vec = self._embed_fn(query)
+            except Exception as exc:
+                logger.warning(
+                    "_score_all_active: embed_fn failed for query %r (%s) — "
+                    "falling back to keyword scoring.", query[:40], exc,
+                )
 
         with self._lock:
             conn = self._connect()
@@ -2700,27 +3089,135 @@ class EpisodicMemoryReader:
                 scored: list[tuple[float, EpisodeRecord]] = []
                 for row in rows:
                     record = self._row_to_record(row)
-                    combined_text = f"{record.subject} {record.content}"
-                    token_set_str = " ".join(_tokenize(combined_text))
-                    score = _keyword_score(query_tokens, token_set_str)
-                    if score >= min_score:
-                        scored.append((score, record))
+                    score: float | None = None
+
+                    if query_vec is not None and row["embedding"] is not None:
+                        try:
+                            doc_vec = _unpack_embedding(row["embedding"])
+                            score = _cosine_similarity(query_vec, doc_vec)
+                        except Exception as exc:
+                            logger.debug(
+                                "_score_all_active: cosine failed for episode "
+                                "id=%s (%s) — falling back to keyword.",
+                                record.id, exc,
+                            )
+                            score = None
+
+                    if score is None:
+                        combined_text = f"{record.subject} {record.content}"
+                        token_set_str = " ".join(_tokenize(combined_text))
+                        score = _keyword_score(query_tokens, token_set_str)
+
+                    scored.append((score, record))
 
                 scored.sort(key=lambda x: x[0], reverse=True)
-                top     = scored[:top_n]
-                records = [rec for _, rec in top]
+                return scored
+            finally:
+                conn.close()
+
+    def _touch_records(self, records: list[EpisodeRecord]) -> None:
+        """
+        Update last_accessed for the given records, in place, in their own
+        lock/connection scope. Shared tail step for by_similarity() and
+        best_match() after they've picked their result set from
+        _score_all_active(). No-op for an empty list.
+        """
+        if not records:
+            return
+        with self._lock:
+            conn = self._connect()
+            try:
                 now = self._touch_last_accessed(conn, [rec.id for rec in records])
                 if now is not None:
                     for rec in records:
                         rec.last_accessed = now
                 conn.commit()
-                logger.debug(
-                    "by_similarity: returning %d records for query '%s...'.",
-                    len(records), query[:40],
-                )
-                return records
             finally:
                 conn.close()
+
+    def by_similarity(
+        self,
+        query:      str,
+        top_n:      int   = 5,
+        min_score:  float = 0.0,
+    ) -> list[EpisodeRecord]:
+        """
+        Mode 3 — Semantic similarity.
+
+        Scores all active episodes against `query` via _score_all_active(),
+        filters to those scoring >= min_score, and returns the top_n.
+
+        Parameters
+        ----------
+        query :
+            Free-text search string.
+        top_n :
+            Maximum records to return. Default 5.
+        min_score :
+            Minimum score threshold. Records below this are excluded.
+            Default 0.0 (no filtering). Cosine and Jaccard scores are not
+            on the same scale — callers mixing embedded and un-embedded
+            corpora should keep this low (e.g. 0.3-0.45) rather than tuned
+            for one scale specifically.
+
+        Returns
+        -------
+        list[EpisodeRecord]
+            Sorted by relevance score descending. May be empty.
+        """
+        scored  = self._score_all_active(query)
+        filtered = [(score, rec) for score, rec in scored if score >= min_score]
+        records = [rec for _, rec in filtered[:top_n]]
+
+        self._touch_records(records)
+
+        logger.debug(
+            "by_similarity: returning %d records for query '%s...'.",
+            len(records), query[:40],
+        )
+        return records
+
+    def best_match(
+        self,
+        query:     str,
+        min_score: float = 0.55,
+    ) -> tuple[float, EpisodeRecord] | None:
+        """
+        Returns the single highest-scoring active episode above min_score,
+        or None if nothing scores that high (or no active episodes exist).
+
+        Built on the same cosine-with-keyword-fallback scoring as
+        by_similarity() (via _score_all_active()), but returns at most one
+        record together with its score. Intended for callers — like
+        retraction — that need to identify *the* episode a query refers to
+        rather than a ranked list of candidates. min_score defaults higher
+        than by_similarity()'s typical recall thresholds (0.45 elsewhere in
+        the codebase) since a caller acting on a single best_match() result
+        has no second chance to disambiguate among candidates the way a
+        ranked list would allow.
+
+        Parameters
+        ----------
+        query :
+            Free-text search string.
+        min_score :
+            Minimum score the top candidate must clear. Default 0.55.
+
+        Returns
+        -------
+        tuple[float, EpisodeRecord] | None
+            (score, record) for the highest scorer, or None.
+        """
+        scored = self._score_all_active(query)
+        if not scored:
+            return None
+
+        top_score, top_record = scored[0]
+        if top_score < min_score:
+            return None
+
+        self._touch_records([top_record])
+        return top_score, top_record
 
 
 # ---------------------------------------------------------------------------
