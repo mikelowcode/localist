@@ -85,6 +85,23 @@
           {/if}
         </button>
       </div>
+    {:else if $selectedFile.type === 'generated'}
+      <div class="content-footer">
+        <a
+          class="ingest-btn-lg"
+          href={`/api/files/download?path=${encodeURIComponent($selectedFile.path)}`}
+          download={$selectedFile.filename}
+        >
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none"
+               stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          Download
+        </a>
+      </div>
     {/if}
   {/if}
 </div>
@@ -224,11 +241,13 @@
     padding: var(--sp-2) var(--sp-4);
     font-size: var(--text-sm);
     font-weight: 500;
+    font-family: var(--font-body);
     border: 1px solid var(--accent);
     border-radius: var(--radius);
     background: transparent;
     color: var(--accent);
     cursor: pointer;
+    text-decoration: none;
     transition: background var(--dur-fast) var(--ease), opacity var(--dur-fast) var(--ease);
   }
 

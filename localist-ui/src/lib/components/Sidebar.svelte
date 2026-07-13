@@ -20,7 +20,7 @@
     formatBytes,
     type FileEntry,
   } from '$lib/stores/files';
-  import { selectedFile, selectFile } from '$lib/stores/fileSelection';
+  import { selectedFile, selectFile, closeFile } from '$lib/stores/fileSelection';
 
   $: active = $page.url.pathname;
   $: isChatActive  = active.startsWith('/conversation');
@@ -117,6 +117,45 @@
     if ($isIngesting) return;
     resetIngest();
     await ingestFile(entry);
+  }
+
+  // ── Delete (two-step: click primes an inline "are you sure", a second
+  // click on the same row confirms; clicking any other row's delete button,
+  // or Cancel, drops the pending confirmation) ──────────────────────
+  let confirmDeletePath: string | null = null;
+  let deletingPath: string | null = null;
+  let deleteError: string | null = null;
+
+  function requestDelete(path: string, e: Event): void {
+    e.stopPropagation();
+    deleteError = null;
+    confirmDeletePath = path;
+  }
+
+  function cancelDelete(e: Event): void {
+    e.stopPropagation();
+    confirmDeletePath = null;
+  }
+
+  async function confirmDelete(entry: FileEntry, e: Event): Promise<void> {
+    e.stopPropagation();
+    deletingPath = entry.path;
+    deleteError = null;
+    try {
+      const res = await fetch(`/api/files?path=${encodeURIComponent(entry.path)}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      if (entry.type === 'wiki') await loadWikiFiles();
+      else if (entry.type === 'raw') await loadRawFiles();
+      else await loadGeneratedFiles();
+
+      if ($selectedFile?.path === entry.path) closeFile();
+    } catch (err) {
+      deleteError = err instanceof Error ? err.message : String(err);
+    } finally {
+      confirmDeletePath = null;
+      deletingPath = null;
+    }
   }
 
   // ── Upload (raw files) ───────────────────────────────────────────
@@ -351,24 +390,57 @@
                     {@const isSelected = $selectedFile?.path === file.path}
                     {@const isActiveIngest = $ingest.sourceFile?.path === file.path && $isIngesting}
                     <div class="file-row-nested" class:selected={isSelected}>
-                      <button type="button" class="file-row-btn" on:click={() => selectFile(file)}>
-                        <span class="file-row-name truncate">{file.name}</span>
-                        <span class="file-row-meta">{grp.key} · {formatSize(file.size)}</span>
-                      </button>
-                      {#if grp.key === 'Raw'}
+                      {#if confirmDeletePath === file.path}
+                        <div class="delete-confirm">
+                          <span class="delete-confirm-text truncate" title={file.name}>
+                            Delete "{file.name}"?
+                          </span>
+                          <button
+                            type="button"
+                            class="delete-confirm-btn delete-confirm-yes"
+                            disabled={deletingPath === file.path}
+                            on:click={(e) => confirmDelete(file, e)}
+                          >{deletingPath === file.path ? 'Deleting…' : 'Delete'}</button>
+                          <button
+                            type="button"
+                            class="delete-confirm-btn delete-confirm-no"
+                            disabled={deletingPath === file.path}
+                            on:click={cancelDelete}
+                          >Cancel</button>
+                        </div>
+                      {:else}
+                        <button type="button" class="file-row-btn" on:click={() => selectFile(file)}>
+                          <span class="file-row-name truncate">{file.name}</span>
+                          <span class="file-row-meta">{grp.key} · {formatSize(file.size)}</span>
+                        </button>
+                        {#if grp.key === 'Raw'}
+                          <button
+                            type="button"
+                            class="file-row-ingest"
+                            class:loading={isActiveIngest}
+                            disabled={$isIngesting}
+                            title="Ingest into the wiki"
+                            on:click={(e) => handleIngest(file, e)}
+                          >
+                            {#if isActiveIngest}
+                              <span class="spinner-sm accent" aria-hidden="true" />
+                            {:else}
+                              ⇧
+                            {/if}
+                          </button>
+                        {/if}
                         <button
                           type="button"
-                          class="file-row-ingest"
-                          class:loading={isActiveIngest}
-                          disabled={$isIngesting}
-                          title="Ingest into the wiki"
-                          on:click={(e) => handleIngest(file, e)}
+                          class="file-row-delete"
+                          title="Delete file"
+                          on:click={(e) => requestDelete(file.path, e)}
                         >
-                          {#if isActiveIngest}
-                            <span class="spinner-sm accent" aria-hidden="true" />
-                          {:else}
-                            ⇧
-                          {/if}
+                          <svg viewBox="0 0 24 24" width="11" height="11" fill="none"
+                               stroke="currentColor" stroke-width="2"
+                               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <polyline points="3 6 5 6 21 6"/>
+                            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                          </svg>
                         </button>
                       {/if}
                     </div>
@@ -376,6 +448,9 @@
                 {/if}
               {/if}
             {/each}
+            {#if deleteError}
+              <p class="sub-nav-state" style="color:var(--error)">{deleteError}</p>
+            {/if}
           </div>
         {/if}
       </li>
@@ -687,6 +762,65 @@
   }
   .file-row-ingest:hover:not(:disabled) { color: var(--accent); background: var(--accent-dim); }
   .file-row-ingest:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .file-row-delete {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: none;
+    border-radius: 5px;
+    color: var(--text-tertiary);
+    cursor: pointer;
+    margin-right: 4px;
+  }
+  .file-row-delete:hover { color: var(--error); background: var(--error-dim); }
+
+  /* Two-step delete confirmation — replaces the row in place */
+  .delete-confirm {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+    min-width: 0;
+    padding: 5px 6px;
+  }
+
+  .delete-confirm-text {
+    flex: 1;
+    min-width: 0;
+    font-size: 11px;
+    color: var(--error);
+  }
+
+  .delete-confirm-btn {
+    flex-shrink: 0;
+    font-size: 10.5px;
+    font-weight: 500;
+    font-family: var(--font-body);
+    padding: 3px 8px;
+    border-radius: 5px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .delete-confirm-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .delete-confirm-yes {
+    background: var(--error-dim);
+    color: var(--error);
+    border-color: var(--error-dim);
+  }
+  .delete-confirm-yes:hover:not(:disabled) { background: color-mix(in srgb, var(--error) 30%, transparent); }
+
+  .delete-confirm-no {
+    background: var(--bg-active);
+    color: var(--text-secondary);
+  }
+  .delete-confirm-no:hover:not(:disabled) { background: var(--bg-hover); }
 
   .spinner-sm {
     display: inline-block;

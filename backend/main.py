@@ -101,6 +101,7 @@ import asyncio
 import datetime
 import json
 import logging
+import mimetypes
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -108,7 +109,7 @@ from typing import Any, AsyncIterator, Literal
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -554,6 +555,12 @@ class FileContentResponse(BaseModel):
     """Response body for GET /files/content."""
     path:    str
     content: str
+
+
+class FileDeleteResponse(BaseModel):
+    """Response body for DELETE /files."""
+    path:    str
+    deleted: bool
 
 
 class ChatHistorySettingsResponse(BaseModel):
@@ -1122,6 +1129,92 @@ async def get_file_content(path: str) -> FileContentResponse:
         raise HTTPException(status_code=500, detail=f"Could not read file: {exc}") from exc
 
     return FileContentResponse(path=str(target), content=content)
+
+
+@app.get(
+    "/files/download",
+    summary = "Download a file",
+)
+async def get_file_download(path: str) -> FileResponse:
+    """
+    Stream a file back with a Content-Disposition: attachment header so the
+    browser saves it (Safari's Downloads queue) instead of navigating to it.
+
+    Same allowed-roots gate as /files/content, but path containment is
+    checked with is_relative_to() rather than a raw string prefix — a
+    prefix check would let /data/wiki_evil slip through for an allowed
+    root of /data/wiki.
+    """
+    if _state.raw_dir is None or _state.wiki_dir is None:
+        raise HTTPException(status_code=503, detail="Directories not configured.")
+
+    target = Path(path).resolve()
+    allowed_roots = [
+        _state.raw_dir.resolve(),
+        _state.wiki_dir.resolve(),
+    ]
+    if _state.generated_dir is not None:
+        allowed_roots.append(_state.generated_dir.resolve())
+    if not any(target.is_relative_to(root) for root in allowed_roots):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: path is outside permitted directories.",
+        )
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+
+    media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    return FileResponse(
+        path=target,
+        filename=target.name,
+        media_type=media_type,
+    )
+
+
+@app.delete(
+    "/files",
+    response_model = FileDeleteResponse,
+    summary        = "Delete a file",
+)
+async def delete_file(path: str) -> FileDeleteResponse:
+    """
+    Delete a file from raw/, wiki/, or generated_files/ by absolute path.
+
+    Same allowed-roots gate as /files/content and /files/download. Also
+    purges any document_index row for the path — a no-op for generated
+    files (never indexed), but necessary for raw/wiki so a deleted file
+    doesn't linger in RAG retrieval.
+    """
+    if _state.raw_dir is None or _state.wiki_dir is None:
+        raise HTTPException(status_code=503, detail="Directories not configured.")
+
+    target = Path(path).resolve()
+    allowed_roots = [
+        _state.raw_dir.resolve(),
+        _state.wiki_dir.resolve(),
+    ]
+    if _state.generated_dir is not None:
+        allowed_roots.append(_state.generated_dir.resolve())
+    if not any(target.is_relative_to(root) for root in allowed_roots):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: path is outside permitted directories.",
+        )
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+
+    try:
+        await asyncio.to_thread(target.unlink)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not delete file: {exc}") from exc
+
+    if _state.memory_manager is not None:
+        try:
+            await asyncio.to_thread(_state.memory_manager.remove_document, target)
+        except Exception as exc:
+            logger.warning("remove_document failed for deleted file %s: %s", target, exc)
+
+    return FileDeleteResponse(path=str(target), deleted=True)
 
 
 @app.post(
