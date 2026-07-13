@@ -51,13 +51,15 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Copy `backend/.env.example` to `backend/.env`. Only `LANGSEARCH_API_KEY` is required for full functionality; everything else has a working default.
+Copy `backend/.env.example` to `backend/.env`. Only an API key for the active `web_search` provider — `LANGSEARCH_API_KEY` by default, or `BRAVE_API_KEY` if you switch providers — is required for full functionality; everything else has a working default.
 
 | Variable | Default | Description |
 |---|---|---|
 | `LOCALIST_RUNTIME_BACKEND` | `foundry` | `foundry`, `omlx`, or `ollama` |
 | `LOCALIST_CHAT_MODEL` | *(none)* | Model ID for the active backend |
-| `LANGSEARCH_API_KEY` | *(none)* | Enables `web_search`; without it, falls back to corpus |
+| `SEARCH_PROVIDER` | `langsearch` | `web_search` provider: `langsearch` or `brave` |
+| `LANGSEARCH_API_KEY` | *(none)* | Required when `SEARCH_PROVIDER=langsearch`; without it, `web_search` fails and falls back to corpus |
+| `BRAVE_API_KEY` | *(none)* | Required when `SEARCH_PROVIDER=brave`; without it, `web_search` fails and falls back to corpus |
 | `LOCALIST_MCP_URL` | `http://localhost:8003` | localist-mcp server URL |
 | `LOCALIST_EPISODIC_WRITE_APPROVAL` | `false` | Gate implicit memory writes behind approve/reject |
 | `LOCALIST_LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING` |
