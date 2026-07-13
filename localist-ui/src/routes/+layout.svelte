@@ -6,6 +6,17 @@
   import StatusBar from '$lib/components/StatusBar.svelte';
   import { startHealthPolling, stopHealthPolling } from '$lib/stores/server';
   import { theme } from '$lib/stores/theme';
+  import { sidebarWidth, sidebarCollapsed } from '$lib/stores/sidebar';
+
+  // #app-shell is the CSS grid container that sizes the sidebar column; it
+  // lives in app.html outside this component's own DOM subtree, so it's
+  // reached directly rather than through a Svelte binding.
+  $: if (browser) {
+    const shell = document.getElementById('app-shell');
+    if (shell) {
+      shell.style.gridTemplateColumns = `${$sidebarCollapsed ? 0 : $sidebarWidth}px 1fr`;
+    }
+  }
 
   onMount(() => {
     // Apply saved theme

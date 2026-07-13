@@ -1,26 +1,33 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
+  import { browser } from '$app/environment';
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
   import { startNewConversation } from '$lib/stores/conversation';
   import { pendingCount, refreshPendingCount } from '$lib/stores/episodes';
-
-  interface NavItem {
-    href: string;
-    label: string;
-    icon: string;
-  }
-
-  const nav: NavItem[] = [
-    { href: '/conversation', label: 'Chat',     icon: 'chat' },
-    { href: '/memory',       label: 'Memory',   icon: 'memory' },
-    { href: '/files',        label: 'Files',    icon: 'folder' },
-    { href: '/settings',     label: 'Settings', icon: 'settings' }
-  ];
+  import { theme } from '$lib/stores/theme';
+  import {
+    sidebarWidth, sidebarCollapsed,
+    MIN_WIDTH, MAX_WIDTH, COLLAPSE_THRESHOLD
+  } from '$lib/stores/sidebar';
+  import {
+    rawFiles, wikiFiles, generatedFiles,
+    rawLoading, wikiLoading, generatedLoading,
+    rawError, wikiError, generatedError,
+    ingest, isIngesting,
+    loadRawFiles, loadWikiFiles, loadGeneratedFiles,
+    uploadFile, ingestFile, resetIngest,
+    formatBytes,
+    type FileEntry,
+  } from '$lib/stores/files';
+  import { selectedFile, selectFile } from '$lib/stores/fileSelection';
 
   $: active = $page.url.pathname;
-  $: showConversationList = active.startsWith('/conversation');
-  $: activeConversationId = $page.params.id;
+  $: isChatActive  = active.startsWith('/conversation');
+  $: isFilesActive = active.startsWith('/files');
+
+  // ── Chat sub-nav (conversation list) ─────────────────────────────
+  let chatHistoryExpanded = false;
 
   interface ConversationSummary {
     conversation_id:    string;
@@ -48,11 +55,10 @@
     }
   }
 
-  // Re-fetch on every navigation to a /conversation* route — this reactive
-  // assignment re-runs whenever `active` changes (even between two
-  // /conversation/[id] routes), which also covers the moment right after
-  // startNewConversation() navigates to the freshly minted conversation.
-  $: if (showConversationList) {
+  // Re-fetch whenever the sub-list is opened while on a /conversation* route
+  // (also covers the moment right after startNewConversation() navigates to
+  // the freshly minted conversation).
+  $: if (chatHistoryExpanded && isChatActive) {
     loadConversations();
   }
 
@@ -64,122 +70,362 @@
     return `New conversation — ${ts}`;
   }
 
-  async function handleNewConversation(): Promise<void> {
-    const id = startNewConversation();
-    await goto(`/conversation/${id}`);
-    loadConversations();
+  function handleChatNavClick(): void {
+    if (isChatActive) {
+      chatHistoryExpanded = !chatHistoryExpanded;
+    } else {
+      chatHistoryExpanded = true;
+      goto('/conversation');
+    }
   }
 
-  // Populates the Memory nav badge on initial app load, independent of
-  // whether the user has ever opened the Memory tab this session.
+  async function handleNewConversation(): Promise<void> {
+    const id = startNewConversation();
+    chatHistoryExpanded = false;
+    await goto(`/conversation/${id}`);
+  }
+
+  // ── Files sub-nav (Wiki / Raw / Generated groups) ────────────────
+  let filesNavExpanded = false;
+  let filesExpanded: Record<string, boolean> = { Wiki: true, Raw: true, Generated: true };
+
+  function toggleFileGroup(name: string): void {
+    filesExpanded = { ...filesExpanded, [name]: !(filesExpanded[name] !== false) };
+  }
+
+  function handleFilesNavClick(): void {
+    if (isFilesActive) {
+      filesNavExpanded = !filesNavExpanded;
+    } else {
+      filesNavExpanded = true;
+      goto('/files');
+    }
+  }
+
+  $: fileGroups = [
+    { key: 'Wiki',      files: $wikiFiles,      loading: $wikiLoading,      error: $wikiError,      refresh: loadWikiFiles },
+    { key: 'Raw',       files: $rawFiles,       loading: $rawLoading,       error: $rawError,       refresh: loadRawFiles },
+    { key: 'Generated', files: $generatedFiles, loading: $generatedLoading, error: $generatedError, refresh: loadGeneratedFiles },
+  ];
+
+  function formatSize(bytes?: number): string {
+    return bytes === undefined ? '' : formatBytes(bytes);
+  }
+
+  async function handleIngest(entry: FileEntry, e: Event): Promise<void> {
+    e.stopPropagation();
+    if ($isIngesting) return;
+    resetIngest();
+    await ingestFile(entry);
+  }
+
+  // ── Upload (raw files) ───────────────────────────────────────────
+  let uploading = false;
+  let uploadError: string | null = null;
+  let fileInputEl: HTMLInputElement;
+
+  async function onFileInput(e: Event): Promise<void> {
+    const input = e.target as HTMLInputElement;
+    const files = input.files;
+    input.value = '';
+    if (!files?.length) return;
+
+    uploadError = null;
+    const list = Array.from(files);
+    for (const f of list) {
+      const ext = f.name.split('.').pop()?.toLowerCase();
+      if (!['md', 'txt'].includes(ext ?? '')) {
+        uploadError = `Unsupported type: .${ext}. Only .md and .txt are accepted.`;
+        return;
+      }
+    }
+
+    uploading = true;
+    try {
+      for (const f of list) await uploadFile(f);
+    } catch (err) {
+      uploadError = err instanceof Error ? err.message : String(err);
+    } finally {
+      uploading = false;
+    }
+  }
+
+  // ── Sidebar resize / collapse ─────────────────────────────────────
+  let dragging = false;
+  let dragStartX = 0;
+  let dragStartW = 0;
+
+  function startResize(e: MouseEvent): void {
+    dragging = true;
+    dragStartX = e.clientX;
+    dragStartW = $sidebarWidth;
+    e.preventDefault();
+  }
+
+  function onMove(e: MouseEvent): void {
+    if (!dragging) return;
+    const dx = e.clientX - dragStartX;
+    const w = dragStartW + dx;
+    if (w < COLLAPSE_THRESHOLD) {
+      sidebarCollapsed.set(true);
+    } else {
+      sidebarCollapsed.set(false);
+      sidebarWidth.set(Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, w)));
+    }
+  }
+
+  function onUp(): void {
+    dragging = false;
+  }
+
+  function onDividerKeydown(e: KeyboardEvent): void {
+    if (e.key === 'ArrowLeft') {
+      sidebarWidth.set(Math.max(MIN_WIDTH, $sidebarWidth - 8));
+    } else if (e.key === 'ArrowRight') {
+      sidebarWidth.set(Math.min(MAX_WIDTH, $sidebarWidth + 8));
+    } else {
+      return;
+    }
+    e.preventDefault();
+  }
+
   onMount(() => {
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
     refreshPendingCount();
+    loadWikiFiles();
+    loadRawFiles();
+    loadGeneratedFiles();
+  });
+
+  onDestroy(() => {
+    if (browser) {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    }
   });
 </script>
 
-<aside class="sidebar" aria-label="Main navigation">
+<aside
+  class="sidebar"
+  aria-label="Main navigation"
+  aria-hidden={$sidebarCollapsed}
+  inert={$sidebarCollapsed}
+>
   <!-- Wordmark -->
   <div class="wordmark">
-    <span class="wordmark-logo">L</span>
+    <span class="brand-mark">L</span>
     <span class="wordmark-text">LOCALIST</span>
   </div>
 
   <!-- Nav links -->
   <nav>
     <ul>
-      {#each nav as item}
-        {@const isActive = active.startsWith(item.href)}
-        <li>
-          <a
-            href={item.href}
-            class="nav-link"
-            class:active={isActive}
-            aria-current={isActive ? 'page' : undefined}
-          >
-            <span class="nav-icon" aria-hidden="true">
-              {#if item.icon === 'chat'}
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-                </svg>
-              {:else if item.icon === 'memory'}
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
-                     stroke="currentColor" stroke-width="1.75"
-                     stroke-linecap="round" stroke-linejoin="round">
-                  <ellipse cx="12" cy="5" rx="9" ry="3"/>
-                  <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
-                  <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
-                </svg>
-              {:else if item.icon === 'folder'}
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-                </svg>
-              {:else if item.icon === 'settings'}
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-                  <circle cx="12" cy="12" r="3"/>
-                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-                </svg>
-              {/if}
-            </span>
-            <span class="nav-label">{item.label}</span>
-            {#if item.label === 'Memory' && $pendingCount > 0}
-              <span class="badge badge-warning nav-badge">{$pendingCount}</span>
-            {/if}
-            {#if isActive}
-              <span class="active-bar" aria-hidden="true" />
-            {/if}
-          </a>
-        </li>
-      {/each}
-    </ul>
-
-    {#if showConversationList}
-      <ul class="sub-nav">
-        <li>
-          <button
-            type="button"
-            class="new-conversation-btn"
-            on:click={handleNewConversation}
-            aria-label="Start new conversation"
-          >
-            <span class="nav-icon" aria-hidden="true">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M12 5v14M5 12h14"/>
-              </svg>
-            </span>
-            <span class="nav-label">New chat</span>
-          </button>
-        </li>
-
-        {#if conversationsLoading}
-          <li class="sub-nav-state">Loading…</li>
-        {:else if conversationsError}
-          <li class="sub-nav-state" style="color:var(--error)">{conversationsError}</li>
-        {:else if conversations.length === 0}
-          <li class="sub-nav-state">No conversations yet.</li>
-        {:else}
-          {#each conversations as c (c.conversation_id)}
-            {@const isActive = c.conversation_id === activeConversationId}
+      <!-- Chat -->
+      <li>
+        <button
+          type="button"
+          class="nav-link"
+          class:active={isChatActive}
+          aria-current={isChatActive ? 'page' : undefined}
+          aria-expanded={chatHistoryExpanded}
+          on:click={handleChatNavClick}
+        >
+          <span class="nav-icon-sq">C</span>
+          <span class="nav-label">Chat</span>
+          <span class="nav-chevron" aria-hidden="true">{chatHistoryExpanded ? '⌃' : '⌄'}</span>
+        </button>
+        {#if chatHistoryExpanded}
+          <ul class="sub-nav">
             <li>
-              <a
-                href={`/conversation/${c.conversation_id}`}
-                class="sub-nav-link"
-                class:active={isActive}
-                aria-current={isActive ? 'page' : undefined}
-                title={conversationLabel(c)}
-              >
-                {conversationLabel(c)}
-              </a>
+              <button type="button" class="new-item-btn" on:click={handleNewConversation}>
+                <span class="new-item-plus" aria-hidden="true">+</span>
+                New chat
+              </button>
             </li>
-          {/each}
+            {#if conversationsLoading}
+              <li class="sub-nav-state">Loading…</li>
+            {:else if conversationsError}
+              <li class="sub-nav-state" style="color:var(--error)">{conversationsError}</li>
+            {:else if conversations.length === 0}
+              <li class="sub-nav-state">No conversations yet.</li>
+            {:else}
+              {#each conversations as c (c.conversation_id)}
+                {@const isActive = c.conversation_id === $page.params.id}
+                <li>
+                  <a
+                    href={`/conversation/${c.conversation_id}`}
+                    class="sub-nav-link"
+                    class:active={isActive}
+                    aria-current={isActive ? 'page' : undefined}
+                    title={conversationLabel(c)}
+                  >
+                    {conversationLabel(c)}
+                  </a>
+                </li>
+              {/each}
+            {/if}
+          </ul>
         {/if}
-      </ul>
-    {/if}
+      </li>
+
+      <!-- Memory -->
+      <li>
+        <a
+          href="/memory"
+          class="nav-link"
+          class:active={active.startsWith('/memory')}
+          aria-current={active.startsWith('/memory') ? 'page' : undefined}
+        >
+          <span class="nav-icon-sq">M</span>
+          <span class="nav-label">Memory</span>
+          {#if $pendingCount > 0}
+            <span class="badge badge-warning nav-badge">{$pendingCount}</span>
+          {/if}
+        </a>
+      </li>
+
+      <!-- Files -->
+      <li>
+        <button
+          type="button"
+          class="nav-link"
+          class:active={isFilesActive}
+          aria-current={isFilesActive ? 'page' : undefined}
+          aria-expanded={filesNavExpanded}
+          on:click={handleFilesNavClick}
+        >
+          <span class="nav-icon-sq">F</span>
+          <span class="nav-label">Files</span>
+          <span class="nav-chevron" aria-hidden="true">{filesNavExpanded ? '⌃' : '⌄'}</span>
+        </button>
+        {#if filesNavExpanded}
+          <div class="sub-nav files-sub-nav">
+            <!-- Upload -->
+            <label class="upload-row" class:uploading>
+              <input
+                bind:this={fileInputEl}
+                type="file"
+                multiple
+                accept=".md,.txt"
+                on:change={onFileInput}
+                class="sr-only"
+              />
+              {#if uploading}
+                <span class="spinner-sm" aria-hidden="true" />
+                <span>Uploading…</span>
+              {:else}
+                <span class="new-item-plus" aria-hidden="true">+</span>
+                <span>Upload .md / .txt</span>
+              {/if}
+            </label>
+            {#if uploadError}
+              <p class="sub-nav-state" style="color:var(--error)">{uploadError}</p>
+            {/if}
+
+            {#if $ingest.phase === 'planning' || $ingest.phase === 'streaming'}
+              <p class="sub-nav-state ingest-state">
+                <span class="spinner-sm accent" aria-hidden="true" />
+                {$ingest.phase === 'planning' ? ($ingest.statusMsg || 'Planning…') : `Ingesting — ${$ingest.tokens.length} chunks…`}
+              </p>
+            {:else if $ingest.phase === 'error'}
+              <p class="sub-nav-state" style="color:var(--error)">Ingest failed: {$ingest.error}</p>
+            {/if}
+
+            {#each fileGroups as grp (grp.key)}
+              {@const expanded = filesExpanded[grp.key] !== false}
+              <button type="button" class="file-group-head" on:click={() => toggleFileGroup(grp.key)}>
+                <span class="fg-chevron" aria-hidden="true">{expanded ? '⌄' : '⌃'}</span>
+                <span class="fg-label">{grp.key}</span>
+                <span class="fg-count">{grp.files.length}</span>
+              </button>
+              {#if expanded}
+                {#if grp.loading}
+                  <p class="sub-nav-state">Loading…</p>
+                {:else if grp.error}
+                  <p class="sub-nav-state" style="color:var(--error)">{grp.error}</p>
+                {:else if grp.files.length === 0}
+                  <p class="sub-nav-state">No files.</p>
+                {:else}
+                  {#each grp.files as file (file.path)}
+                    {@const isSelected = $selectedFile?.path === file.path}
+                    {@const isActiveIngest = $ingest.sourceFile?.path === file.path && $isIngesting}
+                    <div class="file-row-nested" class:selected={isSelected}>
+                      <button type="button" class="file-row-btn" on:click={() => selectFile(file)}>
+                        <span class="file-row-name truncate">{file.name}</span>
+                        <span class="file-row-meta">{grp.key} · {formatSize(file.size)}</span>
+                      </button>
+                      {#if grp.key === 'Raw'}
+                        <button
+                          type="button"
+                          class="file-row-ingest"
+                          class:loading={isActiveIngest}
+                          disabled={$isIngesting}
+                          title="Ingest into the wiki"
+                          on:click={(e) => handleIngest(file, e)}
+                        >
+                          {#if isActiveIngest}
+                            <span class="spinner-sm accent" aria-hidden="true" />
+                          {:else}
+                            ⇧
+                          {/if}
+                        </button>
+                      {/if}
+                    </div>
+                  {/each}
+                {/if}
+              {/if}
+            {/each}
+          </div>
+        {/if}
+      </li>
+
+      <!-- Settings -->
+      <li>
+        <a
+          href="/settings"
+          class="nav-link"
+          class:active={active.startsWith('/settings')}
+          aria-current={active.startsWith('/settings') ? 'page' : undefined}
+        >
+          <span class="nav-icon-sq">S</span>
+          <span class="nav-label">Settings</span>
+        </a>
+      </li>
+    </ul>
   </nav>
 
-  <!-- Footer label -->
+  <!-- Footer: version + theme toggle -->
   <div class="sidebar-footer">
-    <span class="text-tertiary text-xs">v0.2.0</span>
+    <span class="text-tertiary sf-version">v0.2.0</span>
+    <button
+      type="button"
+      class="switch"
+      class:on={$theme === 'light'}
+      title="Toggle light/dark"
+      aria-label="Toggle light/dark theme"
+      on:click={theme.toggle}
+    >
+      <span class="switch-knob" />
+    </button>
   </div>
+
+  {#if !$sidebarCollapsed}
+    <!-- svelte-ignore a11y-no-noninteractive-tabindex -->
+    <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
+    <div
+      class="divider"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize sidebar"
+      aria-valuenow={$sidebarWidth}
+      aria-valuemin={MIN_WIDTH}
+      aria-valuemax={MAX_WIDTH}
+      tabindex="0"
+      on:mousedown={startResize}
+      on:keydown={onDividerKeydown}
+    />
+  {/if}
 </aside>
 
 <style>
@@ -188,9 +434,10 @@
     grid-row: 1 / -1;
     display: flex;
     flex-direction: column;
-    background: var(--bg-panel);
+    background: var(--sidebar-bg);
     border-right: 1px solid var(--border);
-    width: var(--sidebar-w);
+    width: 100%;
+    min-width: 0;
     height: 100vh;
     overflow: hidden;
     position: relative;
@@ -202,32 +449,18 @@
     display: flex;
     align-items: center;
     gap: var(--sp-2);
-    padding: 0 var(--sp-5);
+    padding: 0 var(--sp-4);
     height: var(--topbar-h);
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
     user-select: none;
-  }
-
-  .wordmark-logo {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    background: var(--accent);
-    color: #fff;
-    font-size: 13px;
-    font-weight: 700;
-    border-radius: 5px;
-    letter-spacing: -0.03em;
-    flex-shrink: 0;
+    white-space: nowrap;
   }
 
   .wordmark-text {
-    font-size: var(--text-sm);
+    font-size: 12px;
     font-weight: 600;
-    letter-spacing: 0.12em;
+    letter-spacing: 0.1em;
     color: var(--text-primary);
   }
 
@@ -235,7 +468,7 @@
   nav {
     flex: 1;
     min-height: 0;
-    padding: var(--sp-3) 0;
+    padding: var(--sp-1) 0;
     overflow-y: auto;
   }
 
@@ -249,19 +482,24 @@
 
   .nav-link {
     position: relative;
+    width: 100%;
     display: flex;
     align-items: center;
     gap: var(--sp-3);
-    padding: var(--sp-2) var(--sp-3);
+    padding: 8px 10px;
     border-radius: var(--radius);
+    background: none;
+    border: none;
     color: var(--text-secondary);
-    font-size: var(--text-sm);
+    font-size: 13px;
     font-weight: 400;
+    font-family: var(--font-body);
+    text-align: left;
     text-decoration: none;
-    transition:
-      color var(--dur-fast) var(--ease),
-      background var(--dur-fast) var(--ease);
+    cursor: pointer;
+    white-space: nowrap;
     overflow: hidden;
+    transition: color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
   }
 
   .nav-link:hover {
@@ -270,115 +508,224 @@
   }
 
   .nav-link.active {
-    color: var(--text-accent);
+    color: var(--accent);
     background: var(--accent-glow);
     font-weight: 500;
   }
 
-  .nav-icon {
-    display: flex;
-    align-items: center;
+  .nav-link.active .nav-icon-sq {
+    background: var(--accent);
+    color: #fff;
+  }
+
+  .nav-label { flex: 1; }
+
+  .nav-chevron {
     flex-shrink: 0;
-    opacity: 0.7;
-    transition: opacity var(--dur-fast) var(--ease);
-  }
-
-  .nav-link:hover .nav-icon,
-  .nav-link.active .nav-icon {
-    opacity: 1;
-  }
-
-  .nav-label {
-    flex: 1;
+    font-size: 10px;
+    color: var(--text-tertiary);
   }
 
   .nav-badge {
     flex-shrink: 0;
     padding: 1px 6px;
-    font-size: 10px;
+    font-size: 9.5px;
   }
 
-  /* Conversation sub-list */
+  /* Sub-nav (conversation list / files groups) */
   .sub-nav {
-    margin-top: var(--sp-2);
-    padding-top: var(--sp-2);
-    border-top: 1px solid var(--border-soft);
-    max-height: 240px;
-    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    margin: 2px 4px 8px 14px;
+    padding-left: 8px;
+    border-left: 1px solid var(--border);
   }
 
-  .new-conversation-btn {
-    width: 100%;
+  .new-item-btn {
     display: flex;
     align-items: center;
-    gap: var(--sp-3);
-    padding: var(--sp-2) var(--sp-3);
-    border-radius: var(--radius);
+    gap: var(--sp-2);
+    width: 100%;
+    padding: 6px 8px;
+    border-radius: 6px;
     background: none;
     border: none;
     color: var(--text-secondary);
-    font-size: var(--text-sm);
-    font-family: inherit;
+    font-size: 12px;
+    font-family: var(--font-body);
     cursor: pointer;
-    transition:
-      color var(--dur-fast) var(--ease),
-      background var(--dur-fast) var(--ease);
+    text-align: left;
+    transition: color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
   }
+  .new-item-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
 
-  .new-conversation-btn:hover {
-    color: var(--text-primary);
-    background: var(--bg-hover);
+  .new-item-plus {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    background: var(--accent-glow);
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 700;
+    flex-shrink: 0;
   }
 
   .sub-nav-link {
     display: block;
-    padding: var(--sp-2) var(--sp-3);
-    margin-left: var(--sp-3);
-    border-radius: var(--radius);
-    color: var(--text-secondary);
-    font-size: var(--text-xs);
+    padding: 6px 8px;
+    border-radius: 6px;
+    color: var(--text-tertiary);
+    font-size: 11.5px;
     text-decoration: none;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    transition:
-      color var(--dur-fast) var(--ease),
-      background var(--dur-fast) var(--ease);
+    transition: color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
   }
-
-  .sub-nav-link:hover {
-    color: var(--text-primary);
-    background: var(--bg-hover);
-  }
-
-  .sub-nav-link.active {
-    color: var(--text-accent);
-    background: var(--accent-glow);
-    font-weight: 500;
-  }
+  .sub-nav-link:hover { color: var(--text-secondary); background: var(--bg-hover); }
+  .sub-nav-link.active { color: var(--accent); font-weight: 500; }
 
   .sub-nav-state {
-    padding: var(--sp-2) var(--sp-3);
-    margin-left: var(--sp-3);
-    font-size: var(--text-xs);
+    padding: 6px 8px;
+    font-size: 11px;
     color: var(--text-tertiary);
   }
 
-  /* Active accent bar — left edge */
-  .active-bar {
-    position: absolute;
-    left: 0;
-    top: 20%;
-    bottom: 20%;
-    width: 2.5px;
-    background: var(--accent);
-    border-radius: 0 2px 2px 0;
+  /* Files sub-nav specifics */
+  .files-sub-nav { gap: 1px; }
+
+  .upload-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: 6px 8px;
+    border-radius: 6px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    cursor: pointer;
+    transition: color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
   }
+  .upload-row:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .upload-row.uploading { opacity: 0.7; cursor: wait; }
+
+  .ingest-state { color: var(--accent); }
+
+  .file-group-head {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    width: 100%;
+    background: none;
+    border: none;
+    padding: 6px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: var(--font-body);
+    transition: background var(--dur-fast) var(--ease);
+  }
+  .file-group-head:hover { background: var(--bg-hover); }
+
+  .fg-chevron { font-size: 9px; color: var(--text-tertiary); width: 9px; flex-shrink: 0; }
+  .fg-label {
+    flex: 1;
+    text-align: left;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+  }
+  .fg-count { font-size: 9.5px; color: var(--text-tertiary); font-family: var(--font-mono); }
+
+  .file-row-nested {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding-left: 18px;
+    border-radius: 6px;
+    transition: background var(--dur-fast) var(--ease);
+  }
+  .file-row-nested:hover { background: var(--bg-hover); }
+  .file-row-nested.selected { background: var(--accent-glow); }
+
+  .file-row-btn {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    background: none;
+    border: none;
+    text-align: left;
+    padding: 5px 6px;
+    cursor: pointer;
+    color: var(--text-secondary);
+  }
+  .file-row-nested.selected .file-row-btn { color: var(--accent); }
+
+  .file-row-name { font-size: 12px; color: inherit; }
+  .file-row-meta { font-size: 10px; font-family: var(--font-mono); color: var(--text-tertiary); }
+
+  .file-row-ingest {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: none;
+    border-radius: 5px;
+    color: var(--text-tertiary);
+    font-size: 11px;
+    cursor: pointer;
+    margin-right: 4px;
+  }
+  .file-row-ingest:hover:not(:disabled) { color: var(--accent); background: var(--accent-dim); }
+  .file-row-ingest:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .spinner-sm {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    flex-shrink: 0;
+  }
+  .spinner-sm.accent { border-color: currentColor; border-top-color: transparent; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   /* Footer */
   .sidebar-footer {
-    padding: var(--sp-4) var(--sp-5);
-    border-top: 1px solid var(--border-soft);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-2);
+    padding: var(--sp-3) var(--sp-4);
+    border-top: 1px solid var(--border);
     flex-shrink: 0;
+  }
+
+  .sf-version {
+    font-size: 10px;
+    font-family: var(--font-mono);
+    white-space: nowrap;
+    overflow: hidden;
+  }
+
+  /* Resize divider */
+  .divider {
+    position: absolute;
+    top: 0;
+    right: -3px;
+    width: 6px;
+    height: 100%;
+    cursor: col-resize;
+    z-index: 6;
   }
 </style>

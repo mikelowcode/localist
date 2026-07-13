@@ -66,12 +66,16 @@ export const TYPE_LABELS: Record<string, string> = {
   context:      'Context',
 };
 
-// Colour tokens per episode type (matches prov-chip palette in ChatPanel)
+// Colour tokens per episode type — preference/decision/workflow/correction
+// map to the four semantic accent tokens per the design handoff; fact/
+// relationship/context aren't specified there, so they keep their existing
+// bespoke hues (unaffected by the light/dark token swap — a pre-existing
+// tradeoff, not introduced by this pass).
 export const TYPE_COLORS: Record<string, { bg: string; color: string; border: string }> = {
-  preference:   { bg: '#1a2a1a', color: '#7ecf7e', border: '#2d4a2d' },
-  correction:   { bg: '#2a1a1a', color: '#cf7e7e', border: '#4a2d2d' },
-  decision:     { bg: '#1a1a2e', color: '#7ea8cf', border: '#2d3a5a' },
-  workflow:     { bg: '#2a2218', color: '#cfb07e', border: '#5a4a2d' },
+  preference:   { bg: 'var(--accent-dim)',  color: 'var(--accent)',  border: 'var(--accent-mid)' },
+  decision:     { bg: 'var(--success-dim)', color: 'var(--success)', border: 'var(--success)' },
+  workflow:     { bg: 'var(--warning-dim)', color: 'var(--warning)', border: 'var(--warning)' },
+  correction:   { bg: 'var(--error-dim)',   color: 'var(--error)',   border: 'var(--error)' },
   fact:         { bg: '#2a1a2e', color: '#b07ecf', border: '#4a2d5a' },
   relationship: { bg: '#1e2a2a', color: '#7ecfcf', border: '#2d4a4a' },
   context:      { bg: '#1e1e1e', color: '#9a9a9a', border: '#2a2a2a' },

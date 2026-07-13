@@ -289,9 +289,9 @@
   }
   .filter-chip:hover { color: var(--text-secondary); }
   .filter-chip.active {
-    color: var(--text-primary);
-    border-color: var(--accent-mid);
-    background: var(--accent-dim);
+    color: #fff;
+    border-color: var(--accent);
+    background: var(--accent);
   }
 
   /* Vertical divider between the type-filter chips and the Pending toggle —
@@ -338,7 +338,7 @@
   .episode-card {
     background: var(--bg-panel);
     border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
+    border-radius: 10px;
     padding: var(--sp-3) var(--sp-4);
     display: flex;
     flex-direction: column;
@@ -366,8 +366,8 @@
   }
 
   .episode-subject {
-    font-size: var(--text-sm);
-    font-weight: 500;
+    font-size: 13px;
+    font-weight: 600;
     color: var(--text-primary);
     flex: 1;
     min-width: 0;
@@ -384,7 +384,7 @@
   }
 
   .episode-content {
-    font-size: var(--text-sm);
+    font-size: 12.5px;
     color: var(--text-secondary);
     line-height: 1.6;
     margin: 0;

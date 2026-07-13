@@ -1,8 +1,28 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { health, checkHealth } from '$lib/stores/server';
-  import { modelConfig } from '$lib/stores/model';
+  import { modelConfig, RUNTIME_BACKENDS, RUNTIME_BACKEND_LABELS, type RuntimeBackend } from '$lib/stores/model';
   import { theme } from '$lib/stores/theme';
   import { browser } from '$app/environment';
+  import {
+    chatHistorySettings,
+    chatHistorySettingsLoading,
+    chatHistorySettingsError,
+    loadChatHistorySettings,
+    setChatHistoryEvictionPreset,
+    type EvictionPreset
+  } from '$lib/stores/chatHistorySettings';
+
+  const EVICTION_PRESETS: { value: EvictionPreset; label: string }[] = [
+    { value: '7d',      label: '7 days' },
+    { value: '30d',     label: '30 days' },
+    { value: '90d',     label: '90 days' },
+    { value: 'forever', label: 'Forever' }
+  ];
+
+  onMount(() => {
+    loadChatHistorySettings();
+  });
 
   // Local form state — mirrors store, saved on blur/change
   let backendUrl = '';
@@ -28,11 +48,37 @@
     });
   }
 
+  function selectRuntimeBackend(backend: RuntimeBackend) {
+    modelConfig.set({ ...$modelConfig, backend });
+  }
+
   let checking = false;
   async function runHealthCheck() {
     checking = true;
     await checkHealth();
     checking = false;
+  }
+
+  // Streaming / episodic write-approval — UI-only preferences for now; no
+  // backend endpoint exposes either as a live-switchable setting yet (see
+  // CLAUDE_CODE_PROMPT.md's request to flag missing backend data). Persisted
+  // so the toggle state survives a reload, same pattern as backendUrl above.
+  let streaming = true;
+  let episodicApproval = false;
+
+  $: if (browser) {
+    streaming = localStorage.getItem('lora-streaming') !== '0';
+    episodicApproval = localStorage.getItem('lora-episodic-approval') === '1';
+  }
+
+  function toggleStreaming() {
+    streaming = !streaming;
+    if (browser) localStorage.setItem('lora-streaming', streaming ? '1' : '0');
+  }
+
+  function toggleEpisodicApproval() {
+    episodicApproval = !episodicApproval;
+    if (browser) localStorage.setItem('lora-episodic-approval', episodicApproval ? '1' : '0');
   }
 </script>
 
@@ -42,12 +88,72 @@
 
 <div class="settings-page">
   <div class="settings-inner">
-    <h1 class="settings-title">Settings</h1>
+
+    <!-- Runtime backend -->
+    <section class="settings-card">
+      <div class="card-title">Runtime Backend</div>
+      <div class="segmented">
+        {#each RUNTIME_BACKENDS as b}
+          <button
+            type="button"
+            class="seg-btn"
+            class:active={$modelConfig.backend === b}
+            on:click={() => selectRuntimeBackend(b)}
+          >{RUNTIME_BACKEND_LABELS[b]}</button>
+        {/each}
+      </div>
+      <p class="card-hint">
+        Drives the appbar's status chip on the Chat screen. The active runtime is actually
+        selected at process startup via <code>LOCALIST_RUNTIME_BACKEND</code> — this control is
+        a display preference, not a live backend switch.
+      </p>
+    </section>
+
+    <!-- Chat model (read-only) -->
+    <section class="settings-card">
+      <div class="card-title">Chat Model</div>
+      <div class="card-value text-mono">{chatModel || '—'}</div>
+    </section>
+
+    <!-- Streaming / episodic approval toggles -->
+    <section class="settings-card row">
+      <div class="card-title">Streaming responses</div>
+      <button
+        type="button"
+        class="switch"
+        class:on={streaming}
+        aria-label="Toggle streaming responses"
+        on:click={toggleStreaming}
+      ><span class="switch-knob" /></button>
+    </section>
+
+    <section class="settings-card row">
+      <div class="card-title">Episodic write-approval</div>
+      <button
+        type="button"
+        class="switch"
+        class:on={episodicApproval}
+        aria-label="Toggle episodic write-approval"
+        on:click={toggleEpisodicApproval}
+      ><span class="switch-knob" /></button>
+    </section>
+
+    <!-- Appearance -->
+    <section class="settings-card row">
+      <div class="card-title">Theme — currently <strong>{$theme}</strong></div>
+      <button
+        type="button"
+        class="switch"
+        class:on={$theme === 'light'}
+        aria-label="Toggle light/dark theme"
+        on:click={theme.toggle}
+      ><span class="switch-knob" /></button>
+    </section>
 
     <!-- Backend connection -->
-    <section class="settings-section">
-      <h2 class="section-heading">Backend Connection</h2>
-      <p class="section-desc">Configure the FastAPI server that the UI connects to.</p>
+    <section class="settings-card">
+      <div class="card-title">Backend Connection</div>
+      <p class="card-desc">Configure the FastAPI server that the UI connects to.</p>
 
       <div class="field-group">
         <label class="field-label" for="backend-url">Server URL</label>
@@ -76,7 +182,6 @@
           </button>
         </div>
 
-        <!-- Health status readout -->
         <div class="health-readout">
           <div class="health-row">
             <span class="health-label">Status</span>
@@ -119,12 +224,10 @@
       </div>
     </section>
 
-    <div class="divider" />
-
-    <!-- Model selection -->
-    <section class="settings-section">
-      <h2 class="section-heading">Model Configuration</h2>
-      <p class="section-desc">Model identifiers must match the IDs returned by the active backend.</p>
+    <!-- Model configuration -->
+    <section class="settings-card">
+      <div class="card-title">Model Configuration</div>
+      <p class="card-desc">Model identifiers must match the IDs returned by the active backend.</p>
 
       <div class="field-group">
         <label class="field-label" for="chat-model">Chat model ID</label>
@@ -154,62 +257,30 @@
       </div>
     </section>
 
-    <div class="divider" />
-
-    <!-- Theme -->
-    <section class="settings-section">
-      <h2 class="section-heading">Appearance</h2>
-
-      <div class="theme-row">
-        <div class="theme-info">
-          <span class="field-label">Theme</span>
-          <span class="field-hint" style="margin:0">
-            Currently: <strong>{$theme}</strong>
-          </span>
-        </div>
-        <button
-          class="btn-secondary theme-toggle-btn"
-          on:click={theme.toggle}
-          aria-label="Toggle theme"
-        >
-          {#if $theme === 'dark'}
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="12" cy="12" r="5"/>
-              <line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
-              <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
-              <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
-              <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
-            </svg>
-            Switch to light
-          {:else}
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-            </svg>
-            Switch to dark
-          {/if}
-        </button>
+    <!-- Chat history eviction -->
+    <section class="settings-card">
+      <div class="card-title">Chat History</div>
+      <p class="card-desc">Choose how long chat turns are kept before they're automatically evicted.</p>
+      <div class="segmented">
+        {#each EVICTION_PRESETS as p}
+          <button
+            type="button"
+            class="seg-btn"
+            class:active={$chatHistorySettings.eviction_preset === p.value}
+            disabled={$chatHistorySettingsLoading}
+            on:click={() => setChatHistoryEvictionPreset(p.value)}
+          >{p.label}</button>
+        {/each}
       </div>
+      {#if $chatHistorySettingsError}
+        <p class="card-hint" style="color:var(--error)">{$chatHistorySettingsError}</p>
+      {/if}
     </section>
 
-    <div class="divider" />
-
-    <!-- About -->
-    <section class="settings-section">
-      <h2 class="section-heading">About</h2>
-      <dl class="about-list">
-        <div class="about-row">
-          <dt>System</dt>
-          <dd>Localist Framework</dd>
-        </div>
-        <div class="about-row">
-          <dt>UI Version</dt>
-          <dd class="text-mono">0.1.0</dd>
-        </div>
-        <div class="about-row">
-          <dt>Framework</dt>
-          <dd class="text-mono">SvelteKit</dd>
-        </div>
-      </dl>
+    <!-- Version -->
+    <section class="settings-card row">
+      <div class="card-title">Version</div>
+      <div class="card-value text-mono">0.2.0 · web</div>
     </section>
 
   </div>
@@ -223,36 +294,54 @@
   }
 
   .settings-inner {
-    max-width: 640px;
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-6);
-  }
-
-  .settings-title {
-    font-size: var(--text-2xl);
-    font-weight: 600;
-    color: var(--text-primary);
-    margin-bottom: var(--sp-2);
-  }
-
-  /* Section */
-  .settings-section {
+    max-width: 560px;
     display: flex;
     flex-direction: column;
     gap: var(--sp-4);
   }
 
-  .section-heading {
-    font-size: var(--text-base);
-    font-weight: 600;
+  /* Card */
+  .settings-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: var(--sp-4) var(--sp-5);
+  }
+
+  .settings-card.row {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-4);
+  }
+
+  .card-title {
+    font-size: 12.5px;
+    font-weight: 500;
     color: var(--text-primary);
   }
 
-  .section-desc {
-    font-size: var(--text-sm);
+  .card-desc {
+    font-size: var(--text-xs);
     color: var(--text-tertiary);
-    margin-top: calc(var(--sp-2) * -1);
+    margin-top: calc(var(--sp-3) * -1);
+  }
+
+  .card-value {
+    font-size: 12.5px;
+    color: var(--text-secondary);
+  }
+
+  .card-hint {
+    font-size: var(--text-xs);
+    color: var(--text-tertiary);
+    line-height: 1.6;
+  }
+  .card-hint code {
+    font-size: 10.5px;
   }
 
   /* Fields */
@@ -357,44 +446,4 @@
     gap: var(--sp-1);
     justify-content: flex-end;
   }
-
-  /* Theme toggle */
-  .theme-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--sp-4);
-  }
-
-  .theme-info {
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-1);
-  }
-
-  .theme-toggle-btn {
-    flex-shrink: 0;
-  }
-
-  /* About */
-  .about-list {
-    background: var(--bg-raised);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: var(--sp-4);
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-3);
-  }
-
-  .about-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    font-size: var(--text-sm);
-    gap: var(--sp-4);
-  }
-
-  .about-row dt { color: var(--text-tertiary); }
-  .about-row dd { color: var(--text-secondary); }
 </style>

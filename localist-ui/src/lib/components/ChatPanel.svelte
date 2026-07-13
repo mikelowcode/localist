@@ -225,6 +225,34 @@
     return { label: 'P3 · Tool', cls: 'prov-tool' };
   }
 
+  // Collapsed-by-default provenance disclosure — one pill per assistant
+  // turn showing just the priority route; expanding it reveals the tool/
+  // source/grounded detail that used to render inline unconditionally.
+  let expandedProv: Record<string, boolean> = {};
+
+  function provKey(turn: Turn): string {
+    return turn.task_id ?? String(turn.timestamp);
+  }
+
+  function toggleProv(key: string): void {
+    expandedProv = { ...expandedProv, [key]: !expandedProv[key] };
+  }
+
+  function priorityInfo(p: {
+    priority?:         number;
+    tools_fired?:      string[];
+    file_op_deferred?: boolean;
+  }): { label: string; cls: string } {
+    switch (p.priority) {
+      case 1:  return { label: 'P1 · Direct',        cls: 'prov-direct' };
+      case 2:  return { label: 'P2 · Memory write',  cls: 'prov-memory' };
+      case 3:  return p3Provenance(p);
+      case 4:  return { label: 'P4 · Vault',          cls: 'prov-rag' };
+      case 5:  return { label: 'P5 · Episodic',       cls: 'prov-episodic' };
+      default: return { label: 'P6 · Inference',      cls: 'prov-default' };
+    }
+  }
+
   // ── Review-then-apply wiki diffs ──────────────────────────────
   // Discard is deliberately client-only/ephemeral (no backend call, no
   // persistence) — keyed by "taskId:pageName" in local component state so
@@ -338,48 +366,37 @@
 
               {#if turn.status === 'complete' && turn.metadata}
                 {@const p = turn.metadata}
-                <div class="provenance-bar">
-                  <span class="prov-route">
-                    {#if p.priority === 1}
-                      <span class="prov-chip prov-direct">P1 · Direct</span>
-                    {:else if p.priority === 2}
-                      <span class="prov-chip prov-memory">P2 · Memory write</span>
-                    {:else if p.priority === 3}
-                      {@const p3 = p3Provenance(p)}
-                      <span class="prov-chip {p3.cls}">{p3.label}</span>
-                    {:else if p.priority === 4}
-                      <span class="prov-chip prov-rag">P4 · Vault</span>
-                    {:else if p.priority === 5}
-                      <span class="prov-chip prov-episodic">P5 · Episodic</span>
-                    {:else}
-                      <span class="prov-chip prov-default">P6 · Inference</span>
+                {@const key = provKey(turn)}
+                {@const info = priorityInfo(p)}
+                <button class="prov-toggle" on:click={() => toggleProv(key)}>
+                  <span class="prov-chip {info.cls}">{info.label}</span>
+                  <span aria-hidden="true">{expandedProv[key] ? '⌃' : '⌄'}</span>
+                </button>
+                {#if expandedProv[key]}
+                  <div class="prov-detail">
+                    {#if p.tools_fired && p.tools_fired.length > 0}
+                      {#each p.tools_fired as tool}
+                        <span class="prov-chip prov-tool">⚙ {tool}</span>
+                      {/each}
                     {/if}
-                  </span>
-                  {#if p.tools_fired && p.tools_fired.length > 0}
-                    {#each p.tools_fired as tool}
-                      <span class="prov-chip prov-tool">⚙ {tool}</span>
-                    {/each}
-                  {/if}
-                  {#if p.file_op_deferred && !(p.tools_fired && p.tools_fired.includes('file_op'))}
-                    <span class="prov-chip prov-tool">⚙ file_op</span>
-                  {/if}
-                  {#if p.fetch_episodic}
-                    <span class="prov-chip prov-episodic-mem">◎ episodic</span>
-                  {/if}
-                  {#if p.grounded}
-                    <span class="prov-chip prov-grounded">◈ grounded</span>
-                  {/if}
-                </div>
-              {/if}
-
-              {#if turn.sources && turn.sources.length > 0 && turn.status === 'complete'}
-                <div class="sources-row">
-                  {#each turn.sources as src}
-                    <span class="badge badge-muted source-badge" title={src.path}>
-                      {src.type === 'wiki' ? '📄' : src.type === 'session' ? '📎' : '📁'} {src.name}
-                    </span>
-                  {/each}
-                </div>
+                    {#if p.file_op_deferred && !(p.tools_fired && p.tools_fired.includes('file_op'))}
+                      <span class="prov-chip prov-tool">⚙ file_op</span>
+                    {/if}
+                    {#if p.fetch_episodic}
+                      <span class="prov-chip prov-episodic-mem">◎ episodic</span>
+                    {/if}
+                    {#if p.grounded}
+                      <span class="prov-chip prov-grounded">◈ grounded</span>
+                    {/if}
+                    {#if turn.sources && turn.sources.length > 0}
+                      {#each turn.sources as src}
+                        <span class="badge badge-muted source-badge" title={src.path}>
+                          {src.type === 'wiki' ? '📄' : '📁'} {src.name}
+                        </span>
+                      {/each}
+                    {/if}
+                  </div>
+                {/if}
               {/if}
 
               {#if turn.status === 'complete' && turn.metadata?.pending_diffs}
@@ -625,8 +642,8 @@
   .bubble {
     padding: var(--sp-3) var(--sp-4);
     border-radius: var(--radius-lg);
-    font-size: var(--text-md);
-    line-height: 1.65;
+    font-size: 13.5px;
+    line-height: 1.6;
     max-width: 680px;
     word-break: break-word;
   }
@@ -672,13 +689,28 @@
     margin-top: var(--sp-2);
   }
 
-  .sources-row {
+  .prov-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: var(--sp-2);
+    padding: 0;
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    transition: color var(--dur-fast) var(--ease);
+  }
+  .prov-toggle:hover { color: var(--text-secondary); }
+  .prov-toggle .prov-chip { pointer-events: none; }
+
+  .prov-detail {
     display: flex;
     flex-wrap: wrap;
     gap: var(--sp-1);
-    margin-top: var(--sp-3);
-    padding-top: var(--sp-3);
-    border-top: 1px solid var(--border-soft);
+    margin-top: var(--sp-2);
   }
 
   .source-badge {
@@ -813,7 +845,7 @@
     outline: none;
     resize: none;
     color: var(--text-primary);
-    font-size: var(--text-base);
+    font-size: 13px;
     line-height: 1.6;
     padding: 0;
     min-height: 22px;
@@ -863,15 +895,6 @@
     border-radius: 3px;
     border: 1px solid var(--border);
     color: var(--text-tertiary);
-  }
-
-  .provenance-bar {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--sp-1);
-    margin-top: var(--sp-3);
-    padding-top: var(--sp-2);
-    border-top: 1px solid var(--border-soft);
   }
 
   .prov-chip {
