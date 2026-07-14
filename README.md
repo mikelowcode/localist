@@ -42,6 +42,8 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+First backend startup downloads the local embedding model (`mlx-community/embeddinggemma-300m-4bit`, ~400MB) from the Hugging Face Hub and caches it — a one-time cost that needs internet access. Without it, episodic memory and RAG retrieval still work, just in keyword-only mode instead of cosine-similarity.
+
 ## Running
 
 ```bash

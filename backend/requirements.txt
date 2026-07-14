@@ -19,6 +19,15 @@ python-multipart==0.0.32
 # Wiki document parsing (frontmatter + [[link]] extraction)
 PyYAML>=6.0
 
+# EmbeddingEngine — local corpus/episodic-memory embeddings (embedding_engine.py).
+# Pulls in mlx, mlx-vlm, huggingface-hub, and transformers transitively. Was
+# previously undeclared here (only ever present incidentally via other MLX
+# packages), so a clean venv would silently import-fail and MemoryManager
+# would fall back to keyword-only scoring with no cosine-similarity retrieval.
+# First run downloads mlx-community/embeddinggemma-300m-4bit (~400MB) from
+# the Hugging Face Hub and caches it locally — requires internet access once.
+mlx-embeddings>=0.1.0
+
 # localist-mcp service — HTML extraction (fetch_url tool; ported from the
 # retired standalone Fetcher microservice, Phase 2)
 lxml>=6.1.1

@@ -198,6 +198,19 @@
               {:else}offline{/if}
             </span>
           </div>
+          <div class="health-row">
+            <span class="health-label">Embeddings</span>
+            <span
+              class="badge"
+              class:badge-success={$health.embed_model_found}
+              class:badge-warning={!$health.embed_model_found}
+              title={$health.embed_model_found
+                ? 'Cosine-similarity retrieval active (mlx-community/embeddinggemma-300m-4bit).'
+                : 'Running in keyword-only fallback — check backend logs for the load error.'}
+            >
+              {$health.embed_model_found ? 'ready' : 'keyword-only fallback'}
+            </span>
+          </div>
           {#if $health.base_url}
             <div class="health-row">
               <span class="health-label">Resolved URL</span>
