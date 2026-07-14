@@ -21,6 +21,13 @@ Three backends are registered in `_REGISTRY` today:
 
 ### 16.2 OllamaRuntimeClient — Added 2026-07-08
 
+> **Superseded in part (2026-07-14) — see §16.4.** `embed()` is no longer a permanent stub (it now
+> implements `POST /api/embed`, with a real "not yet configured" `embedding_model` parameter
+> mirroring oMLX's convention) and the "chat model left as an unfilled constructor default" framing
+> below was superseded first by a hardcoded `gemma4:e4b-mlx` default (2026-07-08, later in this
+> section) and then by a fail-fast `ValueError` (2026-07-14). The scoping narrative below is
+> retained as a historical record of what was decided and why at the time.
+
 **Scoping decisions (made before any code was written).** Full interchangeable-backend tier, same
 as Foundry/oMLX — not an offload-style secondary backend as sketched in earlier dual-runtime
 planning (the Apfel spec). Concurrency: swap-only, no dual-runtime logic added. `embed()`: stubbed
@@ -185,3 +192,90 @@ rejected; unreachable backend rejected without side effects; successful swap upd
 updating `CLAUDE.md`'s current "Swapping backends is a config change only" line; updating this
 section; updating the README's Configuration section, which currently and correctly describes the
 control as display-only.
+
+### 16.4 Embedding Support Across Backends, Chat-Model Fail-Fast, and Platform-Gated MLX
+Fallback — Added 2026-07-14
+
+`OllamaRuntimeClient.embed()` is no longer a permanent stub. It POSTs to Ollama's native
+`/api/embed` endpoint (distinct from the OpenAI-compatible `/v1/embeddings` used internally by
+`FoundryRuntimeClient` and `OMLXRuntimeClient` — Ollama's own API returns a plural `embeddings`
+list rather than the singular `data[0].embedding` shape). The client accepts an `embedding_model`
+constructor argument, defaulting to `""` ("not yet configured" — same convention as
+`OMLXRuntimeClient`, not "this backend can never do this").
+
+**Chat model configuration is now mandatory, not defaulted.** `OllamaRuntimeClient.DEFAULT_CHAT_MODEL`
+was previously `"gemma4:e4b-mlx"` — a silent 8.8GB local-model fallback whenever `LOCALIST_CHAT_MODEL`
+was unset. This has been removed. The constructor now raises `ValueError` immediately if
+`chat_model` is falsy, failing at construction time (and therefore at FastAPI startup, surfacing as
+`Application startup failed. Exiting.` with a clear traceback) rather than producing a confusing
+failure on the first chat request. `runtime_factory._make_ollama()` was updated to match. This is
+deliberate: a chat application should never start without a chat model configured, and Ollama in
+particular spans model sizes from tiny local quantizations to 700B-parameter cloud models — there
+is no safe default to assume. Live-verified 2026-07-14: unsetting `LOCALIST_CHAT_MODEL` produces a
+clean startup crash with the expected `ValueError` message; restoring it produces normal startup.
+
+**Embedding source precedence (all backends):**
+
+At startup, `lifespan()` in `main.py` selects an embedding source via
+`_configure_embedding_source(settings, runtime, health)` (extracted 2026-07-14 into a standalone,
+unit-testable function — see Testing note below) in this order:
+
+1. **Runtime-backend embed** — if `Settings.embedding_model` (`LOCALIST_EMBEDDING_MODEL`) is set
+   and the active runtime's `health_check()` reports the model present, `MemoryManager.embed_fn`
+   is bound to `runtime.embed`. This is wired through for the Foundry and Ollama backends and is
+   platform-agnostic for both. **Not yet wired for the oMLX backend** —
+   `runtime_factory._make_omlx()` hardcodes `embedding_model=""` regardless of
+   `Settings.embedding_model`, so this tier can never actually engage while `runtime_backend="omlx"`
+   is active, even though `OMLXRuntimeClient.embed()` itself supports a configurable
+   `embedding_model` when constructed directly. Closing this gap is a follow-up, not part of this
+   change.
+2. **`EmbeddingEngine` (MLX-LM, standalone)** — used only when tier 1 isn't active, AND only on
+   Apple Silicon. Gated behind
+   `is_apple_silicon = platform.system() == "Darwin" and platform.machine() in ("arm64", "aarch64")`,
+   added 2026-07-14, since `mlx_lm` cannot run on Intel Mac, Windows, or Linux. On non-Apple-Silicon
+   hosts with this tier otherwise eligible, the load attempt is skipped entirely (no
+   `EmbeddingEngine()` construction, no import attempt) and an INFO-level log line fires — distinct
+   from the WARNING-level "failed to load" message used when an actual load attempt fails, so the
+   two situations ("this platform can't run this by design" vs. "this platform can but something
+   went wrong") are distinguishable in logs.
+3. **Keyword-only** — universal fallback when neither of the above is available.
+
+`GET /health`'s `embed_model_found` field mirrors this same precedence (fixed 2026-07-14 —
+previously hardcoded to check `EmbeddingEngine` only, which misreported `false` whenever tier 1 was
+actually active).
+
+**Testing note:** the project's test suite convention (established in
+`test_main_memory_episodes.py`) is to never trigger the real FastAPI `lifespan()` in tests — tests
+swap `AppState` fields directly instead. The four-branch embedding-source selection was therefore
+extracted out of `lifespan()`'s inline body into `_configure_embedding_source()` specifically to
+make it unit-testable without violating that convention. `tests/test_main_embedding_source_selection.py`
+covers all four branches, including the Apple-Silicon skip branch under mocked
+`platform.system()`/`platform.machine()` calls (Linux/x86_64, Windows/AMD64) — this is
+mocked/forced-condition testing, not real cross-platform execution; no non-Darwin hardware was
+available to verify the skip branch by actually running on it.
+
+**Verified configuration (2026-07-14, fully live end-to-end):** cloud chat model
+(`gemma4:31b-cloud`, proxied through ollama.com — never resident locally) + local embedding model
+(`nomic-embed-text:latest`, served on-device via `/api/embed`), both routed through the same local
+Ollama daemon at `localhost:11434`. A real turn produced ~30 real embed calls (768-dim vectors)
+plus a completed chat response and working-state extraction, all logged and confirmed via
+`GET /health`. This is the reference configuration for Localist PC (non-Apple-Silicon) users, since
+MLX/`EmbeddingEngine` is unavailable on that hardware entirely — Ollama's `/api/embed` is the only
+local embedding path on Windows/Linux, and the platform gate above ensures those hosts never
+attempt (and fail) an MLX load. One tag-mismatch false start along the way (`.env` needed the
+`:latest` suffix Ollama's `/api/tags` actually reports) — corrected, not a code defect. Full
+narrative: `sessions-log.md` §24 (2026-07-14 entry).
+
+**Test suite:** 728 passed / 0 failed after `embed()` + wiring + `/health` fix; 732 passed / 0
+failed after the chat-model fail-fast change (+4 new tests); 739 passed / 0 failed after the
+platform-gating change (+7 new tests).
+
+**Open items:**
+- Corpus-retrieval similarity thresholds may need to become embedding-model-aware — a low top-score
+  corpus miss (`0.028`) was observed under `nomic-embed-text` on a query that plausibly should have
+  matched; not yet enough samples to confirm this is a real threshold-transfer issue versus normal
+  variance across embedding models' similarity distributions.
+- Apple-Silicon skip branch remains verified only via mocked `platform` calls; real non-Darwin
+  hardware verification is still outstanding, pending access to such a machine.
+- oMLX's `embedding_model` wiring gap noted above (tier 1 never engages for that backend) — a
+  follow-up, not yet scheduled.

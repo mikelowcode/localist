@@ -1,8 +1,8 @@
 # Localist Framework
 
-A local-first, agentic general assistant running entirely on macOS Apple Silicon. Persistent memory across sessions, live web search/fetch, indexed document search, and a deterministic priority-based router — no inference spent deciding how to route a query.
+A local-first, agentic general assistant built primarily for macOS Apple Silicon. Persistent memory across sessions, live web search/fetch, indexed document search, and a deterministic priority-based router — no inference spent deciding how to route a query.
 
-Inference-engine-agnostic: ships with oMLX, Ollama (including Ollama Cloud models), and Azure AI Foundry, swappable via one config variable. Embeddings always run locally regardless of chat backend.
+Inference-engine-agnostic: ships with oMLX, Ollama (including Ollama Cloud models), and Azure AI Foundry, swappable via one config variable. Embeddings always run locally regardless of chat backend — via MLX EmbeddingGemma (Apple Silicon only) or, with the Ollama backend, via any locally-served Ollama embedding model (e.g. `nomic-embed-text`), which also makes the framework usable on non-Apple-Silicon hardware.
 
 ---
 
@@ -30,8 +30,9 @@ Localist UI ──HTTP──► FastAPI :8001
 
 ## Prerequisites
 
-- macOS Apple Silicon, Python 3.13, Node.js
-- One runtime backend: oMLX (chat model on :8000), [Ollama](https://ollama.com) (local or Ollama Cloud, :11434), or Azure AI Foundry
+- Python 3.13, Node.js
+- One runtime backend: oMLX (chat model on :8000, macOS Apple Silicon only), [Ollama](https://ollama.com) (local or Ollama Cloud, :11434, any OS), or Azure AI Foundry
+- MLX EmbeddingGemma (the default local embedding model) requires Apple Silicon; on other platforms, set `LOCALIST_EMBEDDING_MODEL` to an Ollama-served embedding model instead (or fall back to keyword-only retrieval)
 
 ## Installation
 
@@ -42,7 +43,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-First backend startup downloads the local embedding model (`mlx-community/embeddinggemma-300m-4bit`, ~400MB) from the Hugging Face Hub and caches it — a one-time cost that needs internet access. Without it, episodic memory and RAG retrieval still work, just in keyword-only mode instead of cosine-similarity.
+First backend startup downloads the local embedding model (`mlx-community/embeddinggemma-300m-4bit`, ~400MB) from the Hugging Face Hub and caches it — a one-time cost that needs internet access. Without it (or on non-Apple-Silicon hardware, where it can't run at all), episodic memory and RAG retrieval still work in keyword-only mode, or via an Ollama-served embedding model instead (see `LOCALIST_EMBEDDING_MODEL` below).
 
 ## Running
 
@@ -58,7 +59,8 @@ Copy `backend/.env.example` to `backend/.env`. Only an API key for the active `w
 | Variable | Default | Description |
 |---|---|---|
 | `LOCALIST_RUNTIME_BACKEND` | `foundry` | `foundry`, `omlx`, or `ollama` |
-| `LOCALIST_CHAT_MODEL` | *(none)* | Model ID for the active backend |
+| `LOCALIST_CHAT_MODEL` | *(none)* | Model ID for the active backend — required for `ollama` (fails fast at startup if unset) |
+| `LOCALIST_EMBEDDING_MODEL` | *(none)* | Embedding model ID for the active backend (`foundry`/`ollama`); if set and found, takes precedence over MLX EmbeddingGemma |
 | `SEARCH_PROVIDER` | `langsearch` | `web_search` provider: `langsearch` or `brave` |
 | `LANGSEARCH_API_KEY` | *(none)* | Required when `SEARCH_PROVIDER=langsearch`; without it, `web_search` fails and falls back to corpus |
 | `BRAVE_API_KEY` | *(none)* | Required when `SEARCH_PROVIDER=brave`; without it, `web_search` fails and falls back to corpus |
@@ -120,6 +122,6 @@ Tests are organized by phase (memory substrate, routing, controller dispatch, ex
 
 ## Roadmap
 
-**Done:** Localist CLI launcher, MCP migration (tools off legacy dispatcher/Fetcher), identity continuity, user profile injection, generate-then-save file ops, graph retrieval layer (SQLite schema v6), Ollama runtime backend (incl. Cloud), wiki diff updates with review/apply UI, episodic memory hardening (real cosine retrieval, write-approval gate, semantic retraction).
+**Done:** Localist CLI launcher, MCP migration (tools off legacy dispatcher/Fetcher), identity continuity, user profile injection, generate-then-save file ops, graph retrieval layer (SQLite schema v6), Ollama runtime backend (incl. Cloud) with real `/api/embed` support and a cross-platform local embedding path, chat-model fail-fast validation, wiki diff updates with review/apply UI, episodic memory hardening (real cosine retrieval, write-approval gate, semantic retraction).
 
 **Open:** generalize the bullet/diff-marker collision edge case; rollback mechanism for wiki writes (currently gitignored, no undo); broader Localist UI rework for episode browsing and tool result display; macOS `.app` packaging via PyInstaller + Tauri.

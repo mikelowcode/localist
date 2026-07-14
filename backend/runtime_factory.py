@@ -76,11 +76,19 @@ def _make_foundry(kwargs: dict[str, Any]) -> BaseRuntimeClient:
 
 
 def _make_omlx(kwargs: dict[str, Any]) -> BaseRuntimeClient:
-    """Construct an OMLXRuntimeClient from flattened settings kwargs."""
+    """
+    Construct an OMLXRuntimeClient from flattened settings kwargs.
+
+    embedding_model is threaded through like the other two backends —
+    OMLXRuntimeClient itself already supports a configured embedding_model
+    (its constructor and embed() work correctly); this factory function
+    just passes the kwarg on. Defaults to "" ("not yet configured"),
+    matching OMLXRuntimeClient.DEFAULT_EMBEDDING_MODEL.
+    """
     from omlx_runtime_client import OMLXRuntimeClient
     return OMLXRuntimeClient(
         chat_model      = kwargs.get("chat_model") or "gemma-4-e4b-it-4bit",
-        embedding_model = "",
+        embedding_model = kwargs.get("embedding_model", ""),
         base_url        = kwargs.get("omlx_url",        "http://127.0.0.1:8000"),
         request_timeout = kwargs.get("request_timeout", 30.0),
         stream_timeout  = kwargs.get("stream_timeout",  60.0),
@@ -91,7 +99,8 @@ def _make_ollama(kwargs: dict[str, Any]) -> BaseRuntimeClient:
     """Construct an OllamaRuntimeClient from flattened settings kwargs."""
     from ollama_runtime_client import OllamaRuntimeClient
     return OllamaRuntimeClient(
-        chat_model      = kwargs.get("chat_model") or "gemma4:e4b-mlx",
+        chat_model      = kwargs.get("chat_model") or "",
+        embedding_model = kwargs.get("embedding_model", ""),
         base_url        = kwargs.get("ollama_url",      "http://localhost:11434"),
         request_timeout = kwargs.get("request_timeout", 30.0),
         stream_timeout  = kwargs.get("stream_timeout",  60.0),
@@ -132,7 +141,9 @@ def create_runtime(
 
         Common keys (used by all backends):
             chat_model (str)       — model ID for chat completions
-            embedding_model (str)  — model ID for embeddings
+            embedding_model (str)  — model ID for embeddings; honored by
+                                      all three backends ("foundry",
+                                      "omlx", "ollama")
             request_timeout (float)
             stream_timeout (float)
 

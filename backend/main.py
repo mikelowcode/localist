@@ -87,9 +87,19 @@ can be overridden via environment variables or a .env file:
   LOCALIST_REQUEST_TIMEOUT             Non-streaming timeout in seconds (float)
   LOCALIST_MEMORY_DB                   Absolute path to the SQLite memory DB file.
                                        Defaults to <project_root>/localist_memory.db
+  LOCALIST_EMBEDDING_MODEL             Runtime-backend embedding model ID (foundry/ollama
+                                       only; omlx does not yet wire this through). Empty
+                                       string (default) = not configured, falls back to
+                                       EmbeddingEngine.
   LOCALIST_EMBEDDING_ENGINE_ENABLED    Load the standalone MLX-LM EmbeddingEngine at
                                        startup (bool, default True).  Set False to run
                                        in keyword-only mode without loading the model.
+                                       Ignored when LOCALIST_EMBEDDING_MODEL is set and
+                                       found by the active runtime backend — the runtime
+                                       backend's own embed() is used instead.  Also a
+                                       no-op on non-Apple-Silicon platforms regardless of
+                                       its value, since EmbeddingEngine's mlx_lm
+                                       dependency only runs on Apple Silicon.
 """
 
 from __future__ import annotations
@@ -102,6 +112,7 @@ import datetime
 import json
 import logging
 import mimetypes
+import platform
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -143,9 +154,14 @@ class Settings(BaseSettings):
     # Runtime backend selection
     runtime_backend: str = "foundry"
 
-    # Model ID — chat only; embeddings are handled by EmbeddingEngine (MLX-LM),
-    # not by the runtime backend.
+    # Model ID — chat only; embeddings are handled by EmbeddingEngine (MLX-LM)
+    # unless embedding_model below is set and found by the active runtime
+    # backend, in which case the runtime backend's own embed() is used instead.
     chat_model:       str | None = None
+
+    # Runtime-backend embedding model ID (foundry/ollama only; empty string =
+    # not configured, falls back to EmbeddingEngine).
+    embedding_model:  str = ""
 
     # Foundry network (foundry backend only)
     foundry_url:      str | None = None
@@ -214,6 +230,80 @@ _state = AppState()
 
 
 # ---------------------------------------------------------------------------
+# Embedding source selection (pulled out of lifespan() for testability)
+# ---------------------------------------------------------------------------
+
+def _configure_embedding_source(
+    settings: Settings,
+    runtime:  BaseRuntimeClient,
+    health:   dict,
+) -> tuple[Any, EmbeddingEngine | None]:
+    """
+    Decide and construct which embedding source lifespan() should use, in
+    three-tier precedence order:
+
+      1. The active runtime backend's own embed() — used when
+         settings.embedding_model is set AND health["embed_model_found"]
+         (from the health check already run in lifespan()) is truthy.
+         Platform-agnostic.
+      2. EmbeddingEngine (standalone MLX-LM) — attempted only when enabled
+         AND this platform is Apple Silicon, since mlx_lm cannot run
+         elsewhere.
+      3. Neither — MemoryManager falls back to keyword-only retrieval.
+
+    Tiers 1 and 2 are mutually exclusive: loading both would hold two
+    embedding models in memory for no benefit.
+
+    Returns
+    -------
+    tuple[Callable | None, EmbeddingEngine | None]
+        (embed_fn, embedding_engine). embedding_engine is the constructed
+        EmbeddingEngine instance whenever tier 2 was attempted (whether or
+        not it ended up available), so the caller can stash it on app
+        state; otherwise None.
+
+    This is a standalone function (not inlined in lifespan()) purely so the
+    branch selection can be unit-tested without running the full startup
+    sequence (real runtime construction, directory indexing, graph build,
+    etc.) — lifespan() itself is not exercised by the test suite.
+    """
+    is_apple_silicon = platform.system() == "Darwin" and platform.machine() in ("arm64", "aarch64")
+
+    if settings.embedding_model and health.get("embed_model_found"):
+        logger.info(
+            "Runtime-backend embeddings ready — backend=%s model=%s. "
+            "EmbeddingEngine will not be loaded.",
+            settings.runtime_backend.upper(), settings.embedding_model,
+        )
+        return runtime.embed, None
+
+    if settings.embedding_engine_enabled and is_apple_silicon:
+        embedding_engine = EmbeddingEngine()
+        if embedding_engine.available:
+            logger.info("EmbeddingEngine ready — embeddings enabled.")
+            return embedding_engine.embed, embedding_engine
+        logger.warning(
+            "EmbeddingEngine failed to load — MemoryManager will run "
+            "in keyword-only mode.  Install mlx-lm and retry."
+        )
+        return None, embedding_engine
+
+    if settings.embedding_engine_enabled and not is_apple_silicon:
+        logger.info(
+            "EmbeddingEngine skipped — mlx_lm requires Apple Silicon, this platform "
+            "is %s/%s. MemoryManager will run in keyword-only mode.",
+            platform.system(), platform.machine(),
+        )
+        return None, None
+
+    logger.info(
+        "EmbeddingEngine disabled (LOCALIST_EMBEDDING_ENGINE_ENABLED=false) — "
+        "MemoryManager will run in keyword-only mode."
+    )
+    return None, None
+
+
+# ---------------------------------------------------------------------------
 # Lifespan — startup / shutdown
 # ---------------------------------------------------------------------------
 
@@ -241,6 +331,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     runtime = create_runtime(
         backend         = settings.runtime_backend,
         chat_model      = settings.chat_model,
+        embedding_model = settings.embedding_model,
         foundry_url     = settings.foundry_url,
         omlx_url        = settings.omlx_url,
         ollama_url      = settings.ollama_url,
@@ -275,30 +366,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     templates_dir = Path(settings.templates_dir) if settings.templates_dir else project_root / "templates"
     memory_db     = Path(settings.memory_db)     if settings.memory_db     else project_root / "localist_memory.db"
 
-    # -- EmbeddingEngine (standalone MLX-LM, backend-agnostic) ---------------
-    #
-    # Embeddings are now independent of the runtime backend.  EmbeddingEngine
-    # loads mlx-community/embeddinggemma-300m-4bit via mlx_lm at startup.
-    # On failure it logs a warning and sets available=False — MemoryManager
-    # then falls back to keyword-only retrieval without surfacing errors.
+    # -- Embedding source selection -------------------------------------------
+    # See _configure_embedding_source() for the three-tier precedence rules
+    # (runtime-backend embed / EmbeddingEngine-if-Apple-Silicon / keyword-only).
 
-    embed_fn = None
-    if settings.embedding_engine_enabled:
-        embedding_engine = EmbeddingEngine()
+    embed_fn, embedding_engine = _configure_embedding_source(settings, runtime, health)
+    if embedding_engine is not None:
         _state.embedding_engine = embedding_engine
-        if embedding_engine.available:
-            embed_fn = embedding_engine.embed
-            logger.info("EmbeddingEngine ready — embeddings enabled.")
-        else:
-            logger.warning(
-                "EmbeddingEngine failed to load — MemoryManager will run "
-                "in keyword-only mode.  Install mlx-lm and retry."
-            )
-    else:
-        logger.info(
-            "EmbeddingEngine disabled (LOCALIST_EMBEDDING_ENGINE_ENABLED=false) — "
-            "MemoryManager will run in keyword-only mode."
-        )
 
     memory_manager = MemoryManager(db_path=memory_db, embed_fn=embed_fn)
     _state.memory_manager = memory_manager
@@ -830,10 +904,18 @@ async def get_health() -> HealthResponse:
     runtime = _require_runtime()
     raw: dict[str, Any] = await asyncio.to_thread(runtime.health_check)
 
-    # Embedding availability is now independent of the runtime backend —
-    # it comes from EmbeddingEngine (MLX-LM), not from oMLX's model list.
-    embedding_engine = _state.embedding_engine
-    embed_available  = embedding_engine is not None and embedding_engine.available
+    # Mirrors the embed_fn precedence lifespan() establishes at startup: the
+    # runtime backend's own embed() wins when an embedding_model is configured
+    # and the health check confirms it's actually present, since in that case
+    # lifespan() never loads EmbeddingEngine at all (_state.embedding_engine
+    # stays None). Only fall back to EmbeddingEngine's own availability when
+    # the runtime-backend path isn't the one actually wired to MemoryManager.
+    settings = _state.settings
+    if settings is not None and settings.embedding_model and raw.get("embed_model_found"):
+        embed_available = True
+    else:
+        embedding_engine = _state.embedding_engine
+        embed_available  = embedding_engine is not None and embedding_engine.available
 
     return HealthResponse(
         healthy           = bool(raw.get("reachable") and raw.get("chat_model_found")),

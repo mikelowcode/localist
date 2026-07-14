@@ -34,9 +34,14 @@ places:
     SSE stream, so _iter_sse_chunks is not reusable here — this module
     implements its own line-delimited JSON parser (_iter_ndjson_chunks).
 
-embed() is a permanent stub: the configured chat model's capabilities
-(as reported by GET /api/tags) are ["completion", "tools", "thinking"] —
-no "embedding" capability. EmbeddingEngine remains the sole embedding path.
+embed() calls Ollama's native POST /api/embed endpoint, which is also
+structurally different from Foundry/oMLX:
+
+  - Response shape: {"embeddings": [[...]], ...} — a plural "embeddings"
+    key holding a list of vectors (batch-shaped), not the OpenAI-style
+    {"data": [{"embedding": [...]}]} shape Foundry/oMLX use. This client
+    only ever sends a single string as "input", so it extracts index 0
+    of that list.
 """
 
 from __future__ import annotations
@@ -57,11 +62,15 @@ logger = logging.getLogger(__name__)
 # Override via the base_url constructor argument.
 _DEFAULT_BASE_URL = "http://localhost:11434"
 
-_CHAT_PATH = "/api/chat"
-_TAGS_PATH = "/api/tags"
+_CHAT_PATH  = "/api/chat"
+_TAGS_PATH  = "/api/tags"
+_EMBED_PATH = "/api/embed"
 
-# Confirmed chat model — matches the "model" field returned by GET /api/tags.
-DEFAULT_CHAT_MODEL = "gemma4:e4b-mlx"
+# No default chat model — Ollama serves many models of wildly different size
+# (multi-GB local pulls vs. lightweight cloud models), so silently falling
+# back to one is never safe. Empty string means "not configured"; the
+# constructor raises ValueError rather than assuming a model.
+DEFAULT_CHAT_MODEL = ""
 
 
 # ---------------------------------------------------------------------------
@@ -117,33 +126,56 @@ class OllamaRuntimeClient:
     Parameters
     ----------
     chat_model:
-        Ollama model name for chat completions.
+        Ollama model name for chat completions. Required — there is no
+        default. Construction raises ValueError if left empty, since
+        silently falling back to some specific local model would risk
+        pulling in a multi-gigabyte model the caller never asked for.
+    embedding_model:
+        Ollama model name for embedding generation. Empty string (default)
+        means no embedding model is configured — embed() raises
+        NotImplementedError until one is set.
     base_url:
         Base URL of the Ollama HTTP server.  Defaults to _DEFAULT_BASE_URL.
     request_timeout:
         Seconds before a non-streaming request is considered hung.
     stream_timeout:
         Seconds before the first byte of a streaming response must arrive.
+
+    Raises
+    ------
+    ValueError
+        If chat_model is empty — no default chat model is assumed.
     """
 
     def __init__(
         self,
         chat_model:      str   = DEFAULT_CHAT_MODEL,
+        embedding_model: str   = "",
         base_url:        str   = _DEFAULT_BASE_URL,
         request_timeout: float = 30.0,
         stream_timeout:  float = 60.0,
     ) -> None:
+        if not chat_model:
+            raise ValueError(
+                "OllamaRuntimeClient requires an explicit chat_model — no default "
+                "is assumed. Set LOCALIST_CHAT_MODEL (or pass chat_model explicitly) "
+                "to a model name confirmed present via GET /api/tags."
+            )
+
         self._chat_model      = chat_model
+        self._embedding_model = embedding_model
         self._base_url        = base_url.rstrip("/")
         self._request_timeout = request_timeout
         self._stream_timeout  = stream_timeout
 
-        self._chat_endpoint = self._base_url + _CHAT_PATH
-        self._tags_endpoint = self._base_url + _TAGS_PATH
+        self._chat_endpoint  = self._base_url + _CHAT_PATH
+        self._tags_endpoint  = self._base_url + _TAGS_PATH
+        self._embed_endpoint = self._base_url + _EMBED_PATH
 
         logger.info(
-            "OllamaRuntimeClient initialised — chat: %s  base: %s",
+            "OllamaRuntimeClient initialised — chat: %s  embed: %s  base: %s",
             self._chat_model,
+            self._embedding_model,
             self._base_url,
         )
 
@@ -196,31 +228,80 @@ class OllamaRuntimeClient:
 
     def embed(self, text: str) -> list[float]:
         """
-        Embedding is not supported by this backend.
+        Request a dense embedding vector from Ollama via POST /api/embed.
 
-        The configured chat model's capabilities (per GET /api/tags) are
-        ["completion", "tools", "thinking"] — no "embedding" capability.
-        This is a permanent stub, not a "not configured yet" state: use
-        EmbeddingEngine for all embedding needs while Ollama is the active
-        runtime.
+        Raises NotImplementedError when no embedding model is configured —
+        this Ollama client is currently chat-only. Set embedding_model at
+        construction time when an embedding model becomes available.
 
         Parameters
         ----------
         text:
             The input string to embed.
 
+        Returns
+        -------
+        list[float]
+            The embedding vector for the input.
+
         Raises
         ------
         NotImplementedError
-            Always.
+            When embedding_model is empty (no model loaded).
+        RuntimeError
+            On any network error, non-200 status, or unexpected response shape.
         """
-        raise NotImplementedError(
-            "OllamaRuntimeClient has no embedding capability — the configured "
-            "model reports capabilities ['completion', 'tools', 'thinking'] "
-            "with no 'embedding' entry. Use EmbeddingEngine for all embedding "
-            "needs; ensure ResearchAgent is called with use_embeddings=False "
-            "(the default) while Ollama is the active runtime."
-        )
+        if not self._embedding_model:
+            raise NotImplementedError(
+                "No embedding model configured for OllamaRuntimeClient. "
+                "Set embedding_model to a valid model ID when one is available. "
+                "Ensure ResearchAgent is called with use_embeddings=False (the default) "
+                "until then."
+            )
+
+        payload = {
+            "model": self._embedding_model,
+            "input": text,
+        }
+
+        logger.debug("embed() → %s  input_chars=%d", self._embed_endpoint, len(text))
+
+        try:
+            response = requests.post(
+                self._embed_endpoint,
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(payload),
+                timeout=self._request_timeout,
+            )
+        except requests.ConnectionError as exc:
+            raise RuntimeError(
+                f"Cannot reach Ollama at {self._embed_endpoint}. "
+                f"Is the service running?  Detail: {exc}"
+            ) from exc
+        except requests.Timeout:
+            raise RuntimeError(
+                f"Ollama embed request timed out after {self._request_timeout}s."
+            )
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Ollama embed returned HTTP {response.status_code}: "
+                f"{response.text[:400]}"
+            )
+
+        try:
+            data: dict = response.json()
+            # Ollama's native embed response shape:
+            # {"embeddings": [[...]], ...} — plural key, list of vectors.
+            vector: list[float] = data["embeddings"][0]
+        except (KeyError, IndexError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Unexpected Ollama embed response shape: {exc}\n"
+                f"Raw: {response.text[:400]}"
+            ) from exc
+
+        logger.debug("embed() ← vector dim=%d", len(vector))
+        return vector
 
     def infer_stream(
         self,
@@ -318,8 +399,9 @@ class OllamaRuntimeClient:
             reachable (bool), models (list[str]), chat_model_found (bool),
             embed_model_found (bool | None), base_url (str)
 
-        embed_model_found is always None — this backend has no embedding
-        capability (not applicable, not merely unconfigured).
+        embed_model_found is None when no embedding model is configured
+        (not applicable), False when configured but not found, True when
+        found.
 
         Does not raise — all failures are captured in the returned dict.
         """
@@ -327,7 +409,8 @@ class OllamaRuntimeClient:
             "reachable":         False,
             "models":            [],
             "chat_model_found":  False,
-            "embed_model_found": None,
+            # None = not applicable (no embedding model configured)
+            "embed_model_found": None if not self._embedding_model else False,
             "base_url":          self._base_url,
         }
 
@@ -343,6 +426,10 @@ class OllamaRuntimeClient:
                 "reachable":        True,
                 "models":           models,
                 "chat_model_found": self._chat_model in models,
+                "embed_model_found": (
+                    self._embedding_model in models
+                    if self._embedding_model else None
+                ),
             })
         except Exception as exc:
             result["error"] = str(exc)
@@ -358,6 +445,7 @@ class OllamaRuntimeClient:
         return (
             f"OllamaRuntimeClient("
             f"chat_model={self._chat_model!r}, "
+            f"embedding_model={self._embedding_model!r}, "
             f"base_url={self._base_url!r})"
         )
 
@@ -369,7 +457,9 @@ class OllamaRuntimeClient:
 def _assert_protocol_conformance() -> None:
     """Verify OllamaRuntimeClient satisfies BaseRuntimeClient at import time."""
     from base_runtime_client import BaseRuntimeClient
-    assert isinstance(OllamaRuntimeClient(), BaseRuntimeClient), (
+    # chat_model has no default (see class docstring) — pass a placeholder
+    # purely to satisfy the constructor for this conformance check.
+    assert isinstance(OllamaRuntimeClient(chat_model="placeholder"), BaseRuntimeClient), (
         "OllamaRuntimeClient does not satisfy the BaseRuntimeClient Protocol."
     )
     logger.debug("OllamaRuntimeClient protocol conformance check passed.")
