@@ -7,6 +7,8 @@ __pycache__/
 *.pyd
 *.sqlite3
 *.db
+*.db-shm
+*.db-wal
 *.log
 
 # Virtual environments
