@@ -19,8 +19,8 @@ CSS custom properties (no Tailwind, no component library).
 |---|---|---|
 | `/conversation` | `ChatPanel.svelte` | Primary chat interface. Streams SSE responses. |
 | `/memory` | `EpisodesPanel.svelte` | Episodic memory browser. |
-| `/files` | FileBrowser | Raw and wiki file listing; file upload; wiki ingest trigger. |
-| `/settings` | Settings | Runtime status, version info. |
+| `/files` | `FileBrowser.svelte` | Full-width file preview pane. Wiki/Raw/Generated listing, upload, and ingest moved into the sidebar's Files sub-nav (§7.11, 2026-07-13) — no longer part of this route's own component. |
+| `/settings` | Settings | Runtime backend status/health, chat/embedding model IDs, chat-history eviction preset, theme, Runtime Backend display preference (§7.10). |
 
 ### 7.3 Provenance Bar
 
@@ -101,6 +101,14 @@ equivalent reverse proxy. The `/api` prefix is stripped before forwarding.
 ### 7.6 Status Bar & Live Turn Rendering
 
 #### Header status chips
+
+**Superseded 2026-07-13 — see §7.10.** The three-chip layout described in this subsection
+(agents/model/connectivity) was replaced by a single consolidated chip (green dot + active
+inference-engine name, Chat screen only) plus a separate pending-count chip (Memory screen only)
+as part of the 1a desktop-UI port. The agents chip/popover described below no longer exists in the
+UI at all — `agents.ts`'s store and polling are still running but unconsumed by any component (see
+§7.10's open items). The rest of this subsection is retained as the historical record of the
+pre-2026-07-13 SSE/status-event mechanics, which are unchanged by the redesign.
 
 `StatusBar.svelte` (`localist-ui/src/lib/components/StatusBar.svelte`) renders three chip types in the right section of the application header: agents, model, and connectivity. A fourth chip — a "streaming" indicator driven by `$tasksStore.streaming` — existed in earlier versions and was removed 2026-06-28. It duplicated the in-bubble status line already present in `ChatPanel.svelte`; the in-bubble status line is now the canonical live-status indicator for in-flight tasks.
 
@@ -352,3 +360,121 @@ elided silently: add an explicit `test_get_files_generated` case
 alongside the existing `/files/raw`/`/files/wiki` tests if this endpoint
 grows more logic than a directory listing.
 
+
+### 7.10 Desktop UI Direction "1a — Inline Provenance" Ported to Web (2026-07-13)
+
+A desktop-app UI direction, designed and approved separately as an HTML/React click-through
+reference (`design_handoff_desktop_ui/reference.dc.html` + accompanying `README.md`), was ported
+into this SvelteKit app as a visual/structural pass — existing stores' data-fetching logic, backend
+contracts, and SSE handling were explicitly out of scope. Full session narrative and rationale for
+individual decisions: `sessions-log.md` §30. This subsection is the current-state reference.
+
+**Design tokens (`app.css`).** New dark palette (`--bg: #121214`, `--bg-panel: #1a1a1d`, etc.), a
+new `--accent-2` (logo gradient only), `color-mix()`-based `--accent-dim/-mid/-glow`, and a
+`[data-theme="light"]` override block (the `theme` store/`data-theme` attribute mechanism already
+existed; only the light-theme values were added). `--topbar-h` 44px, `--radius`/`--radius-lg`
+8px/12px, `--sidebar-w` default 236px.
+
+**Sidebar (`Sidebar.svelte`).** Two-tone CSS gradient logo mark (`.brand-mark`, no image asset);
+20×20 mono-letter nav icons (C/M/F/S). Chat and Files nav rows expand their sub-lists in place on
+click (local `chatHistoryExpanded`/`filesNavExpanded` state) rather than always rendering them.
+Files' sub-list contains the Wiki/Raw/Generated listing, upload, and per-file ingest that used to
+live in `FileBrowser.svelte` — see §7.11. New `$lib/stores/sidebar.ts` (`sidebarWidth`,
+`sidebarCollapsed`, both `localStorage`-persisted) backs a drag-to-resize divider (180–320px,
+collapses fully below a 120px threshold) and the sidebar footer's theme-toggle switch.
+`+layout.svelte` applies `sidebarWidth`/`sidebarCollapsed` to `#app-shell`'s `grid-template-columns`
+directly via `document.getElementById('app-shell')` (necessary because `#app-shell` is defined in
+`app.html`, outside the component tree `+layout.svelte` renders into) — animating between two fixed-
+length grid tracks this way needs no `@property` registration, unlike animating the `--sidebar-w`
+custom property value itself would have.
+
+**Appbar (`StatusBar.svelte`).** Single consolidated chip (green dot + active inference-engine
+name — `Ollama`/`oMLX`/`Foundry`, not the model id), shown only on the Chat screen; a separate
+"N pending" chip shown only on Memory. New sidebar show/hide toggle button at the start of the bar.
+Screen title now derives from `$page.url.pathname` rather than the component's previously-unused
+`<slot />`. See §7.6 for what this replaced.
+
+**Chat (`ChatPanel.svelte`).** The always-visible provenance bar (§7.3) is now collapsed by default:
+a single `prov-toggle` pill (priority label + chevron) per completed assistant turn, expanding on
+click to reveal the same tool/episodic/grounded/source chips §7.3 already documents — same
+`metadata`/`sources` data and `p3Provenance()` labeling, purely a disclosure restructuring. Per-turn
+expand state is a local `expandedProv` map keyed by `task_id` (falling back to `timestamp`).
+
+**Memory (`EpisodesPanel.svelte`, `episodes.ts`).** `TYPE_COLORS` for `preference`/`decision`/
+`workflow`/`correction` now reference `var(--accent-dim/mid)` / success / warning / error tokens
+instead of bespoke hex triples. `fact`/`relationship`/`context` keep their pre-existing bespoke hex
+colors — not covered by the design handoff, a known gap. Active filter-pill state is now solid
+`--accent` background + white text; the pre-existing amber-tinted `Pending` chip's distinct active
+state was intentionally preserved rather than unified into the same treatment.
+
+**Settings.** Restyled as stacked cards. New Runtime Backend segmented control
+(`RUNTIME_BACKENDS`/`RUNTIME_BACKEND_LABELS`/`runtimeBackendLabel` in `model.ts`,
+`localStorage`-persisted) drives the appbar chip's label — **a display preference only, not a live
+backend switch**; see §16.3 for the scoped-but-not-built proposal to make it one. Pre-existing real
+functionality (backend-URL health check, chat/embedding model ID fields) was restyled in place, not
+removed. New Streaming-responses / Episodic-write-approval toggles are UI-only placeholders with no
+backing endpoint — flagged in the code as such.
+
+**Files.** See §7.11.
+
+**Verification posture.** `npm run check` and a production `npm run build` both clean throughout.
+No browser-automation tool is available in this environment; verification was structural (SSR HTML
+diffed for expected markup against a live backend) rather than a rendered visual/pixel check —
+explicitly flagged as a limitation, not asserted as a full visual pass.
+
+**Open items:**
+- `fact`/`relationship`/`context` episode-type colors don't participate in the token system.
+- `agents.ts`'s `loadAgents()` polling is now unconsumed by any component (the agents chip/popover
+  it fed no longer exists in the UI) — not removed this session.
+- No live human browser/visual QA pass has been performed as of this writing.
+
+### 7.11 File Browser Restructure: Sidebar-Driven Listing, Download, and Two-Step Delete (2026-07-13)
+
+Continuation of §7.10's Files change, with two new real capabilities added in the same session.
+Full narrative: `sessions-log.md` §31.
+
+**Structure.** `FileBrowser.svelte` is now a full-width preview-only pane. Wiki/Raw/Generated
+listing, upload, and per-file ingest live in `Sidebar.svelte`'s expandable Files sub-nav instead —
+each group independently collapsible, all expanded by default. Selection state moved to a new
+`$lib/stores/fileSelection.ts` (`selectedFile`, `fileContent`, `fileContentLoading`,
+`fileContentError`, `selectFile()`, `closeFile()`), shared between the sidebar (selection UI) and
+`FileBrowser.svelte` (preview rendering) — previously this was local component state inside
+`FileBrowser.svelte` alone.
+
+**New endpoint — `GET /files/download`.** Returns a `FileResponse` with an explicit
+`Content-Disposition: attachment` header and a `mimetypes.guess_type()`-derived media type, so the
+browser performs a real download (Safari's Downloads queue, specifically) rather than navigating to
+raw content the way `GET /files/content`'s JSON response would. Gated by the same raw/wiki/generated
+allowed-roots check as `/files/content`, but using `Path.is_relative_to()` rather than those
+endpoints' string-prefix check (`str(target).startswith(str(root))`) — the prefix check is
+vulnerable to a sibling-directory bypass (an allowed root of `/data/wiki` also matches
+`/data/wiki_evil`); `/files/content` and `/files/upload` still use the older, narrower check
+(flagged as an open item below, not fixed in this pass). Frontend: a plain `<a
+href=".../files/download?path=..." download="filename">` in `FileBrowser.svelte`'s footer for
+`type === 'generated'` files — no blob/JS handling; the anchor's `download` attribute plus the
+response header alone trigger the native download.
+
+**New endpoint — `DELETE /files`.** Same `is_relative_to()`-gated path check. Unlinks the file and
+calls `MemoryManager.remove_document()` to purge any `document_index` row for that path — a no-op
+for generated files (never indexed), necessary for raw/wiki so a deleted file doesn't linger in RAG
+retrieval. Frontend: every sidebar file row gets a trash-icon button. First click swaps that row in
+place for an inline `Delete "<filename>"?` / Confirm / Cancel prompt (`confirmDeletePath` local
+state in `Sidebar.svelte`) — a two-step confirmation by design requirement, using the app's existing
+inline-review pattern (cf. the wiki diff apply/discard flow, §17) rather than a browser-native
+`confirm()` dialog. Confirming refreshes the affected list and closes the preview pane if the
+deleted file was open.
+
+**Verification.** Both endpoints exercised directly against the running backend: correct headers
+and byte-identical content for download; real throwaway files created and deleted for the delete
+path, confirmed removed from disk; a path-traversal attempt (`/etc/passwd` / `/etc/hosts`) 403s on
+both. Each check repeated through the Vite dev server's `/api` proxy — the actual path the browser
+UI uses — not just direct-to-backend, to rule out a proxy-layer discrepancy.
+
+**Test suite.** No backend unit tests added for either endpoint — covered only by the live-request
+verification above, following the same precedent set by §7.9's `GET /files/generated` (which also
+shipped without dedicated tests). Flagged as a real gap.
+
+**Open items:**
+- No backend test coverage for `/files/download` or `DELETE /files`.
+- `/files/content` and `/files/upload`'s path-containment checks remain on the older, narrower
+  string-prefix pattern — not fixed in this pass, worth a consistency sweep later.

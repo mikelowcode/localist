@@ -118,3 +118,70 @@ override, not the hardcoded `11434` default — confirmed even with nothing list
 since `health_check()` never raises.
 
 *Test suite:* 595 passed (before and after).
+
+### 16.3 Proposed — Live-Switchable Runtime Backend from Settings (scoped, not built, 2026-07-13)
+
+**Status: proposal only. No code has been changed for this item.** The Settings page's Runtime
+Backend segmented control (§7.10) is a display preference — selecting oMLX/Ollama/Foundry there
+updates only the appbar's status-chip label, not the actual active runtime. This subsection records
+a scoping pass done at the user's explicit request ("don't perform any edits, just scope out how
+many steps it would take"). Full narrative: `sessions-log.md` §34.
+
+**Why this is a real rebuild-and-replace, not a one-line state mutation.** At startup,
+`main.py`'s `lifespan()` constructs one `runtime` object via `create_runtime()` and passes it **by
+value** into the constructors of `WikiAgent`, `ConversationalAgent`, and `ControllerAgent`
+(`self._runtime = runtime`). `ControllerAgent.__init__` further constructs its own
+`Synthesizer(runtime)` and `_RulePlanner(runtime=runtime, ...)` from that same captured reference.
+None of these look the runtime back up dynamically. The sole exception is `GET /health`, which reads
+`_state.runtime` fresh via `_require_runtime()` on every call. So mutating `_state.runtime` alone
+post-startup would make `/health` report a new backend while every actual chat turn kept running
+inference through the *original* client.
+
+**Proposed implementation shape:**
+1. Extract the agent-construction block currently inline in `lifespan()` into a reusable function
+   (e.g. `_build_controller(settings, runtime, memory_manager, embed_fn)`).
+2. New `POST /settings/runtime-backend`: validate the target backend name; call `create_runtime()`
+   for it; call `.health_check()` on the *new* client before committing anything, so an unreachable
+   target fails cleanly and leaves the current backend running.
+3. Rebuild `WikiAgent`/`ConversationalAgent`/`ControllerAgent` via the function from step 1 (which
+   transparently rebuilds `Synthesizer`/`_RulePlanner` too, since they're constructed inside
+   `ControllerAgent.__init__`).
+4. Re-run `_run_cache_warmup` against the new controller/runtime, since persona caching
+   (`ControllerAgent._load_persona()`) is per-instance and would otherwise start cold.
+5. Atomically swap `_state.runtime`/`_state.wiki_agent`/`_state.controller` only after steps 3–4
+   succeed, under a lock (so two rapid switch requests can't interleave).
+6. In-flight requests are expected to be safe by construction — each request resolves
+   `_state.controller` once at request time, so an active stream should finish on the pre-swap
+   controller rather than crashing — but this has **not** been verified live and should be before
+   being trusted.
+
+**The `chat_model`-per-backend interaction with §16.2's existing fix.** §16.2 already fixed the
+*unset* case (`Settings.chat_model = None` correctly falls through to each backend's own hardcoded
+default). This proposal is about the *explicit-override* case: a `LOCALIST_CHAT_MODEL` value set
+for one backend would still get handed unchanged to whichever backend is live-switched to next
+(e.g. a Foundry model id passed into `OllamaRuntimeClient`). Proposed fix: per-backend chat-model
+storage (three settings fields or a dict) plus a new small `GET
+/settings/runtime-backend/{backend}/models` endpoint — builds a throwaway client for that backend,
+calls `.health_check()`, returns its `models` list, discards the client without touching `_state` —
+letting the Settings UI's "Chat model ID" free-text field become a dropdown of models actually
+available on the target backend instead of a field a user can mistype.
+
+**A separate finding from the same scoping conversation, already acted on.** While tracing whether
+Ollama could serve as an alternative embedding backend (unrelated to the switch proposal itself, but
+raised in the same conversation), it became clear the Settings page's "Embedding model ID" field is
+fully inert today — see `sessions-log.md` §33 for the finding and the fix (a `requirements.txt`
+dependency gap, unrelated to runtime-backend switching). Recorded here only because it materially
+affects what "fold Model Configuration into backend-switch config" should mean: that field should
+likely be retired rather than made per-backend.
+
+**Open decisions blocking a build session:**
+- Does a live switch persist across a process restart (would need writing back to `.env` or a small
+  runtime-config store), or is it session-scoped only?
+- Accept the per-backend hardcoded chat-model fallback always, or let users pin a model per backend
+  via the proposed dropdown?
+
+**If built, would also require:** dedicated unit tests for the new endpoint(s) (unknown backend
+rejected; unreachable backend rejected without side effects; successful swap updates `_state`);
+updating `CLAUDE.md`'s current "Swapping backends is a config change only" line; updating this
+section; updating the README's Configuration section, which currently and correctly describes the
+control as display-only.
