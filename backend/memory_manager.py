@@ -333,6 +333,17 @@ class MemoryManager:
             "enabled" if embed_fn else "disabled (keyword-only)",
         )
 
+    @property
+    def embed_fn(self) -> Callable[[str], list[float]] | None:
+        """
+        The embedding function this instance is currently configured with.
+
+        Deliberately read-only and not reassignable from outside the class — see
+        docs/architecture/16-runtime-backend-layer.md §16.5: a live runtime-backend switch must
+        never change which embedding source is in use, only which chat-inference backend is.
+        """
+        return self._embed_fn
+
     # -----------------------------------------------------------------------
     # Database initialisation
     # -----------------------------------------------------------------------

@@ -128,6 +128,13 @@ since `health_check()` never raises.
 
 ### 16.3 Proposed — Live-Switchable Runtime Backend from Settings (scoped, not built, 2026-07-13)
 
+> **Built and live-verified 2026-07-15 — see §16.5.** The proposal below was implemented
+> essentially as scoped, with both open decisions resolved (persist to `.env`, not session-scoped;
+> independent switch/pin endpoints, not folded together) and point 6's concurrency claim now
+> live-verified rather than assumed. The narrative below is retained as the historical record of
+> what was scoped and why; §16.5 is the current-state record of what shipped, and §16.6 closes the
+> two follow-on items code review found there (the frontend now wired, the lock now `asyncio.Lock`).
+
 **Status: proposal only. No code has been changed for this item.** The Settings page's Runtime
 Backend segmented control (§7.10) is a display preference — selecting oMLX/Ollama/Foundry there
 updates only the appbar's status-chip label, not the actual active runtime. This subsection records
@@ -159,8 +166,9 @@ inference through the *original* client.
    succeed, under a lock (so two rapid switch requests can't interleave).
 6. In-flight requests are expected to be safe by construction — each request resolves
    `_state.controller` once at request time, so an active stream should finish on the pre-swap
-   controller rather than crashing — but this has **not** been verified live and should be before
-   being trusted.
+   controller rather than crashing. **Live-verified 2026-07-15 (§16.5):** a switch fired mid-stream
+   let the in-flight request complete its entire lifecycle on the pre-switch client, unaffected by
+   the concurrent rebuild — no hang, no cross-contamination.
 
 **The `chat_model`-per-backend interaction with §16.2's existing fix.** §16.2 already fixed the
 *unset* case (`Settings.chat_model = None` correctly falls through to each backend's own hardcoded
@@ -279,3 +287,155 @@ platform-gating change (+7 new tests).
   hardware verification is still outstanding, pending access to such a machine.
 - oMLX's `embedding_model` wiring gap noted above (tier 1 never engages for that backend) — a
   follow-up, not yet scheduled.
+
+### 16.5 Live-Switchable Runtime Backend — Built and Live-Verified, 2026-07-15
+
+§16.3's proposal shipped as scoped. Implemented entirely in `backend/main.py`;
+`runtime_factory.py`'s existing `create_runtime()`/`available_backends()` required no changes.
+Full narrative, including the step-by-step live-verification checklist: `sessions-log.md` §36.
+
+**What was built.** `_build_controller(settings, runtime, memory_manager, embed_fn, project_root,
+templates_dir)` — the WikiAgent/ConversationalAgent/ControllerAgent construction + cache-warmup
+block, extracted out of `lifespan()` so both startup and a live switch share one code path.
+`_resolve_chat_model(settings, backend)` — single precedence rule: `Settings.chat_model` (global
+override) beats a new per-backend pin (`chat_model_omlx`/`chat_model_ollama`/`chat_model_foundry`,
+`LOCALIST_CHAT_MODEL_OMLX`/`_OLLAMA`/`_FOUNDRY`) beats `None` (falls through to
+`runtime_factory.py`'s existing hardcoded per-backend default). `_write_env_var(project_root, key,
+value)` — atomic (`tempfile` + `os.replace()`) read-modify-write against `.env`, preserving
+comments/blank lines/unrelated keys, skipping commented-out lines when matching the target key.
+`_runtime_switch_lock` (`threading.Lock`) serializes any sequence that reads-then-swaps
+`_state.runtime`/`.wiki_agent`/`.controller`.
+
+Three new endpoints:
+- `POST /settings/runtime-backend` `{backend, chat_model?}` — validates the backend name;
+  health-checks the candidate client before mutating anything; on success, rebuilds via
+  `_build_controller()`, atomically swaps `_state`, then persists `LOCALIST_RUNTIME_BACKEND` to
+  `.env`. An optional `chat_model` on the request also pins that backend (not a one-shot override —
+  see the open call noted in the original Claude Code prompt, resolved this way to keep one source
+  of truth). If the in-memory swap succeeds but the `.env` write itself fails, the swap is **not**
+  rolled back — the response returns `persisted: false` plus a warning instead.
+- `GET /settings/runtime-backend/{backend}/models` — builds a throwaway client for `backend`,
+  health-checks it, returns its reported models, discards the client. Never touches `_state`.
+- `POST /settings/runtime-backend/{backend}/chat-model` `{chat_model}` — always persists the pin
+  (Settings field + `.env`) regardless of which backend is active; additionally triggers a live
+  rebuild via the same lock/health-check/`_build_controller()` sequence if — and only if —
+  `backend` is the currently active one.
+
+**Test suite:** 757 passed / 0 failed (739 baseline + 18 new,
+`backend/tests/test_main_runtime_backend_switch.py`), covering unknown-backend rejection,
+unreachable-target rejection without side effects, successful-switch state/`.env` assertions, both
+chat-model-pin paths (active vs. inactive backend), and `_write_env_var()`/`_resolve_chat_model()`
+directly.
+
+**Live verification (2026-07-15, full 9-step checklist against real oMLX/Ollama/Foundry
+services):** every mechanic in the proposal confirmed working end to end — health-check-before-swap,
+zero-side-effect read-only model listing, `.env` persistence surviving an actual process restart,
+clean rejection of an unreachable target with the prior backend provably untouched, and (closing
+§16.3 point 6's open item) an in-flight streaming request completing unaffected by a concurrent
+switch. Full step-by-step results, including three findings that turned out to be pre-existing
+design decisions or environmental constraints rather than defects (the Ollama fail-fast/pin
+interaction, oMLX's memory ceiling, and `chmod`'s inability to trigger the `persisted: false` path
+via POSIX rename semantics) are in `sessions-log.md` §36.
+
+**Open items:**
+- **`embed_fn` staleness across a switch — confirmed already-correct behavior, now hardened.**
+  A follow-up code review found that neither `switch_runtime_backend()` nor
+  `set_runtime_backend_chat_model()` ever re-derives or reassigns the embedding function from the
+  candidate/new runtime: both read it once from `MemoryManager` and thread it through unchanged
+  into `_build_controller()`. So a chat-backend switch already never touched the embedding source —
+  this was not the bug the original finding above described, just an implicit consequence of how
+  the code happened to be written. Hardened rather than fixed: `MemoryManager` gained a read-only
+  public `embed_fn` property (replacing a private-attribute reach-through via
+  `getattr(memory_manager, "_embed_fn", None)` at both call sites), both call sites gained an inline
+  comment stating the decoupling is deliberate, and
+  `backend/tests/test_main_runtime_backend_switch.py` gained two identity-check tests
+  (`test_successful_switch_leaves_embed_fn_untouched`,
+  `test_pin_for_active_backend_leaves_embed_fn_untouched`) asserting `embed_fn` is the exact same
+  object before and after a live switch/pin. This guarantee is now explicit and test-covered instead
+  of an accidental side effect a future edit could casually "fix" into a coupling bug. See
+  `sessions-log.md` §37.
+- ~~**Lock held across `await`.**~~ **Closed in §16.6** — `_runtime_switch_lock` is now an
+  `asyncio.Lock`, acquired via `async with`.
+- The `persisted: false` `.env`-write-failure path needs a different provocation technique for any
+  future repeatable verification — a read-only *directory* (not a read-only file) would trigger it
+  per POSIX rename semantics; not yet tried.
+- ~~The Settings UI (`localist-ui`, §7.10) is not wired to any of these three endpoints.~~
+  **Closed in §16.6** — the Runtime Backend segmented control, Chat Model dropdown, and per-backend
+  model preview are now wired to all three endpoints.
+
+### 16.6 Settings UI Wired to the Live Switch, and the Lock-Across-`await` Item Closed (2026-07-15)
+
+Two remaining §16.5 open items closed in one pass — full narrative in `sessions-log.md` §38.
+
+**Lock fix.** `_runtime_switch_lock` (`backend/main.py`) changed from `threading.Lock()` to
+`asyncio.Lock()`, and both call sites from `with _runtime_switch_lock:` to
+`async with _runtime_switch_lock:`. The prior synchronous lock, held across
+`await asyncio.to_thread(...)`, didn't just serialize two overlapping switch/pin requests — it
+busy-blocked the *entire event loop* while the second waited to acquire, since a plain
+`threading.Lock.acquire()` has no cooperative-yield path back to the loop. Confirmed by hand: with
+the lock reverted to `threading.Lock`, a new regression test
+(`TestConcurrentSwitchRequestsDoNotBlockEventLoop` in
+`backend/tests/test_main_runtime_backend_switch.py`) deadlocks outright rather than merely running
+slow — the loop can never process the `asyncio.to_thread` completion callback that would let the
+lock-holding coroutine resume and release, so nothing ever unblocks. That test now runs the
+switch/heartbeat coroutines inside a daemon thread with an external `join(timeout=...)`, since an
+in-process `asyncio` timeout can't fire either once the loop itself is frozen. With the
+`asyncio.Lock` fix, the same test passes: two concurrent `switch_runtime_backend()` calls both
+complete, and a concurrent heartbeat coroutine keeps ticking throughout (proving the loop stayed
+responsive) rather than stalling for the ~150ms one request holds the lock.
+
+**Backend prerequisite for the frontend.** `HealthResponse` (`backend/main.py`) gained a `backend:
+str` field, sourced from `settings.runtime_backend` in `get_health()` — the one authoritative
+signal the frontend needs to know which of `omlx`/`ollama`/`foundry` is actually live; `base_url`
+alone can't disambiguate if two backends happen to share a host/port shape.
+
+**Frontend — `localist-ui`.**
+- `server.ts`'s `HealthState` gained the matching `backend: string` field (default `''`); no other
+  change needed since `checkHealth()` already spreads the full response into the store.
+- `model.ts`: `readStoredBackend()`'s `localStorage` value is now only a paint-before-first-health-
+  check cache, not the record of truth. A new `health.subscribe(...)` sets `modelConfig.backend =
+  $health.backend` whenever `$health.reachable` is true and `$health.backend` is non-empty — so a
+  process restart (which reverts to `.env`) or an out-of-band switch (e.g. via `curl`) is reflected
+  once the next health poll lands, not just whatever the browser last remembered.
+- New `runtimeBackendSwitch.ts` store (follows `chatHistorySettings.ts`'s pattern — loading/error
+  writables, no optimistic update on failure): `switchRuntimeBackend(backend, chatModel?)` →
+  `POST /api/settings/runtime-backend`; `fetchBackendModels(backend)` →
+  `GET /api/settings/runtime-backend/{backend}/models` (returns `[]` on failure rather than
+  throwing); `pinChatModel(backend, chatModel)` → `POST /api/settings/runtime-backend/{backend}/chat-model`.
+- `routes/settings/+page.svelte`: the Runtime Backend segmented control now calls
+  `switchRuntimeBackend()` for real, gated by a plain `confirm()` dialog naming the target backend
+  and noting in-flight requests are unaffected but the switch itself takes a few seconds; a no-op
+  guard skips the confirm/switch entirely when the clicked backend is already active. The control
+  disables and shows a spinner while `runtimeBackendSwitchLoading` is true. A new `selectedUiBackend`
+  local variable — deliberately independent of the real active backend — lets a segmented-control
+  click preview a *different* backend's models (via `fetchBackendModels()`, re-run whenever
+  `selectedUiBackend` changes) before or even without confirming an actual switch to it; a
+  `previewing` CSS modifier (`app.css`) distinguishes "previewing" from "active" on the segmented
+  buttons. The former read-only "Chat Model" card is now a `<select>` sourced from that backend's
+  real model list, `onchange` calling `pinChatModel()`; an inline note states whether the pin applies
+  immediately (selected backend is the active one) or only takes effect on a future switch. The
+  free-text "Embedding model ID" field (and the rest of the now-empty "Model Configuration" card) was
+  deleted — confirmed inert for every backend per §33/§34, and there is still no independent
+  embedding-source switch endpoint (out of scope, tracked separately).
+
+**Test suite:** 761 passed / 0 failed (759 baseline + 2 new — the asyncio.Lock type assertion and
+the concurrent-requests-don't-block-the-loop regression test). `npm run check` and `npm run build`
+both clean.
+
+**Live verification (2026-07-15).** No browser-automation tool is available in this environment
+(same limitation §7.10 already flags), so verification was: (1) structural — SSR HTML for
+`/settings` diffed for the expected segmented-control/dropdown markup; (2) direct, against the real
+running backend (Ollama active) and through the Vite dev server's `/api` proxy — `GET /health`
+confirmed the new `backend` field; two genuinely concurrent `POST
+.../ollama/chat-model` requests (idempotent re-pin of the already-active model, so no functional
+change) both returned `200`/`applied_live: true` in ~3s total with no hang, exercising the fixed
+lock on the live server rather than only the mocked test; a `POST` through the `:5173/api` proxy
+confirmed the frontend's exact fetch path reaches the backend correctly. `.env` was restored
+byte-for-byte after each test. No live click-through/visual QA pass was performed — flagged as a
+limitation, not asserted as done, consistent with §7.10's own posture.
+
+**Open items:**
+- No live human browser/visual QA pass of the wired Settings UI has been performed as of this
+  writing — structural/API-level verification only (see above).
+- The `persisted: false` `.env`-write-failure path still needs a different provocation technique
+  (carried forward from §16.5 — a read-only *directory*, not a read-only file, would trigger it).

@@ -2,6 +2,13 @@
   import { onMount } from 'svelte';
   import { health, checkHealth } from '$lib/stores/server';
   import { modelConfig, RUNTIME_BACKENDS, RUNTIME_BACKEND_LABELS, type RuntimeBackend } from '$lib/stores/model';
+  import {
+    runtimeBackendSwitchLoading,
+    runtimeBackendSwitchError,
+    switchRuntimeBackend,
+    fetchBackendModels,
+    pinChatModel
+  } from '$lib/stores/runtimeBackendSwitch';
   import { theme } from '$lib/stores/theme';
   import { browser } from '$app/environment';
   import {
@@ -27,29 +34,58 @@
   // Local form state — mirrors store, saved on blur/change
   let backendUrl = '';
   let chatModel  = '';
-  let embedModel = '';
 
   // Initialize from store
   $: if (browser) {
     backendUrl = localStorage.getItem('lora-backend-url') ?? 'http://127.0.0.1:8000';
     chatModel  = $modelConfig.chat_model;
-    embedModel = $modelConfig.embedding_model;
   }
 
   function saveBackendUrl() {
     if (browser) localStorage.setItem('lora-backend-url', backendUrl);
   }
 
-  function saveModelConfig() {
-    modelConfig.set({
-      ...$modelConfig,
-      chat_model:      chatModel,
-      embedding_model: embedModel
-    });
+  // The backend whose models the Chat Model dropdown below is scoped to.
+  // Deliberately independent of $modelConfig.backend (the real active
+  // backend, synced from health polling) — clicking a segmented-control
+  // button previews that backend's models immediately, even before (or
+  // without) confirming an actual switch to it.
+  let selectedUiBackend: RuntimeBackend = $modelConfig.backend as RuntimeBackend;
+  let availableModels: string[] = [];
+  let modelsFetchToken = 0;
+
+  async function refreshModelsForSelected() {
+    const token = ++modelsFetchToken;
+    const models = await fetchBackendModels(selectedUiBackend);
+    if (token === modelsFetchToken) availableModels = models;
   }
 
+  $: if (selectedUiBackend) refreshModelsForSelected();
+
   function selectRuntimeBackend(backend: RuntimeBackend) {
-    modelConfig.set({ ...$modelConfig, backend });
+    selectedUiBackend = backend;
+    if (backend === $modelConfig.backend) return; // already active — nothing to switch
+
+    const proceed = confirm(
+      `Switch the active runtime backend to ${RUNTIME_BACKEND_LABELS[backend]}? ` +
+      `In-flight requests will keep running on the current backend unaffected, ` +
+      `but this switch itself can take several seconds.`
+    );
+    if (!proceed) return;
+
+    void switchRuntimeBackend(backend);
+  }
+
+  async function handleChatModelPick(value: string) {
+    if (!value) return;
+    chatModel = value;
+    modelConfig.update((s) => ({ ...s, chat_model: value }));
+    await pinChatModel(selectedUiBackend, value);
+  }
+
+  function onChatModelSelectChange(e: Event) {
+    const value = (e.target as HTMLSelectElement).value;
+    void handleChatModelPick(value);
   }
 
   let checking = false;
@@ -98,21 +134,51 @@
             type="button"
             class="seg-btn"
             class:active={$modelConfig.backend === b}
+            class:previewing={selectedUiBackend === b && selectedUiBackend !== $modelConfig.backend}
+            disabled={$runtimeBackendSwitchLoading}
             on:click={() => selectRuntimeBackend(b)}
           >{RUNTIME_BACKEND_LABELS[b]}</button>
         {/each}
+        {#if $runtimeBackendSwitchLoading}
+          <span class="spinner" aria-hidden="true" />
+        {/if}
       </div>
       <p class="card-hint">
-        Drives the appbar's status chip on the Chat screen. The active runtime is actually
-        selected at process startup via <code>LOCALIST_RUNTIME_BACKEND</code> — this control is
-        a display preference, not a live backend switch.
+        Live-switches the active backend via <code>POST /settings/runtime-backend</code>
+        (docs/architecture/16-runtime-backend-layer.md §16.5) — health-checked before anything
+        changes, and persisted to <code>.env</code> so it survives a restart. Switching takes a
+        few seconds (mostly model-load time on the new backend); in-flight requests keep running
+        on the backend that was active when they started.
       </p>
+      {#if $runtimeBackendSwitchError}
+        <p class="card-hint" style="color:var(--error)">{$runtimeBackendSwitchError}</p>
+      {/if}
     </section>
 
-    <!-- Chat model (read-only) -->
+    <!-- Chat model -->
     <section class="settings-card">
-      <div class="card-title">Chat Model</div>
-      <div class="card-value text-mono">{chatModel || '—'}</div>
+      <div class="card-title">Chat Model — {RUNTIME_BACKEND_LABELS[selectedUiBackend]}</div>
+      <div class="field-group">
+        <select
+          id="chat-model"
+          aria-label={`Chat model for ${RUNTIME_BACKEND_LABELS[selectedUiBackend]}`}
+          class="settings-input"
+          disabled={$runtimeBackendSwitchLoading || availableModels.length === 0}
+          on:change={onChatModelSelectChange}
+        >
+          <option value="" disabled selected={!chatModel || !availableModels.includes(chatModel)}>
+            {availableModels.length ? 'Select a model…' : 'No models reported by this backend'}
+          </option>
+          {#each availableModels as m}
+            <option value={m} selected={m === chatModel}>{m}</option>
+          {/each}
+        </select>
+        {#if selectedUiBackend === $modelConfig.backend}
+          <p class="field-hint">Applies immediately — {RUNTIME_BACKEND_LABELS[selectedUiBackend]} is the active backend.</p>
+        {:else}
+          <p class="field-hint">Saved for {RUNTIME_BACKEND_LABELS[selectedUiBackend]} — takes effect the next time you switch to it.</p>
+        {/if}
+      </div>
     </section>
 
     <!-- Streaming / episodic approval toggles -->
@@ -234,39 +300,6 @@
             </div>
           {/if}
         </div>
-      </div>
-    </section>
-
-    <!-- Model configuration -->
-    <section class="settings-card">
-      <div class="card-title">Model Configuration</div>
-      <p class="card-desc">Model identifiers must match the IDs returned by the active backend.</p>
-
-      <div class="field-group">
-        <label class="field-label" for="chat-model">Chat model ID</label>
-        <input
-          id="chat-model"
-          type="text"
-          class="settings-input"
-          bind:value={chatModel}
-          on:blur={saveModelConfig}
-          placeholder="Phi-4-mini-instruct-generic-gpu:5"
-          spellcheck="false"
-        />
-      </div>
-
-      <div class="field-group">
-        <label class="field-label" for="embed-model">Embedding model ID</label>
-        <input
-          id="embed-model"
-          type="text"
-          class="settings-input"
-          bind:value={embedModel}
-          on:blur={saveModelConfig}
-          placeholder="text-embedding-3-small"
-          spellcheck="false"
-        />
-        <p class="field-hint">Leave empty if your backend does not provide embeddings (use_embeddings will be disabled).</p>
       </div>
     </section>
 

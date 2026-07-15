@@ -72,7 +72,10 @@ All tuneable values are in the ``Settings`` class (pydantic-settings).  They
 can be overridden via environment variables or a .env file:
 
   LOCALIST_RUNTIME_BACKEND             Runtime backend: "foundry" | "omlx" (default "foundry")
-  LOCALIST_CHAT_MODEL                  Chat model ID (interpreted by the active backend)
+  LOCALIST_CHAT_MODEL                  Chat model ID override (wins over any per-backend pin below)
+  LOCALIST_CHAT_MODEL_OMLX             Per-backend chat model pin for "omlx"
+  LOCALIST_CHAT_MODEL_OLLAMA           Per-backend chat model pin for "ollama"
+  LOCALIST_CHAT_MODEL_FOUNDRY          Per-backend chat model pin for "foundry"
   LOCALIST_FOUNDRY_URL                 Override auto-resolved Foundry base URL (foundry only)
   LOCALIST_OMLX_URL                    oMLX server base URL (omlx only, default http://localhost:8000)
   LOCALIST_OLLAMA_URL                  Ollama server base URL (ollama only, default http://localhost:11434)
@@ -112,7 +115,9 @@ import datetime
 import json
 import logging
 import mimetypes
+import os
 import platform
+import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -134,7 +139,7 @@ from controller_agent import ControllerAgent, TaskStatus, _MEMORY_MD_PATH
 from conversational_agent import ConversationalAgent
 from embedding_engine import EmbeddingEngine
 from memory_manager import MemoryManager, EpisodicMemoryWriter
-from runtime_factory import create_runtime
+from runtime_factory import available_backends, create_runtime
 import session_files
 import wiki_maintenance_log
 from warmup import run_cache_warmup as _run_cache_warmup
@@ -158,6 +163,14 @@ class Settings(BaseSettings):
     # unless embedding_model below is set and found by the active runtime
     # backend, in which case the runtime backend's own embed() is used instead.
     chat_model:       str | None = None
+
+    # Per-backend chat-model pins (LOCALIST_CHAT_MODEL_OMLX / _OLLAMA / _FOUNDRY).
+    # Used by _resolve_chat_model() when chat_model above is unset; lets a
+    # live runtime-backend switch remember which model to use per backend
+    # instead of carrying one backend's model id into another's client.
+    chat_model_omlx:    str | None = None
+    chat_model_ollama:  str | None = None
+    chat_model_foundry: str | None = None
 
     # Runtime-backend embedding model ID (foundry/ollama only; empty string =
     # not configured, falls back to EmbeddingEngine).
@@ -304,6 +317,126 @@ def _configure_embedding_source(
 
 
 # ---------------------------------------------------------------------------
+# Controller construction (extracted so lifespan() and a live runtime-backend
+# switch share one code path — see _build_controller() below).
+# ---------------------------------------------------------------------------
+
+def _build_controller(
+    settings:       Settings,
+    runtime:        BaseRuntimeClient,
+    memory_manager: MemoryManager,
+    embed_fn:       Any,
+    project_root:   Path,
+    templates_dir:  Path,
+) -> tuple[WikiAgent, ConversationalAgent, ControllerAgent]:
+    """
+    Construct WikiAgent, ConversationalAgent, and ControllerAgent for a given
+    runtime, and warm its persona cache. Used both at startup (lifespan())
+    and by a live runtime-backend switch, since ControllerAgent captures its
+    runtime by value (via its own Synthesizer/_RulePlanner) — there is no way
+    to rebind an existing ControllerAgent to a new runtime, only to build a
+    fresh one.
+    """
+    wiki_agent = WikiAgent(
+        runtime        = runtime,
+        project_root   = project_root,
+        memory_manager = memory_manager,
+    )
+    conversational_agent = ConversationalAgent(
+        runtime        = runtime,
+        memory_manager = memory_manager,
+        project_root   = project_root,
+    )
+    controller = ControllerAgent(
+        runtime                 = runtime,
+        agents                  = [wiki_agent, conversational_agent],
+        memory_manager          = memory_manager,
+        embed_fn                = embed_fn,
+        episodic_write_approval = settings.episodic_write_approval,
+    )
+    _run_cache_warmup(controller, runtime, templates_dir)
+    return wiki_agent, conversational_agent, controller
+
+
+# ---------------------------------------------------------------------------
+# Live runtime-backend switching support
+# ---------------------------------------------------------------------------
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
+
+# Serializes any sequence that reads-then-swaps _state.runtime/wiki_agent/
+# controller, so two concurrent switch/pin requests can't interleave their
+# health-check → rebuild → swap steps. An asyncio.Lock, not threading.Lock —
+# held across `await asyncio.to_thread(...)` below, and a plain threading.Lock
+# there would block the whole event loop on a second requester's acquire
+# instead of just queuing it behind the first (docs/architecture/
+# 16-runtime-backend-layer.md §16.5).
+_runtime_switch_lock = asyncio.Lock()
+
+_CHAT_MODEL_SETTINGS_FIELD: dict[str, str] = {
+    "omlx":    "chat_model_omlx",
+    "ollama":  "chat_model_ollama",
+    "foundry": "chat_model_foundry",
+}
+
+_CHAT_MODEL_ENV_KEY: dict[str, str] = {
+    "omlx":    "LOCALIST_CHAT_MODEL_OMLX",
+    "ollama":  "LOCALIST_CHAT_MODEL_OLLAMA",
+    "foundry": "LOCALIST_CHAT_MODEL_FOUNDRY",
+}
+
+
+def _resolve_chat_model(settings: Settings, backend: str) -> str | None:
+    """
+    Resolve the chat model to use for `backend`, one source of truth shared
+    by lifespan() and the runtime-backend endpoints.
+
+    Precedence: settings.chat_model (global override) > the per-backend pin
+    for `backend` > None (falls through to runtime_factory.py's own
+    hardcoded per-backend default).
+    """
+    if settings.chat_model:
+        return settings.chat_model
+    field = _CHAT_MODEL_SETTINGS_FIELD.get(backend.strip().lower())
+    return getattr(settings, field) if field else None
+
+
+def _write_env_var(project_root: Path, key: str, value: str) -> None:
+    """
+    Set `key=value` in project_root/.env, preserving every other line
+    (comments, blank lines, unrelated keys) byte-for-byte. Replaces the
+    existing `key=...` line if present, otherwise appends a new one.
+    Written atomically via a temp file + os.replace() so a crash or
+    concurrent read never observes a half-written .env.
+    """
+    env_path = project_root / ".env"
+    lines: list[str] = []
+    if env_path.exists():
+        lines = env_path.read_text().splitlines(keepends=True)
+
+    new_line = f"{key}={value}\n"
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped.startswith("#") and stripped.split("=", 1)[0].strip() == key:
+            lines[i] = new_line
+            break
+    else:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append(new_line)
+
+    fd, tmp_path = tempfile.mkstemp(dir=str(project_root), prefix=".env.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.writelines(lines)
+        os.replace(tmp_path, env_path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Lifespan — startup / shutdown
 # ---------------------------------------------------------------------------
 
@@ -324,13 +457,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     logger.info("LORA backend starting up.")
 
-    project_root = Path(__file__).resolve().parent
+    project_root = _PROJECT_ROOT
 
     # -- Runtime -------------------------------------------------------------
 
     runtime = create_runtime(
         backend         = settings.runtime_backend,
-        chat_model      = settings.chat_model,
+        chat_model      = _resolve_chat_model(settings, settings.runtime_backend),
         embedding_model = settings.embedding_model,
         foundry_url     = settings.foundry_url,
         omlx_url        = settings.omlx_url,
@@ -439,20 +572,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("Wiki snapshot TTL sweep skipped — wiki_dir does not exist yet (%s).", wiki_dir)
 
-    # -- Agents --------------------------------------------------------------
-
-    wiki_agent = WikiAgent(
-        runtime        = runtime,
-        project_root   = project_root,
-        memory_manager = memory_manager,
-    )
-    _state.wiki_agent = wiki_agent
-    conversational_agent = ConversationalAgent(
-        runtime        = runtime,
-        memory_manager = memory_manager,
-        project_root   = project_root,
-    )
-
     # -- Store resolved paths in state so endpoints can inject them ----------
 
     _state.wiki_dir      = wiki_dir
@@ -461,22 +580,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _state.schema_path   = schema_path
     _state.templates_dir = templates_dir
 
-    # -- Controller ----------------------------------------------------------
+    # -- Agents + Controller --------------------------------------------------
 
     logger.info(
         "Episodic write-approval gate: %s",
         "ON" if settings.episodic_write_approval else "OFF",
     )
 
-    controller = ControllerAgent(
-        runtime                 = runtime,
-        agents                  = [wiki_agent, conversational_agent],
-        memory_manager          = memory_manager,
-        embed_fn                = embed_fn,
-        episodic_write_approval = settings.episodic_write_approval,
+    wiki_agent, conversational_agent, controller = _build_controller(
+        settings, runtime, memory_manager, embed_fn, project_root, templates_dir,
     )
+    _state.wiki_agent = wiki_agent
     _state.controller = controller
-    _run_cache_warmup(controller, runtime, templates_dir)
 
     logger.info(
         "ControllerAgent ready — agents: %s",
@@ -550,6 +665,7 @@ class HealthResponse(BaseModel):
     """Response body for GET /health."""
     healthy:           bool
     reachable:         bool
+    backend:           str
     base_url:          str
     models:            list[str]  = Field(default_factory=list)
     chat_model_found:  bool       = False
@@ -560,6 +676,52 @@ class HealthResponse(BaseModel):
 class AgentsResponse(BaseModel):
     """Response body for GET /agents."""
     agents: list[str]
+
+
+class RuntimeBackendSwitchRequest(BaseModel):
+    """
+    Payload accepted by POST /settings/runtime-backend.
+
+    chat_model is optional — if provided, it also becomes that backend's
+    persisted pin (see _resolve_chat_model()), not a one-shot override.
+    """
+    backend:    str
+    chat_model: str | None = None
+
+
+class RuntimeBackendSwitchResponse(BaseModel):
+    """Response body for POST /settings/runtime-backend."""
+    backend:          str
+    chat_model:       str | None = None
+    persisted:        bool
+    reachable:        bool
+    base_url:         str
+    models:           list[str]  = Field(default_factory=list)
+    chat_model_found: bool       = False
+    error:            str | None = None
+    warning:          str | None = None
+
+
+class RuntimeBackendModelsResponse(BaseModel):
+    """Response body for GET /settings/runtime-backend/{backend}/models."""
+    reachable:        bool
+    base_url:         str
+    models:           list[str]  = Field(default_factory=list)
+    chat_model_found: bool       = False
+    error:            str | None = None
+
+
+class ChatModelPinRequest(BaseModel):
+    """Payload accepted by POST /settings/runtime-backend/{backend}/chat-model."""
+    chat_model: str = Field(..., min_length=1)
+
+
+class ChatModelPinResponse(BaseModel):
+    """Response body for POST /settings/runtime-backend/{backend}/chat-model."""
+    backend:      str
+    chat_model:   str
+    persisted:    bool
+    applied_live: bool
 
 
 class MemoryStatsResponse(BaseModel):
@@ -920,6 +1082,7 @@ async def get_health() -> HealthResponse:
     return HealthResponse(
         healthy           = bool(raw.get("reachable") and raw.get("chat_model_found")),
         reachable         = bool(raw.get("reachable", False)),
+        backend           = settings.runtime_backend if settings is not None else "",
         base_url          = str(raw.get("base_url", "")),
         models            = raw.get("models", []),
         chat_model_found  = bool(raw.get("chat_model_found", False)),
@@ -937,6 +1100,214 @@ async def get_agents() -> AgentsResponse:
     """Return the names of all agents currently registered with the controller."""
     controller = _require_controller()
     return AgentsResponse(agents=list(controller._agents.keys()))
+
+
+def _validate_backend_name(backend: str) -> str:
+    """Normalize and reject an unknown backend name before anything is touched."""
+    normalized = backend.strip().lower()
+    if normalized not in available_backends():
+        raise HTTPException(
+            status_code = 422,
+            detail      = (
+                f"Unknown runtime backend: {backend!r}. "
+                f"Supported backends: {', '.join(available_backends())}."
+            ),
+        )
+    return normalized
+
+
+def _require_settings() -> Settings:
+    if _state.settings is None:
+        raise HTTPException(status_code=503, detail="Settings not initialised.")
+    return _state.settings
+
+
+def _create_and_check_backend(settings: Settings, backend: str) -> tuple[BaseRuntimeClient, dict]:
+    """Build a runtime client for `backend` and health-check it. Blocking — run via asyncio.to_thread."""
+    chat_model = _resolve_chat_model(settings, backend)
+    candidate_runtime = create_runtime(
+        backend         = backend,
+        chat_model      = chat_model,
+        embedding_model = settings.embedding_model,
+        foundry_url     = settings.foundry_url,
+        omlx_url        = settings.omlx_url,
+        ollama_url      = settings.ollama_url,
+        request_timeout = settings.request_timeout,
+        stream_timeout  = settings.stream_timeout,
+    )
+    return candidate_runtime, candidate_runtime.health_check()
+
+
+@app.post(
+    "/settings/runtime-backend",
+    response_model = RuntimeBackendSwitchResponse,
+    summary        = "Live-switch the active runtime backend",
+)
+async def switch_runtime_backend(request: RuntimeBackendSwitchRequest) -> RuntimeBackendSwitchResponse:
+    """
+    Live-switch the active runtime backend. The target backend must answer
+    health_check() successfully before anything is mutated — an unreachable
+    target leaves the current backend running untouched.
+
+    An optional chat_model on the request pins that backend's chat model as
+    a side effect (persisted Settings field + .env), independent of whether
+    the switch itself succeeds.
+    """
+    backend  = _validate_backend_name(request.backend)
+    settings = _require_settings()
+
+    if request.chat_model:
+        setattr(settings, _CHAT_MODEL_SETTINGS_FIELD[backend], request.chat_model)
+        _write_env_var(_PROJECT_ROOT, _CHAT_MODEL_ENV_KEY[backend], request.chat_model)
+
+    chat_model = _resolve_chat_model(settings, backend)
+
+    async with _runtime_switch_lock:
+        candidate_runtime, health = await asyncio.to_thread(
+            _create_and_check_backend, settings, backend,
+        )
+
+        if not health.get("reachable"):
+            raise HTTPException(
+                status_code = 502,
+                detail      = (
+                    f"Runtime backend {backend!r} is not reachable at "
+                    f"{health.get('base_url')!r} — current backend left untouched."
+                ),
+            )
+
+        memory_manager = _require_memory_manager()
+        # Deliberately NOT re-derived from candidate_runtime — a chat-backend switch changes
+        # inference only, never the embedding source. Re-coupling this would risk silently
+        # dropping a working embedder when switching to a backend that doesn't wire embeddings
+        # (oMLX today, per §16.4's open gap), even though nothing about embeddings was supposed
+        # to change. See docs/architecture/16-runtime-backend-layer.md §16.5.
+        embed_fn = memory_manager.embed_fn
+
+        wiki_agent, _conversational_agent, controller = await asyncio.to_thread(
+            _build_controller,
+            settings, candidate_runtime, memory_manager, embed_fn,
+            _PROJECT_ROOT, _state.templates_dir,
+        )
+
+        _state.runtime    = candidate_runtime
+        _state.wiki_agent = wiki_agent
+        _state.controller = controller
+        settings.runtime_backend = backend
+
+        persisted: bool = True
+        warning:   str | None = None
+        try:
+            _write_env_var(_PROJECT_ROOT, "LOCALIST_RUNTIME_BACKEND", backend)
+        except OSError as exc:
+            persisted = False
+            warning = (
+                f"Runtime switched to {backend!r} in-process, but writing .env failed "
+                f"({exc}) — it will revert to the previous backend on next restart."
+            )
+
+    return RuntimeBackendSwitchResponse(
+        backend          = backend,
+        chat_model       = chat_model,
+        persisted        = persisted,
+        reachable        = bool(health.get("reachable", False)),
+        base_url         = str(health.get("base_url", "")),
+        models           = health.get("models", []),
+        chat_model_found = bool(health.get("chat_model_found", False)),
+        error            = health.get("error"),
+        warning          = warning,
+    )
+
+
+@app.get(
+    "/settings/runtime-backend/{backend}/models",
+    response_model = RuntimeBackendModelsResponse,
+    summary        = "List models available on a runtime backend without switching to it",
+)
+async def get_runtime_backend_models(backend: str) -> RuntimeBackendModelsResponse:
+    """
+    Build a throwaway client for `backend`, health-check it, and return its
+    reported models. Never touches _state — not even a read — so this is
+    safe to call for the currently-inactive backend(s) as a "what's
+    available there" lookup.
+    """
+    normalized = _validate_backend_name(backend)
+    settings   = _require_settings()
+
+    _candidate_runtime, health = await asyncio.to_thread(
+        _create_and_check_backend, settings, normalized,
+    )
+
+    return RuntimeBackendModelsResponse(
+        reachable        = bool(health.get("reachable", False)),
+        base_url         = str(health.get("base_url", "")),
+        models           = health.get("models", []),
+        chat_model_found = bool(health.get("chat_model_found", False)),
+        error            = health.get("error"),
+    )
+
+
+@app.post(
+    "/settings/runtime-backend/{backend}/chat-model",
+    response_model = ChatModelPinResponse,
+    summary        = "Pin a chat model for a specific runtime backend",
+)
+async def set_runtime_backend_chat_model(
+    backend: str, request: ChatModelPinRequest,
+) -> ChatModelPinResponse:
+    """
+    Persist a chat-model pin for `backend`. Always writes the Settings field
+    and .env, regardless of which backend is currently active. If `backend`
+    is the active backend, also live-rebuilds the controller against it so
+    the pin takes effect immediately rather than only on the next switch.
+    """
+    normalized = _validate_backend_name(backend)
+    settings   = _require_settings()
+
+    setattr(settings, _CHAT_MODEL_SETTINGS_FIELD[normalized], request.chat_model)
+    _write_env_var(_PROJECT_ROOT, _CHAT_MODEL_ENV_KEY[normalized], request.chat_model)
+
+    applied_live = False
+    if normalized == settings.runtime_backend.strip().lower():
+        async with _runtime_switch_lock:
+            candidate_runtime, health = await asyncio.to_thread(
+                _create_and_check_backend, settings, normalized,
+            )
+
+            if not health.get("reachable"):
+                raise HTTPException(
+                    status_code = 502,
+                    detail      = (
+                        f"Chat model pin saved for {normalized!r}, but it is not "
+                        f"reachable at {health.get('base_url')!r} — live rebuild skipped."
+                    ),
+                )
+
+            memory_manager = _require_memory_manager()
+            # Deliberately NOT re-derived from candidate_runtime — a chat-backend switch changes
+            # inference only, never the embedding source. Re-coupling this would risk silently
+            # dropping a working embedder when switching to a backend that doesn't wire embeddings
+            # (oMLX today, per §16.4's open gap), even though nothing about embeddings was supposed
+            # to change. See docs/architecture/16-runtime-backend-layer.md §16.5.
+            embed_fn = memory_manager.embed_fn
+
+            wiki_agent, _conversational_agent, controller = await asyncio.to_thread(
+                _build_controller,
+                settings, candidate_runtime, memory_manager, embed_fn,
+                _PROJECT_ROOT, _state.templates_dir,
+            )
+
+            _state.runtime    = candidate_runtime
+            _state.wiki_agent = wiki_agent
+            _state.controller = controller
+            applied_live = True
+
+    return ChatModelPinResponse(
+        backend      = normalized,
+        chat_model   = request.chat_model,
+        persisted    = True,
+        applied_live = applied_live,
+    )
 
 
 @app.get(

@@ -3,6 +3,7 @@ import { writable, derived } from 'svelte/store';
 export interface HealthState {
   healthy: boolean;
   reachable: boolean;
+  backend: string;
   base_url: string;
   models: string[];
   chat_model_found: boolean;
@@ -20,6 +21,7 @@ export interface AgentsState {
 const initialHealth: HealthState = {
   healthy: false,
   reachable: false,
+  backend: '',
   base_url: '',
   models: [],
   chat_model_found: false,

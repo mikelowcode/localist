@@ -67,9 +67,16 @@ both retired — their logic now lives on localist-mcp.
 All inference goes through a `BaseRuntimeClient`-conforming runtime selected at startup via
 `LOCALIST_RUNTIME_BACKEND` and constructed by `runtime_factory.py`: `OMLXRuntimeClient`,
 `OllamaRuntimeClient` (also serves Ollama Cloud models over the same local daemon), or
-`FoundryRuntimeClient`. Swapping backends is a config change only — never assume which one is
-active when reading/editing agent code. Vector embeddings are always local via `EmbeddingEngine`
-(`mlx-community/embeddinggemma-300m-4bit`, 768-dim), independent of the chat backend.
+`FoundryRuntimeClient`. The active backend can also be changed live, without a restart, via
+`POST /settings/runtime-backend` (health-checks the target before swapping, persists the choice to
+`.env`; see `docs/architecture/16-runtime-backend-layer.md` §16.5) — so never assume the backend
+active at startup is still the one active when a request is handled; always resolve it from
+`_state.runtime` at request time, never capture it once and hold onto it. The Settings UI's Runtime
+Backend control is wired to this endpoint (§7.10, §16.6) — a live switch there is a real,
+confirm-gated action, not a display preference. Vector embeddings are always local via
+`EmbeddingEngine` (`mlx-community/embeddinggemma-300m-4bit`,
+768-dim) *unless* a runtime-backend embed source is configured and active (§16.4) — independent of
+the chat backend only in the keyword-only/EmbeddingEngine case, not universally.
 
 `MemoryManager` is the SQLite-backed store (WAL mode) for two independent memory types:
 **episodic memory** (typed, sparse facts — preferences, corrections, decisions — extracted

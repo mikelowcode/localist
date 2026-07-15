@@ -438,6 +438,8 @@ input::placeholder, textarea::placeholder {
 /* ── Segmented control (Settings → Runtime Backend) ────────────────────── */
 .segmented {
   display: flex;
+  align-items: center;
+  gap: var(--sp-2);
   background: var(--bg-active);
   border-radius: var(--radius);
   padding: 2px;
@@ -454,6 +456,8 @@ input::placeholder, textarea::placeholder {
   cursor: pointer;
 }
 .seg-btn.active { background: var(--accent); color: #fff; }
+.seg-btn.previewing:not(.active) { box-shadow: inset 0 0 0 1.5px var(--accent); color: var(--text-primary); }
+.seg-btn:disabled { cursor: not-allowed; opacity: 0.6; }
 
 /* ── Mono pill chip (status/provenance/meta) ────────────────────────────── */
 .pill-mono {

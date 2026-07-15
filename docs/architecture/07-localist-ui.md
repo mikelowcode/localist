@@ -20,7 +20,7 @@ CSS custom properties (no Tailwind, no component library).
 | `/conversation` | `ChatPanel.svelte` | Primary chat interface. Streams SSE responses. |
 | `/memory` | `EpisodesPanel.svelte` | Episodic memory browser. |
 | `/files` | `FileBrowser.svelte` | Full-width file preview pane. Wiki/Raw/Generated listing, upload, and ingest moved into the sidebar's Files sub-nav (§7.11, 2026-07-13) — no longer part of this route's own component. |
-| `/settings` | Settings | Runtime backend status/health, chat/embedding model IDs, chat-history eviction preset, theme, Runtime Backend display preference (§7.10). |
+| `/settings` | Settings | Runtime backend status/health, live runtime-backend switch + per-backend chat-model dropdown (§7.10, §16.6), chat-history eviction preset, theme. |
 
 ### 7.3 Provenance Bar
 
@@ -407,13 +407,22 @@ colors — not covered by the design handoff, a known gap. Active filter-pill st
 `--accent` background + white text; the pre-existing amber-tinted `Pending` chip's distinct active
 state was intentionally preserved rather than unified into the same treatment.
 
-**Settings.** Restyled as stacked cards. New Runtime Backend segmented control
-(`RUNTIME_BACKENDS`/`RUNTIME_BACKEND_LABELS`/`runtimeBackendLabel` in `model.ts`,
-`localStorage`-persisted) drives the appbar chip's label — **a display preference only, not a live
-backend switch**; see §16.3 for the scoped-but-not-built proposal to make it one. Pre-existing real
-functionality (backend-URL health check, chat/embedding model ID fields) was restyled in place, not
-removed. New Streaming-responses / Episodic-write-approval toggles are UI-only placeholders with no
-backing endpoint — flagged in the code as such.
+**Settings.** Restyled as stacked cards. Runtime Backend segmented control
+(`RUNTIME_BACKENDS`/`RUNTIME_BACKEND_LABELS`/`runtimeBackendLabel` in `model.ts`) drives the appbar
+chip's label. **Live-wired as of §16.6 (2026-07-15)** — clicking a backend other than the active one
+now calls `switchRuntimeBackend()` (a new `runtimeBackendSwitch.ts` store) against the real
+`POST /settings/runtime-backend`, gated by a `confirm()` dialog; a no-op guard skips the confirm/
+switch when the clicked backend is already active. The real active backend is synced from
+`GET /health`'s new `backend` field (`model.ts`'s `health.subscribe(...)`), not just read from
+`localStorage` — the browser's cached value is now only a paint-before-first-poll placeholder. The
+former read-only "Chat Model" card is now a `<select>` populated from `fetchBackendModels()` for
+whichever backend is currently selected in the segmented control (independent of which one is
+actually active, so a different backend's models can be previewed before switching to it);
+`onchange` calls `pinChatModel()` against `POST /settings/runtime-backend/{backend}/chat-model`. The
+free-text "Embedding model ID" field (and the rest of the by-then-empty "Model Configuration" card)
+was deleted — confirmed inert for every backend per §33/§34. New Streaming-responses /
+Episodic-write-approval toggles are UI-only placeholders with no backing endpoint — flagged in the
+code as such.
 
 **Files.** See §7.11.
 

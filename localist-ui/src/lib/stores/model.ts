@@ -35,9 +35,20 @@ modelConfig.subscribe((s) => {
   if (browser) localStorage.setItem(BACKEND_KEY, s.backend);
 });
 
+// localStorage is only a paint-before-first-health-check cache. Once a real
+// health response has arrived, the actual active backend (which can now
+// change at runtime via POST /settings/runtime-backend — see
+// docs/architecture/16-runtime-backend-layer.md §16.5) is authoritative and
+// overrides whatever the browser last remembered — a process restart reverts
+// to .env, or someone may have switched it directly via curl.
+health.subscribe(($health) => {
+  if ($health.reachable && $health.backend) {
+    modelConfig.update((s) => (s.backend === $health.backend ? s : { ...s, backend: $health.backend }));
+  }
+});
+
 // Display label for the appbar's consolidated status chip and the Settings
-// segmented control — cosmetic only; the real backend is selected at process
-// startup via LOCALIST_RUNTIME_BACKEND (see CLAUDE.md), not switched at runtime.
+// segmented control.
 export const runtimeBackendLabel = derived(modelConfig, ($m) =>
   RUNTIME_BACKEND_LABELS[$m.backend as RuntimeBackend] ?? $m.backend
 );
