@@ -66,6 +66,7 @@ Copy `backend/.env.example` to `backend/.env`. Only an API key for the active `w
 | `BRAVE_API_KEY` | *(none)* | Required when `SEARCH_PROVIDER=brave`; without it, `web_search` fails and falls back to corpus |
 | `LOCALIST_MCP_URL` | `http://localhost:8003` | localist-mcp server URL |
 | `LOCALIST_EPISODIC_WRITE_APPROVAL` | `false` | Gate implicit memory writes behind approve/reject |
+| `LOCALIST_RESEARCH_LOOP_ENABLED` | `false` | Upgrade `web_search` to a bounded search/evaluate/fetch/reformulate loop for price/spec-lookup queries |
 | `LOCALIST_LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING` |
 
 See `backend/.env.example` for the full list (embedding engine, wiki/raw directories, MCP project root, etc.).
@@ -76,7 +77,7 @@ See `backend/.env.example` for the full list (embedding engine, wiki/raw directo
 
 **Routing** — `Planner` evaluates priority rules (P1–P6) in order, no inference required: raw file/ingest → `WikiAgent`; diff keywords → targeted wiki diff; memory keywords → episode write; tool signals (URL, file, search) → tool dispatch; factual gaps → web search; corpus match → RAG; fallback → direct answer.
 
-**Tools** — served over MCP/SSE by localist-mcp: `web_search` (LangSearch), `fetch_url` (readability-lxml extraction), and sandboxed `file_op` (`read_file`/`write_file`/`append_file`, versioned on collision). File writes for not-yet-generated content are deferred until after the answer, then confirmed inline.
+**Tools** — served over MCP/SSE by localist-mcp: `web_search` (LangSearch), `fetch_url` (readability-lxml extraction), and sandboxed `file_op` (`read_file`/`write_file`/`append_file`, versioned on collision). File writes for not-yet-generated content are deferred until after the answer, then confirmed inline. A bounded research loop (search → evaluate → fetch → reformulate, capped at 3 iterations) can upgrade `web_search` for price/spec-lookup queries a single search snippet can't resolve, gated behind `LOCALIST_RESEARCH_LOOP_ENABLED` — off by default.
 
 **Memory** — two SQLite-backed stores. Episodic memory captures typed facts (preferences, decisions, corrections, etc.) with confidence scores and a `pending → active → superseded/retracted` lifecycle; retrieval by subject, recency, or cosine similarity; retraction via semantic match; every write scanned for prompt-injection/credential content before storing. A human-readable snapshot regenerates at `wiki/MEMORY.md`. The corpus (RAG) stores embeddings of wiki pages and documents. A user profile (`wiki/users/michael.md`) is embedded line-by-line and injected only where relevant (cosine ≥ 0.45).
 
