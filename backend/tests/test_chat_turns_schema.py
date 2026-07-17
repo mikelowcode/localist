@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from memory_manager import MemoryManager
+from memory_manager import MemoryManager, _SCHEMA_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -222,8 +222,8 @@ class TestChatTurnsMigration:
         assert "chat_history_settings" not in tables_before
 
         # Open with MemoryManager → triggers _migrate(from_version=5) →
-        # v5→v6→v7 (chat_turns objects land at v6; v6→v7 then adds
-        # conversation_id/conversation_title on top, per §12.3).
+        # v5→v6→v7→...→current (chat_turns objects land at v6; v6→v7 then
+        # adds conversation_id/conversation_title on top, per §12.3).
         MemoryManager(db_path=path)
 
         conn = sqlite3.connect(str(path))
@@ -233,7 +233,7 @@ class TestChatTurnsMigration:
         ).fetchall()}
         conn.close()
 
-        assert version_after == 7
+        assert version_after == _SCHEMA_VERSION
         assert "chat_turns" in names_after
         assert "chat_turns_fts" in names_after
         assert "chat_history_settings" in names_after

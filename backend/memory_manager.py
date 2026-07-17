@@ -149,13 +149,22 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION   = 7          # increment when schema changes require migration
+_SCHEMA_VERSION   = 8          # increment when schema changes require migration
 _EMBEDDING_DIM    = 768        # EmbeddingGemma-300M-4bit output dimension
 _EMBEDDING_FORMAT = ">768f"    # big-endian float32 × 768
 
 # Soft cap: keep at most this many conversation_log rows per task_id.
 # Older rows are deleted (FIFO) when the cap is exceeded.
 _CONV_LOG_CAP_PER_TASK = 200
+
+# embedding_provenance store keys — see _check_embedding_provenance().
+_PROVENANCE_STORES: tuple[str, ...] = ("corpus", "episodes")
+
+# Episodes are expected to stay small enough to re-embed synchronously at
+# startup with no bounding/pagination (docs/architecture/
+# 16-runtime-backend-layer.md §16.4). This is a "revisit if it fires live"
+# tripwire, not a hard limit — re-embedding still runs regardless.
+_EPISODES_REEMBED_WARN_ROW_COUNT = 500
 
 # Closed set of valid chat_history_settings.eviction_preset values.
 _CHAT_HISTORY_EVICTION_PRESETS: frozenset[str] = frozenset({"7d", "30d", "90d", "forever"})
@@ -311,26 +320,52 @@ class MemoryManager:
         of length 768.  When provided, embeddings are computed and stored on
         index_document() and used for cosine re-ranking in query_corpus().
         When absent, keyword overlap scoring is used exclusively.
+    embedding_model_name :
+        Name of the embedding model actually producing embed_fn's vectors
+        (e.g. "mlx-community/embeddinggemma-300m-4bit"), or None when no
+        embedding source is configured at all. Compared at construction
+        time against the 'corpus' and 'episodes' rows in the
+        embedding_provenance table (see _check_embedding_provenance()) —
+        the same detect-and-fail-safe pattern as Planner's
+        _TUNED_EMBEDDING_MODEL guard, applied to stored vectors instead of
+        threshold constants. docs/architecture/16-runtime-backend-layer.md
+        §16.4.
     """
 
     def __init__(
         self,
-        db_path:  Path | str | None = None,
-        embed_fn: Callable[[str], list[float]] | None = None,
+        db_path:               Path | str | None = None,
+        embed_fn:               Callable[[str], list[float]] | None = None,
+        embedding_model_name:   str | None = None,
     ) -> None:
         if db_path is None:
             db_path = Path(__file__).resolve().parent / "lora_memory.db"
-        self._db_path  = Path(db_path)
-        self._embed_fn = embed_fn
-        self._lock     = threading.Lock()
+        self._db_path             = Path(db_path)
+        self._embed_fn            = embed_fn
+        self._embedding_model_name = embedding_model_name
+        self._lock                = threading.Lock()
+
+        # Set when the 'corpus' store's stored embedding_provenance model
+        # disagrees with self._embedding_model_name (see
+        # _check_embedding_provenance()). query_corpus() falls back to
+        # keyword-only scoring while this is True — same fail-safe posture
+        # as self._embed_fn being None — until POST /memory/reembed
+        # (reembed_corpus()) explicitly clears it. Episodes get no
+        # equivalent flag: a mismatch there is auto-corrected in place
+        # below, never left stale.
+        self._corpus_stale = False
 
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
+        if self._embedding_model_name is not None:
+            self._check_embedding_provenance()
+
         logger.info(
-            "MemoryManager initialised — db=%s  embeddings=%s",
+            "MemoryManager initialised — db=%s  embeddings=%s  corpus_stale=%s",
             self._db_path,
             "enabled" if embed_fn else "disabled (keyword-only)",
+            self._corpus_stale,
         )
 
     @property
@@ -433,6 +468,11 @@ class MemoryManager:
                         );
                         CREATE INDEX IF NOT EXISTS idx_cache_hash
                             ON retrieval_cache(query_hash, valid);
+
+                        CREATE TABLE IF NOT EXISTS embedding_provenance (
+                            store TEXT NOT NULL PRIMARY KEY,
+                            model TEXT NOT NULL
+                        );
 
                         CREATE TABLE IF NOT EXISTS episodes (
                             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -699,11 +739,266 @@ class MemoryManager:
                     ON chat_turns(conversation_id, created_at);
             """)
 
+        if from_version < 8:
+            logger.info("Applying migration v7→v8: creating embedding_provenance table.")
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS embedding_provenance (
+                    store TEXT NOT NULL PRIMARY KEY,
+                    model TEXT NOT NULL
+                );
+            """)
+
         conn.execute(
             "UPDATE schema_version SET version = ?", (_SCHEMA_VERSION,)
         )
         conn.commit()
         logger.info("Migration complete. Schema is now v%d.", _SCHEMA_VERSION)
+
+    # -----------------------------------------------------------------------
+    # Embedding provenance  (docs/architecture/16-runtime-backend-layer.md §16.4)
+    #
+    # Same detect-and-fail-safe pattern as Planner's _TUNED_EMBEDDING_MODEL
+    # guard, applied to stored vectors: cosine similarity between a query
+    # embedding and a stored document/episode embedding is only meaningful
+    # if both came from the same model's geometry. embedding_provenance
+    # tracks, per store ('corpus' | 'episodes'), which model actually
+    # produced the vectors currently on disk.
+    # -----------------------------------------------------------------------
+
+    def _check_embedding_provenance(self) -> None:
+        """
+        Called once at construction time (only when embedding_model_name is
+        not None — no embedding source configured means nothing to check).
+
+        For each store in _PROVENANCE_STORES, compares the stored
+        embedding_provenance row (if any) against self._embedding_model_name:
+
+          - No row, and the store has zero embedded rows: nothing to compare
+            against yet — defer. 'corpus' seeds its own row the first time
+            index_document() actually writes an embedding (see
+            _maybe_seed_corpus_provenance()); 'episodes' seeds on the next
+            process restart that finds embedded rows present (or whenever
+            episode-embedding provenance tracking is added to the writer
+            path — not yet, so it seeds one boot later than corpus, at worst).
+          - No row, but the store already has embedded rows: the pre-
+            existing-database migration case — provenance tracking shipped
+            after data was already embedded under whatever model was active
+            at the time. Seeded silently, no warning, no re-embed. Treating
+            this as a mismatch would trigger a surprise re-embed for every
+            existing user on their very next boot.
+          - Row present and it matches: no-op.
+          - Row present and it disagrees: a genuine mismatch. Handled per-
+            store below — 'corpus' is flagged stale (manual refresh via
+            reembed_corpus() / POST /memory/reembed); 'episodes' is
+            auto-corrected immediately (small, bounded cost).
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                for store in _PROVENANCE_STORES:
+                    table = "document_index" if store == "corpus" else "episodes"
+                    row = conn.execute(
+                        "SELECT model FROM embedding_provenance WHERE store = ?",
+                        (store,),
+                    ).fetchone()
+
+                    if row is None:
+                        has_data = conn.execute(
+                            f"SELECT 1 FROM {table} WHERE embedding IS NOT NULL LIMIT 1"
+                        ).fetchone() is not None
+                        if has_data:
+                            conn.execute(
+                                "INSERT INTO embedding_provenance (store, model) VALUES (?, ?)",
+                                (store, self._embedding_model_name),
+                            )
+                            conn.commit()
+                            logger.info(
+                                "MemoryManager: seeded embedding_provenance for %r store "
+                                "at %r — pre-existing embedded data found with no "
+                                "provenance row (first boot after provenance tracking "
+                                "shipped); trusted silently, no re-embed triggered.",
+                                store, self._embedding_model_name,
+                            )
+                        continue
+
+                    stored_model = row["model"]
+                    if stored_model == self._embedding_model_name:
+                        continue
+
+                    if store == "corpus":
+                        logger.warning(
+                            "MemoryManager: corpus embeddings were produced by %r, but "
+                            "the active embedding model is now %r — disabling "
+                            "embedding-based corpus re-ranking (falling back to "
+                            "keyword-only scoring) until POST /memory/reembed is run. "
+                            "Cosine similarity is not portable across embedding models; "
+                            "see docs/architecture/16-runtime-backend-layer.md §16.4.",
+                            stored_model, self._embedding_model_name,
+                        )
+                        self._corpus_stale = True
+                        self._invalidate_cache(conn)
+                        conn.commit()
+                    else:
+                        self._reembed_episodes_locked(conn, stored_model)
+            finally:
+                conn.close()
+
+    def _reembed_episodes_locked(self, conn: sqlite3.Connection, stored_model: str) -> None:
+        """
+        Re-embed every episodes row in place with the currently active
+        embed_fn, then update the 'episodes' provenance row.
+
+        Must be called with self._lock already held (only caller today is
+        _check_embedding_provenance()) — threading.Lock is not reentrant.
+
+        Provenance is only advanced to the new model if every row succeeded;
+        a partial failure leaves both the surviving stale rows and the old
+        provenance value in place (so the mismatch is detected again, and
+        retried, on the next boot) rather than claiming a clean re-embed
+        that didn't fully happen.
+        """
+        rows = conn.execute("SELECT id, subject, content FROM episodes").fetchall()
+        if len(rows) > _EPISODES_REEMBED_WARN_ROW_COUNT:
+            logger.warning(
+                "MemoryManager: episodes re-embed triggered for %d rows — episodes "
+                "was assumed to stay small enough to re-embed synchronously at "
+                "startup with no bounding/pagination; that assumption may need "
+                "revisiting.", len(rows),
+            )
+        logger.warning(
+            "MemoryManager: episodes embeddings were produced by %r, but the "
+            "active embedding model is now %r — auto re-embedding %d episode "
+            "row(s) now (small, bounded cost; see docs/architecture/"
+            "16-runtime-backend-layer.md §16.4).",
+            stored_model, self._embedding_model_name, len(rows),
+        )
+
+        reembedded = 0
+        for row in rows:
+            try:
+                vector = self._embed_fn(f"{row['subject']}. {row['content']}")
+                blob   = _pack_embedding(vector)
+            except Exception as exc:
+                logger.warning(
+                    "MemoryManager: episodes re-embed failed for id=%d (%s) — "
+                    "leaving its previous embedding in place.", row["id"], exc,
+                )
+                continue
+            conn.execute("UPDATE episodes SET embedding = ? WHERE id = ?", (blob, row["id"]))
+            reembedded += 1
+
+        if rows and reembedded < len(rows):
+            logger.warning(
+                "MemoryManager: episodes re-embed incomplete (%d/%d succeeded) — "
+                "leaving 'episodes' provenance at %r; will retry on next boot.",
+                reembedded, len(rows), stored_model,
+            )
+            conn.commit()
+            return
+
+        conn.execute(
+            """
+            INSERT INTO embedding_provenance (store, model) VALUES ('episodes', ?)
+            ON CONFLICT(store) DO UPDATE SET model = excluded.model
+            """,
+            (self._embedding_model_name,),
+        )
+        conn.commit()
+        logger.info(
+            "MemoryManager: episodes re-embed complete — %d/%d row(s) updated to %r.",
+            reembedded, len(rows), self._embedding_model_name,
+        )
+
+    def _maybe_seed_corpus_provenance(self, conn: sqlite3.Connection) -> None:
+        """
+        Seed the 'corpus' embedding_provenance row the first time this
+        process actually writes a corpus embedding, if no row exists yet.
+
+        Cheap (INSERT OR IGNORE) and safe to call on every embedded write
+        from index_document() — only the very first call after a fresh DB
+        (or after _check_embedding_provenance()'s migration-seed case
+        already handled it) actually inserts a row. Must be called with
+        self._lock already held, inside the same transaction as the write.
+        """
+        if self._embedding_model_name is None:
+            return
+        conn.execute(
+            "INSERT OR IGNORE INTO embedding_provenance (store, model) VALUES ('corpus', ?)",
+            (self._embedding_model_name,),
+        )
+
+    def reembed_corpus(self) -> dict[str, Any]:
+        """
+        Manually re-embed every document_index row with the currently
+        active embed_fn, update the 'corpus' embedding_provenance row,
+        flush the retrieval cache, and clear self._corpus_stale.
+
+        The explicit, potentially-expensive counterpart to episodes'
+        automatic startup re-embed — wiki/raw corpora can be arbitrarily
+        large, so unlike episodes this is never triggered automatically on
+        a detected mismatch (docs/architecture/16-runtime-backend-layer.md
+        §16.4). Exposed as POST /memory/reembed.
+
+        Idempotent — safe to call whether or not the corpus is currently
+        flagged stale (a "just refresh it" operation, not gated on the flag).
+
+        Raises
+        ------
+        RuntimeError
+            If no embed_fn is configured — there is nothing to re-embed with.
+        """
+        if self._embed_fn is None:
+            raise RuntimeError("reembed_corpus: no embed_fn configured — cannot re-embed.")
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute("SELECT id, content FROM document_index").fetchall()
+                reembedded = 0
+                for row in rows:
+                    try:
+                        vec = self._embed_fn(row["content"][:500])
+                    except Exception as exc:
+                        logger.warning(
+                            "reembed_corpus: embed failed for document id=%d (%s) — "
+                            "leaving its previous embedding in place.", row["id"], exc,
+                        )
+                        continue
+                    if len(vec) != _EMBEDDING_DIM:
+                        logger.warning(
+                            "reembed_corpus: embed returned dim=%d, expected %d for "
+                            "document id=%d — skipping.",
+                            len(vec), _EMBEDDING_DIM, row["id"],
+                        )
+                        continue
+                    conn.execute(
+                        "UPDATE document_index SET embedding = ? WHERE id = ?",
+                        (_pack_embedding(vec), row["id"]),
+                    )
+                    reembedded += 1
+
+                self._invalidate_cache(conn)
+                conn.execute(
+                    """
+                    INSERT INTO embedding_provenance (store, model) VALUES ('corpus', ?)
+                    ON CONFLICT(store) DO UPDATE SET model = excluded.model
+                    """,
+                    (self._embedding_model_name,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        self._corpus_stale = False
+        logger.info(
+            "reembed_corpus: complete — %d/%d document(s) re-embedded to %r.",
+            reembedded, len(rows), self._embedding_model_name,
+        )
+        return {
+            "reembedded": reembedded,
+            "total":      len(rows),
+            "model":      self._embedding_model_name,
+        }
 
     # -----------------------------------------------------------------------
     # Conversation log  (ControllerAgent / Synthesizer API)
@@ -1387,6 +1682,9 @@ class MemoryManager:
                     )
                     logger.info("index_document: indexed %s (%s).", path.name, doc_type)
 
+                if embedding_blob is not None:
+                    self._maybe_seed_corpus_provenance(conn)
+
                 conn.commit()
                 # Invalidate retrieval cache on any index mutation.
                 self._invalidate_cache(conn)
@@ -1836,8 +2134,10 @@ class MemoryManager:
             scored.append((score, row))
         scored.sort(key=lambda x: x[0], reverse=True)
 
-        # Embedding re-rank on top-2N candidates
-        if use_embeddings and self._embed_fn is not None:
+        # Embedding re-rank on top-2N candidates. self._corpus_stale is the
+        # same fail-safe-to-keyword-only posture as self._embed_fn being
+        # None — see _check_embedding_provenance() / reembed_corpus().
+        if use_embeddings and self._embed_fn is not None and not self._corpus_stale:
             pool = scored[: max_results * 2]
             try:
                 query_vec = self._embed_fn(query)

@@ -54,7 +54,7 @@ class BaseRuntimeClient(Protocol):
 
     Methods
     -------
-    infer(prompt, system, max_tokens, temperature) → str
+    infer(prompt, system, max_tokens, temperature, timeout) → str
         Blocking single-turn completion.  Returns the full response string.
         Used by the Planner, Synthesizer, and all sub-agents.
 
@@ -63,7 +63,7 @@ class BaseRuntimeClient(Protocol):
         whose dimensionality depends on the backend model.
         Used by ResearchAgent for embedding-based re-ranking.
 
-    infer_stream(prompt, system, max_tokens, temperature) → Generator[str, None, None]
+    infer_stream(prompt, system, max_tokens, temperature, timeout) → Generator[str, None, None]
         Synchronous generator that yields text chunks (tokens or small
         word-level pieces) as they are produced by the model.
         Used by the FastAPI streaming endpoint (POST /task/stream) to relay
@@ -79,6 +79,7 @@ class BaseRuntimeClient(Protocol):
         max_tokens:  int   = 1024,
         temperature: float = 0.2,
         label:       str   = "",
+        timeout:     float | None = None,
     ) -> str:
         """
         Request a blocking chat completion.
@@ -97,6 +98,20 @@ class BaseRuntimeClient(Protocol):
             Optional caller identifier for diagnostic correlation (e.g.
             overlap/throughput logging). Backends that don't need it may
             accept and ignore it; it must never affect the request itself.
+        timeout:
+            Optional per-call override for the request timeout, in
+            seconds. None (default) means "use the client's configured
+            default timeout" — every existing call site is unaffected by
+            this parameter's addition. Intended for cheap, small-
+            max_tokens calls (classifiers, gate checks) that should fail
+            fast rather than share the same budget as a full-length main-
+            dispatch answer (2026-07-17 — see mcp_tool_dispatcher.py's
+            _RESEARCH_CLASSIFIER_TIMEOUT for the motivating incident: a
+            max_tokens=10 gate-check call stalled for the full default
+            timeout on a cloud-model-side hang, confirmed not a local
+            issue since health-check polling stayed healthy throughout).
+            A backend whose transport doesn't support a per-call timeout
+            may accept and ignore this parameter rather than breaking.
 
         Returns
         -------
@@ -140,6 +155,7 @@ class BaseRuntimeClient(Protocol):
         max_tokens:  int   = 1024,
         temperature: float = 0.2,
         label:       str   = "",
+        timeout:     float | None = None,
     ) -> Generator[str, None, None]:
         """
         Request a streaming chat completion.
@@ -151,13 +167,17 @@ class BaseRuntimeClient(Protocol):
         method; they may yield the full infer() result as one chunk:
 
             def infer_stream(self, prompt, system="", max_tokens=1024,
-                             temperature=0.2):
-                yield self.infer(prompt, system, max_tokens, temperature)
+                             temperature=0.2, label="", timeout=None):
+                yield self.infer(prompt, system, max_tokens, temperature,
+                                  label, timeout)
 
         Parameters
         ----------
-        prompt, system, max_tokens, temperature:
+        prompt, system, max_tokens, temperature, label:
             Same semantics as infer().
+        timeout:
+            Same semantics as infer()'s `timeout` parameter — None means
+            "use the client's configured default timeout".
 
         Yields
         ------

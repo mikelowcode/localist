@@ -89,7 +89,29 @@ def _iter_ndjson_chunks(response: requests.Response) -> Iterator[str]:
     a trailing empty/absent content) — the loop stops there rather than
     waiting for connection close.
 
-    Malformed lines and empty deltas are silently skipped.
+    Malformed (non-JSON) lines are silently skipped, as are well-formed
+    lines that carry neither "message" content nor "error" nor "done"
+    (e.g. a pure metadata line) — those are legitimate NDJSON shapes, not
+    errors.
+
+    2026-07-17: two failure modes were previously silent. Ollama sends
+    {"error": "..."} instead of a normal content chunk mid-stream on a
+    rate limit, context-length overflow, moderation block, or a
+    mid-generation crash — that line has no "message" key, so content
+    resolved to "" and was skipped via `if content:` same as any other
+    empty delta, and if the connection then closed without ever sending
+    "done": true, the generator just finished with zero chunks yielded and
+    no exception, indistinguishable from a genuine empty completion.
+    Confirmed live (repeated output_chars=0 completions, task still marked
+    COMPLETE, during 2026-07-16 research-loop testing) before this fix.
+    Both are now surfaced as RuntimeError instead of resolving silently.
+
+    Raises
+    ------
+    RuntimeError
+        If a line carries a truthy "error" field, or if the stream
+        (response.iter_lines()) is exhausted without ever seeing a line
+        where "done" is true.
     """
     for raw_line in response.iter_lines(decode_unicode=True):
         if not raw_line:
@@ -101,12 +123,21 @@ def _iter_ndjson_chunks(response: requests.Response) -> Iterator[str]:
             logger.debug("NDJSON: skipping non-JSON line: %s", raw_line[:120])
             continue
 
+        error = data.get("error")
+        if error:
+            raise RuntimeError(f"Ollama returned an error mid-stream: {error}")
+
         content = data.get("message", {}).get("content", "")
         if content:
             yield content
 
         if data.get("done"):
             return
+
+    raise RuntimeError(
+        "Ollama NDJSON stream ended without a \"done\": true line — "
+        "incomplete or truncated response."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +221,7 @@ class OllamaRuntimeClient:
         max_tokens:  int   = 1024,
         temperature: float = 0.2,
         label:       str   = "",
+        timeout:     float | None = None,
     ) -> str:
         """
         Request a blocking chat completion from Ollama via NDJSON accumulation.
@@ -204,6 +236,9 @@ class OllamaRuntimeClient:
             Optional caller identifier forwarded to infer_stream() for
             diagnostic correlation. Purely diagnostic — has no effect on
             the request itself.
+        timeout:
+            Optional per-call override, in seconds, forwarded to
+            infer_stream(). None (default) uses self._stream_timeout.
 
         Returns
         -------
@@ -213,7 +248,10 @@ class OllamaRuntimeClient:
         Raises
         ------
         RuntimeError
-            On any network error, non-200 status, or stream decode failure.
+            On any network error, non-200 status, NDJSON decode failure, a
+            mid-stream {"error": ...} line from Ollama, or a stream that
+            closes without ever sending "done": true (see
+            _iter_ndjson_chunks).
         """
         chunks = list(self.infer_stream(
             prompt      = prompt,
@@ -221,6 +259,7 @@ class OllamaRuntimeClient:
             max_tokens  = max_tokens,
             temperature = temperature,
             label       = label,
+            timeout     = timeout,
         ))
         result = "".join(chunks)
         logger.debug("infer() ← %d chars received.", len(result))
@@ -310,6 +349,7 @@ class OllamaRuntimeClient:
         max_tokens:  int   = 1024,
         temperature: float = 0.2,
         label:       str   = "",
+        timeout:     float | None = None,
     ) -> Generator[str, None, None]:
         """
         Request a streaming chat completion from Ollama.
@@ -323,6 +363,14 @@ class OllamaRuntimeClient:
         label:
             Optional caller identifier for diagnostic correlation. Has no
             effect on the request itself.
+        timeout:
+            Optional per-call override for the request timeout, in
+            seconds. None (default) uses self._stream_timeout, exactly as
+            before this parameter was added (2026-07-17). Pass a smaller
+            value for cheap, small-max_tokens calls (classifiers, gate
+            checks) that should fail fast rather than share the full
+            main-dispatch budget — see mcp_tool_dispatcher.py's
+            _RESEARCH_CLASSIFIER_TIMEOUT for the motivating incident.
 
         Yields
         ------
@@ -332,7 +380,10 @@ class OllamaRuntimeClient:
         Raises
         ------
         RuntimeError
-            On any network error, non-200 status, or NDJSON decode failure.
+            On any network error, non-200 status, NDJSON decode failure, a
+            mid-stream {"error": ...} line from Ollama, or a stream that
+            closes without ever sending "done": true (see
+            _iter_ndjson_chunks).
         """
         messages = []
         if system:
@@ -349,9 +400,13 @@ class OllamaRuntimeClient:
             },
         }
 
+        effective_timeout = timeout if timeout is not None else self._stream_timeout
+
         logger.debug(
-            "infer_stream() → %s  max_tokens=%d  temp=%.2f  prompt_chars=%d  label=%s",
+            "infer_stream() → %s  max_tokens=%d  temp=%.2f  prompt_chars=%d  "
+            "label=%s  timeout=%.1fs",
             self._chat_endpoint, max_tokens, temperature, len(prompt), label,
+            effective_timeout,
         )
 
         try:
@@ -360,7 +415,7 @@ class OllamaRuntimeClient:
                 headers={"Content-Type": "application/json"},
                 data=json.dumps(payload),
                 stream=True,
-                timeout=self._stream_timeout,
+                timeout=effective_timeout,
             )
         except requests.ConnectionError as exc:
             raise RuntimeError(
@@ -369,7 +424,7 @@ class OllamaRuntimeClient:
             ) from exc
         except requests.Timeout:
             raise RuntimeError(
-                f"Ollama did not respond within {self._stream_timeout}s "
+                f"Ollama did not respond within {effective_timeout}s "
                 f"(endpoint: {self._chat_endpoint})."
             )
 

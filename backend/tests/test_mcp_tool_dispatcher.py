@@ -22,6 +22,17 @@ Covers:
     connection-failure graceful degradation.
   - An unrecognized tool name returns an inline error ToolResult
     (success=False) without calling the MCP server at all.
+  - research (2026-07-16): the bounded search/evaluate/reformulate/fetch
+    loop (_run_research_loop and its helpers) — gate-passes-immediately,
+    gate-fails-then-fetch-succeeds, iteration cap with the synthetic
+    trailing tool_name="research" failure ToolResult, the reformulation
+    repeat-guard, connectivity-failure short-circuit (no synthetic result),
+    fail-closed behavior when the gate/reformulate infer() calls raise, the
+    dispatch() "research" routing branch, and _derive_initial_query's query
+    resolution order. dispatcher._runtime.infer is controlled per-test via
+    side_effect, branching on the `system` kwarg
+    (_RESEARCH_GATE_SYSTEM_PROMPT vs _RESEARCH_REFORMULATE_SYSTEM_PROMPT)
+    since both calls share the same mock.
 
 _call_mcp_tool is monkeypatched per-test rather than opening a real SSE
 socket — the real network round-trip is covered by mcp_server's own
@@ -36,12 +47,20 @@ the real localist-mcp subprocess instead.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mcp_tool_dispatcher import MCPToolDispatcher
+from mcp_tool_dispatcher import (
+    MCPToolDispatcher,
+    _MAX_RESEARCH_ITERATIONS,
+    _RESEARCH_CLASSIFIER_TIMEOUT,
+    _RESEARCH_GATE_SYSTEM_PROMPT,
+    _RESEARCH_REFORMULATE_SYSTEM_PROMPT,
+)
+from prompt_builder import ToolResult
 
 # Sentinel session object handed back by the mocked _open_session below.
 # Never actually used to send protocol messages — _call_mcp_tool itself is
@@ -189,6 +208,39 @@ class TestUrlFetch:
         assert "Source: https://example.com/article" in r.result
         assert "Words: 3" in r.result
         assert "Body text here." in r.result
+
+    def test_bracket_wrapped_url_in_instruction_excludes_trailing_bracket(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """
+        2026-07-16 regression: _URL_RE is shared between _run_url_fetch's
+        instruction-text extraction (this test) and _extract_first_url
+        (the research loop's own regression tests, in TestResearchLoop) —
+        a user pasting a bracket- or paren-wrapped URL into their own
+        message would hit the same "]"/")" captured as part of the URL bug
+        that broke the research loop against web_search's
+        "[{url}]"-formatted result text.
+        """
+        async def fake_call(session, name, arguments):
+            assert arguments == {"url": "https://www.t-mobile.com/cell-phones/brand/apple"}
+            return json.dumps({
+                "url":               "https://www.t-mobile.com/cell-phones/brand/apple",
+                "title":             "Apple",
+                "author":            "",
+                "date_published":    "",
+                "cleaned_text":      "Body text here.",
+                "word_count":        3,
+                "fetch_duration_ms": 5.0,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["url_fetch"],
+                instruction   = "check out [https://www.t-mobile.com/cell-phones/brand/apple] for pricing",
+                context       = {},
+            )
+
+        assert results[0].success is True
 
     def test_context_fetch_url_overrides_instruction_url(self, dispatcher: MCPToolDispatcher):
         async def fake_call(session, name, arguments):
@@ -490,3 +542,429 @@ class TestSessionReuse:
         assert all(r.success is False for r in results)
         assert all("unreachable" in r.result for r in results)
         assert [r.tool_name for r in results] == ["file_op", "url_fetch", "web_search"]
+
+
+class TestResearchLoop:
+    """
+    Coverage for MCPToolDispatcher._run_research_loop and its helpers
+    (_derive_initial_query, _evaluate_pricing_gate, _reformulate_query,
+    _extract_first_url). This code shipped (2026-07-16) with only the
+    763-passed full-suite regression check as evidence — that confirmed
+    nothing ELSE broke, not that the loop itself behaves correctly. These
+    tests are that missing direct coverage.
+
+    dispatcher._runtime is a MagicMock(spec=["infer"]) (see the `dispatcher`
+    fixture) — its .infer.side_effect is set per-test to a function keyed
+    off the `system` kwarg, since _evaluate_pricing_gate and
+    _reformulate_query share the same mock but use different system
+    prompts (_RESEARCH_GATE_SYSTEM_PROMPT vs
+    _RESEARCH_REFORMULATE_SYSTEM_PROMPT) to select which one is "talking".
+
+    _evaluate_pricing_gate/_reformulate_query are exercised both indirectly
+    (via dispatch(tools_to_call=["research"], ...)) and, for the two
+    fail-closed cases, directly via asyncio.run() — no pytest-asyncio
+    plugin is installed in this project, so async helpers are awaited the
+    same way dispatch() itself does internally (asyncio.run), not via an
+    async test function.
+    """
+
+    # ------------------------------------------------------------------
+    # Gate outcomes
+    # ------------------------------------------------------------------
+
+    def test_gate_passes_immediately_stops_after_one_iteration(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """Gate says "yes" on the very first search result: one ToolResult,
+        no url_fetch, no reformulate call."""
+        async def fake_call(session, name, arguments):
+            assert name == "web_search"
+            return json.dumps({
+                "query": arguments["query"],
+                "result_text": "The Basic plan costs $10/month.",
+                "result_count": 1,
+            }), False
+
+        def infer_side_effect(**kw):
+            assert kw["system"] == _RESEARCH_GATE_SYSTEM_PROMPT, (
+                "reformulate must not be called when the gate passes immediately"
+            )
+            return "yes"
+
+        dispatcher._runtime.infer.side_effect = infer_side_effect
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["research"],
+                instruction   = "what does the Basic plan cost",
+                context       = {},
+            )
+
+        assert mock_call.call_count == 1
+        assert mock_call.call_args.args[1] == "web_search"
+        assert len(results) == 1
+        assert results[0].tool_name == "web_search"
+        assert results[0].success is True
+        assert dispatcher._runtime.infer.call_count == 1
+
+    def test_gate_fails_on_snippet_then_passes_after_fetch(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """Search snippet is inconclusive but names a URL; fetching that URL
+        and re-running the gate on the full page text passes. Both
+        ToolResults are returned, no synthetic failure result."""
+        gate_calls: list[str] = []
+
+        def infer_side_effect(**kw):
+            if kw["system"] == _RESEARCH_GATE_SYSTEM_PROMPT:
+                gate_calls.append(kw["prompt"])
+                # First gate call = search snippet (no price stated) -> "no".
+                # Second gate call = fetched page text (has a price) -> "yes".
+                return "yes" if len(gate_calls) == 2 else "no"
+            raise AssertionError("reformulate must not be called once the gate passes")
+
+        dispatcher._runtime.infer.side_effect = infer_side_effect
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return json.dumps({
+                    "query": arguments["query"],
+                    "result_text": "See https://vendor.example/pricing for plan details.",
+                    "result_count": 1,
+                }), False
+            if name == "fetch_url":
+                assert arguments == {"url": "https://vendor.example/pricing"}
+                return json.dumps({
+                    "url": "https://vendor.example/pricing", "title": "Pricing", "author": "",
+                    "date_published": "", "cleaned_text": "The Basic plan is $10 per month.",
+                    "word_count": 6, "fetch_duration_ms": 2.0,
+                }), False
+            raise AssertionError(f"unexpected tool name {name!r}")
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["research"],
+                instruction   = "what does the vendor plan cost",
+                context       = {},
+            )
+
+        called_tools = [c.args[1] for c in mock_call.call_args_list]
+        assert called_tools == ["web_search", "fetch_url"]
+        assert len(gate_calls) == 2
+
+        assert len(results) == 2
+        assert results[0].tool_name == "web_search" and results[0].success is True
+        assert results[1].tool_name == "url_fetch" and results[1].success is True
+        assert not any(r.tool_name == "research" for r in results)
+
+    # ------------------------------------------------------------------
+    # Loop termination: iteration cap and repeat-guard
+    # ------------------------------------------------------------------
+
+    def test_iteration_cap_appends_synthetic_research_failure(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """Gate always says "no" and reformulate keeps returning a fresh
+        query — the loop must stop at _MAX_RESEARCH_ITERATIONS web_search
+        calls and append a trailing tool_name="research" success=False
+        ToolResult (the piece controller_agent.py's Step 3b depends on)."""
+        reformulate_count = 0
+
+        def infer_side_effect(**kw):
+            nonlocal reformulate_count
+            if kw["system"] == _RESEARCH_GATE_SYSTEM_PROMPT:
+                return "no"
+            if kw["system"] == _RESEARCH_REFORMULATE_SYSTEM_PROMPT:
+                reformulate_count += 1
+                return f"reformulated query {reformulate_count}"
+            raise AssertionError(f"unexpected system prompt {kw['system']!r}")
+
+        dispatcher._runtime.infer.side_effect = infer_side_effect
+
+        async def fake_call(session, name, arguments):
+            assert name == "web_search"
+            return json.dumps({
+                "query": arguments["query"],
+                "result_text": "No pricing information available here.",
+                "result_count": 1,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["research"],
+                instruction   = "vendor plan cost",
+                context       = {},
+            )
+
+        assert mock_call.call_count == _MAX_RESEARCH_ITERATIONS
+        assert len(results) == _MAX_RESEARCH_ITERATIONS + 1
+        assert all(
+            r.tool_name == "web_search" and r.success is True
+            for r in results[:_MAX_RESEARCH_ITERATIONS]
+        )
+
+        synthetic = results[-1]
+        assert synthetic.tool_name == "research"
+        assert synthetic.success is False
+        assert synthetic.result.startswith("ERROR:")
+
+    def test_repeat_guard_stops_before_iteration_cap(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """Reformulate degenerates to a query already tried — the loop must
+        stop immediately rather than spend another round-trip, and the
+        synthetic trailing failure result is still appended."""
+        def infer_side_effect(**kw):
+            if kw["system"] == _RESEARCH_GATE_SYSTEM_PROMPT:
+                return "no"
+            if kw["system"] == _RESEARCH_REFORMULATE_SYSTEM_PROMPT:
+                # Same as the derived initial query for instruction below ->
+                # guaranteed repeat after the first iteration.
+                return "vendor plan cost"
+            raise AssertionError(f"unexpected system prompt {kw['system']!r}")
+
+        dispatcher._runtime.infer.side_effect = infer_side_effect
+
+        async def fake_call(session, name, arguments):
+            assert name == "web_search"
+            return json.dumps({
+                "query": arguments["query"],
+                "result_text": "No pricing information available here.",
+                "result_count": 1,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["research"],
+                instruction   = "vendor plan cost",
+                context       = {},
+            )
+
+        assert mock_call.call_count == 1
+        assert mock_call.call_count < _MAX_RESEARCH_ITERATIONS
+
+        assert len(results) == 2
+        assert results[0].tool_name == "web_search" and results[0].success is True
+        synthetic = results[-1]
+        assert synthetic.tool_name == "research"
+        assert synthetic.success is False
+        assert synthetic.result.startswith("ERROR:")
+
+    # ------------------------------------------------------------------
+    # Connectivity failure: no synthetic result appended
+    # ------------------------------------------------------------------
+
+    def test_connectivity_failure_stops_immediately_without_synthetic_result(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """A search/fetch call itself failing (provider/connectivity error)
+        already looks like a plain web_search failure to Step 3b's existing
+        `r.tool_name == "web_search" and not r.success` clause — the loop
+        must stop after this first iteration and must NOT also append the
+        synthetic tool_name="research" result (that's reserved for the
+        "every call succeeded but no pricing was found" case)."""
+        async def fake_call(session, name, arguments):
+            raise ConnectionRefusedError("Connection refused")
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["research"],
+                instruction   = "vendor plan cost",
+                context       = {},
+            )
+
+        assert mock_call.call_count == 1
+        assert len(results) == 1
+        assert results[0].tool_name == "web_search"
+        assert results[0].success is False
+        assert "unreachable" in results[0].result
+        assert not any(r.tool_name == "research" for r in results)
+        dispatcher._runtime.infer.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Fail-closed behavior of the gate/reformulate helpers themselves
+    # ------------------------------------------------------------------
+
+    def test_evaluate_pricing_gate_fails_closed_on_infer_error(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """A raising runtime.infer() must not propagate out of
+        _evaluate_pricing_gate — it's treated as "no" (fail-closed), per
+        the method's own docstring."""
+        dispatcher._runtime.infer.side_effect = RuntimeError("model unavailable")
+
+        result = asyncio.run(
+            dispatcher._evaluate_pricing_gate("The Basic plan costs $10/month.")
+        )
+        assert result is False
+
+    def test_reformulate_failure_falls_through_to_repeat_guard(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """_reformulate_query's own except-clause falls back to `tried[-1]`
+        on a raising infer() call — that guaranteed repeat should trip the
+        repeat-guard and stop the loop cleanly, not propagate the
+        exception out of dispatch()."""
+        def infer_side_effect(**kw):
+            if kw["system"] == _RESEARCH_GATE_SYSTEM_PROMPT:
+                return "no"
+            if kw["system"] == _RESEARCH_REFORMULATE_SYSTEM_PROMPT:
+                raise RuntimeError("model unavailable")
+            raise AssertionError(f"unexpected system prompt {kw['system']!r}")
+
+        dispatcher._runtime.infer.side_effect = infer_side_effect
+
+        async def fake_call(session, name, arguments):
+            assert name == "web_search"
+            return json.dumps({
+                "query": arguments["query"],
+                "result_text": "No pricing information available here.",
+                "result_count": 1,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["research"],
+                instruction   = "vendor plan cost",
+                context       = {},
+            )
+
+        assert mock_call.call_count == 1
+        assert mock_call.call_count < _MAX_RESEARCH_ITERATIONS
+        assert len(results) == 2
+        synthetic = results[-1]
+        assert synthetic.tool_name == "research"
+        assert synthetic.success is False
+
+    # ------------------------------------------------------------------
+    # Classifier timeout override (2026-07-17)
+    # ------------------------------------------------------------------
+    #
+    # Live testing showed a gate-check call (max_tokens=10) stall for the
+    # full 60s default timeout on a cloud-model-side hang — confirmed not a
+    # local issue since Ollama daemon health-check polling stayed healthy
+    # throughout. _evaluate_pricing_gate/_reformulate_query now pass
+    # timeout=_RESEARCH_CLASSIFIER_TIMEOUT (15.0) instead of relying on the
+    # runtime's default, so a stuck classifier call fails fast and lets the
+    # loop reformulate/exhaust rather than burning a full minute per stall.
+
+    def test_evaluate_pricing_gate_passes_research_classifier_timeout(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        dispatcher._runtime.infer.return_value = "no"
+
+        asyncio.run(dispatcher._evaluate_pricing_gate("some search result text"))
+
+        assert dispatcher._runtime.infer.call_args.kwargs["timeout"] == _RESEARCH_CLASSIFIER_TIMEOUT
+
+    def test_reformulate_query_passes_research_classifier_timeout(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        dispatcher._runtime.infer.return_value = "a reformulated query"
+
+        asyncio.run(dispatcher._reformulate_query("original instruction", ["tried one"]))
+
+        assert dispatcher._runtime.infer.call_args.kwargs["timeout"] == _RESEARCH_CLASSIFIER_TIMEOUT
+
+    # ------------------------------------------------------------------
+    # dispatch() routing
+    # ------------------------------------------------------------------
+
+    def test_dispatch_routes_research_tool_to_the_loop(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """tools_to_call=["research"] must reach _run_research_loop, not the
+        "unknown tool" inline-error branch — mirrors how the file already
+        proves the file_op/url_fetch/web_search branches route correctly."""
+        captured: dict = {}
+
+        async def fake_loop(session, connect_error, instruction, context):
+            captured["instruction"] = instruction
+            captured["context"] = context
+            return [ToolResult(
+                tool_name  = "web_search",
+                parameters = "",
+                result     = "stubbed research result",
+                success    = True,
+            )]
+
+        with patch.object(MCPToolDispatcher, "_run_research_loop", side_effect=fake_loop):
+            results = dispatcher.dispatch(
+                tools_to_call = ["research"],
+                instruction   = "what does the vendor plan cost",
+                context       = {"web_search_queries": ["vendor plan pricing"]},
+            )
+
+        assert captured["instruction"] == "what does the vendor plan cost"
+        assert captured["context"] == {"web_search_queries": ["vendor plan pricing"]}
+        assert len(results) == 1
+        assert results[0].result == "stubbed research result"
+
+    # ------------------------------------------------------------------
+    # _derive_initial_query
+    # ------------------------------------------------------------------
+
+    def test_derive_initial_query_uses_explicit_queries_first_element(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        result = dispatcher._derive_initial_query(
+            "this instruction text is ignored",
+            {"web_search_queries": ["explicit query one", "explicit query two"]},
+        )
+        assert result == "explicit query one"
+
+    def test_derive_initial_query_falls_back_to_filler_stripped_instruction(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """Same resolution _run_web_search uses (test_query_derived_from_
+        instruction_strips_filler in TestWebSearch) — "research" and
+        "web_search" must behave identically on turn one."""
+        result = dispatcher._derive_initial_query(
+            "what is the latest oMLX release", {}
+        )
+        assert result == "latest oMLX release"
+
+    # ------------------------------------------------------------------
+    # _extract_first_url — 2026-07-16 regression
+    # ------------------------------------------------------------------
+    #
+    # Live research loop run confirmed _URL_RE captured the trailing "]"
+    # from mcp_server/web_search.py's result formatting
+    # (f"• {title}\n  {body}\n  [{url}]") — every URL is wrapped in
+    # literal [...] — producing ".../apple]" and a 404 on url_fetch.
+    # _URL_RE now excludes ]/) from the match itself, and
+    # _extract_first_url additionally rstrips trailing sentence
+    # punctuation (".,;:") as a second, cheap layer of defense.
+
+    def test_extract_first_url_strips_trailing_bracket(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        text = "• Apple iPhone pricing\n  Compare plans and pricing.\n  [https://www.t-mobile.com/cell-phones/brand/apple]"
+        url = dispatcher._extract_first_url(text, exclude=set())
+        assert url == "https://www.t-mobile.com/cell-phones/brand/apple"
+
+    def test_extract_first_url_strips_trailing_paren(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        text = "See the pricing page (https://vendor.example/pricing) for details."
+        url = dispatcher._extract_first_url(text, exclude=set())
+        assert url == "https://vendor.example/pricing"
+
+    def test_extract_first_url_strips_trailing_sentence_punctuation(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """Not bracket-wrapped — a URL sitting at the end of a sentence,
+        e.g. from a differently-formatted future source. Covered by
+        _extract_first_url's rstrip(".,;:"), not by _URL_RE itself."""
+        text = "Full pricing details are available at https://vendor.example/pricing."
+        url = dispatcher._extract_first_url(text, exclude=set())
+        assert url == "https://vendor.example/pricing"
+
+    def test_extract_first_url_unwrapped_url_unaffected(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """A normal, unwrapped URL with no trailing punctuation must come
+        back exactly as it appears — the fix must not over-trim."""
+        text = "Direct link: https://vendor.example/pricing/plans/v2"
+        url = dispatcher._extract_first_url(text, exclude=set())
+        assert url == "https://vendor.example/pricing/plans/v2"

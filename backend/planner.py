@@ -291,7 +291,54 @@ _SEARCH_INTENT_TEMPLATES: dict[str, tuple[str, ...]] = {
         "what's the current status of this",
         "is there anything new about this",
     ),
+
+    # New — a specialization of lookup_request: the user wants a specific,
+    # extractable fact (price, spec, plan tier) run down, not a general
+    # summary. Kept as its own group rather than folded into lookup_request
+    # so it can carry its own threshold and be tuned independently, same
+    # reasoning that already separates explicit_search_action (0.72) from
+    # lookup_request (0.60). Only ever decides web_search -> research
+    # upgrade in _priority3_tool (see _RESEARCH_INTENT_THRESHOLD below) —
+    # never gates whether a tool fires at all, so it is intentionally not
+    # part of _SEMANTIC_GATE_THRESHOLDS.
+    #
+    # v2 (2026-07-16): every template anchors on an explicit lookup/search
+    # verb + a concrete object, replacing v1's bare interrogative forms
+    # ("what does this cost") that syntactically collided with subjective
+    # price-opinion utterances ("is this worth the price") — see
+    # diagnostics/reports/research_intent_threshold_assessment_2026-07-16.md.
+    "research_intent": (
+        "look up the pricing for this product",
+        "find out how much this subscription costs",
+        "search for the price of this item",
+        "check the current price of this plan",
+        "find the pricing tiers for this service",
+        "track down how much this product costs",
+        "look up the specs and price for this product",
+        "find the cost of this plan per month",
+    ),
 }
+
+# Mirrors _SEARCH_NEGATIVE_FILTER below, scoped to research_intent's own
+# collision: subjective price-opinion phrasing ("is this worth the price")
+# shares cost/price vocabulary with real lookup requests but isn't asking
+# for a number. The 2026-07-16 v1 diagnostic found this collision was
+# threshold-unfixable (the negative scored above every true positive), the
+# same failure shape as lookup_request's 2026-06-25 incident — so it's
+# handled the same way: a substring pre-filter, not a threshold. Checked
+# (alongside _SEARCH_NEGATIVE_FILTER, combined as _ALL_SEARCH_NEGATIVE_
+# FILTERS below) in _semantic_search_intent() — see that method's 2026-07-16
+# redesign docstring for the current two-step conflict-resolution behavior;
+# a match no longer unconditionally skips scoring. The v2 diagnostic
+# (research_intent_threshold_assessment_2026-07-16-v2.md) confirmed this
+# fully resolves the raw collision: all 4 test utterances that match are
+# intercepted before they can reach any gate absent a tie-break override.
+_RESEARCH_NEGATIVE_FILTER: frozenset[str] = frozenset({
+    "worth the price",
+    "too expensive",
+    "lot of money for",
+    "can't believe how expensive",
+})
 
 _SEARCH_NEGATIVE_FILTER: frozenset[str] = frozenset({
     "search your memory",
@@ -335,6 +382,15 @@ _SEARCH_NEGATIVE_FILTER: frozenset[str] = frozenset({
     "hey there",
     "what's up",
 })
+
+# Combined lookup set for the single substring-match pass in
+# _semantic_search_intent()'s post-scoring negative-filter check (2026-07-16
+# redesign) — one membership test covers both filters' phrases rather than
+# two separate passes, since post-redesign both are handled identically
+# (matched-phrase lookup -> conflict check -> optional tie-break), unlike
+# the old pre-scoring behavior where they were checked as separate
+# early-return blocks.
+_ALL_SEARCH_NEGATIVE_FILTERS: frozenset[str] = _SEARCH_NEGATIVE_FILTER | _RESEARCH_NEGATIVE_FILTER
 
 # Relevance threshold for Priority 4 corpus scoring
 _CORPUS_SCORE_THRESHOLD: float = 0.55
@@ -386,6 +442,86 @@ _SEMANTIC_GATE_THRESHOLDS: dict[str, float] = {
     "explicit_search_action": 0.72,
     "lookup_request": 0.60,
 }
+
+
+# ---------------------------------------------------------------------------
+# Tuned-embedding-model guard
+#
+# Every threshold above (_SEMANTIC_GATE_THRESHOLDS, and _RESEARCH_INTENT_
+# THRESHOLD further below) and both negative-filter substring pre-filters
+# (_SEARCH_NEGATIVE_FILTER, _RESEARCH_NEGATIVE_FILTER) were tuned against
+# cosine scores produced by this specific embedding model. Cosine similarity
+# is not portable across embedding models — the same utterance pair can
+# score very differently under a different model's geometry, which silently
+# flips gate_fired without raising anything. Confirmed live 2026-07-16: the
+# identical lookup_request utterance scored 0.7119 under
+# mlx-community/embeddinggemma-300m-4bit vs 0.578 under nomic-embed-text —
+# enough to cross the 0.60 lookup_request gate one way and not the other.
+#
+# Measured against (all assumed this exact model):
+#   - the lookup_request / explicit_search_action threshold history in the
+#     comments above (2026-06-25 update A/B, 2026-06-28 ESA raise)
+#   - diagnostics/reports/research_intent_threshold_assessment_2026-07-16.md
+#   - diagnostics/reports/research_intent_threshold_assessment_2026-07-16-v2.md
+#   - diagnostics/reports/negative_filter_tiebreak_assessment_2026-07-16.md
+#
+# See Planner.__init__ / _semantic_search_intent() for the runtime guard this
+# constant backs, and docs/architecture/16-runtime-backend-layer.md §16.4.
+_TUNED_EMBEDDING_MODEL: str = "mlx-community/embeddinggemma-300m-4bit"
+
+
+# ---------------------------------------------------------------------------
+# research_intent upgrade  (web_search -> research, plain on/off — no
+# shadow phase)
+#
+# Unlike the P6-fallthrough classifier below, this doesn't ship shadow-first.
+# 2026-07-16 decision: single-user, non-production app — the shadow-first
+# rollout discipline used elsewhere in this file exists to de-risk a
+# threshold change against real multi-user traffic before it can affect a
+# live answer; that risk doesn't apply here. Plain on/off switch instead,
+# read at call time (not cached) so flipping backend/.env doesn't require
+# reconstructing the Planner — same rationale as _TOOL_FALLBACK_ENV_VAR.
+# ---------------------------------------------------------------------------
+_RESEARCH_LOOP_ENV_VAR: str = "LOCALIST_RESEARCH_LOOP_ENABLED"
+
+# Picked from the v2 diagnostic trade-off table
+# (diagnostics/reports/research_intent_threshold_assessment_2026-07-16-v2.md):
+# 9/10 true positives survive (only "What's the going rate for a plumber in
+# this area?", itself a marginal non-brand-specific phrasing, drops out),
+# and only 2/16 FP-pool items leak — both Category L generic lookups that
+# already trigger web_search via lookup_request regardless, so a false
+# positive here just burns extra bounded loop iterations rather than
+# producing a wrong answer. That asymmetry (false positive = wasted
+# latency, capped by _MAX_RESEARCH_ITERATIONS; false negative = today's
+# existing plain-web_search behavior, not broken) is why full T/FP
+# separation wasn't chased further. No threshold in the scanned range
+# achieved full separation — see the report for the complete trade-off.
+# Revisit directly if 0.65 turns out wrong against live usage, same as how
+# lookup_request's threshold was revised from 0.65 to 0.60.
+_RESEARCH_INTENT_THRESHOLD: float = 0.65
+
+
+# ---------------------------------------------------------------------------
+# Negative-filter conflict resolution  (2026-07-16 redesign)
+#
+# _semantic_search_intent() checks _ALL_SEARCH_NEGATIVE_FILTERS AFTER
+# scoring, not before — see that method's docstring for the full rationale.
+# This prompt backs the single bounded inference call
+# (_resolve_negative_filter_conflict) made only when a filter phrase
+# matched AND some gated group's score cleared its own threshold anyway;
+# validated in diagnostics/reports/negative_filter_tiebreak_assessment_
+# 2026-07-16.md (11/11 accuracy on the operationally-reachable subset)
+# before being wired in here.
+# ---------------------------------------------------------------------------
+_NEGATIVE_FILTER_TIEBREAK_SYSTEM_PROMPT: str = (
+    "You are a routing classifier, not a conversational assistant. The "
+    "instruction below matched a known phrase pattern that is usually NOT "
+    "a request to search for or look up information (e.g. a subjective "
+    "opinion, a greeting, an identity question) but also scored high on "
+    "semantic similarity to real search-intent phrasing — an ambiguous "
+    "case. Decide which one it actually is. Respond with exactly one "
+    "word: lookup or other."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -620,10 +756,29 @@ class Planner:
         RuntimeClient. Used for the Priority 5 inference call, and — only
         when LOCALIST_TOOL_FALLBACK_CLASSIFIER is "shadow" or "active" —
         the P6-fallthrough tool-need classifier's bounded inference call.
-        Not used in Priorities 1–4 or 6.
+        Not used in Priority 1, 2, 4, or 6, and in Priority 3 only for
+        negative-filter conflict resolution (2026-07-16 — see
+        _resolve_negative_filter_conflict, reached from
+        _semantic_search_intent when a _SEARCH_NEGATIVE_FILTER /
+        _RESEARCH_NEGATIVE_FILTER phrase matches AND a gated group's score
+        clears its own threshold anyway) — never for the base P3 keyword/
+        semantic routing decision itself, and validated empirically before
+        being wired in (diagnostics/reports/
+        negative_filter_tiebreak_assessment_2026-07-16.md: 11/11 accuracy
+        on the operationally-reachable subset).
     memory_manager :
         Optional MemoryManager. Required for Priority 4 corpus scoring.
         When absent, Priority 4 is skipped (no corpus to query).
+    embedding_model_name :
+        Name of the embedding model actually producing embed_fn's vectors
+        (e.g. "mlx-community/embeddinggemma-300m-4bit"), or None when no
+        embedding source is configured at all (keyword-only mode — embed_fn
+        is also None in that case, so semantic scoring is already
+        short-circuited). When set and it does not match
+        _TUNED_EMBEDDING_MODEL, semantic search-intent gating is disabled
+        for this Planner instance — see the module-level comment above
+        _TUNED_EMBEDDING_MODEL for why cosine-similarity thresholds don't
+        transfer across embedding models.
     """
 
     # Class-level aliases so callers can access via instance (e.g. p._WEB_SEARCH_KEYWORDS)
@@ -633,13 +788,37 @@ class Planner:
 
     def __init__(
         self,
-        runtime:        Any,
-        memory_manager: "MemoryManager | None" = None,
-        embed_fn:       Callable[[str], list[float]] | None = None,
+        runtime:              Any,
+        memory_manager:       "MemoryManager | None" = None,
+        embed_fn:             Callable[[str], list[float]] | None = None,
+        embedding_model_name: str | None = None,
     ) -> None:
         self._runtime        = runtime
         self._memory_manager = memory_manager
         self._embed_fn       = embed_fn
+
+        # Guard against silently-invalid semantic gating (docs/architecture/
+        # 16-runtime-backend-layer.md §16.4): every threshold in this file
+        # was tuned against _TUNED_EMBEDDING_MODEL's cosine geometry. A
+        # different active embedding model means those thresholds have no
+        # validated meaning, so gating is disabled rather than left to
+        # silently over/under-fire. None (no embedding source configured at
+        # all) is not a mismatch — embed_fn is already None in that case,
+        # which already short-circuits semantic scoring.
+        self._embedding_model_name     = embedding_model_name
+        self._semantic_gating_disabled = False
+        if embedding_model_name is not None and embedding_model_name != _TUNED_EMBEDDING_MODEL:
+            logger.warning(
+                "Planner: active embedding model %r does not match the model "
+                "semantic-gating thresholds were tuned against (%r) — "
+                "disabling semantic search-intent gating for this session. "
+                "The thresholds in _SEMANTIC_GATE_THRESHOLDS / "
+                "_RESEARCH_INTENT_THRESHOLD have no validated meaning against "
+                "embeddings from a different model.",
+                embedding_model_name, _TUNED_EMBEDDING_MODEL,
+            )
+            self._semantic_gating_disabled = True
+
         # Session state for Priority 5 caching (§4.3)
         # _episodic_injected: True once episodic bullets have been injected
         #   this session; causes all further Priority 5 checks to return True
@@ -1044,18 +1223,35 @@ class Planner:
         so collisions between groups can be inspected directly, not just
         inferred from the argmax.
 
-        Returns (best_group, best_score, all_group_scores) or None under
-        the same conditions as Diagnostic 1 (no embed_fn, negative filter
-        match, embedding failure).
-        """
-        if self._embed_fn is None or not self._template_embeddings:
-            return None
+        Returns (best_group, best_score, all_group_scores) or None under:
+        no embed_fn, embedding failure, no group scored above -1, or a
+        confirmed negative-filter suppression (see below).
 
-        if any(phrase in lowered for phrase in _SEARCH_NEGATIVE_FILTER):
-            logger.debug(
-                "Planner: Priority 3 semantic check skipped — negative filter matched (%r).",
-                next(p for p in _SEARCH_NEGATIVE_FILTER if p in lowered),
-            )
+        2026-07-16 redesign (negative-filter conflict resolution): prior to
+        this, _SEARCH_NEGATIVE_FILTER / _RESEARCH_NEGATIVE_FILTER were
+        checked BEFORE the embedding was computed, so (a) no score was ever
+        available to log for a filtered turn, contrary to how this method
+        is described elsewhere as running "on every turn", and (b) a filter
+        match on one group's known collision (e.g. lookup_request's
+        greeting/identity phrases) suppressed ALL groups' gating that turn,
+        research_intent included, not just the group the filter targets.
+
+        Scores are now always computed first. The negative filters are
+        checked AFTER scoring, and only escalate to a model call
+        (_resolve_negative_filter_conflict) when there's a genuine
+        conflict — a filter phrase matched AND some gated group's score
+        cleared its own threshold anyway. If nothing cleared threshold,
+        the filter and the embedding already agree (nothing was going to
+        fire) and no call is needed — empirically the common case: see
+        diagnostics/reports/negative_filter_tiebreak_assessment_2026-07-16.md
+        §3, where only 4-8 of 11 filter-matched test utterances (depending
+        on LOCALIST_RESEARCH_LOOP_ENABLED) actually reached a conflict.
+        """
+        if (
+            self._embed_fn is None
+            or not self._template_embeddings
+            or self._semantic_gating_disabled
+        ):
             return None
 
         try:
@@ -1079,7 +1275,106 @@ class Planner:
         if best_score < 0:
             return None
 
+        matched_phrase = next(
+            (p for p in _ALL_SEARCH_NEGATIVE_FILTERS if p in lowered), None
+        )
+        if matched_phrase is not None:
+            # research_intent is only a "gated" group worth resolving a
+            # conflict over when the research loop is actually enabled —
+            # otherwise nothing acts on its score regardless.
+            gated_groups = dict(_SEMANTIC_GATE_THRESHOLDS)
+            if self._research_loop_enabled():
+                gated_groups["research_intent"] = _RESEARCH_INTENT_THRESHOLD
+
+            conflicting = [
+                g for g, t in gated_groups.items() if group_scores.get(g, -1.0) >= t
+            ]
+            if not conflicting:
+                # Filter and embedding already agree — nothing was going to
+                # fire anyway. No model call needed.
+                logger.debug(
+                    "Planner: Priority 3 semantic check — negative filter %r "
+                    "matched but no group cleared threshold; no conflict.",
+                    matched_phrase,
+                )
+                return None
+
+            if not self._resolve_negative_filter_conflict(lowered, matched_phrase):
+                logger.debug(
+                    "Planner: Priority 3 semantic check — negative filter %r "
+                    "confirmed by tie-break over conflicting group(s) %s; "
+                    "suppressing.",
+                    matched_phrase, conflicting,
+                )
+                return None
+
+            logger.debug(
+                "Planner: Priority 3 semantic check — negative filter %r "
+                "overridden by tie-break for group(s) %s.",
+                matched_phrase, conflicting,
+            )
+
         return (best_group, best_score, group_scores)
+
+    def _resolve_negative_filter_conflict(
+        self, lowered: str, matched_phrase: str
+    ) -> bool:
+        """
+        Single bounded inference call — the SAME "one classifier call,
+        yes/no or single-word answer" shape as the Priority 5
+        episodic-relevance check and the P6-fallthrough tool-need
+        classifier. Only reached when a negative-filter phrase matched AND
+        at least one semantically-gated group cleared its threshold
+        anyway; the common case (filter matches, nothing near threshold)
+        never gets here, so this should be rare in practice, not a
+        per-turn cost — confirmed empirically (not assumed) in
+        diagnostics/reports/negative_filter_tiebreak_assessment_2026-07-16.md
+        §3: 4/11 (research loop off) to 8/11 (on) filter-matched
+        utterances actually reach this call.
+
+        Returns True to override the filter (real lookup intent — let
+        best_group/best_score through) or False to confirm the filter's
+        suppression (return None from the caller).
+
+        Fails closed: any runtime error, timeout, or unparseable response
+        suppresses the match (returns False) — a live failure here should
+        not accidentally let a known collision phrase through gating;
+        same fail-safe direction _research_loop_enabled() and every other
+        gate in this file already defaults to.
+
+        Accuracy validated before wiring this in: 11/11 (100%) on the
+        operationally-reachable subset of the 2026-07-16 diagnostic's
+        37-utterance test set (0 false positives — a real Category E
+        opinion incorrectly let through — and 0 false negatives — a real
+        lookup incorrectly suppressed).
+        """
+        try:
+            raw = self._runtime.infer(
+                system      = _NEGATIVE_FILTER_TIEBREAK_SYSTEM_PROMPT,
+                prompt      = f"Instruction: {lowered}\n\nClassification (lookup/other):",
+                max_tokens  = 10,
+                temperature = 0.1,
+            )
+            return raw.strip().lower().startswith("lookup")
+        except Exception as exc:
+            logger.debug(
+                "Planner: negative-filter tie-break failed (%s); suppressing.", exc
+            )
+            return False
+
+    @staticmethod
+    def _research_loop_enabled() -> bool:
+        """
+        Read LOCALIST_RESEARCH_LOOP_ENABLED from the environment.
+
+        Read at call time (not cached at construction) — same rationale as
+        _tool_fallback_mode(): flipping backend/.env shouldn't require
+        reconstructing the Planner. Defaults to disabled; unset or any
+        value other than "true" (case-insensitive) is "off" — fail-safe to
+        zero behavior change (plain web_search) rather than fail-open into
+        the loop.
+        """
+        return os.environ.get(_RESEARCH_LOOP_ENV_VAR, "false").strip().lower() == "true"
 
     def _priority3_tool(
         self, lowered: str, instruction: str | None = None
@@ -1157,6 +1452,28 @@ class Planner:
                 "Planner: Priority 3 — web_search signal detected via semantic "
                 "gate (fired=[%s]).", fired_str,
             )
+
+        # research_intent upgrade: decide web_search vs research using the
+        # SAME semantic_result already computed above; no second embed call.
+        # research_intent only ever decides which tool variant fires, given
+        # web_search already fired for some other reason — it is not itself
+        # a gate on whether a tool fires at all (see the module-level note
+        # above _RESEARCH_LOOP_ENV_VAR), which is why it lives outside
+        # _SEMANTIC_GATE_THRESHOLDS rather than as an entry in it.
+        if (
+            "web_search" in tools
+            and semantic_result is not None
+            and self._research_loop_enabled()
+        ):
+            _, _, all_scores = semantic_result
+            research_score = all_scores.get("research_intent", -1.0)
+            if research_score >= _RESEARCH_INTENT_THRESHOLD:
+                tools[tools.index("web_search")] = "research"
+                logger.debug(
+                    "Planner: Priority 3 — upgraded web_search to research "
+                    "(research_intent=%.3f >= %.2f).",
+                    research_score, _RESEARCH_INTENT_THRESHOLD,
+                )
 
         raw = instruction if instruction is not None else lowered
 

@@ -48,6 +48,12 @@ Endpoints
       coverage, cache state.  Always HTTP 200 — degraded values are shown
       when the MemoryManager is not initialised.
 
+  POST /memory/reembed
+      Manually re-embed the wiki/raw corpus with the active embedding model
+      and clear MemoryManager's corpus_stale flag (docs/architecture/
+      16-runtime-backend-layer.md §16.4). Idempotent; safe to call whether
+      or not the corpus is currently stale.
+
   GET /files/raw
       List all .md and .txt files in the raw/ directory.
 
@@ -231,6 +237,11 @@ class AppState:
         self.memory_manager:    MemoryManager     | None = None
         self.embedding_engine:  EmbeddingEngine   | None = None
         self.settings:          Settings          | None = None
+        # Name of the embedding model actually backing embed_fn, resolved by
+        # _derive_active_embedding_model_name() alongside _configure_embedding_
+        # source() — see planner.py's _TUNED_EMBEDDING_MODEL guard. None means
+        # keyword-only mode (no embedding source at all).
+        self.active_embedding_model_name: str | None = None
         # Resolved at startup by lifespan()
         self.wiki_dir:          Path | None = None
         self.raw_dir:           Path | None = None
@@ -316,18 +327,47 @@ def _configure_embedding_source(
     return None, None
 
 
+def _derive_active_embedding_model_name(
+    settings:         Settings,
+    embed_fn:         Any,
+    embedding_engine: EmbeddingEngine | None,
+) -> str | None:
+    """
+    Name the embedding model actually backing `embed_fn`, mirroring
+    _configure_embedding_source()'s three-tier precedence:
+
+      1. Runtime-backend embed (embedding_engine is None, embed_fn is not)
+         -> settings.embedding_model.
+      2. EmbeddingEngine (embedding_engine is not None) -> its model_path,
+         but only if it loaded successfully (embedding_engine.available);
+         a construction attempt that failed to load names no model.
+      3. Keyword-only (embed_fn is None, embedding_engine is None) -> None.
+
+    Consumed by Planner's _TUNED_EMBEDDING_MODEL guard (docs/architecture/
+    16-runtime-backend-layer.md §16.4) so a mismatched embedding model
+    disables semantic gating instead of silently producing thresholds with
+    no validated meaning.
+    """
+    if embedding_engine is not None:
+        return embedding_engine.model_path if embedding_engine.available else None
+    if embed_fn is not None:
+        return settings.embedding_model
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Controller construction (extracted so lifespan() and a live runtime-backend
 # switch share one code path — see _build_controller() below).
 # ---------------------------------------------------------------------------
 
 def _build_controller(
-    settings:       Settings,
-    runtime:        BaseRuntimeClient,
-    memory_manager: MemoryManager,
-    embed_fn:       Any,
-    project_root:   Path,
-    templates_dir:  Path,
+    settings:              Settings,
+    runtime:               BaseRuntimeClient,
+    memory_manager:        MemoryManager,
+    embed_fn:              Any,
+    project_root:          Path,
+    templates_dir:         Path,
+    embedding_model_name:  str | None = None,
 ) -> tuple[WikiAgent, ConversationalAgent, ControllerAgent]:
     """
     Construct WikiAgent, ConversationalAgent, and ControllerAgent for a given
@@ -352,6 +392,7 @@ def _build_controller(
         agents                  = [wiki_agent, conversational_agent],
         memory_manager          = memory_manager,
         embed_fn                = embed_fn,
+        embedding_model_name    = embedding_model_name,
         episodic_write_approval = settings.episodic_write_approval,
     )
     _run_cache_warmup(controller, runtime, templates_dir)
@@ -506,8 +547,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     embed_fn, embedding_engine = _configure_embedding_source(settings, runtime, health)
     if embedding_engine is not None:
         _state.embedding_engine = embedding_engine
+    _state.active_embedding_model_name = _derive_active_embedding_model_name(
+        settings, embed_fn, embedding_engine,
+    )
 
-    memory_manager = MemoryManager(db_path=memory_db, embed_fn=embed_fn)
+    memory_manager = MemoryManager(
+        db_path               = memory_db,
+        embed_fn              = embed_fn,
+        embedding_model_name  = _state.active_embedding_model_name,
+    )
     _state.memory_manager = memory_manager
 
     # Seed the document index from disk on startup.  index_directory() is
@@ -589,6 +637,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     wiki_agent, conversational_agent, controller = _build_controller(
         settings, runtime, memory_manager, embed_fn, project_root, templates_dir,
+        _state.active_embedding_model_name,
     )
     _state.wiki_agent = wiki_agent
     _state.controller = controller
@@ -735,6 +784,19 @@ class MemoryStatsResponse(BaseModel):
     cache_invalid:    int
     embeddings_pct:   float
     available:        bool   # False when MemoryManager is not initialised
+
+
+class ReembedCorpusResponse(BaseModel):
+    """
+    Response body for POST /memory/reembed — the manual, explicitly-
+    triggered wiki/raw corpus re-embed (docs/architecture/
+    16-runtime-backend-layer.md §16.4's confirmed embedding-provenance
+    follow-up). Episodes get no equivalent endpoint — a genuine embedding-
+    model mismatch there is auto-corrected at startup, not left pending.
+    """
+    reembedded: int
+    total:      int
+    model:      str | None
 
 
 class EpisodeItem(BaseModel):
@@ -1183,11 +1245,16 @@ async def switch_runtime_backend(request: RuntimeBackendSwitchRequest) -> Runtim
         # (oMLX today, per §16.4's open gap), even though nothing about embeddings was supposed
         # to change. See docs/architecture/16-runtime-backend-layer.md §16.5.
         embed_fn = memory_manager.embed_fn
+        # Read fresh from _state, not captured once — the embedding source
+        # itself isn't re-derived here either (see comment above), but this
+        # follows the same "always resolve from _state at request time" rule
+        # as _state.runtime, in case that ever changes.
+        embedding_model_name = _state.active_embedding_model_name
 
         wiki_agent, _conversational_agent, controller = await asyncio.to_thread(
             _build_controller,
             settings, candidate_runtime, memory_manager, embed_fn,
-            _PROJECT_ROOT, _state.templates_dir,
+            _PROJECT_ROOT, _state.templates_dir, embedding_model_name,
         )
 
         _state.runtime    = candidate_runtime
@@ -1290,11 +1357,16 @@ async def set_runtime_backend_chat_model(
             # (oMLX today, per §16.4's open gap), even though nothing about embeddings was supposed
             # to change. See docs/architecture/16-runtime-backend-layer.md §16.5.
             embed_fn = memory_manager.embed_fn
+            # Read fresh from _state, not captured once — the embedding source
+            # itself isn't re-derived here either (see comment above), but this
+            # follows the same "always resolve from _state at request time" rule
+            # as _state.runtime, in case that ever changes.
+            embedding_model_name = _state.active_embedding_model_name
 
             wiki_agent, _conversational_agent, controller = await asyncio.to_thread(
                 _build_controller,
                 settings, candidate_runtime, memory_manager, embed_fn,
-                _PROJECT_ROOT, _state.templates_dir,
+                _PROJECT_ROOT, _state.templates_dir, embedding_model_name,
             )
 
             _state.runtime    = candidate_runtime
@@ -1350,6 +1422,35 @@ async def get_memory_stats() -> MemoryStatsResponse:
     )
 
 
+@app.post(
+    "/memory/reembed",
+    response_model = ReembedCorpusResponse,
+    summary        = "Manually re-embed the wiki/raw corpus with the active embedding model",
+)
+async def reembed_corpus() -> ReembedCorpusResponse:
+    """
+    Explicit, manually-triggered corpus re-embed — the counterpart to
+    episodes' automatic startup re-embed (docs/architecture/
+    16-runtime-backend-layer.md §16.4). Wiki/raw corpora can be arbitrarily
+    large, so unlike episodes a detected embedding-model mismatch never
+    triggers this automatically; call it after switching embedding models
+    to clear MemoryManager's corpus_stale flag and restore embedding-based
+    re-ranking in query_corpus().
+
+    Idempotent — safe to call whether or not the corpus is currently
+    flagged stale (a "just refresh it" operation).
+    """
+    mm = _state.memory_manager
+    if mm is None:
+        raise HTTPException(status_code=503, detail="MemoryManager not initialised.")
+    if mm.embed_fn is None:
+        raise HTTPException(
+            status_code = 409,
+            detail      = "No embedding source configured — nothing to re-embed with.",
+        )
+
+    result = await asyncio.to_thread(mm.reembed_corpus)
+    return ReembedCorpusResponse(**result)
 
 
 @app.get(

@@ -14,7 +14,10 @@ This is where `file_op`, `url_fetch`, and `web_search` actually execute.
 `MCPToolDispatcher` (`backend/mcp_tool_dispatcher.py`) is the client —
 `controller_agent.py`'s `_execute_plan()` constructs one per dispatch call
 (the same single seam `ToolDispatcher` used to occupy) and calls it over
-an MCP `ClientSession` per tool invocation.
+an MCP `ClientSession` per tool invocation. `MCPToolDispatcher` also owns
+a fourth tool name, `"research"` — a client-side bounded loop over the
+`web_search`/`fetch_url` MCP tools above, not a fifth tool implemented on
+`localist-mcp` itself; see §18.
 
 Built across four phases (all 2026-07-03): Phase 1 migrated `file_op` and
 stood up the service; Phase 2 added `fetch_url`, retiring the standalone

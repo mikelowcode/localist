@@ -208,6 +208,7 @@ class FoundryRuntimeClient:
         max_tokens:  int   = 1024,
         temperature: float = 0.2,
         label:       str   = "",
+        timeout:     float | None = None,
     ) -> str:
         """
         Request a chat completion from Foundry (blocking).
@@ -232,6 +233,9 @@ class FoundryRuntimeClient:
             Hard cap on generated tokens.
         temperature:
             Sampling temperature.
+        timeout:
+            Optional per-call override, in seconds, forwarded to
+            infer_stream(). None (default) uses self._stream_timeout.
 
         Returns
         -------
@@ -248,6 +252,7 @@ class FoundryRuntimeClient:
             system      = system,
             max_tokens  = max_tokens,
             temperature = temperature,
+            timeout     = timeout,
         ))
         result = "".join(chunks)
         logger.debug("infer() ← %d chars received.", len(result))
@@ -260,6 +265,7 @@ class FoundryRuntimeClient:
         max_tokens:  int   = 1024,
         temperature: float = 0.2,
         label:       str   = "",
+        timeout:     float | None = None,
     ) -> Generator[str, None, None]:
         """
         Request a streaming chat completion from Foundry via SSE.
@@ -270,6 +276,13 @@ class FoundryRuntimeClient:
         This is the canonical transport path.  infer() calls this method
         and accumulates its output; the FastAPI streaming endpoint can
         consume this generator directly to relay tokens to the Svelte UI.
+
+        Parameters
+        ----------
+        timeout:
+            Optional per-call override for the request timeout, in
+            seconds. None (default) uses self._stream_timeout, unchanged
+            from before this parameter was added (2026-07-17).
 
         Yields
         ------
@@ -294,12 +307,15 @@ class FoundryRuntimeClient:
             "temperature": temperature,
         }
 
+        effective_timeout = timeout if timeout is not None else self._stream_timeout
+
         logger.debug(
-            "infer_stream() → %s  max_tokens=%d  temp=%.2f  prompt_chars=%d",
+            "infer_stream() → %s  max_tokens=%d  temp=%.2f  prompt_chars=%d  timeout=%.1fs",
             self._chat_endpoint,
             max_tokens,
             temperature,
             len(prompt),
+            effective_timeout,
         )
 
         try:
@@ -308,7 +324,7 @@ class FoundryRuntimeClient:
                 headers={"Content-Type": "application/json"},
                 data=json.dumps(payload),
                 stream=True,
-                timeout=self._stream_timeout,
+                timeout=effective_timeout,
             )
         except requests.ConnectionError as exc:
             raise RuntimeError(
@@ -317,7 +333,7 @@ class FoundryRuntimeClient:
             ) from exc
         except requests.Timeout:
             raise RuntimeError(
-                f"Foundry did not respond within {self._stream_timeout}s "
+                f"Foundry did not respond within {effective_timeout}s "
                 f"(endpoint: {self._chat_endpoint})."
             )
 

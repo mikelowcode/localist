@@ -165,3 +165,51 @@ class TestDisabledTier:
         assert embed_fn is None
         assert embedding_engine is None
         assert "EmbeddingEngine disabled" in caplog.text
+
+
+class TestDeriveActiveEmbeddingModelName:
+    """
+    main._derive_active_embedding_model_name() — the three-tier name
+    derivation that feeds Planner's _TUNED_EMBEDDING_MODEL guard (docs/
+    architecture/16-runtime-backend-layer.md §16.4). Mirrors
+    _configure_embedding_source()'s own tier precedence, so each case here
+    is fed the same (embed_fn, embedding_engine) shape that function would
+    actually return for that tier.
+    """
+
+    def test_tier1_runtime_backend_embed_returns_settings_model(self):
+        settings = _settings(embedding_model="nomic-embed-text:latest")
+        embed_fn = MagicMock(name="runtime.embed")
+
+        name = main._derive_active_embedding_model_name(settings, embed_fn, None)
+
+        assert name == "nomic-embed-text:latest"
+
+    def test_tier2_embedding_engine_available_returns_model_path(self):
+        settings = _settings(embedding_model="")
+        fake_engine = SimpleNamespace(
+            available=True, model_path="mlx-community/embeddinggemma-300m-4bit",
+            embed=MagicMock(name="engine.embed"),
+        )
+
+        name = main._derive_active_embedding_model_name(settings, fake_engine.embed, fake_engine)
+
+        assert name == "mlx-community/embeddinggemma-300m-4bit"
+
+    def test_tier2_embedding_engine_failed_to_load_returns_none(self):
+        """embedding_engine was constructed (tier 2 attempted) but failed to
+        load (available=False) — names no model, even if embed_fn happens
+        to be non-None."""
+        settings = _settings(embedding_model="")
+        fake_engine = SimpleNamespace(available=False, model_path="mlx-community/embeddinggemma-300m-4bit")
+
+        name = main._derive_active_embedding_model_name(settings, None, fake_engine)
+
+        assert name is None
+
+    def test_tier3_keyword_only_returns_none(self):
+        settings = _settings(embedding_model="")
+
+        name = main._derive_active_embedding_model_name(settings, None, None)
+
+        assert name is None

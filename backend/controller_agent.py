@@ -706,11 +706,17 @@ class ControllerAgent:
         agents:                   list[AgentInterface],
         memory_manager:           "MemoryManager | None" = None,
         embed_fn:                 Callable[[str], list[float]] | None = None,
+        embedding_model_name:     str | None = None,
         episodic_write_approval:  bool = False,
     ) -> None:
         self._runtime        = runtime
         self._agents         = {a.name: a for a in agents}
-        self._planner        = _RulePlanner(runtime=runtime, memory_manager=memory_manager, embed_fn=embed_fn)
+        self._planner        = _RulePlanner(
+            runtime               = runtime,
+            memory_manager        = memory_manager,
+            embed_fn              = embed_fn,
+            embedding_model_name  = embedding_model_name,
+        )
         self._synthesizer    = Synthesizer(runtime)
         # IntentClassifier retired — routing is now handled by _RulePlanner
         self._memory_manager = memory_manager   # None → use ephemeral shim per request
@@ -1204,9 +1210,21 @@ class ControllerAgent:
         # instruction using the same threshold (_priority4_corpus reuses 0.55)
         # so the answer can be grounded in vault content even when live
         # search is unavailable.
+        #
+        # research (mcp_tool_dispatcher._run_research_loop) also feeds this:
+        # a connectivity/provider failure inside the loop already surfaces
+        # as a normal tool_name="web_search" success=False entry (caught by
+        # the first clause below, unchanged). A "loop exhausted without
+        # finding concrete pricing" outcome is different — every individual
+        # search/fetch call in that case succeeded, so nothing would trip
+        # the first clause — the loop appends one synthetic trailing
+        # ToolResult(tool_name="research", success=False) for exactly this
+        # case, caught by the second clause. Decision (2026-07-16): "no
+        # pricing found" deserves the same corpus-grounding attempt as
+        # "search API down" rather than leaving the answer ungrounded.
         rag_sources: list[RagSource] = []
         _web_search_failed = any(
-            r.tool_name == "web_search" and not r.success
+            (r.tool_name == "web_search" and not r.success) or r.tool_name == "research"
             for r in dispatched_tool_results
         )
         if _web_search_failed and self._memory_manager is not None:

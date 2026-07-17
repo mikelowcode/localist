@@ -165,6 +165,7 @@ class OMLXRuntimeClient:
         max_tokens:  int   = 1024,
         temperature: float = 0.2,
         label:       str   = "",
+        timeout:     float | None = None,
     ) -> str:
         """
         Request a blocking chat completion from oMLX via SSE accumulation.
@@ -181,6 +182,9 @@ class OMLXRuntimeClient:
             infer_stream() so overlap/throughput logging can be correlated
             back to the call site. Purely diagnostic — has no effect on
             the request itself.
+        timeout:
+            Optional per-call override, in seconds, forwarded to
+            infer_stream(). None (default) uses self._stream_timeout.
 
         Returns
         -------
@@ -198,6 +202,7 @@ class OMLXRuntimeClient:
             max_tokens  = max_tokens,
             temperature = temperature,
             label       = label,
+            timeout     = timeout,
         ))
         result = "".join(chunks)
         logger.debug("infer() ← %d chars received.", len(result))
@@ -288,6 +293,7 @@ class OMLXRuntimeClient:
         max_tokens:  int   = 1024,
         temperature: float = 0.2,
         label:       str   = "",
+        timeout:     float | None = None,
     ) -> Generator[str, None, None]:
         """
         Request a streaming chat completion from oMLX.
@@ -309,6 +315,10 @@ class OMLXRuntimeClient:
             Optional caller identifier for diagnostic correlation (see
             RUNTIME_OVERLAP / THROUGHPUT log lines). Has no effect on the
             request itself.
+        timeout:
+            Optional per-call override for the request timeout, in
+            seconds. None (default) uses self._stream_timeout, unchanged
+            from before this parameter was added (2026-07-17).
 
         Yields
         ------
@@ -337,9 +347,13 @@ class OMLXRuntimeClient:
         # Authorization token or a custom Accept header), add them here.
         headers = {"Content-Type": "application/json"}
 
+        effective_timeout = timeout if timeout is not None else self._stream_timeout
+
         logger.debug(
-            "infer_stream() → %s  max_tokens=%d  temp=%.2f  prompt_chars=%d  label=%s",
+            "infer_stream() → %s  max_tokens=%d  temp=%.2f  prompt_chars=%d  "
+            "label=%s  timeout=%.1fs",
             self._chat_endpoint, max_tokens, temperature, len(prompt), label,
+            effective_timeout,
         )
 
         global _inflight_count
@@ -357,7 +371,7 @@ class OMLXRuntimeClient:
                         headers = headers,
                         data    = json.dumps(payload),
                         stream  = True,
-                        timeout = self._stream_timeout,
+                        timeout = effective_timeout,
                     )
                 except requests.ConnectionError as exc:
                     raise RuntimeError(
@@ -366,7 +380,7 @@ class OMLXRuntimeClient:
                     ) from exc
                 except requests.Timeout:
                     raise RuntimeError(
-                        f"oMLX did not respond within {self._stream_timeout}s "
+                        f"oMLX did not respond within {effective_timeout}s "
                         f"(endpoint: {self._chat_endpoint})."
                     )
 

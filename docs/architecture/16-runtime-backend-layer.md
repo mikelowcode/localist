@@ -279,10 +279,72 @@ failed after the chat-model fail-fast change (+4 new tests); 739 passed / 0 fail
 platform-gating change (+7 new tests).
 
 **Open items:**
-- Corpus-retrieval similarity thresholds may need to become embedding-model-aware — a low top-score
-  corpus miss (`0.028`) was observed under `nomic-embed-text` on a query that plausibly should have
-  matched; not yet enough samples to confirm this is a real threshold-transfer issue versus normal
-  variance across embedding models' similarity distributions.
+- ~~Corpus-retrieval similarity thresholds may need to become embedding-model-aware~~ — **confirmed,
+  2026-07-16.** The low top-score corpus miss (`0.028` under `nomic-embed-text`) noted below was the
+  first hint; live testing the same day made it unambiguous: the identical `lookup_request`
+  utterance scored `0.7119` under `mlx-community/embeddinggemma-300m-4bit` (the model
+  `planner.py`'s semantic-gating thresholds were tuned against) vs `0.578` under `nomic-embed-text`
+  — a swing large enough to flip `gate_fired` from `True` to `False` for the same input. Two more
+  diagnostics required assuming a fixed embedding model to be meaningful at all:
+  `diagnostics/reports/research_intent_threshold_assessment_2026-07-16*.md` and
+  `diagnostics/reports/negative_filter_tiebreak_assessment_2026-07-16.md`. Cosine similarity is not
+  portable across embedding models' geometries; a threshold tuned on one model's score distribution
+  has no guaranteed meaning on another's.
+
+  **Fixed on the Planner side (2026-07-16).** `planner.py` now declares `_TUNED_EMBEDDING_MODEL =
+  "mlx-community/embeddinggemma-300m-4bit"`. `Planner.__init__` takes an `embedding_model_name`
+  parameter; when it's set and doesn't match `_TUNED_EMBEDDING_MODEL`, semantic search-intent gating
+  (`_semantic_search_intent()`, backing `explicit_search_action` / `lookup_request` /
+  `research_intent`) is disabled for that Planner instance — a startup-time guard rather than a
+  silent runtime degradation, with a `logger.warning` naming both models. `main.py` derives this name
+  via the new `_derive_active_embedding_model_name()` (mirroring `_configure_embedding_source()`'s
+  own three-tier precedence), stores it on `_state.active_embedding_model_name`, and threads it
+  through `_build_controller()` into `ControllerAgent` at every construction site — startup
+  (`lifespan()`) and both live-switch endpoints (`/settings/runtime-backend`,
+  `/settings/runtime-backend/{backend}/chat-model`), read fresh from `_state` at request time rather
+  than captured once. `embedding_model_name=None` (keyword-only mode, no embedding source
+  configured) is not treated as a mismatch — `embed_fn` is already `None` in that case, which already
+  short-circuits semantic scoring.
+
+  **Fixed on the MemoryManager side too (2026-07-16).** A new `embedding_provenance` table
+  (`store TEXT PRIMARY KEY` — `'corpus'` | `'episodes'` — `model TEXT NOT NULL`, schema v8) records
+  which embedding model actually produced the vectors currently stored in `document_index` and
+  `episodes`. `MemoryManager.__init__` gains `embedding_model_name`, threaded from `main.py`'s
+  `_state.active_embedding_model_name` (the same value `ControllerAgent`/`Planner` now receive), and
+  runs `_check_embedding_provenance()` once at construction time. Per store, per the recorded row:
+
+  - No row, no embedded data yet → nothing to compare against — deferred; `'corpus'` seeds its own
+    row the first time `index_document()` actually writes an embedding
+    (`_maybe_seed_corpus_provenance()`).
+  - No row, but embedded data already present → the pre-existing-database migration case (provenance
+    tracking shipped after data was already embedded under whatever model was active at the time).
+    Seeded silently, no warning, no re-embed — treating this as a mismatch would have triggered a
+    surprise re-embed for every existing user on their very next boot.
+  - Row present and it matches → no-op.
+  - Row present and it disagrees → a genuine mismatch, handled per the decided split:
+    - **`'corpus'`** (wiki/raw documents): potentially large/expensive to re-embed, so never
+      automatic. `logger.warning`, `self._corpus_stale = True`, and an immediate retrieval-cache
+      flush (stale rankings from the old model are wrong the instant the mismatch is detected, even
+      before any re-embed happens). `query_corpus()` checks `not self._corpus_stale` alongside its
+      existing `self._embed_fn is not None` check before taking the embedding re-rank path — same
+      fail-safe-to-keyword-only posture as no `embed_fn` at all. Cleared only by the new
+      `MemoryManager.reembed_corpus()` (exposed as `POST /memory/reembed`), which re-embeds every
+      `document_index` row, flushes the cache, updates the provenance row, and clears
+      `_corpus_stale` — idempotent, callable regardless of whether the corpus is currently flagged
+      stale.
+    - **`'episodes'`**: small and bounded, so auto-corrected in place before `__init__` returns —
+      every `episodes` row is re-embedded via the active `embed_fn` (`"{subject}. {content}"`, the
+      same convention `EpisodicMemoryWriter.insert()` uses) and the provenance row is advanced to the
+      new model. Provenance only advances if every row succeeded; a partial failure leaves the old
+      provenance value in place so the mismatch is detected and retried on the next boot rather than
+      claiming a clean re-embed that didn't fully happen. A row-count tripwire
+      (`_EPISODES_REEMBED_WARN_ROW_COUNT`) logs a warning if this ever needs revisiting at scale, but
+      re-embedding runs regardless.
+
+  This is the same detect-and-fail-safe pattern as the Planner-side fix above — a tuned-model
+  comparison at construction time, disabling (not silently degrading) on a mismatch — applied to
+  stored vectors instead of threshold constants, split into an automatic path where the fix is cheap
+  and a manual path where it isn't.
 - Apple-Silicon skip branch remains verified only via mocked `platform` calls; real non-Darwin
   hardware verification is still outstanding, pending access to such a machine.
 - oMLX's `embedding_model` wiring gap noted above (tier 1 never engages for that backend) — a

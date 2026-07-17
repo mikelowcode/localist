@@ -13,6 +13,7 @@ All tests use mocks — no SQLite, no runtime calls for P1–P4 and P6.
 P3c tests use a real MemoryManager with a temporary SQLite database.
 """
 
+import logging
 import math
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -702,17 +703,60 @@ class TestSemanticSearchIntent:
         result = p._semantic_search_intent("why don't you search for something")
         assert result is None
 
-    def test_returns_none_when_negative_filter_matches_and_embed_fn_not_called(self):
-        """A phrase from _SEARCH_NEGATIVE_FILTER short-circuits before calling embed_fn."""
-        spy = MagicMock(return_value=_unit_vector())
-        p = Planner(runtime=make_runtime(), embed_fn=spy)
-        # Reset call count after __init__ (which calls embed_fn for templates)
-        spy.reset_mock()
+    def test_negative_filter_no_conflict_returns_none_without_model_call(self):
+        """
+        2026-07-16 redesign: the negative filter is checked AFTER scoring,
+        not before — so embed_fn IS now called even for a filter-matched
+        phrase (unlike the pre-redesign short-circuit this test used to
+        assert). But when the resulting scores don't clear any gated
+        group's threshold, filter and embedding already agree — no
+        conflict, so no model call (runtime.infer) is made either.
+        """
+        fixed_vec = _unit_vector(4)                    # [0.5, 0.5, 0.5, 0.5]
+        orthogonal_vec = [0.5, 0.5, -0.5, -0.5]         # cosine(fixed, orthogonal) == 0
+
+        embed_fn = MagicMock(return_value=fixed_vec)
+        runtime = make_runtime()
+        p = Planner(runtime=runtime, embed_fn=embed_fn)
+        embed_fn.reset_mock()
+        embed_fn.return_value = orthogonal_vec
 
         result = p._semantic_search_intent("did you search for that already?")
         assert result is None
-        # embed_fn must NOT have been called for the query
-        spy.assert_not_called()
+        embed_fn.assert_called_once()                  # now called, unlike pre-redesign
+        runtime.infer.assert_not_called()               # but no conflict -> no model call
+
+    def test_negative_filter_conflict_confirmed_by_tiebreak_returns_none(self):
+        """
+        A filter phrase matches AND the score clears a gated threshold (a
+        genuine conflict) — the tie-break model call fires. When it
+        answers anything other than "lookup" (make_runtime()'s default
+        infer_return="no"), the filter's suppression is confirmed and the
+        method still returns None.
+        """
+        fixed_vec = _unit_vector(4)
+        embed_fn = MagicMock(return_value=fixed_vec)    # same vector everywhere -> cosine 1.0
+        runtime = make_runtime()                         # infer() returns "no" by default
+        p = Planner(runtime=runtime, embed_fn=embed_fn)
+
+        result = p._semantic_search_intent("did you search for that already?")
+        assert result is None
+        runtime.infer.assert_called_once()
+
+    def test_negative_filter_conflict_overridden_by_tiebreak_returns_result(self):
+        """
+        Same genuine-conflict setup as above, but the tie-break answers
+        "lookup" — the filter is overridden and the real (best_group,
+        best_score, all_scores) result is returned instead of None.
+        """
+        fixed_vec = _unit_vector(4)
+        embed_fn = MagicMock(return_value=fixed_vec)
+        runtime = make_runtime(infer_return="lookup")
+        p = Planner(runtime=runtime, embed_fn=embed_fn)
+
+        result = p._semantic_search_intent("did you search for that already?")
+        assert result is not None
+        runtime.infer.assert_called_once()
 
     def test_returns_group_and_score_for_matching_vector(self):
         """
@@ -767,11 +811,69 @@ class TestSemanticSearchIntent:
         assert result is None
 
 
+class TestTunedEmbeddingModelGuard:
+    """
+    Unit tests for the _TUNED_EMBEDDING_MODEL guard (docs/architecture/
+    16-runtime-backend-layer.md §16.4): semantic search-intent gating is
+    disabled whenever the active embedding model doesn't match the model
+    every _SEMANTIC_GATE_THRESHOLDS / _RESEARCH_INTENT_THRESHOLD value was
+    tuned against, confirmed live 2026-07-16 (lookup_request scored 0.7119
+    under mlx-community/embeddinggemma-300m-4bit vs 0.578 under
+    nomic-embed-text for the identical utterance).
+    """
+
+    def _matching_vec_planner(self, **kwargs) -> "Planner":
+        """Planner whose embed_fn returns the identical vector everywhere —
+        every template group scores ~1.0, clearing every gate threshold —
+        so any None result can only be attributed to the guard, not to a
+        genuinely low score."""
+        fixed_vec = _unit_vector(8)
+        embed_fn = MagicMock(return_value=fixed_vec)
+        return Planner(runtime=make_runtime(), embed_fn=embed_fn, **kwargs)
+
+    def test_mismatched_model_disables_semantic_gating(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="planner"):
+            p = self._matching_vec_planner(embedding_model_name="nomic-embed-text")
+
+        assert p._semantic_gating_disabled is True
+        assert "does not match the model" in caplog.text
+        assert "nomic-embed-text" in caplog.text
+
+        result = p._semantic_search_intent("why don't you do a web search for APC")
+        assert result is None
+
+    def test_matching_model_name_unaffected(self, caplog):
+        from planner import _TUNED_EMBEDDING_MODEL
+
+        with caplog.at_level(logging.WARNING, logger="planner"):
+            p = self._matching_vec_planner(embedding_model_name=_TUNED_EMBEDDING_MODEL)
+
+        assert p._semantic_gating_disabled is False
+        assert caplog.text == ""
+
+        result = p._semantic_search_intent("why don't you do a web search for APC")
+        assert result is not None
+        best_group, best_score, all_scores = result
+        assert abs(best_score - 1.0) < 1e-6
+
+    def test_none_model_name_unaffected_no_warning(self, caplog):
+        """embedding_model_name=None (keyword-only / no embedding source
+        configured) is not a mismatch — no warning, gating untouched."""
+        with caplog.at_level(logging.WARNING, logger="planner"):
+            p = self._matching_vec_planner(embedding_model_name=None)
+
+        assert p._semantic_gating_disabled is False
+        assert caplog.text == ""
+
+        result = p._semantic_search_intent("why don't you do a web search for APC")
+        assert result is not None
+
+
 class TestSemanticSearchIntentDiag2:
     """Diagnostic Slot 2 additions — per-group score dict shape and correctness."""
 
-    def test_all_group_scores_contains_exactly_four_expected_keys(self):
-        """all_group_scores must contain exactly the four template-group keys."""
+    def test_all_group_scores_contains_exactly_five_expected_keys(self):
+        """all_group_scores must contain exactly the five template-group keys."""
         from planner import _SEARCH_INTENT_TEMPLATES
         expected_keys = set(_SEARCH_INTENT_TEMPLATES.keys())
         assert expected_keys == {
@@ -779,6 +881,7 @@ class TestSemanticSearchIntentDiag2:
             "lookup_request",
             "knowledge_request_open",
             "freshness_request",
+            "research_intent",
         }
 
         fixed_vec = _unit_vector(8)
@@ -826,6 +929,7 @@ class TestSemanticSearchIntentDiag2:
             "lookup_request":         vec_b,
             "knowledge_request_open": vec_other,
             "freshness_request":      vec_other,
+            "research_intent":        vec_other,
         }
         p._template_embeddings = [
             (g, group_to_vec[g]) for g in _SEARCH_INTENT_TEMPLATES
@@ -847,6 +951,7 @@ class TestSemanticSearchIntentDiag2:
         assert abs(all_scores["lookup_request"] - expected_ab) < 1e-5
         assert abs(all_scores["knowledge_request_open"]) < 1e-5
         assert abs(all_scores["freshness_request"]) < 1e-5
+        assert abs(all_scores["research_intent"]) < 1e-5
 
         # best_group is either A or B (tied — max() picks the first alphabetically)
         assert best_group in ("explicit_search_action", "lookup_request")
@@ -1256,9 +1361,16 @@ class TestGreetingFalsePositiveFilter:
     What these tests DO verify:
         Substring-match behavior: the filter's `phrase in lowered` check fires
         correctly for each new entry and the surrounding confirmed-live
-        utterance forms (trailing punctuation, mixed case, etc.). This is
-        independent of any embedding model — the filter fires before embed_fn
-        is ever called.
+        utterance forms (trailing punctuation, mixed case, etc.).
+
+        2026-07-16 redesign note: the filter is now checked AFTER scoring
+        (see _semantic_search_intent's docstring), not before — embed_fn IS
+        called for these utterances. Most tests below use
+        _make_planner_with_embed's identical-vector stub, which makes every
+        group score 1.0 (a guaranteed conflict), so suppression here is
+        actually confirmed via the tie-break model call
+        (_resolve_negative_filter_conflict, stubbed via make_runtime()'s
+        default infer_return="no") rather than a pre-scoring short-circuit.
 
     What these tests CANNOT verify with a stub embed_fn:
         Whether these utterances would actually clear the 0.60 lookup_request
@@ -1307,22 +1419,29 @@ class TestGreetingFalsePositiveFilter:
     def test_hey_lora_exclamation_filtered(self):
         """
         'Hey LORA!' — the confirmed live false positive (2026-06-27) — is
-        intercepted by the 'hey lora' substring match before embedding runs.
+        still suppressed post-redesign, but now via the tie-break conflict
+        path rather than a pre-scoring short-circuit: embed_fn IS called
+        (scores are computed first), the 'hey lora' substring match creates
+        a conflict against the identical-vector stub (score 1.0 clears
+        every gated threshold), and make_runtime()'s default
+        infer_return="no" confirms the filter's suppression.
 
-        Inlines the spy (rather than using _make_planner_with_embed) so that
-        spy.assert_not_called() can verify the filter truly short-circuits
-        before the embed call, not just that the method returns None.
+        Inlines the spy (rather than using _make_planner_with_embed) so
+        call counts on both embed_fn and runtime.infer can be asserted
+        explicitly, not just that the method returns None.
 
         Note: this stub cannot verify the real model would have scored this
         ≥ 0.60 — that was confirmed by the live diagnostic only.
         """
         spy = MagicMock(return_value=_unit_vector(8))
-        p = Planner(runtime=make_runtime(), embed_fn=spy)
+        runtime = make_runtime()
+        p = Planner(runtime=runtime, embed_fn=spy)
         spy.reset_mock()
 
         result = p._semantic_search_intent("hey lora!")
         assert result is None
-        spy.assert_not_called()
+        spy.assert_called_once()          # now called — scores compute before the filter check
+        runtime.infer.assert_called_once()  # genuine conflict (score 1.0) -> tie-break fires
 
     def test_hi_there_filtered(self):
         """'hi there' is caught by the filter → _semantic_search_intent returns None."""
