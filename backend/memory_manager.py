@@ -795,6 +795,20 @@ class MemoryManager:
         with self._lock:
             conn = self._connect()
             try:
+                # Self-heal: a DB can report schema_version == _SCHEMA_VERSION
+                # while missing this table if an earlier buggy migration run
+                # bumped the version without actually creating it — _init_db's
+                # `row["version"] < _SCHEMA_VERSION` gate never re-triggers
+                # _migrate() in that state, so this guard is the only recovery
+                # path. IF NOT EXISTS makes it a no-op on a healthy DB.
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS embedding_provenance (
+                        store TEXT NOT NULL PRIMARY KEY,
+                        model TEXT NOT NULL
+                    );
+                """)
+                conn.commit()
+
                 for store in _PROVENANCE_STORES:
                     table = "document_index" if store == "corpus" else "episodes"
                     row = conn.execute(

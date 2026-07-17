@@ -19,6 +19,11 @@
     setChatHistoryEvictionPreset,
     type EvictionPreset
   } from '$lib/stores/chatHistorySettings';
+  import {
+    reembedLoading,
+    reembedError,
+    reembedCorpus
+  } from '$lib/stores/reembedCorpus';
 
   const EVICTION_PRESETS: { value: EvictionPreset; label: string }[] = [
     { value: '7d',      label: '7 days' },
@@ -29,7 +34,42 @@
 
   onMount(() => {
     loadChatHistorySettings();
+    loadMemoryStats();
   });
+
+  // Corpus staleness — fetched once on mount and again after a re-embed
+  // completes, so the badge reflects the server's current MemoryManager
+  // state without adding a dedicated poll.
+  let corpusStale = false;
+  let reembedResult: string | null = null;
+
+  async function loadMemoryStats() {
+    try {
+      const res = await fetch('/api/memory/stats');
+      if (!res.ok) return;
+      const data = await res.json();
+      corpusStale = Boolean(data.corpus_stale);
+    } catch {
+      // Leave last-known state — a transient fetch failure here isn't
+      // worth surfacing on its own card.
+    }
+  }
+
+  async function handleReembedCorpus() {
+    const proceed = confirm(
+      'Re-embed the wiki/raw corpus now with the active embedding model? ' +
+      'This blocks until every document has been re-embedded, which can take ' +
+      'a while for a large corpus.'
+    );
+    if (!proceed) return;
+
+    reembedResult = null;
+    const result = await reembedCorpus();
+    if (result) {
+      reembedResult = `Re-embedded ${result.reembedded} of ${result.total} documents.`;
+      await loadMemoryStats();
+    }
+  }
 
   // Local form state — mirrors store, saved on blur/change
   let backendUrl = '';
@@ -152,6 +192,43 @@
       </p>
       {#if $runtimeBackendSwitchError}
         <p class="card-hint" style="color:var(--error)">{$runtimeBackendSwitchError}</p>
+      {/if}
+    </section>
+
+    <!-- Corpus re-embed -->
+    <section class="settings-card">
+      <div class="card-title">Corpus Embeddings</div>
+      <p class="card-hint">
+        Re-embeds the wiki/raw corpus with the active embedding model via
+        <code>POST /memory/reembed</code> (docs/architecture/16-runtime-backend-layer.md §16.4).
+        Needed after switching embedding models or embed sources — until then, retrieval
+        falls back to keyword-only ranking.
+      </p>
+      {#if corpusStale}
+        <span class="badge badge-warning">
+          Corpus embeddings out of date — re-ranking is running keyword-only.
+        </span>
+      {/if}
+      <div class="field-row">
+        <button
+          type="button"
+          class="btn-secondary"
+          disabled={$reembedLoading}
+          on:click={handleReembedCorpus}
+        >
+          {#if $reembedLoading}
+            <span class="spinner" aria-hidden="true" />
+            Re-embedding…
+          {:else}
+            Re-embed Corpus Now
+          {/if}
+        </button>
+      </div>
+      {#if reembedResult}
+        <p class="card-hint">{reembedResult}</p>
+      {/if}
+      {#if $reembedError}
+        <p class="card-hint" style="color:var(--error)">{$reembedError}</p>
       {/if}
     </section>
 

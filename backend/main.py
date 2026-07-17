@@ -783,6 +783,7 @@ class MemoryStatsResponse(BaseModel):
     cache_valid:      int
     cache_invalid:    int
     embeddings_pct:   float
+    corpus_stale:     bool   # True when the wiki/raw corpus needs POST /memory/reembed
     available:        bool   # False when MemoryManager is not initialised
 
 
@@ -1405,6 +1406,7 @@ async def get_memory_stats() -> MemoryStatsResponse:
             cache_valid    = 0,
             cache_invalid  = 0,
             embeddings_pct = 0.0,
+            corpus_stale   = False,
             available      = False,
         )
 
@@ -1418,6 +1420,7 @@ async def get_memory_stats() -> MemoryStatsResponse:
         cache_valid    = raw["cache_valid"],
         cache_invalid  = raw["cache_invalid"],
         embeddings_pct = raw["embeddings_pct"],
+        corpus_stale   = mm._corpus_stale,
         available      = True,
     )
 

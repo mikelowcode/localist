@@ -424,6 +424,18 @@ was deleted — confirmed inert for every backend per §33/§34. New Streaming-r
 Episodic-write-approval toggles are UI-only placeholders with no backing endpoint — flagged in the
 code as such.
 
+**Corpus Embeddings (2026-07-17).** New card directly below Runtime Backend, wired to the real
+`POST /memory/reembed` (§16.4) via a new `reembedCorpus.ts` store — not a placeholder. A
+"Re-embed Corpus Now" button, gated by the same `confirm()`-dialog pattern as the Runtime Backend
+switch, calls `reembed_corpus()` and blocks (single `asyncio.to_thread` call, no progress
+callback) until every wiki/raw document has been re-embedded; an indeterminate spinner covers the
+wait, matching the Runtime Backend card's loading treatment. A `corpus_stale` badge — sourced from
+the new `corpus_stale` field on `GET /memory/stats`, fetched once on mount and refreshed after a
+re-embed completes — reads "Corpus embeddings out of date — re-ranking is running keyword-only"
+when `MemoryManager._corpus_stale` is set. On success the card shows "Re-embedded X of Y
+documents."; on failure it shows `reembedError` in `var(--error)`, same as the Runtime Backend
+card's error paragraph.
+
 **Files.** See §7.11.
 
 **Verification posture.** `npm run check` and a production `npm run build` both clean throughout.

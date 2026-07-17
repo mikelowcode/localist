@@ -25,7 +25,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from memory_manager import MemoryManager, _pack_embedding, _unpack_embedding, _EMBEDDING_DIM
+from memory_manager import (
+    MemoryManager,
+    _pack_embedding,
+    _unpack_embedding,
+    _EMBEDDING_DIM,
+    _SCHEMA_VERSION,
+)
 
 
 _TUNED = "mlx-community/embeddinggemma-300m-4bit"
@@ -185,6 +191,51 @@ class TestMigrationSeeding:
         MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_TUNED)
 
         assert _get_provenance(path, "corpus") is None
+
+
+# ---------------------------------------------------------------------------
+# Self-heal — schema_version already current but embedding_provenance table
+# missing (an earlier buggy migration bumped the version without creating it;
+# _init_db's version-gate never re-triggers _migrate() in that state).
+# ---------------------------------------------------------------------------
+
+class TestMissingProvenanceTableSelfHeals:
+    def test_construction_does_not_raise_and_table_is_recreated(self, tmp_path):
+        path = tmp_path / "corrupted.db"
+        _build_schema(path)
+
+        conn = sqlite3.connect(str(path))
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        assert version == _SCHEMA_VERSION
+        conn.execute("DROP TABLE embedding_provenance")
+        conn.commit()
+        conn.close()
+
+        mm = MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_TUNED)
+
+        conn = sqlite3.connect(str(path))
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='embedding_provenance'"
+        ).fetchone() is not None
+        conn.close()
+        assert mm._corpus_stale is False
+
+    def test_seeds_provenance_normally_after_self_heal(self, tmp_path):
+        """The self-heal shouldn't just avoid crashing — the rest of
+        _check_embedding_provenance()'s logic (migration-seeding here) must
+        still run correctly against the freshly recreated table."""
+        path = tmp_path / "corrupted.db"
+        _build_schema(path)
+        _insert_document(path, name="old-doc", embedded=True)
+
+        conn = sqlite3.connect(str(path))
+        conn.execute("DROP TABLE embedding_provenance")
+        conn.commit()
+        conn.close()
+
+        MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_TUNED)
+
+        assert _get_provenance(path, "corpus") == _TUNED
 
 
 # ---------------------------------------------------------------------------
