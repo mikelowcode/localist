@@ -47,6 +47,30 @@ All lower priorities are skipped.
 
 ---
 
+*Update 2026-07-17 — explicit-date signal added, independent of both the
+literal keyword list above and the semantic gate (§4.2a).* Live bug: "Look
+up TSM's July 16 2026 earnings and report back a summary" hit no
+`_WEB_SEARCH_KEYWORDS` entry and scored `lookup_request=0.573` — just under
+the 0.60 semantic gate — so `_priority3_tool` returned `None`, no tool
+fired, and the model (Ollama backend) returned a well-formed but
+zero-content completion with no grounding to work from. Fix, in
+`planner.py`: `_has_explicit_date()` matches a specific calendar date
+(month name + year, optional day, either order; or an ISO `YYYY-MM-DD`
+date) via `_EXPLICIT_DATE_PATTERN`, and fires `web_search` on its own,
+independent of the keyword/semantic OR. Deliberately excludes a bare
+4-digit year with no month — a bare year is too weak a signal and risks
+false positives on version/model numbers ("Windows 2000", "the SR-2026
+model"). This is treated as close to a hard rule rather than a threshold
+tuning problem: the model structurally cannot verify a specific date from
+training alone, so no semantic-gate threshold value would be principled
+here. Neither `_SEMANTIC_GATE_THRESHOLDS` value was touched by this change.
+See `_has_explicit_date()`'s tests in `TestExplicitDateSignal`
+(`test_planner_phase3.py`) for the false-positive cases checked. This fix
+narrows the gap but is explicitly not expected to catch every phrasing
+that should trigger a tool call — §4.6.2 documents the independent
+empty-completion safety net that holds regardless of what the Planner
+gate missed.
+
 *Correction 2026-07-06 — bare `"today"`/`"write"`/`"save"` pruned from the keyword lists above.* Live traffic showed the deterministic keyword branch firing independently of, and before, the semantic gate's judgment: an utterance like "Did you know I added a new file read / write / append tool to my Localist app today?" correctly scored non-search by the semantic gate (`lookup_request=0.532 < 0.65`, `gate_fired=False`) but still triggered both `web_search` (on bare `"today"`) and `file_op` (on bare `"write"`) via the keyword branch, which runs unconditionally regardless of the semantic result. Fix: removed `"today"` from `_WEB_SEARCH_KEYWORDS` and `"write"`/`"save"` from `_FILE_OP_KEYWORDS` — all three were too common in ordinary conversational sentences to serve as reliable single-word tool signals. No replacement phrases were added; instructions that used to hit these bare words now fall through to P3b/P4/P5/§15.1's P6 classifier, which is the intended effect, not a gap to be immediately recaptured. Two tests keyed to the removed words (`test_file_op_guard_defers_to_p3`, `test_p3c_beats_web_search_p3` in `test_planner_phase3.py`) were rewritten to use surviving keywords (`"create a file"`, `"recent"`) — same P3c-ordering behavior under test, just a different trigger word; full suite restored to the 572 passed / 2 failed baseline (the 2 being the pre-existing, unrelated failures tracked in §14.6).
 
 ---
@@ -408,6 +432,88 @@ the exact condition it was designed for.
 Open Item 5 in §10.4 (SUCCESS with irrelevant results) is a distinct,
 still-open failure mode — see that section; it is not addressed by this
 update.
+
+#### 4.6.2 Empty-completion guard + forced-tool retry (added 2026-07-17)
+
+**Bug.** Confirmed live: for a query the Planner's P3 gate doesn't
+recognize as needing a tool (see §4.2's 2026-07-17 update above), Ollama
+can return a well-formed but zero-content stream — `"done": true` with no
+content in between, a valid stream by `OllamaRuntimeClient`'s own
+correctness check, not an exception. Nothing downstream validated
+`answer` for emptiness before returning `TaskStatus.COMPLETE`, so an empty
+string could reach the user as the final response.
+
+**Two-layer fix, deliberately asymmetric across the two places
+`ConversationalAgent.run()` can be reached from:**
+
+1. **`ControllerAgent._dispatch_conversational_with_empty_guard()`** — the
+   real fix, and the only one with retry capability, because tool dispatch
+   (`MCPToolDispatcher`) and prompt assembly (`PromptBuilder.build()`) both
+   live in `ControllerAgent`, not `ConversationalAgent`. Used for
+   `_execute_plan()`'s Step 7 dispatch whenever
+   `effective_agent_name == "conversational_agent"`, replacing the generic
+   `self._dispatch()` call for that case only (other agents, e.g.
+   `wiki_agent`, are unaffected). When the first `agent.run()` result is
+   `COMPLETE` with an empty/whitespace-only `answer`: retries exactly once
+   (`_EMPTY_RESPONSE_RETRY_LIMIT = 1` — its own constant, deliberately not
+   a reuse of `mcp_tool_dispatcher._MAX_RESEARCH_ITERATIONS`, which bounds
+   the unrelated multi-turn `research` loop scoped to a tool that's
+   already fired) with `web_search` forced into `tools_to_call` if not
+   already present, a fresh `MCPToolDispatcher.dispatch()` call, and the
+   prompt rebuilt via `PromptBuilder.build()` with the new tool results —
+   not a bare re-run of the identical ungrounded prompt, which would risk
+   reproducing the same empty output for no reason. If the retry is also
+   empty (or the retry's tool dispatch raises), the result is replaced
+   with `conversational_agent._EMPTY_RESPONSE_FALLBACK`, forcing
+   `grounded=False, sources=[]` — same substitution shape as the existing
+   fabricated-tool-call guard (§8.8 Open Item 11), but a distinct string:
+   `_SEARCH_UNAVAILABLE_FALLBACK` promises training-knowledge content to
+   follow ("here's what I know from training"), which would be a
+   non-sequitur for a genuinely empty completion with nothing to follow it.
+
+   **Why this bypasses `self._dispatch()` entirely, not just wraps it.**
+   `MemoryManager.add_agent_result()` serializes `result.output` into
+   SQLite synchronously, at call time — mutating `result.output` after the
+   fact does not retroactively fix what's already persisted. Going through
+   `self._dispatch()` for the first attempt would have already written the
+   empty answer into working memory before any retry could run. The
+   guard's `_run()` helper mirrors `self._dispatch()`'s per-subtask
+   behavior (agent lookup, `agent.run()`, exception → `FAILED` conversion,
+   `"Dispatching subtask..."` log line) but defers
+   `memory.add_agent_result()` until the final outcome — original,
+   retried, or fallback-substituted — is decided, and writes it exactly
+   once. Verified directly:
+   `TestEmptyCompletionGuard::test_memory_receives_exactly_one_entry_not_two`
+   in `test_controller_phase4.py`.
+
+2. **`ConversationalAgent.run()`'s legacy (non-prebuilt) RAG path only** —
+   a narrower, non-retrying floor: `if not answer.strip():` substitutes
+   `_EMPTY_RESPONSE_FALLBACK` immediately, same shape as the
+   fabricated-tool-call guard it sits next to. This path has no
+   tool-dispatch capability of its own and nothing wraps it with a retry
+   (it's reached directly, without going through
+   `ControllerAgent._execute_plan()`, whenever `context["_prebuilt_prompt"]`
+   is absent — the "rare non-prebuilt path" per §11), so a single
+   substitution is the best available guarantee for it.
+
+   **Deliberately not added to the prebuilt-prompt path.**
+   `context["_prebuilt_prompt"]` is set by exactly one caller —
+   `ControllerAgent._execute_plan()` — which is the layer that now owns
+   retry-then-fallback for that path (see 1. above). Adding a second,
+   silently-substituting guard directly in `ConversationalAgent.run()`'s
+   prebuilt-prompt branch would substitute the fallback text *before* the
+   controller ever saw the true empty signal it needs to decide whether to
+   retry — masking the condition the retry logic depends on, not
+   protecting against it. This asymmetry is intentional, not an oversight;
+   see the module docstring in `test_conversational_agent_empty_guard.py`
+   and `TestPrebuiltPathNotGuardedHere` in that file for the explicit
+   regression guard on this behavior.
+
+**No change to `ollama_runtime_client.py`.** It correctly reports what
+Ollama returned — raising on a genuinely broken stream (mid-stream error,
+or closing without `"done": true`) and passing through a validly-terminated
+zero-content stream as an empty string. The gap was entirely in the layers
+above not validating the result before completing the task.
 
 ### 4.7 Gemma 4B Behavioral Constraints
 

@@ -48,6 +48,7 @@ from memory_manager import (
 from episodic_extractor import ExtractionResult
 from planner import RoutingPlan
 from prompt_builder import PromptBuilder, WorkingMemoryState, ToolResult as _ToolResult
+from conversational_agent import _EMPTY_RESPONSE_FALLBACK
 from wiki_doc import load_wiki_doc, ParsedWikiDoc
 
 
@@ -89,6 +90,35 @@ def make_conv_agent(answer: str = "Test answer."):
             agent_name = "conversational_agent",
             status     = TaskStatus.COMPLETE,
             output     = {"answer": answer, "sources": [], "grounded": False},
+        )
+    agent.run.side_effect = run
+    agent._received = received
+    return agent
+
+
+def make_conv_agent_with_answers(answers: list[str]):
+    """
+    Conversational agent that returns each string in `answers` in turn (the
+    last one repeats if called more times than len(answers)), capturing
+    every SubTask it receives. Used to simulate an empty first completion
+    followed by a real one on retry.
+    """
+    received: list[SubTask] = []
+    call_count = {"n": 0}
+
+    agent = MagicMock()
+    agent.name = "conversational_agent"
+    agent.can_handle.return_value = True
+
+    def run(subtask):
+        received.append(subtask)
+        idx = min(call_count["n"], len(answers) - 1)
+        call_count["n"] += 1
+        return AgentResult(
+            subtask_id = subtask.subtask_id,
+            agent_name = "conversational_agent",
+            status     = TaskStatus.COMPLETE,
+            output     = {"answer": answers[idx], "sources": [], "grounded": False},
         )
     agent.run.side_effect = run
     agent._received = received
@@ -157,6 +187,205 @@ class TestDirectAnswerPath:
 
         prompt = conv._received[0].context["_prebuilt_prompt"]
         assert "[CONTEXT]" not in prompt
+
+
+class TestCurrentDatetimeSlot:
+    """
+    [CURRENT DATETIME] is computed fresh at each _execute_plan() call site
+    (controller_agent.py, immediately before PromptBuilder.build()), never
+    memoized — unlike _load_persona()'s intentional session-lifetime cache.
+    """
+
+    def test_current_datetime_slot_present_in_prompt(self, mm):
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        ctrl.handle_task({"instruction": "What is 2+2?"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[CURRENT DATETIME]" in prompt
+        assert prompt.index("[CURRENT DATETIME]") < prompt.index("[INSTRUCTION]")
+
+    def test_two_turns_with_advancing_clock_render_different_timestamps(self, mm):
+        """
+        A mocked clock advancing between two build() calls must produce two
+        different [CURRENT DATETIME] slot strings — proof the value is read
+        fresh per turn, not cached across the ControllerAgent's process
+        lifetime the way _load_persona() deliberately is.
+        """
+        import controller_agent as controller_agent_module
+        from datetime import datetime, timezone
+
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        t1 = datetime(2026, 7, 17, 10, 10, 0, tzinfo=timezone.utc)
+        t2 = datetime(2026, 7, 17, 11, 45, 0, tzinfo=timezone.utc)
+
+        with patch.object(controller_agent_module, "datetime") as mock_dt:
+            mock_dt.now.return_value.astimezone.return_value = t1
+            ctrl.handle_task({"instruction": "First turn."})
+            prompt_1 = conv._received[0].context["_prebuilt_prompt"]
+
+            mock_dt.now.return_value.astimezone.return_value = t2
+            ctrl.handle_task({"instruction": "Second turn."})
+            prompt_2 = conv._received[1].context["_prebuilt_prompt"]
+
+        slot_1 = prompt_1.split("\n\n")[0]
+        slot_2 = prompt_2.split("\n\n")[0]
+        assert slot_1.startswith("[CURRENT DATETIME]")
+        assert slot_2.startswith("[CURRENT DATETIME]")
+        assert slot_1 != slot_2
+        assert "10:10:00" in slot_1
+        assert "11:45:00" in slot_2
+
+
+class TestEmptyCompletionGuard:
+    """
+    ControllerAgent._dispatch_conversational_with_empty_guard(): the
+    controller-owned floor + bounded forced-web_search retry for empty
+    completions. See conversational_agent.py's own (narrower) legacy-path
+    guard and its tests in test_conversational_agent_empty_guard.py — that
+    guard deliberately does NOT cover the prebuilt-prompt path, since this
+    is the layer that owns it.
+    """
+
+    @staticmethod
+    def _plan(tools_to_call: list[str] | None = None) -> RoutingPlan:
+        return RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = False,
+            priority       = 6,
+            tools_to_call  = tools_to_call or [],
+        )
+
+    @staticmethod
+    def _tool_result(text: str = "TSM reported Q2 2026 earnings on July 16, beating estimates."):
+        return _ToolResult(
+            tool_name  = "web_search",
+            parameters = "query='TSM earnings'",
+            result     = text,
+            success    = True,
+        )
+
+    def test_empty_then_real_answer_on_retry_forces_web_search(self, mm):
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent_with_answers(["", "TSM reported strong Q2 2026 earnings."])
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = self._plan(tools_to_call=[])
+
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.return_value = [self._tool_result()]
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch("controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            result = ctrl.handle_task(
+                {"instruction": "Look up TSM's July 16 2026 earnings and report back a summary."}
+            )
+
+        assert result["status"] == "complete"
+        assert result["answer"] == "TSM reported strong Q2 2026 earnings."
+        assert len(conv._received) == 2, "expected exactly one retry (original + 1)"
+
+        _, dispatch_kwargs = mock_dispatcher.dispatch.call_args
+        assert "web_search" in dispatch_kwargs["tools_to_call"]
+
+        retry_prompt = conv._received[1].context["_prebuilt_prompt"]
+        assert "TSM reported Q2 2026 earnings" in retry_prompt
+
+    def test_empty_then_empty_falls_back_to_canned_message(self, mm):
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent_with_answers(["", ""])
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = self._plan(tools_to_call=[])
+
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.return_value = [self._tool_result()]
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch("controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            result = ctrl.handle_task(
+                {"instruction": "Look up TSM's July 16 2026 earnings and report back a summary."}
+            )
+
+        assert result["status"] == "complete"
+        assert result["answer"] == _EMPTY_RESPONSE_FALLBACK
+        assert result["answer"].strip() != ""
+        assert result["sources"] == []
+        assert len(conv._received) == 2, "retry must be bounded to exactly one attempt"
+
+    def test_retry_bounded_even_when_dispatcher_raises(self, mm):
+        """A tool-dispatch exception during retry must fall back cleanly, never raise."""
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent_with_answers([""])
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = self._plan(tools_to_call=[])
+
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.side_effect = RuntimeError("MCP session failed")
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch("controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            result = ctrl.handle_task(
+                {"instruction": "Look up TSM's July 16 2026 earnings and report back a summary."}
+            )
+
+        assert result["status"] == "complete"
+        assert result["answer"] == _EMPTY_RESPONSE_FALLBACK
+
+    def test_non_empty_first_answer_never_triggers_retry(self, mm):
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent_with_answers(["Direct answer, no retry needed."])
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = self._plan(tools_to_call=[])
+
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.return_value = [self._tool_result()]
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch("controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            result = ctrl.handle_task({"instruction": "What is 2+2?"})
+
+        assert result["answer"] == "Direct answer, no retry needed."
+        assert len(conv._received) == 1
+        mock_dispatcher.dispatch.assert_not_called()
+
+    def test_memory_receives_exactly_one_entry_not_two(self, mm, db_path):
+        """
+        Regression guard for the ordering bug this design specifically
+        avoids: memory_manager.add_agent_result() serializes synchronously
+        at call time, so dispatching the original (empty) attempt through
+        the normal self._dispatch() path would have already persisted the
+        empty answer into working memory before any retry could replace
+        it. Exactly one entry must be written for this turn, carrying the
+        final (retried) answer.
+        """
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent_with_answers(["", "Real retried answer."])
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = self._plan(tools_to_call=[])
+
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.return_value = [self._tool_result()]
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch("controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            ctrl.handle_task({
+                "instruction": "Look up TSM's July 16 2026 earnings and report back a summary.",
+                "task_id":     "mem-write-once-test",
+            })
+
+        entries = mm.get_context_window(task_id="mem-write-once-test", limit=50)
+        agent_entries = [e for e in entries if e["role"] == "agent"]
+        assert len(agent_entries) == 1, (
+            f"expected exactly one persisted agent result, got {len(agent_entries)}: "
+            f"{agent_entries}"
+        )
+        assert "" not in [e["content"] for e in agent_entries]
+        assert "Real retried answer." in agent_entries[0]["content"]
 
 
 # ---------------------------------------------------------------------------

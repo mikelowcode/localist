@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -140,10 +141,11 @@ def run_cache_warmup(
     try:
         persona = controller._load_persona()
         system_prompt, user_prompt = _WARMUP_BUILDER.build(
-            instruction    = "Summarise the key themes from the tool results above.",
-            persona        = persona,
-            tool_results   = tool_results or None,
-            working_memory = working_memory or None,
+            instruction      = "Summarise the key themes from the tool results above.",
+            current_datetime = datetime.now().astimezone(),
+            persona          = persona,
+            tool_results     = tool_results or None,
+            working_memory   = working_memory or None,
         )
     except Exception as exc:
         logger.warning(

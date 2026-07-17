@@ -67,6 +67,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime
 from typing import Any
 
 import session_files as _session_files
@@ -103,6 +104,22 @@ def _is_fabricated_toolcall(text: str) -> bool:
 _SEARCH_UNAVAILABLE_FALLBACK = (
     "I don't have live search results for that — here's what I know "
     "from training, which may be stale or incomplete."
+)
+
+# Substituted when the model returns a well-formed but empty completion
+# (confirmed live: Ollama can return "done": true with zero content in
+# between, typically when the model has no tool grounding for a query it
+# structurally can't answer from training alone — e.g. a specific recent
+# or future date). Deliberately a different string from
+# _SEARCH_UNAVAILABLE_FALLBACK: that message promises training-knowledge
+# content to follow ("here's what I know from training"), which would be
+# a non-sequitur here — there is no content to follow. Grounded=False and
+# sources=[] are forced alongside this message for the same reason as
+# above. This string itself must never be empty — that's the actual
+# invariant the empty-completion guard exists to protect.
+_EMPTY_RESPONSE_FALLBACK = (
+    "I wasn't able to put together an answer for that — could you "
+    "rephrase, or ask again?"
 )
 
 
@@ -365,9 +382,10 @@ class ConversationalAgent:
             if results else None
         )
         system, prompt = _PROMPT_BUILDER.build(
-            instruction   = instruction,
-            session_files = _session_files.get_files(),
-            rag_snippets  = rag_sources,
+            instruction      = instruction,
+            current_datetime = datetime.now().astimezone(),
+            session_files    = _session_files.get_files(),
+            rag_snippets     = rag_sources,
         )
 
         # -- Step 4: Inference -----------------------------------------------
@@ -419,6 +437,28 @@ class ConversationalAgent:
                 status     = TaskStatus.COMPLETE,
                 output     = {
                     "answer":   _SEARCH_UNAVAILABLE_FALLBACK,
+                    "sources":  [],
+                    "grounded": False,
+                },
+            )
+
+        # Empty-completion floor (legacy RAG path only — the prebuilt-prompt
+        # path above is exclusively reached via ControllerAgent._execute_plan(),
+        # which owns a smarter forced-tool retry before falling back; this
+        # path has no tool-dispatch capability of its own and nothing wraps
+        # it with a retry, so a single substitution is the best available
+        # guarantee that TaskStatus.COMPLETE never carries an empty answer).
+        if not answer.strip():
+            logger.warning(
+                "ConversationalAgent: empty completion (legacy RAG path) "
+                "for subtask %s — substituting fallback.", subtask.subtask_id,
+            )
+            return AgentResult(
+                subtask_id = subtask.subtask_id,
+                agent_name = self.name,
+                status     = TaskStatus.COMPLETE,
+                output     = {
+                    "answer":   _EMPTY_RESPONSE_FALLBACK,
                     "sources":  [],
                     "grounded": False,
                 },

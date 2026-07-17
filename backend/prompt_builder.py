@@ -13,6 +13,7 @@ client. It is pure Python and safe to import anywhere in the backend.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +95,13 @@ class PromptBuilder:
                                   500-token ceiling; appended to system msg
 
     USER MESSAGE (static-first ordering for KV-cache prefix reuse)
+      Slot DT [CURRENT DATETIME] — current local datetime + trust directive;
+                                  always present, always first; unnumbered
+                                  (see §3.2 — deliberately placed ahead of
+                                  the stable-prefix ordering below for
+                                  model salience, not cache reuse)
+      Slot SF [SESSION FILES]   — uploaded file content; conditional; before
+                                  Slot 3, after Slot DT
       Slot 3  [EPISODIC MEMORY] — durable facts; conditional; 150-token ceiling
       Slot 4  [CONTEXT]         — RAG snippets; conditional; 800-token ceiling
       Slot 5  [TOOL RESULTS]    — tool output; conditional; 500-token ceiling
@@ -198,6 +206,32 @@ class PromptBuilder:
             return self._SYSTEM
         truncated = self._truncate_to_tokens(persona, self._CEIL_PERSONA)
         return self._SYSTEM + "\n\n" + truncated
+
+    def _slot_datetime(self, current_datetime: datetime) -> str:
+        """
+        Return the [CURRENT DATETIME] slot: ISO-8601 timestamp + weekday
+        (+ tz abbreviation when the datetime carries one), followed by a
+        trust-hierarchy directive.
+
+        Unconditional — always rendered, unlike every other slot in the
+        user message. There is no "empty" current time. Positioned first
+        in the user message (ahead of [SESSION FILES]) so it is the first
+        thing the model reads, deliberately trading a small, unavoidable
+        cache cost (this content changes every call and can never be
+        cached regardless of position) for maximum salience against the
+        model's training-cutoff prior. See LOCALIST-Architecture.md §3.2.
+        """
+        weekday  = current_datetime.strftime("%A")
+        tz_label = current_datetime.tzname()
+        tz_part  = f", {tz_label}" if tz_label else ""
+        timestamp = current_datetime.isoformat(timespec="seconds")
+        return (
+            "[CURRENT DATETIME]\n"
+            f"{timestamp} ({weekday}{tz_part})\n"
+            "This is ground truth for \"now.\" Tool results dated at or "
+            "after your training cutoff are not errors — trust this "
+            "timestamp and tool output over your training prior."
+        )
 
     def _slot_session_files(
         self,
@@ -623,6 +657,7 @@ class PromptBuilder:
     def build(
         self,
         instruction:      str,
+        current_datetime: datetime,
         session_files:    list[SessionFile]        | None = None,
         persona:          str | None              = None,
         episodic_summary: list[EpisodeBullet]     | None = None,
@@ -641,6 +676,14 @@ class PromptBuilder:
         ----------
         instruction :
             The raw user instruction (Slot 7). Never transformed.
+        current_datetime :
+            The current local datetime (unnumbered [CURRENT DATETIME] slot),
+            computed by the caller — never by PromptBuilder itself, so the
+            builder stays free of a system-clock dependency and remains
+            trivially testable with a fixed value. Required; always rendered
+            first in the user message, ahead of session_files. Callers should
+            pass `datetime.now().astimezone()` freshly on every build() call —
+            never memoized/cached across turns.
         session_files :
             Uploaded session files ([SESSION FILES], unnumbered slot before
             Slot 3). Per-file ceiling 4,000 tokens; total slot ceiling
@@ -695,6 +738,7 @@ class PromptBuilder:
         system_prompt = self._slot1_system(persona)
 
         slots = [
+            self._slot_datetime(current_datetime),      # unnumbered — always first
             self._slot_session_files(session_files),   # unnumbered — before Slot 3
             self._slot3_combined(episodic_summary, profile_facts),
             self._slot4_rag(rag_snippets),

@@ -8,6 +8,8 @@ Covers:
   PB-D — Slot ordering with all slots populated
 """
 
+from datetime import datetime, timezone
+
 import pytest
 
 from prompt_builder import (
@@ -16,17 +18,22 @@ from prompt_builder import (
     EpisodeBullet,
     UserProfileFact,
     RagSource,
+    SessionFile,
     ToolResult,
     GraphLinkEntry,
     GraphQueryResult,
     WorkingMemoryState,
 )
 
+# Fixed datetime used across tests that don't specifically exercise
+# [CURRENT DATETIME] rendering — keeps assertions deterministic.
+_FIXED_DT = datetime(2026, 7, 17, 10, 10, 0, tzinfo=timezone.utc)
+
 
 def test_pb_a_no_persona_system_is_identity_only():
     """build() with no persona returns bare _SYSTEM as system_prompt."""
     pb = PromptBuilder()
-    system_prompt, user_prompt = pb.build(instruction="hello")
+    system_prompt, user_prompt = pb.build(instruction="hello", current_datetime=_FIXED_DT)
 
     assert system_prompt == PromptBuilder._SYSTEM
     assert "[INSTRUCTION]" in user_prompt
@@ -37,7 +44,7 @@ def test_pb_b_persona_appended_to_system_not_in_user():
     """Persona is appended to system_prompt and does not appear in user_prompt."""
     pb = PromptBuilder()
     persona = "I am LORA, your assistant."
-    system_prompt, user_prompt = pb.build(instruction="hello", persona=persona)
+    system_prompt, user_prompt = pb.build(instruction="hello", persona=persona, current_datetime=_FIXED_DT)
 
     assert system_prompt == PromptBuilder._SYSTEM + "\n\n" + persona
     assert "[INSTRUCTION]" in user_prompt
@@ -48,7 +55,7 @@ def test_pb_c_persona_truncated_at_ceiling():
     """Persona longer than 500 tokens (2000 chars) is hard-truncated."""
     pb = PromptBuilder()
     long_persona = "word " * 600   # 3000 chars >> 2000-char (500-token) ceiling
-    system_prompt, _ = pb.build(instruction="x", persona=long_persona)
+    system_prompt, _ = pb.build(instruction="x", persona=long_persona, current_datetime=_FIXED_DT)
 
     assert len(system_prompt) < len(PromptBuilder._SYSTEM) + len(long_persona)
     assert "… [truncated]" in system_prompt
@@ -59,6 +66,7 @@ def test_pb_d_slot_ordering_all_slots():
     pb = PromptBuilder()
     _, user_prompt = pb.build(
         instruction      = "final question",
+        current_datetime = _FIXED_DT,
         episodic_summary = [EpisodeBullet("pref x", "preference", 0.9)],
         rag_snippets     = [RagSource("doc.md", "some context content here")],
         tool_results     = [ToolResult("search", "q=test", "search result text")],
@@ -94,6 +102,7 @@ def test_pb_e_build_enforces_dynamic_suffix_slot_order():
     persona = "Test persona content — stable prefix fixture."
     system_prompt, user_prompt = pb.build(
         instruction      = "test instruction",
+        current_datetime = _FIXED_DT,
         persona          = persona,
         episodic_summary = [EpisodeBullet("episodic fact A", "preference", 0.9)],
         profile_facts    = [UserProfileFact("profile fact B")],
@@ -132,9 +141,10 @@ def test_pb_f_slot3_profile_only_precedes_context():
     """
     pb = PromptBuilder()
     _, user_prompt = pb.build(
-        instruction   = "test instruction",
-        profile_facts = [UserProfileFact("profile fact only")],
-        rag_snippets  = [RagSource("test-doc.md", "rag context content")],
+        instruction      = "test instruction",
+        current_datetime = _FIXED_DT,
+        profile_facts    = [UserProfileFact("profile fact only")],
+        rag_snippets     = [RagSource("test-doc.md", "rag context content")],
     )
 
     assert "[EPISODIC MEMORY]" not in user_prompt, (
@@ -148,6 +158,131 @@ def test_pb_f_slot3_profile_only_precedes_context():
         f"[USER PROFILE] must precede [CONTEXT] in dynamic suffix (§3.7a): "
         f"profile={profile_pos} ctx={ctx_pos}"
     )
+
+
+# ---------------------------------------------------------------------------
+# TestSlotDatetime — [CURRENT DATETIME] (unnumbered, always first)
+# ---------------------------------------------------------------------------
+
+class TestSlotDatetime:
+    """
+    Covers the datetime-hallucination fix: a ground-truth "now" anchor so
+    the model stops treating real, recent/future-dated tool results as
+    training-cutoff-violating errors (see LOCALIST-Architecture.md §3.2).
+    """
+
+    def _pb(self) -> PromptBuilder:
+        return PromptBuilder()
+
+    def test_renders_iso8601_weekday_and_tz(self):
+        pb = self._pb()
+        dt = datetime(2026, 7, 16, 9, 30, 0, tzinfo=timezone.utc)
+        result = pb._slot_datetime(dt)
+
+        assert result.startswith("[CURRENT DATETIME]\n")
+        assert "2026-07-16T09:30:00+00:00" in result
+        assert "Thursday" in result   # 2026-07-16 is a Thursday
+        assert "UTC" in result
+
+    def test_naive_datetime_omits_tz_label_cleanly(self):
+        """No tzinfo → tzname() is None → no dangling ", " before the paren close."""
+        pb = self._pb()
+        dt = datetime(2026, 7, 16, 9, 30, 0)   # naive, no tzinfo
+        result = pb._slot_datetime(dt)
+
+        assert "(Thursday)" in result
+        assert ", )" not in result
+
+    def test_carries_trust_directive(self):
+        pb = self._pb()
+        result = pb._slot_datetime(_FIXED_DT)
+        assert "ground truth" in result
+        assert "not errors" in result
+
+    def test_always_present_and_first_slot_in_user_message(self):
+        """Unlike every other slot, [CURRENT DATETIME] is unconditional —
+        it renders even when every other optional slot is absent, and it
+        is always the first slot in the assembled user message."""
+        pb = self._pb()
+        _, user_prompt = pb.build(instruction="hello", current_datetime=_FIXED_DT)
+
+        assert user_prompt.startswith("[CURRENT DATETIME]")
+        dt_pos   = user_prompt.index("[CURRENT DATETIME]")
+        inst_pos = user_prompt.index("[INSTRUCTION]")
+        assert dt_pos < inst_pos
+
+    def test_precedes_session_files_and_all_dynamic_suffix_slots(self):
+        pb = self._pb()
+        _, user_prompt = pb.build(
+            instruction      = "test",
+            current_datetime = _FIXED_DT,
+            session_files    = [SessionFile("notes.md", "file content")],
+            episodic_summary = [EpisodeBullet("fact", "preference", 0.9)],
+            rag_snippets     = [RagSource("doc.md", "context")],
+            tool_results     = [ToolResult("search", "q=x", "result")],
+            working_memory   = [Turn("user", "prior turn")],
+        )
+
+        dt_pos    = user_prompt.index("[CURRENT DATETIME]")
+        sf_pos    = user_prompt.index("[SESSION FILES]")
+        ep_pos    = user_prompt.index("[EPISODIC MEMORY]")
+        ctx_pos   = user_prompt.index("[CONTEXT]")
+        tools_pos = user_prompt.index("[TOOL RESULTS]")
+        wm_pos    = user_prompt.index("[WORKING MEMORY]")
+        inst_pos  = user_prompt.index("[INSTRUCTION]")
+
+        assert dt_pos < sf_pos < ep_pos < ctx_pos < tools_pos < wm_pos < inst_pos, (
+            f"dt={dt_pos} sf={sf_pos} ep={ep_pos} ctx={ctx_pos} "
+            f"tools={tools_pos} wm={wm_pos} inst={inst_pos}"
+        )
+
+    def test_not_memoized_across_build_calls(self):
+        """PromptBuilder is documented stateless (class docstring). Two
+        build() calls with different current_datetime values on the same
+        instance must not reuse the first call's rendered slot."""
+        pb = self._pb()
+        dt1 = datetime(2026, 7, 17, 8, 0, 0, tzinfo=timezone.utc)
+        dt2 = datetime(2026, 7, 17, 20, 0, 0, tzinfo=timezone.utc)
+
+        _, prompt_1 = pb.build(instruction="hello", current_datetime=dt1)
+        _, prompt_2 = pb.build(instruction="hello", current_datetime=dt2)
+
+        slot_1 = prompt_1.split("\n\n")[0]
+        slot_2 = prompt_2.split("\n\n")[0]
+        assert slot_1 != slot_2
+        assert "08:00:00" in slot_1
+        assert "20:00:00" in slot_2
+
+    def test_recent_tool_result_does_not_read_as_an_error(self):
+        """
+        Regression guard mirroring the live TSM-earnings case: a tool
+        result dated on/after the current datetime must sit alongside a
+        [CURRENT DATETIME] slot that explicitly tells the model such dates
+        are not errors, rather than the model being left to guess "now"
+        from its training cutoff alone.
+        """
+        pb = self._pb()
+        current = datetime(2026, 7, 16, 9, 0, 0, tzinfo=timezone.utc)
+        _, user_prompt = pb.build(
+            instruction      = "What were TSM's latest earnings?",
+            current_datetime = current,
+            tool_results      = [
+                ToolResult(
+                    "web_search",
+                    "q=TSM earnings",
+                    "TSM reported Q2 earnings on 2026-07-16.",
+                ),
+            ],
+        )
+
+        dt_pos    = user_prompt.index("[CURRENT DATETIME]")
+        tools_pos = user_prompt.index("[TOOL RESULTS]")
+        assert dt_pos < tools_pos, (
+            "The trust-hierarchy anchor must precede tool results so the "
+            "model reads ground-truth 'now' before evaluating their dates."
+        )
+        assert "not errors" in user_prompt
+        assert "2026-07-16" in user_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -269,10 +404,11 @@ class TestSlotGraph:
             links=[GraphLinkEntry("how-localist-works", True)],
         )
         _, user_prompt = pb.build(
-            instruction    = "test",
-            tool_results   = [ToolResult("search", "q=wiki", "some result")],
-            graph_result   = gr,
-            working_memory = [Turn("user", "prior message")],
+            instruction      = "test",
+            current_datetime = _FIXED_DT,
+            tool_results     = [ToolResult("search", "q=wiki", "some result")],
+            graph_result     = gr,
+            working_memory   = [Turn("user", "prior message")],
         )
         tools_pos = user_prompt.index("[TOOL RESULTS]")
         graph_pos = user_prompt.index("[GRAPH RESULT]")
@@ -285,9 +421,10 @@ class TestSlotGraph:
     #    no [GRAPH RESULT] in output, no stray separators
     def test_build_none_graph_no_stray_output(self):
         pb = self._pb()
-        _, user_prompt = pb.build(instruction="hello")
+        _, user_prompt = pb.build(instruction="hello", current_datetime=_FIXED_DT)
         assert "[GRAPH RESULT]" not in user_prompt
-        assert user_prompt == "[INSTRUCTION]\nhello"
+        expected_dt_slot = pb._slot_datetime(_FIXED_DT)
+        assert user_prompt == expected_dt_slot + "\n\n[INSTRUCTION]\nhello"
 
 
 # ---------------------------------------------------------------------------
@@ -302,8 +439,8 @@ class TestSlot6AWorkingState:
     # 1. None state → clean omission; build() output byte-identical to no-arg baseline
     def test_none_state_clean_omission_regression_guard(self):
         pb = self._pb()
-        baseline_sys, baseline_user = pb.build(instruction="test")
-        sys_with_none, user_with_none = pb.build(instruction="test", working_state=None)
+        baseline_sys, baseline_user = pb.build(instruction="test", current_datetime=_FIXED_DT)
+        sys_with_none, user_with_none = pb.build(instruction="test", working_state=None, current_datetime=_FIXED_DT)
         assert sys_with_none == baseline_sys
         assert user_with_none == baseline_user
         assert "[WORKING STATE]" not in user_with_none
@@ -312,8 +449,9 @@ class TestSlot6AWorkingState:
     def test_empty_state_clean_omission(self):
         pb = self._pb()
         _, user_prompt = pb.build(
-            instruction   = "test",
-            working_state = WorkingMemoryState(),
+            instruction      = "test",
+            current_datetime = _FIXED_DT,
+            working_state    = WorkingMemoryState(),
         )
         assert "[WORKING STATE]" not in user_prompt
 
@@ -374,8 +512,9 @@ class TestSlot6AWorkingState:
     def test_build_slot_order_with_working_state(self):
         pb = self._pb()
         _, user_prompt = pb.build(
-            instruction   = "test",
-            tool_results  = [ToolResult("search", "q=test", "some result")],
+            instruction      = "test",
+            current_datetime = _FIXED_DT,
+            tool_results     = [ToolResult("search", "q=test", "some result")],
             working_state = WorkingMemoryState(
                 current_project  = "localist-v2",
                 active_artifacts = ["wiki/lora.md"],

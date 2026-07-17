@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -264,6 +265,7 @@ def main() -> None:
 
     system_prompt, user_prompt = builder.build(
         instruction      = INSTRUCTION,
+        current_datetime = datetime.now().astimezone(),
         episodic_summary = EPISODIC_BULLETS,
         tool_results     = TOOL_RESULTS,
         working_memory   = WORKING_MEMORY,

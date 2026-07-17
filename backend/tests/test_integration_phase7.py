@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -146,8 +147,9 @@ class TestFullPipeline:
         assert total_content_chars > 1200   # sanity: raw content already over ceiling
 
         _, user_prompt = PromptBuilder().build(
-            instruction    = "Follow-up question.",
-            working_memory = turns,
+            instruction      = "Follow-up question.",
+            current_datetime = datetime(2026, 7, 17, 10, 10, 0, tzinfo=timezone.utc),
+            working_memory   = turns,
         )
 
         assert "Turn -8" not in user_prompt

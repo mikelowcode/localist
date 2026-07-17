@@ -197,6 +197,44 @@ _WEB_SEARCH_KEYWORDS: frozenset[str] = frozenset({
     "do a search",
 })
 
+# Priority 3 — explicit-date web search signal, independent of both
+# _WEB_SEARCH_KEYWORDS and _SEMANTIC_GATE_THRESHOLDS. A query that names a
+# specific calendar date (month + year, with or without a day) is a
+# qualitatively different signal from the fuzzy semantic gates below: the
+# model structurally cannot verify a specific date from training alone, so
+# this is close to a hard rule rather than a threshold judgment call. Added
+# to close a live gap where "Look up TSM's July 16 2026 earnings..." had no
+# keyword hit and scored 0.573 on lookup_request — just under the 0.60
+# gate — so no tool fired and the model produced an empty completion with
+# zero grounding. Deliberately requires a month name (full or abbreviated)
+# paired with a year, or an ISO date, rather than a bare 4-digit year —
+# a bare year alone is too weak a signal and risks false positives on
+# version/model numbers ("Windows 2000", "the SR-2026 model").
+_MONTH_NAMES: tuple[str, ...] = (
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+)
+_MONTH_ALTERNATION = "|".join(_MONTH_NAMES)
+_EXPLICIT_DATE_PATTERN = re.compile(
+    rf"""
+    \b(?:{_MONTH_ALTERNATION})\.?\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+(?:19|20)\d{{2}}\b
+  | \b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:{_MONTH_ALTERNATION})\.?,?\s+(?:19|20)\d{{2}}\b
+  | \b(?:{_MONTH_ALTERNATION})\.?\s+(?:19|20)\d{{2}}\b
+  | \b(?:19|20)\d{{2}}-\d{{2}}-\d{{2}}\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _has_explicit_date(text: str) -> bool:
+    """
+    True when `text` names a specific calendar date (month + year, with an
+    optional day, in either order; or an ISO YYYY-MM-DD date). See the
+    _EXPLICIT_DATE_PATTERN comment above for the false-positive rationale.
+    """
+    return bool(_EXPLICIT_DATE_PATTERN.search(text))
+
 # Priority 3b — factual query keywords (trigger web search when corpus misses)
 _FACTUAL_QUERY_KEYWORDS: frozenset[str] = frozenset({
     "when did",
@@ -1380,8 +1418,10 @@ class Planner:
         self, lowered: str, instruction: str | None = None
     ) -> RoutingPlan | None:
         """
-        Match condition: web search keyword OR file operation keyword present
-        in lowercased instruction.
+        Match condition: web search keyword, explicit-date pattern, semantic
+        search-intent gate, OR file operation keyword present in lowercased
+        instruction — see _WEB_SEARCH_KEYWORDS, _has_explicit_date(), and
+        _SEMANTIC_GATE_THRESHOLDS respectively; any one alone is sufficient.
 
         Populates tools_to_call with "web_search" or "file_op" as
         appropriate. Sets compound=True when a tool is scheduled alongside
@@ -1440,6 +1480,13 @@ class Planner:
                 "Planner: Priority 3 — semantic signal best=%r(%.3f) all=%s "
                 "gate_fired=%s.",
                 best_group, best_score, all_scores, semantic_triggered,
+            )
+
+        if _has_explicit_date(lowered) and "web_search" not in tools:
+            tools.append("web_search")
+            logger.debug(
+                "Planner: Priority 3 — web_search signal detected via "
+                "explicit-date pattern."
             )
 
         if semantic_triggered and "web_search" not in tools:

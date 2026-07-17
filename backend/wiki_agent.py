@@ -1207,7 +1207,8 @@ class WikiAgent:
                         raw_content  = raw_content,
                     )
                     _sys, user_prompt = _PROMPT_BUILDER.build(
-                        instruction = raw_user_prompt,
+                        instruction      = raw_user_prompt,
+                        current_datetime = datetime.now().astimezone(),
                     )
                     # _sys (PromptBuilder's generic identity prompt) is discarded —
                     # WikiAgent must use SYSTEM_PROMPT (XML-only directive) here.

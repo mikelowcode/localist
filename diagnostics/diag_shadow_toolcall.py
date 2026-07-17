@@ -37,6 +37,7 @@ import csv
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -257,9 +258,10 @@ def _build_grounded_prompt(instruction: str) -> str:
     comparison across categories stays apples-to-apples.
     """
     _, user_prompt = _prompt_builder.build(
-        instruction    = instruction,
-        tool_results   = _GROUNDED_TOOL_RESULTS,
-        working_memory = _GROUNDED_WORKING_MEMORY,
+        instruction      = instruction,
+        current_datetime = datetime.now().astimezone(),
+        tool_results     = _GROUNDED_TOOL_RESULTS,
+        working_memory   = _GROUNDED_WORKING_MEMORY,
     )
     return user_prompt
 

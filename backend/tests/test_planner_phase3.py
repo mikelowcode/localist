@@ -1204,6 +1204,113 @@ class TestPriority3SemanticGating:
         )
 
 
+class TestExplicitDateSignal:
+    """
+    Explicit-date web-search signal (independent of both _WEB_SEARCH_KEYWORDS
+    and _SEMANTIC_GATE_THRESHOLDS) — closes the live gap where "Look up
+    TSM's July 16 2026 earnings..." had no keyword hit and scored 0.573 on
+    lookup_request (just under the 0.60 gate), so no tool fired and the
+    model produced an empty completion with zero grounding.
+    """
+
+    def test_month_day_year_fires_web_search_with_low_semantic_scores(self):
+        """
+        The exact live-bug phrasing: no keyword match, semantic scores all
+        below threshold — only the date-pattern signal should fire.
+        """
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.10,
+            "lookup_request":         0.573,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool(
+            "look up tsm's july 16 2026 earnings and report back a summary."
+        )
+        assert result is not None
+        assert "web_search" in result.tools_to_call
+
+    def test_day_month_year_fires(self):
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.10,
+            "lookup_request":         0.10,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("what happened on 16 july 2026")
+        assert result is not None
+        assert "web_search" in result.tools_to_call
+
+    def test_iso_date_fires(self):
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.10,
+            "lookup_request":         0.10,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("earnings were reported on 2026-07-16")
+        assert result is not None
+        assert "web_search" in result.tools_to_call
+
+    def test_month_year_without_day_fires(self):
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.10,
+            "lookup_request":         0.10,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("tsm earnings for july 2026")
+        assert result is not None
+        assert "web_search" in result.tools_to_call
+
+    def test_bare_year_alone_does_not_fire_date_signal(self):
+        """
+        A bare 4-digit year with no month name is deliberately NOT enough —
+        avoids false positives on version/model numbers. With semantic
+        scores also below threshold and no keyword, nothing should fire.
+        """
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.10,
+            "lookup_request":         0.10,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("what happened with windows 2000")
+        assert result is None
+
+    def test_model_number_false_positive_guard(self):
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.10,
+            "lookup_request":         0.10,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("tell me about the sr-2026 model specs")
+        assert result is None
+
+    def test_no_duplicate_web_search_when_keyword_and_date_both_match(self):
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.10,
+            "lookup_request":         0.10,
+            "knowledge_request_open": 0.10,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("latest tsm earnings, july 16 2026")
+        assert result is not None
+        assert result.tools_to_call.count("web_search") == 1
+
+    def test_existing_keyword_gate_cases_unaffected(self):
+        """Regression guard: no threshold was touched by this signal."""
+        p = _planner_with_mocked_semantic({
+            "explicit_search_action": 0.30,
+            "lookup_request":         0.59,
+            "knowledge_request_open": 0.20,
+            "freshness_request":      0.10,
+        })
+        result = p._priority3_tool("find me a good name for this variable")
+        assert result is None
+
+
 class TestWebSearchKeywordLiteralFix2:
     """
     Slot Fix 2: 'web search' and 'do a search' added to _WEB_SEARCH_KEYWORDS.

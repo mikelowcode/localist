@@ -117,6 +117,71 @@ As of the 2026-06-20 rewrite, `wiki/lora-persona.md` is five plain prose sentenc
 
 ---
 
+#### Slot DT — Current Datetime (unnumbered)
+
+**Purpose:** Give the model a live, ground-truth anchor for "now." Without
+this slot, the model has no signal for the actual current date/time and
+falls back to its training cutoff — leading it to either refuse tasks
+involving real recent/future-sounding dates as impossible, or to
+second-guess correct tool results (e.g. a real earnings date) as likely
+errors simply because they postdate training. Added 2026-07-17 to close
+this gap; see the persona carve-out in §3.6-adjacent `wiki/lora-persona.md`
+for the matching trust-hierarchy rule.
+
+**Token ceiling:** None formally enforced — content is fixed-shape
+(timestamp + weekday + optional tz label + one fixed directive sentence),
+not user- or corpus-supplied, so there is nothing to truncate. Typical
+render is well under 50 tokens.
+
+**Position:** Always the *first* slot in the user message — ahead of even
+`[SESSION FILES]`. This is a deliberate exception to the "static before
+dynamic, stable before volatile" ordering principle in §3.1: this slot's
+content changes on every single call and can never be cache-stable
+regardless of placement, so there is no caching argument for placing it
+anywhere in particular. It is placed first purely for model salience —
+small models under attention constraints weight what they read first more
+heavily, and the goal here is maximum trust, not cache reuse. Practically,
+this costs nothing beyond what already existed: the trailing partial block
+after the system message is already unconditionally uncacheable at current
+prompt lengths regardless of its content (§3.7c), so this slot does not
+regress any cache behavior that exists today. It does forgo a *future*
+option (§3.7c Lever 2 — making a second block cacheable by keeping the
+front of the dynamic suffix stable); that tradeoff is accepted knowingly,
+not overlooked.
+
+**Format:**
+```
+[CURRENT DATETIME]
+2026-07-17T10:10:00-04:00 (Thursday, EDT)
+This is ground truth for "now." Tool results dated at or after your
+training cutoff are not errors — trust this timestamp and tool output
+over your training prior.
+```
+
+**Rules:**
+- **Unconditional.** Unlike every other slot in the user message, this one
+  is never omitted — there is no "empty" current time. `current_datetime`
+  is a required parameter of `PromptBuilder.build()`.
+- Computed by the caller — `datetime.now().astimezone()` (system local
+  timezone; no new `.env` config) — immediately before each `build()` call,
+  never by `PromptBuilder` itself. This keeps the builder free of a
+  system-clock dependency and trivially testable with a fixed value, and
+  guarantees the timestamp is fresh on every turn rather than captured
+  once and reused — the same staleness trap `ControllerAgent` already
+  guards against for the active runtime backend (see this doc's parent
+  `CLAUDE.md` note on `_state.runtime`).
+- Implemented in `_slot_datetime()` in `prompt_builder.py`. Weekday via
+  `strftime("%A")`; tz label via `tzname()` when the datetime is
+  timezone-aware, omitted cleanly when naive.
+- All four `PromptBuilder.build()` call sites pass a freshly computed
+  value: `ControllerAgent._execute_plan()`, `ConversationalAgent.run()`,
+  `WikiAgent`'s raw-ingestion path, and the cache warm-up hook
+  (`warmup.py`). WikiAgent's system prompt is still fully replaced per
+  §3.5 — this slot renders in WikiAgent's discarded-system/kept-user-prompt
+  the same as any other user-message slot, harmless there.
+
+---
+
 #### Slot SF — Session Files (unnumbered)
 
 **Purpose:** Content of text/code files uploaded by the user during the current
@@ -433,6 +498,8 @@ Turn -1 [assistant]: {most recent prior assistant response}
 |---|---|---|---|---|
 | 1a — Identity | *(none)* | ~50 | Always | System |
 | 1b — Persona | *(none)* | 500 | Conditional | System |
+| DT — Current datetime | `[CURRENT DATETIME]` | none (fixed-shape) | Always | User |
+| SF — Session files | `[SESSION FILES]` | 4,000/file, 20,000 total | Conditional | User |
 | 3a — Episodic memory | `[EPISODIC MEMORY]` | 150 | Conditional | User |
 | 3b — User profile | `[USER PROFILE]` | 100 | Conditional | User |
 | 4 — RAG snippets | `[CONTEXT]` | 800 | Conditional | User |
@@ -485,6 +552,7 @@ class PromptBuilder:
     def build(
         self,
         instruction:      str,
+        current_datetime: datetime,
         persona:          str | None            = None,
         episodic_summary: list[EpisodeBullet]   | None = None,
         rag_snippets:     list[RagSource]        | None = None,
@@ -494,13 +562,19 @@ class PromptBuilder:
         """
         Assembles the canonical 7-slot prompt (static-first ordering).
 
+        current_datetime is required — callers must pass a freshly computed
+        `datetime.now().astimezone()` on every call; PromptBuilder never
+        reads the system clock itself (see Slot DT).
+
         Returns
         -------
         (system_prompt, user_prompt)
             system_prompt : Slots 1a + 1b. Byte-stable when persona is
                             unchanged — maximises KV-cache prefix reuse.
-            user_prompt   : Slots 3–7, in stability order. Empty slots
-                            are omitted cleanly — no label, no whitespace.
+            user_prompt   : Slot DT, then Slots 3–7 in stability order.
+                            Slot DT is always present; empty optional
+                            slots are omitted cleanly — no label, no
+                            whitespace.
         """
         ...
 ```
