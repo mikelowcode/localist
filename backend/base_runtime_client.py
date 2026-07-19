@@ -70,7 +70,21 @@ class BaseRuntimeClient(Protocol):
         tokens to the Svelte UI without buffering the full response.
         Backends that do not natively stream may yield the full string as a
         single chunk — the streaming endpoint degrades gracefully to this.
+
+    Attributes
+    ----------
+    is_local: bool
+        True when this client's inference runs on this machine (oMLX,
+        Foundry, or Ollama serving a locally-resident model); False when it
+        runs on someone else's hardware (Ollama Cloud). This is the single
+        signal every backend-tier-aware ceiling (context_profile.py) keys
+        off — set once at construction, never recomputed per request.
+        Concrete clients set this as a plain instance attribute; it is
+        declared here only so callers typed against BaseRuntimeClient can
+        read it.
     """
+
+    is_local: bool
 
     def infer(
         self,

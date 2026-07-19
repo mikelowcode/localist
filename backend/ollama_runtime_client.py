@@ -52,6 +52,8 @@ from typing import Generator, Iterator
 
 import requests
 
+from context_profile import CLOUD_PROFILE, LOCAL_PROFILE
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -71,6 +73,21 @@ _EMBED_PATH = "/api/embed"
 # back to one is never safe. Empty string means "not configured"; the
 # constructor raises ValueError rather than assuming a model.
 DEFAULT_CHAT_MODEL = ""
+
+# Ollama Cloud models are proxied through the *same* local daemon
+# (base_url stays http://localhost:11434 either way — confirmed live,
+# see docs/architecture/16-runtime-backend-layer.md §16.4's
+# "gemma4:31b-cloud, proxied through ollama.com — never resident locally"
+# verification) — so base_url can never distinguish local from cloud here.
+# The model tag itself is the only signal: cloud-hosted models carry a
+# "-cloud" suffix on their tag (e.g. "gemma4:31b-cloud"), local pulls don't.
+_CLOUD_TAG_SUFFIX = "-cloud"
+
+
+def _is_cloud_model(model: str) -> bool:
+    """True if `model`'s tag (the part after ':') ends in "-cloud"."""
+    tag = model.split(":", 1)[1] if ":" in model else model
+    return tag.endswith(_CLOUD_TAG_SUFFIX)
 
 
 # ---------------------------------------------------------------------------
@@ -199,15 +216,22 @@ class OllamaRuntimeClient:
         self._request_timeout = request_timeout
         self._stream_timeout  = stream_timeout
 
+        self.is_local = not _is_cloud_model(chat_model)
+        _profile = LOCAL_PROFILE if self.is_local else CLOUD_PROFILE
+        self._num_ctx = _profile.total_context_tokens
+
         self._chat_endpoint  = self._base_url + _CHAT_PATH
         self._tags_endpoint  = self._base_url + _TAGS_PATH
         self._embed_endpoint = self._base_url + _EMBED_PATH
 
         logger.info(
-            "OllamaRuntimeClient initialised — chat: %s  embed: %s  base: %s",
+            "OllamaRuntimeClient initialised — chat: %s  embed: %s  base: %s  "
+            "is_local: %s  num_ctx: %d",
             self._chat_model,
             self._embedding_model,
             self._base_url,
+            self.is_local,
+            self._num_ctx,
         )
 
     # -----------------------------------------------------------------------
@@ -397,6 +421,12 @@ class OllamaRuntimeClient:
             "options": {
                 "num_predict": max_tokens,
                 "temperature": temperature,
+                # Explicit input context length — without this, Ollama
+                # silently falls back to the Modelfile default (which may
+                # not match either tier's intended ceiling). Sized from
+                # context_profile.py's local/cloud total_context_tokens,
+                # resolved once at construction from is_local.
+                "num_ctx": self._num_ctx,
             },
         }
 

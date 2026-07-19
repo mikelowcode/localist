@@ -448,8 +448,35 @@ only applies to rendering.
 
 **Purpose:** The immediate conversational context. What just happened.
 
-**Token ceiling:** 300 tokens (hard limit). Oldest turns are dropped first
-when the ceiling is exceeded.
+**Token ceiling: backend-tier-aware, added 2026-07-18 (`context_profile.py`).**
+The ceiling below was previously one hardcoded global constant; it now
+comes from a `ContextProfile` resolved once per turn from the active
+runtime client's `is_local` flag (`base_runtime_client.py`) —
+`ControllerAgent._execute_plan()` calls `profile_for(self._runtime.is_local)`
+and threads the result into both `MemoryManager.get_context_window()` and
+`PromptBuilder.build(working_memory_ceiling=...)`:
+
+| Profile | `working_memory_limit` (rows fetched) | `working_memory_tokens` (ceiling) |
+|---|---|---|
+| **Local** (oMLX, Foundry, Ollama serving a locally-resident model) | 5 | 300 |
+| **Cloud** (Ollama Cloud — model tag ends `-cloud`) | None (unbounded) | 60,000 |
+
+The local row is byte-identical to the pre-2026-07-18 hardcoded behavior —
+this was a real constraint of the 16GB Apple-Silicon local-inference case
+(RAM holds the KV cache), not an arbitrary number, and is left untouched.
+The cloud row exists because a cloud-hosted model (Gemma-4-31B via Ollama
+Cloud, ~128K real context) doesn't have that RAM constraint — the ceiling
+there is a deliberately-budgeted fraction of `CLOUD_PROFILE.total_context_tokens`
+(100,000; also what `OllamaRuntimeClient` sets `options.num_ctx` to),
+reserving headroom for output generation and the other prompt slots'
+worst case rather than spending the model's literal ceiling. Oldest turns
+are still dropped first when either ceiling is exceeded — enforced twice,
+independently, over the same fetched rows: once by
+`MemoryManager.get_context_window()`'s `max_tokens` argument (row-level
+eviction before assembly) and again by `PromptBuilder._slot6_working_memory()`'s
+`ceiling` argument (char-level truncation at render time). Both must be
+raised together — raising one alone leaves the other silently
+re-truncating back down to its old value.
 
 **Format:**
 ```
@@ -461,14 +488,26 @@ Turn -1 [assistant]: {most recent prior assistant response}
 ```
 
 **Rules:**
-- Default window: last 3 turns. Maximum window: 5 turns.
+- Local tier: last 5 turns, 300-token ceiling (unchanged pre-2026-07-18
+  behavior). Cloud tier: no turn-count cap, 60,000-token ceiling — in
+  practice this holds the full accumulated conversation for all but
+  unusually long sessions.
 - Turns are listed in chronological order (oldest first, newest last).
 - Tool results from prior turns are included as
   `[tool: {tool_name}] {truncated result}` entries, capped at 2–3 lines.
-- The 300-token ceiling is enforced by `MemoryManager.get_context_window()`
-  via a `max_tokens` parameter. Truncation drops oldest turns first, never
-  mid-turn.
 - This slot is conditional. It is omitted when no prior turns exist.
+- KV-cache implication: `OllamaRuntimeClient.infer_stream()` builds the
+  same single-shot shape §3.7 established for oMLX — one system message +
+  one user message per HTTP call, no accumulated `messages` array, no
+  session/cache-control field. Growing this slot to "full history" doesn't
+  change that shape; it's still one large user-message string sent fresh
+  each call. Whether Ollama Cloud's serving stack independently does
+  cross-request prefix-hash KV-cache reuse on the *content* of that string
+  (as distinct from oMLX's per-session block-hash cache, §3.7b) is
+  unconfirmed — not verified this session, flagged as an open item. If it
+  doesn't, the cloud profile still delivers the reasoning-quality half of
+  the goal (the model can see full history) but not a latency/cost win
+  from cache reuse.
 
 ---
 

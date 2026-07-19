@@ -144,6 +144,10 @@ class OMLXRuntimeClient:
         self._request_timeout = request_timeout
         self._stream_timeout  = stream_timeout
 
+        # oMLX only ever runs on-device — never a candidate for the cloud
+        # tier's relaxed context-window ceilings (context_profile.py).
+        self.is_local = True
+
         self._chat_endpoint  = self._base_url + _CHAT_COMPLETIONS_PATH
         self._embed_endpoint = self._base_url + _EMBEDDINGS_PATH
 

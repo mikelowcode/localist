@@ -501,3 +501,95 @@ limitation, not asserted as done, consistent with §7.10's own posture.
   writing — structural/API-level verification only (see above).
 - The `persisted: false` `.env`-write-failure path still needs a different provocation technique
   (carried forward from §16.5 — a read-only *directory*, not a read-only file, would trigger it).
+
+### 16.7 `is_local` — Backend-Tier Classification for Context-Window Ceilings (2026-07-18)
+
+Every concrete `BaseRuntimeClient` now exposes a public `is_local: bool` attribute, set once at
+construction and never recomputed per request. It is the single flag `context_profile.py`'s
+`ContextProfile` (local/cloud ceiling pairs — Working Memory turn/token caps, `num_ctx`) keys off;
+see §3's Slot 6 for the consuming side. Added specifically to stop truncating conversation history
+to a small fixed budget regardless of what the active model can actually hold — the prior ceilings
+(5 turns / 300 tokens) were sized for the 16GB Apple-Silicon local-inference case and applied
+identically even when Ollama Cloud (~128K real context) was active.
+
+**Per-backend derivation — grounded in live code, not assumed:**
+
+- **`OMLXRuntimeClient.is_local = True`, always.** oMLX only ever runs on-device; no branching.
+- **`FoundryRuntimeClient.is_local = True`, always.** The module's own docstring states Foundry is
+  "local execution... (local only, never cloud)" (§16.1) — confirmed by grep before writing any
+  branching logic for a cloud case that doesn't exist in this deployment.
+- **`OllamaRuntimeClient.is_local`** — **not derivable from `base_url`.** The obvious-looking
+  signal (a `localhost` vs. a cloud hostname) is wrong for this backend: §16.4's live-verified
+  reference configuration runs a cloud chat model (`gemma4:31b-cloud`, "proxied through
+  ollama.com — never resident locally") through the *same* local daemon at
+  `http://localhost:11434` as any local pull. `base_url` is identical in both cases. The actual
+  signal is the model tag itself — Ollama Cloud models carry a `-cloud` suffix on their tag (the
+  part after `:`, e.g. `"31b-cloud"` in `"gemma4:31b-cloud"`); local pulls don't. `is_local` is
+  computed once from `chat_model` at construction (`_is_cloud_model()` in
+  `ollama_runtime_client.py`) and never re-derived from `base_url`.
+
+**Consumers, threaded from `is_local` via `context_profile.profile_for()`:**
+- `ControllerAgent._execute_plan()` resolves the profile once per turn (defaulting to local —
+  `getattr(self._runtime, "is_local", True)` — so any test double lacking the attribute keeps
+  today's behavior rather than silently landing in the cloud tier) and passes
+  `working_memory_limit`/`working_memory_tokens` into `MemoryManager.get_context_window()` and
+  `working_memory_tokens` into `PromptBuilder.build(working_memory_ceiling=...)`.
+- `OllamaRuntimeClient` also uses its own resolved profile to set `options.num_ctx` on every chat
+  request (previously unset entirely — Ollama was silently using whatever the Modelfile defaulted
+  to, independent of either tier's intended ceiling).
+
+**`MemoryManager.get_context_window()`'s `limit` parameter now accepts `None`** (unbounded — no
+`LIMIT` clause at all), used only by the cloud profile. The pre-existing `limit=50` default and its
+other caller (`format_for_prompt()`'s Synthesizer/multi-agent-research path, `controller_agent.py`
+line ~580 — a separate, unrelated code path from the Working Memory slot) are untouched; only the
+one Working Memory call site was changed to pass an explicit profile-derived value instead of the
+old hardcoded `limit=5, max_tokens=300`.
+
+**Two independent truncation passes, both must scale together.** `MemoryManager.get_context_window()`'s
+`max_tokens` trims rows before assembly; `PromptBuilder._slot6_working_memory()`'s own ceiling
+(previously the hardcoded class constant `_CEIL_WORKING=300`, now an optional `ceiling` parameter
+defaulting to that same constant) truncates again at render time. Raising only one silently leaves
+the other re-truncating back down — `PromptBuilder.build()` gained a `working_memory_ceiling`
+parameter for exactly this reason, always passed explicitly by `ControllerAgent` alongside the
+`get_context_window()` call so the two stay in lockstep.
+
+**Values chosen (`context_profile.py`), not copied from the model's raw ceiling:**
+
+| | Local | Cloud |
+|---|---|---|
+| `working_memory_tokens` | 300 (unchanged) | 60,000 |
+| `working_memory_limit` | 5 (unchanged) | None (unbounded) |
+| `total_context_tokens` (→ Ollama `num_ctx`) | 8,000 | 100,000 |
+
+Cloud's 100,000 leaves ~28K headroom under Gemma-4-31B's ~128K stated ceiling for framework/
+tokenizer overhead and margin against an inexact context-length assumption. 60,000 for working
+memory is what's left after budgeting the other slots' worst case out of that 100K (session files
+up to 20K, persona/RAG/tool/graph/working-state slots combined ~3K, output generation ~4K) plus a
+safety margin — a deliberate allocation, not the literal model ceiling. Confirmed with the user
+before implementation (three options presented; the above was selected over both a more
+conservative 30K/60K pairing and a more aggressive 100K/128K pairing).
+
+**Deliberately out of scope.** No cost-based guardrail was added for the cloud tier. The RAM-bloat
+protection the original local ceilings existed for doesn't apply under cloud — the host Mac's RAM
+never held the KV cache to begin with. A cloud prompt of ~60K tokens has a real, non-zero request
+cost/latency on Ollama Cloud; this is a known, flagged trade-off, not a guardrail gap to close in
+this pass.
+
+**Test suite:** 871 passed / 0 failed (851 baseline + 20 new — `tests/test_runtime_is_local.py`
+covering `is_local` per backend and `ContextProfile` value sanity; new cases in
+`tests/test_ollama_runtime_client.py::TestIsLocalAndNumCtx` covering cloud/local model-name
+derivation and the resulting `options.num_ctx`; `tests/test_memory_phase1.py`'s
+`test_limit_none_returns_every_row`; two new cases in `test_controller_phase4.py`'s
+`TestContextProfileTiering` confirming the local tier's 5-row cap is unchanged and the cloud tier
+removes it end-to-end through a real `ControllerAgent.handle_task()` call).
+
+**Open items:**
+- **Live verification against real Ollama Cloud** (per this project's `diagnostics/` convention,
+  not the pytest suite): confirm `num_ctx` is actually honored server-side (e.g. via `/api/show` or
+  a deliberately-long-history probe) and that a long conversation isn't silently clipped anywhere
+  in the chain. Not performed this session — no live Ollama Cloud session was run.
+- Whether Ollama Cloud's serving stack does cross-request prefix-hash KV-cache reuse at all is
+  unconfirmed — see §3's Slot 6 note. If it doesn't, the cloud profile still delivers the
+  reasoning-quality half of the original goal but not a latency/cost win from cache reuse.
+- The 60,000/100,000 cloud figures are a deliberate starting budget, not empirically tuned against
+  real long-conversation traffic — may need revisiting once there's live usage data.

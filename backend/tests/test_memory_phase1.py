@@ -944,6 +944,21 @@ class TestGetContextWindowMaxTokens:
         result = mm.get_context_window(task_id=task, limit=3)
         assert len(result) == 3
 
+    def test_limit_none_returns_every_row(self, mm):
+        """
+        The cloud ContextProfile (context_profile.py) passes
+        working_memory_limit=None to remove the turn-count cap entirely —
+        confirm this fetches every row for the task, not just the default
+        50, and that the row count keeps growing past 50 with no cap.
+        """
+        task = "test_unbounded"
+        for i in range(60):
+            mm.add(role="user", content=f"Message {i}", task_id=task)
+        result = mm.get_context_window(task_id=task, limit=None)
+        assert len(result) == 60
+        assert result[0]["content"]  == "Message 0"
+        assert result[-1]["content"] == "Message 59"
+
 
 # ---------------------------------------------------------------------------
 # TestGraphSchema — v2→v3 migration: graph_nodes and graph_edges tables

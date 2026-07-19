@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 from planner import Planner as _RulePlanner, RoutingPlan
 from pathlib import Path
 from prompt_builder import PromptBuilder, Turn, EpisodeBullet, RagSource, UserProfileFact, GraphQueryResult, GraphLinkEntry, WorkingMemoryState
+from context_profile import profile_for
 from memory_manager import (
     EpisodicMemoryWriter,
     EpisodicMemoryReader,
@@ -225,6 +226,8 @@ class RuntimeClient(Protocol):
     Abstraction over the Local Runtime Layer (Azure AI Foundry / oMLX).
     The Controller and sub-agents call this — never a model API directly.
     """
+
+    is_local: bool
 
     def infer(
         self,
@@ -1477,12 +1480,20 @@ class ControllerAgent:
                 )
 
         # -- Step 6: PromptBuilder assembly ----------------------------------
+        # Backend-tier-aware ceiling (context_profile.py): local runtimes keep
+        # today's 5-turn/300-token cap; a cloud runtime (Ollama Cloud) removes
+        # the turn cap and raises the token ceiling, since the host Mac's RAM
+        # is no longer what's holding the KV cache. `is_local` defaults to
+        # True when absent so any test double lacking the attribute keeps
+        # today's behavior rather than silently falling into the cloud tier.
+        context_profile = profile_for(getattr(self._runtime, "is_local", True))
+
         working_turns: list[Turn] = []
         try:
             entries = memory.get_context_window(
                 task_id    = mem_key,
-                limit      = 5,
-                max_tokens = 300,
+                limit      = context_profile.working_memory_limit,
+                max_tokens = context_profile.working_memory_tokens,
             )
             working_turns = [
                 Turn(role=e["role"], content=e["content"])
@@ -1511,6 +1522,7 @@ class ControllerAgent:
             graph_result     = graph_result             or None,
             working_state    = working_state,
             working_memory   = working_turns            or None,
+            working_memory_ceiling = context_profile.working_memory_tokens,
             session_files    = _session_files.get_files() or None,
         )
 

@@ -596,7 +596,8 @@ class PromptBuilder:
 
     def _slot6_working_memory(
         self,
-        turns: list[Turn] | None,
+        turns:   list[Turn] | None,
+        ceiling: int | None = None,
     ) -> str:
         """
         Return Slot 6: working memory block, or empty string if no turns.
@@ -608,8 +609,20 @@ class PromptBuilder:
             Turn -1 [role]: content
 
         Turns are listed chronologically (oldest surviving first, newest last).
-        The 300-token ceiling is enforced by dropping oldest turns first.
+        The token ceiling is enforced by dropping oldest turns first.
         Each turn is formatted as a single line before ceiling enforcement.
+
+        Parameters
+        ----------
+        ceiling :
+            Token ceiling for this slot. None (default) uses the class's
+            `_CEIL_WORKING` constant (300) — today's behavior, unchanged.
+            Callers pass a larger value (e.g. from a cloud ContextProfile,
+            context_profile.py) to let more history survive into the
+            prompt; this must scale in lockstep with whatever `max_tokens`
+            the caller already passed into `get_context_window()`, since
+            this is a second, independent truncation pass — raising one
+            without the other silently re-truncates back down.
 
         Returns "" if turns is None or empty.
         """
@@ -626,8 +639,9 @@ class PromptBuilder:
                 role_str = turn.role
             formatted.append(f"Turn {offset} [{role_str}]: {turn.content}")
 
-        # Enforce 300-token ceiling: drop oldest until budget is met
-        max_chars = self._CEIL_WORKING * 4
+        # Enforce token ceiling: drop oldest until budget is met
+        effective_ceiling = ceiling if ceiling is not None else self._CEIL_WORKING
+        max_chars = effective_ceiling * 4
         while formatted:
             total = sum(len(f) for f in formatted)
             if total <= max_chars:
@@ -668,6 +682,7 @@ class PromptBuilder:
         graph_result:     GraphQueryResult         | None = None,
         working_state:    WorkingMemoryState       | None = None,
         working_memory:   list[Turn]               | None = None,
+        working_memory_ceiling: int                | None = None,
     ) -> tuple[str, str]:
         """
         Assemble the canonical 7-slot prompt.
@@ -720,7 +735,17 @@ class PromptBuilder:
             Pass None to omit (zero-impact on output when absent).
         working_memory :
             Recent conversation turns (Slot 6). Oldest dropped first when
-            the 300-token ceiling is exceeded. Pass None or [] to omit.
+            the ceiling (see working_memory_ceiling) is exceeded. Pass
+            None or [] to omit.
+        working_memory_ceiling :
+            Token ceiling for Slot 6. None (default) uses the class's
+            300-token `_CEIL_WORKING` constant — unchanged local-tier
+            behavior. Pass a ContextProfile's `working_memory_tokens`
+            (context_profile.py) to scale this with the caller's runtime
+            tier; must match whatever `max_tokens` the caller already
+            passed into `MemoryManager.get_context_window()`, since that
+            call and this ceiling are two independent truncation passes
+            over the same data.
 
         Returns
         -------
@@ -746,7 +771,7 @@ class PromptBuilder:
             self._slot5a_tool_failures(tool_failures),
             self._slot_graph(graph_result),
             self._slot6a_working_state(working_state),
-            self._slot6_working_memory(working_memory),
+            self._slot6_working_memory(working_memory, working_memory_ceiling),
             self._slot7_instruction(instruction),
         ]
 

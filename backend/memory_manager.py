@@ -1082,8 +1082,8 @@ class MemoryManager:
 
     def get_context_window(
         self,
-        task_id:    str        = "global",
-        limit:      int        = 50,
+        task_id:    str            = "global",
+        limit:      int | None     = 50,
         max_tokens: int | None = None,
     ) -> list[dict[str, Any]]:
         """
@@ -1096,7 +1096,10 @@ class MemoryManager:
             Groups entries by task. Defaults to "global".
         limit :
             Maximum number of rows to fetch from the DB before token
-            trimming is applied. Defaults to 50.
+            trimming is applied. Defaults to 50. None means unbounded —
+            every row for `task_id` is fetched (used by the cloud
+            ContextProfile, context_profile.py, which removes the
+            turn-count cap entirely and relies on `max_tokens` alone).
         max_tokens :
             When provided, entries are trimmed (oldest first) until the
             total estimated token count of all remaining entries is at or
@@ -1114,16 +1117,27 @@ class MemoryManager:
         """
         conn = self._connect()
         try:
-            rows = conn.execute(
-                """
-                SELECT role, content, meta_json
-                FROM   conversation_log
-                WHERE  task_id = ?
-                ORDER  BY created_at DESC
-                LIMIT  ?
-                """,
-                (task_id, limit),
-            ).fetchall()
+            if limit is None:
+                rows = conn.execute(
+                    """
+                    SELECT role, content, meta_json
+                    FROM   conversation_log
+                    WHERE  task_id = ?
+                    ORDER  BY created_at DESC
+                    """,
+                    (task_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT role, content, meta_json
+                    FROM   conversation_log
+                    WHERE  task_id = ?
+                    ORDER  BY created_at DESC
+                    LIMIT  ?
+                    """,
+                    (task_id, limit),
+                ).fetchall()
         finally:
             conn.close()
 

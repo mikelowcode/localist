@@ -187,6 +187,11 @@ class FoundryRuntimeClient:
         self._request_timeout = request_timeout
         self._stream_timeout  = stream_timeout
 
+        # Azure AI Foundry is local-only in this deployment (see module
+        # docstring) — never a candidate for the cloud tier's relaxed
+        # context-window ceilings (context_profile.py).
+        self.is_local = True
+
         self._chat_endpoint  = self._base_url + _CHAT_COMPLETIONS_PATH
         self._embed_endpoint = self._base_url + _EMBEDDINGS_PATH
 

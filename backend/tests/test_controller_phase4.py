@@ -825,6 +825,59 @@ class TestWorkingMemoryPath:
 
 
 # ---------------------------------------------------------------------------
+# Backend-tier-aware context window (context_profile.py)
+# ---------------------------------------------------------------------------
+
+class TestContextProfileTiering:
+    """
+    Local runtimes (is_local truthy — including the MagicMock default used
+    by every other test in this file) must keep today's 5-turn/300-token
+    Working Memory cap byte-identical. A cloud runtime (is_local=False)
+    must remove the turn-count cap entirely and let many more turns survive.
+    """
+
+    def test_local_runtime_keeps_5_turn_cap(self, mm):
+        rt = make_runtime(infer_return="no")
+        rt.is_local = True   # explicit, though MagicMock's default is already truthy
+        conv = make_conv_agent("Answer.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        task_id = "local-tier-cap-test"
+        for i in range(7):
+            mm.add(role="user", content=f"turn-marker-{i}", task_id=task_id)
+
+        ctrl.handle_task({"task_id": task_id, "instruction": "Continue."})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        # The 5-row limit also counts the just-logged current-turn row, so
+        # only the newest 4 of the 7 prior markers fit alongside it.
+        assert "turn-marker-0" not in prompt
+        assert "turn-marker-1" not in prompt
+        assert "turn-marker-2" not in prompt
+        for i in range(3, 7):
+            assert f"turn-marker-{i}" in prompt
+
+    def test_cloud_runtime_removes_turn_cap(self, mm):
+        rt = make_runtime(infer_return="no")
+        rt.is_local = False   # e.g. Ollama serving a "-cloud"-suffixed model
+        conv = make_conv_agent("Answer.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        task_id = "cloud-tier-no-cap-test"
+        for i in range(12):
+            mm.add(role="user", content=f"turn-marker-{i}", task_id=task_id)
+
+        ctrl.handle_task({"task_id": task_id, "instruction": "Continue."})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        # All twelve turns survive — no 5-row cap under the cloud profile,
+        # and the (tiny, well under 60k tokens) content never nears the
+        # raised token ceiling either.
+        for i in range(12):
+            assert f"turn-marker-{i}" in prompt
+
+
+# ---------------------------------------------------------------------------
 # Tool stub path (Priority 3)
 # ---------------------------------------------------------------------------
 
