@@ -506,7 +506,7 @@ limitation, not asserted as done, consistent with §7.10's own posture.
 
 Every concrete `BaseRuntimeClient` now exposes a public `is_local: bool` attribute, set once at
 construction and never recomputed per request. It is the single flag `context_profile.py`'s
-`ContextProfile` (local/cloud ceiling pairs — Working Memory turn/token caps, `num_ctx`) keys off;
+`ContextProfile` (local/cloud ceiling pairs — Working Memory turn/token caps) keys off;
 see §3's Slot 6 for the consuming side. Added specifically to stop truncating conversation history
 to a small fixed budget regardless of what the active model can actually hold — the prior ceilings
 (5 turns / 300 tokens) were sized for the 16GB Apple-Silicon local-inference case and applied
@@ -534,9 +534,10 @@ identically even when Ollama Cloud (~128K real context) was active.
   today's behavior rather than silently landing in the cloud tier) and passes
   `working_memory_limit`/`working_memory_tokens` into `MemoryManager.get_context_window()` and
   `working_memory_tokens` into `PromptBuilder.build(working_memory_ceiling=...)`.
-- `OllamaRuntimeClient` also uses its own resolved profile to set `options.num_ctx` on every chat
-  request (previously unset entirely — Ollama was silently using whatever the Modelfile defaulted
-  to, independent of either tier's intended ceiling).
+- `OllamaRuntimeClient` *used to* also set `options.num_ctx` on every chat request from its own
+  resolved profile — **superseded by §16.9 (2026-07-19): confirmed inert and removed.** See §16.9
+  for the corrected picture; the rest of this section is left as the historical record of what was
+  built at the time, not a live description of current `options.num_ctx` behavior.
 
 **`MemoryManager.get_context_window()`'s `limit` parameter now accepts `None`** (unbounded — no
 `LIMIT` clause at all), used only by the cloud profile. The pre-existing `limit=50` default and its
@@ -553,21 +554,29 @@ the other re-truncating back down — `PromptBuilder.build()` gained a `working_
 parameter for exactly this reason, always passed explicitly by `ControllerAgent` alongside the
 `get_context_window()` call so the two stay in lockstep.
 
-**Values chosen (`context_profile.py`), not copied from the model's raw ceiling:**
+**Values chosen (`context_profile.py`), not copied from the model's raw ceiling — as of this
+session's original implementation (superseded by §16.9 for `total_context_tokens`, since removed):**
 
 | | Local | Cloud |
 |---|---|---|
 | `working_memory_tokens` | 300 (unchanged) | 60,000 |
 | `working_memory_limit` | 5 (unchanged) | None (unbounded) |
-| `total_context_tokens` (→ Ollama `num_ctx`) | 8,000 | 100,000 |
+| ~~`total_context_tokens` (→ Ollama `num_ctx`)~~ | ~~8,000~~ | ~~100,000~~ |
 
-Cloud's 100,000 leaves ~28K headroom under Gemma-4-31B's ~128K stated ceiling for framework/
-tokenizer overhead and margin against an inexact context-length assumption. 60,000 for working
-memory is what's left after budgeting the other slots' worst case out of that 100K (session files
-up to 20K, persona/RAG/tool/graph/working-state slots combined ~3K, output generation ~4K) plus a
-safety margin — a deliberate allocation, not the literal model ceiling. Confirmed with the user
-before implementation (three options presented; the above was selected over both a more
-conservative 30K/60K pairing and a more aggressive 100K/128K pairing).
+`total_context_tokens` and its ~28K-headroom-under-128K budget math (described in the paragraph
+below, left for historical context) were removed in §16.9 after `num_ctx` was confirmed to have no
+effect on Ollama, local or cloud.
+
+Cloud's working_memory_tokens=60,000 was originally budgeted against a 100,000 `total_context_tokens`
+figure (100,000 chosen to leave ~28K headroom under Gemma-4-31B's ~128K stated ceiling for
+framework/tokenizer overhead), reserving the rest for the other slots' worst case (session files up
+to 20K, persona/RAG/tool/graph/working-state slots combined ~3K, output generation ~4K) plus a
+safety margin — a deliberate allocation, not the literal model ceiling. The 60,000 figure itself is
+unchanged by §16.9's removal (it was never derived *from* `total_context_tokens` at runtime — only
+documented alongside it); only the now-dead `total_context_tokens` field and its Ollama `num_ctx`
+consumer were removed. Confirmed with the user before the original implementation (three options
+presented; the above was selected over both a more conservative 30K/60K pairing and a more
+aggressive 100K/128K pairing).
 
 **Deliberately out of scope.** No cost-based guardrail was added for the cloud tier. The RAM-bloat
 protection the original local ceilings existed for doesn't apply under cloud — the host Mac's RAM
@@ -584,12 +593,250 @@ derivation and the resulting `options.num_ctx`; `tests/test_memory_phase1.py`'s
 removes it end-to-end through a real `ControllerAgent.handle_task()` call).
 
 **Open items:**
-- **Live verification against real Ollama Cloud** (per this project's `diagnostics/` convention,
-  not the pytest suite): confirm `num_ctx` is actually honored server-side (e.g. via `/api/show` or
-  a deliberately-long-history probe) and that a long conversation isn't silently clipped anywhere
-  in the chain. Not performed this session — no live Ollama Cloud session was run.
+- ~~**Live verification against real Ollama Cloud**: confirm `num_ctx` is actually honored
+  server-side~~ — **closed by `diagnostics/diag_ollama_num_ctx_probe.py` / `diagnostics/reports/
+  ollama_cloud_num_ctx_findings.md`: it is not honored, in either direction, on either tier. See
+  §16.9.**
 - Whether Ollama Cloud's serving stack does cross-request prefix-hash KV-cache reuse at all is
   unconfirmed — see §3's Slot 6 note. If it doesn't, the cloud profile still delivers the
   reasoning-quality half of the original goal but not a latency/cost win from cache reuse.
 - The 60,000/100,000 cloud figures are a deliberate starting budget, not empirically tuned against
   real long-conversation traffic — may need revisiting once there's live usage data.
+
+### §16.8 — LOCAL_PROFILE working-memory ceiling investigated, left unchanged (2026-07-19)
+
+Investigated whether `LOCAL_PROFILE`'s 300-token/5-turn working-memory ceiling (unchanged since
+the pre-`ContextProfile` hardcoded behavior — see §16.7 above) could be safely raised. Full
+methodology and data: `diagnostics/reports/local_working_memory_ram_findings.md`; the resulting
+rationale also lives directly in `context_profile.py`'s module docstring.
+
+**Result: no safe increase.** Built `diagnostics/diag_local_working_memory_ram_probe.py`, which
+sends real `conversation_log` text (not synthetic filler) at working-memory sizes from 300 to
+3,000 tokens against both local backends — oMLX and local (non-`-cloud`) Ollama — 3 trials each,
+measuring per-process memory footprint and `vm_stat` swap-in/out deltas during live generation.
+
+A real methodology bug surfaced and was fixed during this investigation: on Apple Silicon,
+`psutil`'s per-process RSS does not capture Metal/unified-memory GPU-resident allocations — it
+reported ~200MB for the Ollama runner process at the same instant `top`'s memory-footprint column
+reported ~8.3GB for that same pid, a ~40x undercount. The probe uses `top -l 1 -pid <pid> -stats
+mem` as ground truth instead.
+
+Marginal cost came out modest in isolation (~320MB/1,000 tokens for local Ollama, ~190MB/1,000 for
+oMLX — confirming the two local serving stacks have meaningfully different memory profiles, as
+expected), but every single trial at every token size tested — including at today's unchanged
+300-token baseline — produced measurable swap activity under this machine's ordinary real
+(non-idle) background load. Per this project's own standard for this class of measurement (watch
+the actual failure precursor, not just headroom arithmetic), that outweighs the naive "there's
+still N GB free" calculation. `LOCAL_PROFILE` values are unchanged: `working_memory_tokens=300`,
+`working_memory_limit=5`.
+
+Also confirmed against the live `conversation_log` table: the turn-count and token ceilings are
+both real, coupled constraints today — 107/318 (34%) of real conversation windows already hit the
+300-token trim at 5 rows, so raising the row-count limit alone (without the token ceiling) would be
+a near-total no-op for a third of real usage.
+
+Added `context_profile.check_local_ram_headroom()` — not gating a raised budget (there isn't one),
+but a lightweight, warn-only startup check (wired into `main.py`'s `lifespan()`, gated on the
+active runtime's `is_local` flag) that surfaces the same already-happening swap-under-load
+condition on whatever machine the app next runs on, mirroring `lifespan()`'s existing
+reachable/not-reachable warn-and-continue pattern for runtime health. Thresholds
+(`available < 8.0GB` or `swap > 40%`) are set from this session's own measured numbers (this
+machine's pre-test state — 6.60GB available, 61.3% swap — already produced swapping throughout),
+with margin added so the check doesn't always- or never-fire.
+
+**Open items:**
+- One-machine, one-session snapshot, taken under real (not synthetic-idle) background load — not
+  a permanent hardware constant. Re-run the probe script if RAM changes, the local model changes,
+  or a specifically quieter/busier baseline needs characterizing.
+- `top`'s memory-footprint reporting has ~0.1GB quantization noise at the gigabyte boundary; the
+  marginal-cost figures above are directional, not exact to the MB.
+
+### §16.9 — `total_context_tokens`/`num_ctx` removed; `LOCAL_PROFILE.working_memory_tokens` made RAM-tiered (2026-07-19)
+
+Two changes, done together because the second built directly on the first's cleanup.
+
+**Part 1 — `total_context_tokens` deleted (confirmed-dead parameter).**
+`diagnostics/reports/ollama_cloud_num_ctx_findings.md` (a prior session's investigation) found that
+`options.num_ctx` — the field §16.7 describes `OllamaRuntimeClient` setting from this profile field
+— has **zero observed effect on Ollama, local or cloud**: identical `prompt_eval_count` across a
+25x range of requested `num_ctx` values, including a request smaller than the actual prompt with no
+truncation; the real, always-enforced ceiling is each model's hardcoded native context length,
+completely independent of what the client sends. §16.7's description of this mechanism (and the
+open item asking to verify it) is now known incorrect and has been corrected in place above, not
+rewritten — this section is the actual current state.
+
+Removed: the `total_context_tokens` field from `ContextProfile`, its values from `LOCAL_PROFILE`
+(8,000) and `CLOUD_PROFILE` (100,000), `OllamaRuntimeClient._num_ctx`, and the `"num_ctx"` key from
+its request payload — rather than leave a dead parameter (and the now-unjustifiable "~28K headroom"
+budget narrative built around it) in place. `tests/test_runtime_is_local.py` and
+`tests/test_ollama_runtime_client.py` (formerly `TestIsLocalAndNumCtx`) updated to stop asserting on
+the removed field/behavior and instead assert `"num_ctx"` is **absent** from the Ollama request
+payload, so a future change can't silently reintroduce it without a test noticing.
+
+**Part 2 — `LOCAL_PROFILE.working_memory_tokens` made RAM-tiered, fail-closed.**
+§16.8's finding (no safe increase on this 16GB Mac) is a fact about *this machine*, not a formula for
+other RAM sizes — memory headroom doesn't scale linearly with total RAM (OS overhead, background
+apps, and the model's own fixed footprint don't scale with it either), so a 32GB budget needs its
+own measurement, not "300 × 2".
+
+`context_profile.py` now resolves `LOCAL_PROFILE.working_memory_tokens` at import time from
+detected total RAM (`psutil.virtual_memory().total` — a system-wide read, confirmed *not* subject to
+the per-process Metal/unified-memory RSS-undercount bug found in §16.8, since that bug is specific
+to per-process RSS, a different metric) against `_VALIDATED_LOCAL_TIERS`, a dict seeded with
+**exactly one entry: `{16: 300}`**, the §16.8 measurement. `resolve_local_working_memory_tokens()`
+fails closed: any RAM size without its own validated entry — above 16GB (e.g. 32GB) or below it —
+gets the same conservative 300-token value rather than an extrapolated guess, and logs clearly
+(`logger.warning`) that it did so, distinguishing "below the smallest validated tier" (more
+concerning — even the fallback is unproven at a smaller size) from "above the largest validated
+tier" (falling back to the smaller machine's known-safe number). A machine that actually matches the
+validated tier (within a 4GB margin, to absorb macOS's decimal-GB-vs-marketed-GiB rounding — this
+dev Mac reports `total=17.18GB` for hardware sold as "16GB") logs an informational match instead.
+
+**No 32GB (or other) tier was added — this ships the mechanism, not a second number.** The
+follow-up is explicit and small: re-run `diagnostics/diag_local_working_memory_ram_probe.py` (already
+backend- and machine-agnostic by construction, no changes needed) on real hardware of a new size and
+add the measured result to `_VALIDATED_LOCAL_TIERS`.
+
+**A real logging-visibility bug caught and fixed while wiring this in:** `context_profile.py` is
+imported (resolving `LOCAL_PROFILE` and logging the tier match/fallback) before `main.py`'s
+`lifespan()` calls `logging.basicConfig()` — Python's default no-handler-configured behavior only
+surfaces WARNING+ via a last-resort stderr handler, so the common-case INFO "matched validated
+tier" line would never reach the app's real log output, only the rarer WARNING fallback lines
+would (by accident, not design). Added `context_profile.log_local_working_memory_tier()`, called
+from `lifespan()` (alongside `check_local_ram_headroom()`) purely to re-emit the same resolution's
+log line after logging is actually configured, so it's genuinely visible at startup rather than
+lost to import ordering.
+
+**Test suite:** 871 passed / 0 failed, unchanged from §16.8's baseline (removed/updated assertions
+replaced 1:1, new tier-resolution tests added — `resolve_local_working_memory_tokens(16.0) == 300`,
+a sub-16GB input falls back to 300 with a warning log, and a 32GB input falls back to 300 with a
+distinct "no validated tier" warning log; deliberately no test asserts a specific 32GB token value).
+
+### §16.10 — `OMLXRuntimeClient` exposes `max_model_len` from `health_check()` (2026-07-19)
+
+`GET /v1/models` on oMLX returns a vLLM-compatible extension per model entry, `max_model_len` (the
+loaded model's real effective context window; can be `null`, e.g. for oMLX's markitdown
+pseudo-model entry). `health_check()`'s existing model-listing call now also locates the active
+chat model's entry and caches its `max_model_len` onto a new `self.max_model_len` instance
+attribute — the same plain-attribute pattern already used for `self.is_local`, not a new getter
+method, so callers read it the same way. `null` and a missing field are treated identically (both
+just mean "not reported") and fall back to a new `_DEFAULT_MAX_MODEL_LEN = 8192` module constant —
+a safe floor most local chat models meet or exceed — via an explicit `isinstance(x, int)` check
+rather than a falsy/truthy check, so a `0` or unexpected type can't silently pass through as if it
+were a real reported value. This value stays at the fallback until the first successful health
+check; nothing in this codebase calls `health_check()` synchronously before the first inference, so
+early requests use the fallback rather than blocking on one.
+
+This is the enabling change for §16.11 below — `context_profile.py`'s `LOCAL_PROFILE` budget is
+built directly from this value rather than from detected host RAM.
+
+**Test suite:** 878 passed / 0 failed (877 baseline + 1 net new — three new `health_check()` tests
+for the real-integer/null/missing-field cases, offset by no removals).
+
+### §16.11 — `LOCAL_PROFILE` retires RAM-tiering for a real per-model budget; `profile_for()` signature change (2026-07-19)
+
+§16.8/§16.9's RAM-tiered lookup (`_VALIDATED_LOCAL_TIERS`, `resolve_local_working_memory_tokens()`)
+is **retired outright, not re-measured or extended to a second tier.** It was confirmed to be
+measuring the wrong layer: oMLX runs as a separate process with its own paged KV cache and memory
+enforcer that already manages RAM dynamically per-machine, independent of total system RAM, so a
+host-RAM-keyed lookup was never actually bounding the thing that matters. §16.10's `max_model_len`
+gives a real, per-model, server-reported number to budget against instead.
+
+`LOCAL_PROFILE.working_memory_tokens` is now `max_model_len - 27,000`, floored at `300`. The
+27,000-token reservation is the same per-slot breakdown `CLOUD_PROFILE`'s docstring already used —
+session files up to 20K (`PromptBuilder._CEIL_SESSION_FILES_TOTAL`), persona/RAG/tool/graph/
+working-state slots combined ~3K, output generation ~4K — reused here because those slot ceilings
+are shared `PromptBuilder` constants, not backend-tier-dependent; unlike `CLOUD_PROFILE` there is no
+further "inexact context-length" safety margin stacked on top, since `max_model_len` is a value the
+server reports for the model it actually loaded, not an assumption. The 300-token floor exists so a
+small or unreported `max_model_len` (e.g. §16.10's own conservative fallback, before a health check
+or on an oMLX version that never reports the field) can't drive the reservation past the window and
+leave working memory at zero or negative — 300 is deliberately the same figure this profile used
+under the retired RAM-tiered approach, so the degraded case lands on a familiar, previously-live
+number rather than an untested new one. `working_memory_limit` is now `None` on **both** profiles —
+the local tier's fixed 5-turn cap is gone; the token budget above is the only real limiter, matching
+`CLOUD_PROFILE`'s existing pattern (that 5-turn number was never derived from anything about the
+model or the machine in the first place, just carried over unexamined from the original 300-token/
+5-turn pair).
+
+**`profile_for()`'s signature changed**, from `profile_for(is_local: bool)` to
+`profile_for(runtime: object)` — necessary, not cosmetic: the local budget now depends on a second
+live value, `runtime.max_model_len`, which can change after a runtime-backend swap
+(`POST /settings/runtime-backend`, §16.5/§16.6) or once the first health check completes, so
+`LOCAL_PROFILE` can no longer be a fixed module-level constant resolved once at import time — it's
+rebuilt fresh on every call from whatever the passed-in runtime currently reports. Both `is_local`
+and `max_model_len` are read via `getattr` with a documented fallback rather than direct attribute
+access: `is_local` defaults to `True` when absent (fails toward the more conservative tier, same
+posture as the pre-existing pattern this replaces); `max_model_len` defaults to
+`_LOCAL_MAX_MODEL_LEN_FALLBACK` (also `8192`) when absent *or present but not an int* — the
+`isinstance` guard matters concretely for test doubles: a bare `MagicMock`'s unconfigured attribute
+access returns another `MagicMock`, not an `AttributeError`, so a plain `getattr(..., default)`
+alone would silently pass a non-numeric value into the subtraction below and raise `TypeError` at
+call time — confirmed by a real test failure while wiring this in (`controller_agent.py`'s
+`_dispatch_conversational_with_empty_guard`, a separate method/scope from the primary
+`_execute_plan` call site, hadn't recomputed the runtime-type check it needed independently).
+
+`controller_agent.py`'s one call site (`profile_for(getattr(self._runtime, "is_local", True))` →
+`profile_for(self._runtime)`) and `main.py`'s startup log line (previously
+`log_local_working_memory_tier()`, now removed — logging the resolved profile no longer needs the
+import-time-vs-`logging.basicConfig()` ordering workaround §16.9 added, since `profile_for()` is no
+longer resolved at import time at all) were both updated accordingly.
+`check_local_ram_headroom()` **stays, but is now purely a startup observability log line** — its
+docstring is updated to say so explicitly; nothing that computes `working_memory_tokens` reads its
+return value any more.
+
+**Test suite:** 884 passed / 0 failed (878 baseline + 6 net new — `test_runtime_is_local.py`
+rewritten around a `_FakeRuntime` double covering the real-`max_model_len`, floor-triggering,
+missing-attribute, and non-int fallback cases plus an integration check against a real
+pre-health-check `OMLXRuntimeClient()`; `test_controller_phase4.py`'s
+`TestContextProfileTiering::test_local_runtime_keeps_5_turn_cap` — asserting the now-retired 5-turn
+cap — rewritten to assert token-budget trimming with no row cap instead).
+
+### §16.12 — oMLX real multi-turn `messages` array, and "Prompt too long" 400 recovery (2026-07-19)
+
+oMLX's own web UI sends a genuine multi-turn `messages` array — one leading system message, then
+one array entry per prior conversation turn, then the live query last — which is what lets its
+prefix cache reuse KV blocks turn-over-turn. `OMLXRuntimeClient.infer_stream()` previously packed
+the *entire* assembled prompt (including all flattened working-memory turns) into one system
+message + one user message, foreclosing that reuse for the working-memory portion of the prompt
+entirely; see §3.7d in `03-unified-prompt-contract.md` for the prompt-assembly side of this change
+and how it relates to §3.7b's speculative "future engine" framing.
+
+`infer()`/`infer_stream()` gained an oMLX-only `working_memory_turns: list[Turn] | None = None`
+keyword. This is invisible to Ollama/Foundry: `@runtime_checkable` Protocol conformance
+(`base_runtime_client.py`) only checks member *presence*, not signatures, so an extra optional
+parameter on one concrete client doesn't affect `isinstance()` checks against `BaseRuntimeClient`,
+and `conversational_agent.py` only ever passes this kwarg when
+`context["_prebuilt_working_memory_turns"]` is present — which `controller_agent.py` only sets when
+`isinstance(self._runtime, OMLXRuntimeClient)` is true (checked independently at both the primary
+`_execute_plan` call site and the separate-scope empty-answer retry path). Ollama/Foundry files have
+zero diff from this change.
+
+When provided, each turn becomes its own `messages` entry — chronological, oldest first — with
+`turn.role` mapped `"agent"` → `"assistant"` (`memory_manager.py`'s `add_agent_result()` stores
+`role="agent"`, the correct value everywhere else in this codebase — DB rows, `PromptBuilder`'s
+flattened `[WORKING MEMORY]` text — but not a role oMLX's OpenAI-compatible endpoint recognizes;
+mapped at this message-building boundary only). `None` (every non-oMLX call site) reproduces the
+prior single system+user message shape exactly.
+
+**"Prompt too long" 400 handling.** oMLX's `server.py` `validate_context_window()` 400s with a body
+shaped `{"detail": "Prompt too long: {N} tokens exceeds max context window of {M} tokens"}`. A new
+`_is_prompt_too_long_response()` matches on the distinctive `"Prompt too long:"` marker (JSON
+`detail` field first, falling back to raw response text) so this is distinguishable from every other
+400. On a match: drops the single oldest working-memory message from the outgoing array — tracked
+via a `working_memory_start_idx`, never the system message or the current query — and retries
+exactly once through a new shared `_post_chat_completion()` helper (factored out so the initial
+attempt and the retry use identical transport/error-normalization code). A second "Prompt too long"
+400 raises a clear, distinguishable `RuntimeError` (does not loop, does not drop a second turn); if
+there was no working-memory turn available to drop in the first place, the same clear error is
+raised immediately without attempting a retry. Any other non-200 (including a differently-shaped
+400) is untouched — same generic-error handling as before this change.
+
+**Test suite:** 888 passed / 0 failed (884 baseline + 4 net new, in
+`test_omlx_runtime_client_concurrency.py::TestPromptTooLongRetry` — normal 200 never triggers the
+retry path; a "Prompt too long" 400 then 200 drops exactly the oldest turn and returns the retried
+response; two "Prompt too long" 400s in a row raise a distinguishable error with no third attempt;
+a differently-shaped 400 falls through to the pre-existing generic-error path untouched). No live
+oMLX server was used for any of this — all HTTP is mocked, consistent with the rest of this suite
+per `CLAUDE.md`. Real end-to-end KV-cache-reuse verification (e.g. via oMLX's `/admin/api/cache/probe`,
+§3.7c) was not performed this session and remains an explicit open item.

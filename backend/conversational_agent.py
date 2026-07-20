@@ -231,35 +231,38 @@ class ConversationalAgent:
         on_token         = context.get("_on_token")
         prebuilt_prompt  = context.get("_prebuilt_prompt")
         prebuilt_system  = context.get("_prebuilt_system")
+        # Only ever set by controller_agent.py when the active runtime is
+        # OMLXRuntimeClient (see its emit_structured_working_memory wiring,
+        # prompt_builder.py). Every other runtime path leaves this key
+        # absent, so the kwarg below is simply never passed for them —
+        # their infer()/infer_stream() signatures are untouched.
+        prebuilt_working_memory_turns = context.get("_prebuilt_working_memory_turns")
 
         if prebuilt_prompt is not None:
             logger.debug(
                 "ConversationalAgent: using prebuilt prompt from controller "
                 "(chars=%d).", len(prebuilt_prompt),
             )
+            infer_kwargs: dict[str, Any] = dict(
+                prompt      = prebuilt_prompt,
+                system      = prebuilt_system or system,
+                max_tokens  = max_tokens,
+                temperature = temperature,
+                label       = "main_dispatch",
+            )
+            if prebuilt_working_memory_turns is not None:
+                infer_kwargs["working_memory_turns"] = prebuilt_working_memory_turns
             try:
                 if on_token is not None:
                     chunks: list[str] = []
                     _t0 = time.monotonic()
-                    for chunk in self._runtime.infer_stream(
-                        prompt      = prebuilt_prompt,
-                        system      = prebuilt_system or system,
-                        max_tokens  = max_tokens,
-                        temperature = temperature,
-                        label       = "main_dispatch",
-                    ):
+                    for chunk in self._runtime.infer_stream(**infer_kwargs):
                         on_token(chunk)
                         chunks.append(chunk)
                     answer = "".join(chunks)
                     _log_infer_throughput("main_dispatch", time.monotonic() - _t0, len(answer))
                 else:
-                    answer = self._runtime.infer(
-                        prompt      = prebuilt_prompt,
-                        system      = prebuilt_system or system,
-                        max_tokens  = max_tokens,
-                        temperature = temperature,
-                        label       = "main_dispatch",
-                    )
+                    answer = self._runtime.infer(**infer_kwargs)
             except Exception as exc:
                 logger.error(
                     "ConversationalAgent: inference failed (prebuilt path) "

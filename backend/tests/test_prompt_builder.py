@@ -527,3 +527,134 @@ class TestSlot6AWorkingState:
         assert tools_pos < ws_pos < wm_pos, (
             f"Slot 6A order wrong: tools={tools_pos} ws={ws_pos} wm={wm_pos}"
         )
+
+
+class TestEmitStructuredWorkingMemory:
+    """
+    Opt-in `emit_structured_working_memory=True` (default False): Slot 6
+    ([WORKING MEMORY]) is withheld from user_prompt and its trimmed turns
+    are returned as a third tuple element instead — additive, not a
+    replacement for the default flattened-text path (see the ~8 other
+    tests in this file and test_integration_phase7.py/test_controller_
+    phase4.py/test_tool_dispatcher_phase6.py/test_warmup_hook.py that call
+    build() without this flag and must keep asserting on flattened text
+    unmodified).
+    """
+
+    def _pb(self) -> PromptBuilder:
+        return PromptBuilder()
+
+    def test_default_false_still_returns_2_tuple_with_flattened_text(self):
+        """Sanity check: omitting the flag reproduces the pre-existing shape."""
+        pb = self._pb()
+        result = pb.build(
+            instruction      = "hello",
+            current_datetime = _FIXED_DT,
+            working_memory   = [Turn("user", "prior turn content")],
+        )
+        assert len(result) == 2
+        system_prompt, user_prompt = result
+        assert "[WORKING MEMORY]" in user_prompt
+        assert "prior turn content" in user_prompt
+
+    def test_true_omits_flattened_slot_and_returns_3_tuple(self):
+        pb = self._pb()
+        turns = [
+            Turn("user", "what is LORA?"),
+            Turn("assistant", "a local research assistant."),
+        ]
+        system_prompt, user_prompt, working_memory_turns = pb.build(
+            instruction      = "tell me more",
+            current_datetime = _FIXED_DT,
+            working_memory   = turns,
+            emit_structured_working_memory = True,
+        )
+        assert "[WORKING MEMORY]" not in user_prompt
+        assert "what is LORA?" not in user_prompt
+        assert "a local research assistant." not in user_prompt
+        # Everything else (e.g. the instruction) is still present as normal.
+        assert "[INSTRUCTION]" in user_prompt
+        assert "tell me more" in user_prompt
+
+        assert working_memory_turns == turns
+
+    def test_true_preserves_chronological_order(self):
+        pb = self._pb()
+        turns = [Turn("user", f"turn-{i}") for i in range(5)]
+        _, _, working_memory_turns = pb.build(
+            instruction      = "x",
+            current_datetime = _FIXED_DT,
+            working_memory   = turns,
+            emit_structured_working_memory = True,
+        )
+        assert [t.content for t in working_memory_turns] == [
+            "turn-0", "turn-1", "turn-2", "turn-3", "turn-4",
+        ]
+
+    def test_true_trims_oldest_first_against_ceiling(self):
+        """
+        Same drop-oldest-first ceiling enforcement as the flattened path
+        (_slot6_working_memory), just returned as Turn objects instead of
+        rendered text. Mirrors test_integration_phase7.py's ceiling-trim
+        scenario but asserts on the structured list, not substring text.
+        """
+        pb = self._pb()
+        # Each turn line is comfortably over 100 chars once formatted
+        # ("Turn -N [user]: " + padding), so a tight ceiling forces drops.
+        padding = "x" * 100
+        turns = [Turn("user", f"turn-{i}-{padding}") for i in range(10)]
+
+        _, user_prompt, working_memory_turns = pb.build(
+            instruction             = "x",
+            current_datetime        = _FIXED_DT,
+            working_memory          = turns,
+            working_memory_ceiling  = 50,   # 200 chars — only the newest turns fit
+            emit_structured_working_memory = True,
+        )
+
+        assert "[WORKING MEMORY]" not in user_prompt
+        assert len(working_memory_turns) < len(turns)
+        # Oldest dropped first: whatever survives must be a chronological
+        # (contiguous, order-preserved) suffix of the original list ending
+        # at the newest turn.
+        assert working_memory_turns == turns[-len(working_memory_turns):]
+        assert turns[-1] in working_memory_turns   # newest always survives
+        assert turns[0] not in working_memory_turns   # oldest dropped first
+
+    def test_true_with_no_turns_returns_empty_list(self):
+        pb = self._pb()
+        _, user_prompt, working_memory_turns = pb.build(
+            instruction      = "x",
+            current_datetime = _FIXED_DT,
+            working_memory   = None,
+            emit_structured_working_memory = True,
+        )
+        assert "[WORKING MEMORY]" not in user_prompt
+        assert working_memory_turns == []
+
+    def test_true_matches_flattened_path_trim_count(self):
+        """
+        The structured path and the flattened path must trim identically —
+        same ceiling, same survivors — since both delegate to
+        _trim_working_memory() internally.
+        """
+        pb = self._pb()
+        padding = "x" * 100
+        turns = [Turn("user", f"turn-{i}-{padding}") for i in range(10)]
+
+        _, flattened_prompt = pb.build(
+            instruction            = "x",
+            current_datetime       = _FIXED_DT,
+            working_memory         = turns,
+            working_memory_ceiling = 50,
+        )
+        _, _, working_memory_turns = pb.build(
+            instruction            = "x",
+            current_datetime       = _FIXED_DT,
+            working_memory         = turns,
+            working_memory_ceiling = 50,
+            emit_structured_working_memory = True,
+        )
+
+        surviving_count = sum(1 for i in range(len(turns)) if f"turn-{i}-" in flattened_prompt)
+        assert len(working_memory_turns) == surviving_count

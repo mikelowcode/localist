@@ -830,32 +830,39 @@ class TestWorkingMemoryPath:
 
 class TestContextProfileTiering:
     """
-    Local runtimes (is_local truthy — including the MagicMock default used
-    by every other test in this file) must keep today's 5-turn/300-token
-    Working Memory cap byte-identical. A cloud runtime (is_local=False)
-    must remove the turn-count cap entirely and let many more turns survive.
+    Neither tier caps by turn count any more (working_memory_limit=None on
+    both LOCAL_PROFILE and CLOUD_PROFILE — context_profile.py). Local
+    runtimes (is_local truthy — including the MagicMock default used by
+    every other test in this file) are now budgeted from the runtime's
+    max_model_len instead of a fixed row count; a MagicMock's unconfigured
+    `max_model_len` attribute isn't a real int, so profile_for() falls back
+    to its conservative default and floors at 300 tokens (see
+    context_profile.py's _LOCAL_MAX_MODEL_LEN_FALLBACK /
+    _LOCAL_WORKING_MEMORY_FLOOR_TOKENS) — small enough to still trim old
+    turns by token budget, just no longer by row count.
     """
 
-    def test_local_runtime_keeps_5_turn_cap(self, mm):
+    def test_local_runtime_trims_by_token_budget_not_row_count(self, mm):
         rt = make_runtime(infer_return="no")
         rt.is_local = True   # explicit, though MagicMock's default is already truthy
         conv = make_conv_agent("Answer.")
         ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
 
-        task_id = "local-tier-cap-test"
-        for i in range(7):
-            mm.add(role="user", content=f"turn-marker-{i}", task_id=task_id)
+        task_id = "local-tier-token-trim-test"
+        # Long enough per-turn that the 300-token floor (not a row count)
+        # is what trims the oldest ones — a plain "turn-marker-N" alone is
+        # short enough that even 60 of them fit inside 300 tokens.
+        padding = "x" * 100
+        for i in range(20):
+            mm.add(role="user", content=f"turn-marker-{i}-{padding}", task_id=task_id)
 
         ctrl.handle_task({"task_id": task_id, "instruction": "Continue."})
 
         prompt = conv._received[0].context["_prebuilt_prompt"]
-        # The 5-row limit also counts the just-logged current-turn row, so
-        # only the newest 4 of the 7 prior markers fit alongside it.
-        assert "turn-marker-0" not in prompt
-        assert "turn-marker-1" not in prompt
-        assert "turn-marker-2" not in prompt
-        for i in range(3, 7):
-            assert f"turn-marker-{i}" in prompt
+        # No row-count cap: it's the 300-token ceiling, not "keep the last
+        # 5 rows", that drops the oldest markers here.
+        assert "turn-marker-0-" not in prompt
+        assert "turn-marker-19-" in prompt
 
     def test_cloud_runtime_removes_turn_cap(self, mm):
         rt = make_runtime(infer_return="no")

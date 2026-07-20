@@ -141,6 +141,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from base_runtime_client import BaseRuntimeClient
 from build_graph import build_graph
+from context_profile import check_local_ram_headroom, profile_for
 from controller_agent import ControllerAgent, TaskStatus, _MEMORY_MD_PATH
 from conversational_agent import ConversationalAgent
 from embedding_engine import EmbeddingEngine
@@ -530,6 +531,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             settings.runtime_backend.upper(),
             health.get("base_url"),
         )
+
+    if getattr(runtime, "is_local", True):
+        local_profile = profile_for(runtime)
+        logger.info(
+            "LOCAL_PROFILE working_memory_tokens=%d (max_model_len=%s)",
+            local_profile.working_memory_tokens,
+            getattr(runtime, "max_model_len", "unknown"),
+        )
+        ram = check_local_ram_headroom()
+        if ram["warning"]:
+            logger.warning(
+                "LOCAL_PROFILE RAM headroom check: %s — this machine's current "
+                "load matches the swap-under-load condition measured 2026-07-19 "
+                "(see diagnostics/reports/local_working_memory_ram_findings.md); "
+                "expect swap activity under the working-memory ceiling.",
+                ram["message"],
+            )
+        else:
+            logger.info("LOCAL_PROFILE RAM headroom check: %s", ram["message"])
 
     # -- Resolve path defaults -----------------------------------------------
 

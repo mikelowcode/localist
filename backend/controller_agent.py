@@ -48,6 +48,7 @@ from planner import Planner as _RulePlanner, RoutingPlan
 from pathlib import Path
 from prompt_builder import PromptBuilder, Turn, EpisodeBullet, RagSource, UserProfileFact, GraphQueryResult, GraphLinkEntry, WorkingMemoryState
 from context_profile import profile_for
+from omlx_runtime_client import OMLXRuntimeClient
 from memory_manager import (
     EpisodicMemoryWriter,
     EpisodicMemoryReader,
@@ -1480,13 +1481,15 @@ class ControllerAgent:
                 )
 
         # -- Step 6: PromptBuilder assembly ----------------------------------
-        # Backend-tier-aware ceiling (context_profile.py): local runtimes keep
-        # today's 5-turn/300-token cap; a cloud runtime (Ollama Cloud) removes
-        # the turn cap and raises the token ceiling, since the host Mac's RAM
-        # is no longer what's holding the KV cache. `is_local` defaults to
-        # True when absent so any test double lacking the attribute keeps
-        # today's behavior rather than silently falling into the cloud tier.
-        context_profile = profile_for(getattr(self._runtime, "is_local", True))
+        # Backend-tier-aware ceiling (context_profile.py): local runtimes are
+        # budgeted from the active model's real max_model_len (oMLX health
+        # check); a cloud runtime (Ollama Cloud) uses a fixed ~128K-based
+        # budget instead, since the host Mac's RAM is no longer what's
+        # holding the KV cache. profile_for() takes the runtime client
+        # itself (not just its `is_local` flag) because the local budget
+        # also depends on the live `max_model_len` value — see its
+        # docstring for the defaulting behavior when either is absent.
+        context_profile = profile_for(self._runtime)
 
         working_turns: list[Turn] = []
         try:
@@ -1502,7 +1505,15 @@ class ControllerAgent:
         except Exception as exc:
             logger.debug("_execute_plan: working memory fetch failed (%s).", exc)
 
-        system_prompt, user_prompt = _PROMPT_BUILDER.build(
+        # emit_structured_working_memory is opt-in and, today, oMLX-only:
+        # every other runtime client (Ollama, Foundry) keeps consuming the
+        # flattened [WORKING MEMORY] text inside user_prompt exactly as
+        # before. The oMLX request-building side that will actually consume
+        # working_memory_turns as discrete messages is a later step — this
+        # just makes the structured turns available on the subtask context.
+        _use_structured_working_memory = isinstance(self._runtime, OMLXRuntimeClient)
+
+        _build_kwargs = dict(
             instruction      = task.instruction,
             current_datetime = datetime.now().astimezone(),
             persona          = self._load_persona(),
@@ -1525,6 +1536,13 @@ class ControllerAgent:
             working_memory_ceiling = context_profile.working_memory_tokens,
             session_files    = _session_files.get_files() or None,
         )
+        if _use_structured_working_memory:
+            system_prompt, user_prompt, working_memory_turns = _PROMPT_BUILDER.build(
+                **_build_kwargs, emit_structured_working_memory=True,
+            )
+        else:
+            system_prompt, user_prompt = _PROMPT_BUILDER.build(**_build_kwargs)
+            working_memory_turns = None
 
         logger.debug(
             "_execute_plan: prompt assembled — "
@@ -1587,6 +1605,12 @@ class ControllerAgent:
         }
         if on_token is not None:
             subtask_context["_on_token"] = on_token
+        if working_memory_turns is not None:
+            # Only set on the oMLX path (emit_structured_working_memory=True
+            # above) — the discrete-message request-building side that
+            # consumes this is a later step; every other runtime never sets
+            # this key and is unaffected.
+            subtask_context["_prebuilt_working_memory_turns"] = working_memory_turns
         if plan.diff_target is not None:
             # Priority 1b (diff-only wiki update) — resolved target page
             # stem, consumed by WikiAgent.run()'s dispatch branch as
@@ -1998,6 +2022,10 @@ class ControllerAgent:
         decided, and writes it exactly once.
         """
         agent = self._agents[subtask.agent_name]
+        # Recomputed here (not shared from _execute_plan) — this method has
+        # its own scope; see the identical flag/comment at the primary
+        # build() call site in _execute_plan for why oMLX-only.
+        _use_structured_working_memory = isinstance(self._runtime, OMLXRuntimeClient)
 
         def _run(st: SubTask) -> AgentResult:
             logger.info("Dispatching subtask %s to '%s'.", st.subtask_id, agent.name)
@@ -2041,7 +2069,7 @@ class ControllerAgent:
                         context       = task.context,
                     )
 
-                    retry_system, retry_prompt = _PROMPT_BUILDER.build(
+                    _retry_build_kwargs = dict(
                         instruction      = task.instruction,
                         current_datetime = datetime.now().astimezone(),
                         persona          = self._load_persona(),
@@ -2063,20 +2091,30 @@ class ControllerAgent:
                         working_memory   = working_turns  or None,
                         session_files    = _session_files.get_files() or None,
                     )
+                    if _use_structured_working_memory:
+                        retry_system, retry_prompt, retry_working_memory_turns = _PROMPT_BUILDER.build(
+                            **_retry_build_kwargs, emit_structured_working_memory=True,
+                        )
+                    else:
+                        retry_system, retry_prompt = _PROMPT_BUILDER.build(**_retry_build_kwargs)
+                        retry_working_memory_turns = None
 
                     retry_sources = [s.path for s in rag_sources] + [
                         f"session://{sf.filename}" for sf in _session_files.get_files()
                     ]
+                    retry_context = {
+                        **subtask.context,
+                        "_prebuilt_prompt":  retry_prompt,
+                        "_prebuilt_system":  retry_system,
+                        "_prebuilt_sources": retry_sources,
+                    }
+                    if retry_working_memory_turns is not None:
+                        retry_context["_prebuilt_working_memory_turns"] = retry_working_memory_turns
                     retry_subtask = SubTask(
                         subtask_id  = subtask.subtask_id,
                         agent_name  = subtask.agent_name,
                         instruction = task.instruction,
-                        context     = {
-                            **subtask.context,
-                            "_prebuilt_prompt":  retry_prompt,
-                            "_prebuilt_system":  retry_system,
-                            "_prebuilt_sources": retry_sources,
-                        },
+                        context     = retry_context,
                     )
                     retry_result = _run(retry_subtask)
                     if (

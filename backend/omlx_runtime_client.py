@@ -56,6 +56,7 @@ import requests
 # Reuse the SSE chunk iterator from FoundryRuntimeClient — the wire
 # format is identical (OpenAI-compatible SSE envelope).
 from foundry_runtime_client import _iter_sse_chunks
+from prompt_builder import Turn
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,52 @@ DEFAULT_CHAT_MODEL      = "gemma-4-e4b-it-4bit"
 # raises NotImplementedError to give a clear signal rather than a bad request.
 DEFAULT_EMBEDDING_MODEL = ""
 
+# Conservative fallback context window (tokens) for the active chat model,
+# used when GET /v1/models doesn't report max_model_len for it — either the
+# field is missing entirely (older oMLX version) or present but null (oMLX
+# returns null for some entries, e.g. its markitdown pseudo-model). 8192 is
+# a safe floor most local chat models meet or exceed, so under-reporting
+# here costs some working-memory budget rather than causing an over-length
+# request the server would reject.
+_DEFAULT_MAX_MODEL_LEN = 8192
+
+# conversation_log stores role="agent" for completed agent turns
+# (memory_manager.py's add_agent_result()), not "assistant" — but oMLX's
+# OpenAI-compatible /v1/chat/completions only recognizes system/user/
+# assistant/tool. Map at the message-building boundary rather than
+# upstream, since "agent" is the correct value everywhere else (DB rows,
+# PromptBuilder's flattened [WORKING MEMORY] text) and this endpoint is the
+# only place that needs the OpenAI vocabulary.
+_TURN_ROLE_TO_MESSAGE_ROLE = {"agent": "assistant"}
+
+# oMLX's server.py validate_context_window() 400s with a JSON body shaped
+# like {"detail": "Prompt too long: {N} tokens exceeds max context window
+# of {M} tokens"}. Matched as a substring (not equality) since the token
+# counts inside it vary per request.
+_PROMPT_TOO_LONG_MARKER = "Prompt too long:"
+
+
+def _is_prompt_too_long_response(response: "requests.Response") -> bool:
+    """
+    True if `response` is oMLX's specific 400 "Prompt too long" error.
+
+    Tries the standard FastAPI HTTPException JSON shape
+    ({"detail": "..."}) first; falls back to scanning the raw response
+    text in case the body isn't valid JSON or isn't in that shape, so a
+    differently-wrapped error still matches on the same distinctive
+    marker string rather than silently falling through to the generic
+    non-200 handler.
+    """
+    if response.status_code != 400:
+        return False
+    try:
+        detail = str(response.json().get("detail", ""))
+    except Exception:
+        detail = ""
+    if _PROMPT_TOO_LONG_MARKER in detail:
+        return True
+    return _PROMPT_TOO_LONG_MARKER in response.text
+
 
 # ---------------------------------------------------------------------------
 # OMLXRuntimeClient
@@ -115,6 +162,13 @@ class OMLXRuntimeClient:
         def embed(self, text) -> list[float]
         def infer_stream(self, prompt, system, max_tokens, temperature)
                -> Generator[str, None, None]
+
+    infer()/infer_stream() also accept an oMLX-only `working_memory_turns`
+    keyword (not part of the Protocol — @runtime_checkable Protocol
+    conformance only checks for member presence, not signatures, so this
+    extra optional parameter doesn't affect isinstance() checks against
+    BaseRuntimeClient). See infer_stream()'s docstring for the full
+    contract; Ollama/Foundry never receive this keyword and are unaffected.
 
     Parameters
     ----------
@@ -148,6 +202,12 @@ class OMLXRuntimeClient:
         # tier's relaxed context-window ceilings (context_profile.py).
         self.is_local = True
 
+        # Populated from GET /v1/models by health_check(); until the first
+        # successful health check, or if the server never reports
+        # max_model_len for this model, this stays at the conservative
+        # fallback (see _DEFAULT_MAX_MODEL_LEN).
+        self.max_model_len = _DEFAULT_MAX_MODEL_LEN
+
         self._chat_endpoint  = self._base_url + _CHAT_COMPLETIONS_PATH
         self._embed_endpoint = self._base_url + _EMBEDDINGS_PATH
 
@@ -170,6 +230,7 @@ class OMLXRuntimeClient:
         temperature: float = 0.2,
         label:       str   = "",
         timeout:     float | None = None,
+        working_memory_turns: list[Turn] | None = None,
     ) -> str:
         """
         Request a blocking chat completion from oMLX via SSE accumulation.
@@ -189,6 +250,9 @@ class OMLXRuntimeClient:
         timeout:
             Optional per-call override, in seconds, forwarded to
             infer_stream(). None (default) uses self._stream_timeout.
+        working_memory_turns:
+            Optional structured conversation history (see infer_stream()'s
+            docstring for the full contract). Forwarded as-is.
 
         Returns
         -------
@@ -207,6 +271,7 @@ class OMLXRuntimeClient:
             temperature = temperature,
             label       = label,
             timeout     = timeout,
+            working_memory_turns = working_memory_turns,
         ))
         result = "".join(chunks)
         logger.debug("infer() ← %d chars received.", len(result))
@@ -290,6 +355,49 @@ class OMLXRuntimeClient:
         logger.debug("embed() ← vector dim=%d", len(vector))
         return vector
 
+    def _post_chat_completion(
+        self,
+        messages:    list[dict],
+        max_tokens:  int,
+        temperature: float,
+        timeout:     float,
+    ) -> "requests.Response":
+        """
+        POST one /v1/chat/completions request and normalize transport
+        failures to RuntimeError. Shared by infer_stream()'s initial
+        attempt and its single "Prompt too long" retry so both use
+        identical error handling.
+        """
+        payload = {
+            "model":       self._chat_model,
+            "messages":    messages,
+            "stream":      True,
+            "max_tokens":  max_tokens,
+            "temperature": temperature,
+        }
+        # TODO(omlx): If oMLX requires additional request headers (e.g. an
+        # Authorization token or a custom Accept header), add them here.
+        headers = {"Content-Type": "application/json"}
+
+        try:
+            return requests.post(
+                self._chat_endpoint,
+                headers = headers,
+                data    = json.dumps(payload),
+                stream  = True,
+                timeout = timeout,
+            )
+        except requests.ConnectionError as exc:
+            raise RuntimeError(
+                f"Cannot reach oMLX at {self._chat_endpoint}. "
+                f"Is the service running?  Detail: {exc}"
+            ) from exc
+        except requests.Timeout:
+            raise RuntimeError(
+                f"oMLX did not respond within {timeout}s "
+                f"(endpoint: {self._chat_endpoint})."
+            )
+
     def infer_stream(
         self,
         prompt:      str,
@@ -298,6 +406,7 @@ class OMLXRuntimeClient:
         temperature: float = 0.2,
         label:       str   = "",
         timeout:     float | None = None,
+        working_memory_turns: list[Turn] | None = None,
     ) -> Generator[str, None, None]:
         """
         Request a streaming chat completion from oMLX.
@@ -323,6 +432,18 @@ class OMLXRuntimeClient:
             Optional per-call override for the request timeout, in
             seconds. None (default) uses self._stream_timeout, unchanged
             from before this parameter was added (2026-07-17).
+        working_memory_turns:
+            Optional structured, chronologically-ordered (oldest first)
+            conversation history — the third element of PromptBuilder.
+            build()'s return value when called with
+            emit_structured_working_memory=True (controller_agent.py's
+            oMLX-only call path; see prompt_builder.py). When provided,
+            each turn becomes its own message in the outgoing `messages`
+            array (mirroring how oMLX's own web UI sends history, one
+            array entry per turn, so oMLX's prefix cache can reuse KV
+            blocks turn-over-turn) instead of being flattened into
+            `prompt`'s text. None (default, used by every other call site)
+            reproduces today's single system+user message shape exactly.
 
         Yields
         ------
@@ -332,32 +453,33 @@ class OMLXRuntimeClient:
         Raises
         ------
         RuntimeError
-            On any network error, non-200 status, or SSE decode failure.
+            On any network error, non-200 status, SSE decode failure, or
+            an oMLX "Prompt too long" 400 that persists after the single
+            oldest-turn-drop retry described below.
         """
-        messages = []
+        messages: list[dict] = []
         if system:
             messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
 
-        payload = {
-            "model":       self._chat_model,
-            "messages":    messages,
-            "stream":      True,
-            "max_tokens":  max_tokens,
-            "temperature": temperature,
-        }
+        # Index of the first working-memory message (or, if there are none,
+        # the index the final current-query message below will land at) —
+        # used by the "Prompt too long" retry to identify which entry is
+        # the single oldest conversation-log turn, never the system message
+        # or the current query.
+        working_memory_start_idx = len(messages)
+        for turn in working_memory_turns or []:
+            role = _TURN_ROLE_TO_MESSAGE_ROLE.get(turn.role, turn.role)
+            messages.append({"role": role, "content": turn.content})
 
-        # TODO(omlx): If oMLX requires additional request headers (e.g. an
-        # Authorization token or a custom Accept header), add them here.
-        headers = {"Content-Type": "application/json"}
+        messages.append({"role": "user", "content": prompt})   # current query — always last
 
         effective_timeout = timeout if timeout is not None else self._stream_timeout
 
         logger.debug(
             "infer_stream() → %s  max_tokens=%d  temp=%.2f  prompt_chars=%d  "
-            "label=%s  timeout=%.1fs",
-            self._chat_endpoint, max_tokens, temperature, len(prompt), label,
-            effective_timeout,
+            "working_memory_turns=%d  label=%s  timeout=%.1fs",
+            self._chat_endpoint, max_tokens, temperature, len(prompt),
+            len(working_memory_turns or []), label, effective_timeout,
         )
 
         global _inflight_count
@@ -369,24 +491,38 @@ class OMLXRuntimeClient:
                 )
             _inflight_count += 1
             try:
-                try:
-                    response = requests.post(
-                        self._chat_endpoint,
-                        headers = headers,
-                        data    = json.dumps(payload),
-                        stream  = True,
-                        timeout = effective_timeout,
+                response = self._post_chat_completion(
+                    messages, max_tokens, temperature, effective_timeout,
+                )
+
+                if response.status_code == 400 and _is_prompt_too_long_response(response):
+                    # Only the current-query message (and possibly a system
+                    # message) remain before working_memory_start_idx —
+                    # there is no conversation-log turn left to shed.
+                    if working_memory_start_idx >= len(messages) - 1:
+                        raise RuntimeError(
+                            f"oMLX: prompt too long and no working-memory turn "
+                            f"left to drop (endpoint: {self._chat_endpoint}): "
+                            f"{response.text[:400]}"
+                        )
+
+                    dropped = messages.pop(working_memory_start_idx)
+                    logger.warning(
+                        "oMLX returned 'Prompt too long' — dropping the oldest "
+                        "working-memory turn (role=%s, %d chars) and retrying "
+                        "once — label=%s.",
+                        dropped["role"], len(dropped["content"]), label,
                     )
-                except requests.ConnectionError as exc:
-                    raise RuntimeError(
-                        f"Cannot reach oMLX at {self._chat_endpoint}. "
-                        f"Is the service running?  Detail: {exc}"
-                    ) from exc
-                except requests.Timeout:
-                    raise RuntimeError(
-                        f"oMLX did not respond within {effective_timeout}s "
-                        f"(endpoint: {self._chat_endpoint})."
+                    response = self._post_chat_completion(
+                        messages, max_tokens, temperature, effective_timeout,
                     )
+                    if response.status_code == 400 and _is_prompt_too_long_response(response):
+                        raise RuntimeError(
+                            f"oMLX: prompt still too long after dropping the "
+                            f"oldest working-memory turn — not retrying further "
+                            f"(endpoint: {self._chat_endpoint}): "
+                            f"{response.text[:400]}"
+                        )
 
                 if response.status_code != 200:
                     raise RuntimeError(
@@ -574,6 +710,11 @@ class OMLXRuntimeClient:
         (not applicable), False when configured but not found, True when
         found.
 
+        As a side effect, also refreshes self.max_model_len from the active
+        chat model's max_model_len field (oMLX's vLLM-compatible extension
+        to GET /v1/models), when present and non-null — see
+        _DEFAULT_MAX_MODEL_LEN for the fallback behaviour.
+
         Does not raise — all failures are captured in the returned dict.
         """
         result: dict = {
@@ -591,8 +732,9 @@ class OMLXRuntimeClient:
                 timeout=self._request_timeout,
             )
             resp.raise_for_status()
-            data   = resp.json()
-            models = [m["id"] for m in data.get("data", [])]
+            data    = resp.json()
+            entries = data.get("data", [])
+            models  = [m["id"] for m in entries]
             result.update({
                 "reachable":        True,
                 "models":           models,
@@ -602,6 +744,20 @@ class OMLXRuntimeClient:
                     if self._embedding_model else None
                 ),
             })
+
+            chat_entry = next(
+                (m for m in entries if m.get("id") == self._chat_model), None
+            )
+            if chat_entry is not None:
+                max_model_len = chat_entry.get("max_model_len")
+                # Missing field and explicit null both fall back to the
+                # conservative default — treated identically per oMLX's
+                # contract (null just means "not reported", same as absent).
+                self.max_model_len = (
+                    max_model_len
+                    if isinstance(max_model_len, int)
+                    else _DEFAULT_MAX_MODEL_LEN
+                )
         except Exception as exc:
             result["error"] = str(exc)
             logger.warning("OMLXRuntimeClient health_check() failed: %s", exc)

@@ -135,6 +135,13 @@ class PromptBuilder:
                         when graph_result is not None, even with zero links —
                         see _slot_graph() for the full contract.
 
+    Opt-in third return value: passing `emit_structured_working_memory=True`
+    omits Slot 6 ([WORKING MEMORY]) from user_prompt and instead returns it
+    as a third tuple element — a trimmed, chronological list[Turn] — so a
+    caller can send each turn as its own discrete message instead of
+    flattened text. Default is False, which reproduces today's 2-tuple
+    behavior exactly; see build()'s own docstring for the full contract.
+
     Invariants
     ----------
     - Stateless. Safe to call from multiple threads concurrently.
@@ -594,6 +601,53 @@ class PromptBuilder:
 
         return "\n".join(lines)
 
+    def _trim_working_memory(
+        self,
+        turns:   list[Turn] | None,
+        ceiling: int | None = None,
+    ) -> list[Turn]:
+        """
+        Return the chronologically-ordered (oldest surviving first) subset
+        of `turns` that fits within Slot 6's token ceiling — the exact same
+        drop-oldest-first algorithm _slot6_working_memory() uses to build
+        its flattened text, factored out so build()'s structured-turns
+        return path (see `emit_structured_working_memory`) trims identically
+        without ever rendering to text.
+
+        Each turn is formatted the same way (`Turn {offset} [{role}]:
+        {content}`) purely to measure size for the ceiling check; the
+        returned list is the original Turn objects, not formatted strings.
+
+        ceiling : None (default) uses the class's `_CEIL_WORKING` constant
+            (300). Same parameter contract as _slot6_working_memory()'s
+            `ceiling` — see that method's docstring.
+
+        Returns [] if turns is None or empty.
+        """
+        if not turns:
+            return []
+
+        formatted: list[str] = []
+        for i, turn in enumerate(turns):
+            offset = -(len(turns) - i)   # -N … -1
+            if turn.role == "tool" and turn.label:
+                role_str = f"tool:{turn.label}"
+            else:
+                role_str = turn.role
+            formatted.append(f"Turn {offset} [{role_str}]: {turn.content}")
+
+        surviving = list(turns)
+        effective_ceiling = ceiling if ceiling is not None else self._CEIL_WORKING
+        max_chars = effective_ceiling * 4
+        while formatted:
+            total = sum(len(f) for f in formatted)
+            if total <= max_chars:
+                break
+            formatted.pop(0)
+            surviving.pop(0)
+
+        return surviving
+
     def _slot6_working_memory(
         self,
         turns:   list[Turn] | None,
@@ -609,7 +663,8 @@ class PromptBuilder:
             Turn -1 [role]: content
 
         Turns are listed chronologically (oldest surviving first, newest last).
-        The token ceiling is enforced by dropping oldest turns first.
+        The token ceiling is enforced by dropping oldest turns first (see
+        _trim_working_memory(), which this method delegates the trimming to).
         Each turn is formatted as a single line before ceiling enforcement.
 
         Parameters
@@ -626,32 +681,20 @@ class PromptBuilder:
 
         Returns "" if turns is None or empty.
         """
-        if not turns:
+        surviving = self._trim_working_memory(turns, ceiling)
+        if not surviving:
             return ""
 
-        # Format all turns first
-        formatted: list[str] = []
-        for i, turn in enumerate(turns):
-            offset = -(len(turns) - i)   # -N … -1
+        lines: list[str] = []
+        for i, turn in enumerate(surviving):
+            offset = -(len(surviving) - i)   # -N … -1
             if turn.role == "tool" and turn.label:
                 role_str = f"tool:{turn.label}"
             else:
                 role_str = turn.role
-            formatted.append(f"Turn {offset} [{role_str}]: {turn.content}")
+            lines.append(f"Turn {offset} [{role_str}]: {turn.content}")
 
-        # Enforce token ceiling: drop oldest until budget is met
-        effective_ceiling = ceiling if ceiling is not None else self._CEIL_WORKING
-        max_chars = effective_ceiling * 4
-        while formatted:
-            total = sum(len(f) for f in formatted)
-            if total <= max_chars:
-                break
-            formatted.pop(0)
-
-        if not formatted:
-            return ""
-
-        body = "\n".join(formatted)
+        body = "\n".join(lines)
         return f"[WORKING MEMORY]\n{body}"
 
     def _slot7_instruction(self, instruction: str) -> str:
@@ -683,7 +726,8 @@ class PromptBuilder:
         working_state:    WorkingMemoryState       | None = None,
         working_memory:   list[Turn]               | None = None,
         working_memory_ceiling: int                | None = None,
-    ) -> tuple[str, str]:
+        emit_structured_working_memory: bool = False,
+    ) -> tuple[str, str] | tuple[str, str, list[Turn]]:
         """
         Assemble the canonical 7-slot prompt.
 
@@ -746,10 +790,23 @@ class PromptBuilder:
             passed into `MemoryManager.get_context_window()`, since that
             call and this ceiling are two independent truncation passes
             over the same data.
+        emit_structured_working_memory :
+            Opt-in, default False. When False, behavior is completely
+            unchanged from before this parameter existed: Slot 6 flattens
+            `working_memory` into the [WORKING MEMORY] block inside
+            `user_prompt`, exactly as always, and build() returns the
+            (system_prompt, user_prompt) 2-tuple below. When True, Slot 6
+            is OMITTED from `user_prompt` entirely (so a caller that also
+            wants the turns structured — e.g. to send each as its own
+            message — doesn't get the same content twice), and build()
+            returns a 3-tuple instead, with the trimmed working-memory
+            turns as the third element. Every existing caller that doesn't
+            pass this flag is unaffected — see Returns below.
 
         Returns
         -------
         (system_prompt, user_prompt) : tuple[str, str]
+            Returned when emit_structured_working_memory=False (default).
             system_prompt : Slot 1a + optional 1b. Pass as `system=` to
                             the runtime.
             user_prompt   : [SESSION FILES] (when present) followed by
@@ -759,8 +816,26 @@ class PromptBuilder:
                             when profile_facts are provided. Slot 5b
                             ([GRAPH RESULT]) is always rendered when
                             graph_result is not None; see _slot_graph().
+        (system_prompt, user_prompt, working_memory_turns) : tuple[str, str, list[Turn]]
+            Returned when emit_structured_working_memory=True.
+            system_prompt : same as above.
+            user_prompt   : same as above, EXCEPT Slot 6 ([WORKING MEMORY])
+                            is never included.
+            working_memory_turns : the same turns Slot 6 would otherwise
+                            have flattened, trimmed against the same
+                            ceiling (working_memory_ceiling, or
+                            `_CEIL_WORKING` when None), chronologically
+                            ordered oldest-first. [] when `working_memory`
+                            is None/empty or nothing survives the ceiling.
         """
         system_prompt = self._slot1_system(persona)
+
+        working_memory_turns: list[Turn] | None = None
+        if emit_structured_working_memory:
+            working_memory_turns = self._trim_working_memory(working_memory, working_memory_ceiling)
+            working_memory_slot = ""
+        else:
+            working_memory_slot = self._slot6_working_memory(working_memory, working_memory_ceiling)
 
         slots = [
             self._slot_datetime(current_datetime),      # unnumbered — always first
@@ -771,9 +846,12 @@ class PromptBuilder:
             self._slot5a_tool_failures(tool_failures),
             self._slot_graph(graph_result),
             self._slot6a_working_state(working_state),
-            self._slot6_working_memory(working_memory, working_memory_ceiling),
+            working_memory_slot,
             self._slot7_instruction(instruction),
         ]
 
         user_prompt = "\n\n".join(s for s in slots if s)
+
+        if emit_structured_working_memory:
+            return system_prompt, user_prompt, working_memory_turns
         return system_prompt, user_prompt

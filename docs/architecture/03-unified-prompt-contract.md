@@ -448,33 +448,53 @@ only applies to rendering.
 
 **Purpose:** The immediate conversational context. What just happened.
 
-**Token ceiling: backend-tier-aware, added 2026-07-18 (`context_profile.py`).**
+**Token ceiling: backend-tier-aware, added 2026-07-18 (`context_profile.py`),
+budget mechanism corrected 2026-07-19 (§16.11).**
 The ceiling below was previously one hardcoded global constant; it now
-comes from a `ContextProfile` resolved once per turn from the active
-runtime client's `is_local` flag (`base_runtime_client.py`) —
-`ControllerAgent._execute_plan()` calls `profile_for(self._runtime.is_local)`
-and threads the result into both `MemoryManager.get_context_window()` and
+comes from a `ContextProfile` resolved fresh on every call from the active
+runtime client itself — `ControllerAgent._execute_plan()` calls
+`profile_for(self._runtime)` (not just its `is_local` flag; see §16.11 for
+why the signature had to change) and threads the result into both
+`MemoryManager.get_context_window()` and
 `PromptBuilder.build(working_memory_ceiling=...)`:
 
 | Profile | `working_memory_limit` (rows fetched) | `working_memory_tokens` (ceiling) |
 |---|---|---|
-| **Local** (oMLX, Foundry, Ollama serving a locally-resident model) | 5 | 300 |
+| **Local** (oMLX, Foundry, Ollama serving a locally-resident model) | None (unbounded, as of §16.11) | `max_model_len − 27,000`, floored at 300 (§16.11) |
 | **Cloud** (Ollama Cloud — model tag ends `-cloud`) | None (unbounded) | 60,000 |
 
-The local row is byte-identical to the pre-2026-07-18 hardcoded behavior —
-this was a real constraint of the 16GB Apple-Silicon local-inference case
-(RAM holds the KV cache), not an arbitrary number, and is left untouched.
-The cloud row exists because a cloud-hosted model (Gemma-4-31B via Ollama
-Cloud, ~128K real context) doesn't have that RAM constraint — the ceiling
-there is a deliberately-budgeted fraction of `CLOUD_PROFILE.total_context_tokens`
-(100,000; also what `OllamaRuntimeClient` sets `options.num_ctx` to),
-reserving headroom for output generation and the other prompt slots'
-worst case rather than spending the model's literal ceiling. Oldest turns
+**Corrected 2026-07-19 (§16.11) — the RAM-tiered mechanism this paragraph
+described through §16.9 is retired, not extended.** It measured the wrong
+layer: oMLX manages its own paged KV cache and memory dynamically
+per-machine, independent of total system RAM, so a host-RAM-keyed lookup
+was never actually bounding the real constraint. The local tier is now
+budgeted directly from `OMLXRuntimeClient.max_model_len` (§16.10 — read
+from `GET /v1/models`, the model's real server-reported context window)
+minus the same 27,000-token reservation `CLOUD_PROFILE` already used for
+the other slots' worst case (session files up to 20K, persona/RAG/tool/
+graph/working-state slots ~3K, generation ~4K), floored at 300 so a small
+or unreported `max_model_len` can't drive the budget negative — 300 is the
+same figure this profile used under the retired approach, kept as the
+degraded-case floor rather than a live number. The local tier's
+`working_memory_limit` is now `None` too — the fixed 5-turn cap is gone;
+that number was never derived from the model or the machine, just carried
+over from the original hardcoded 300-token/5-turn pair. The cloud row is
+unchanged: a cloud-hosted model (Gemma-4-31B via Ollama Cloud, ~128K real
+context) doesn't have oMLX's local-process RAM constraint at all — the
+ceiling there is a deliberately-budgeted 60,000-token figure reserving the
+same per-slot headroom plus an extra safety margin against an inexact
+context-length assumption, spending less than the model's literal ceiling
+(`CLOUD_PROFILE.total_context_tokens` and `OllamaRuntimeClient`'s
+`options.num_ctx` — both referenced in early drafts of this section —
+were removed in §16.9 after being confirmed to have zero effect on
+Ollama's actual behavior). Oldest turns
 are still dropped first when either ceiling is exceeded — enforced twice,
 independently, over the same fetched rows: once by
 `MemoryManager.get_context_window()`'s `max_tokens` argument (row-level
-eviction before assembly) and again by `PromptBuilder._slot6_working_memory()`'s
-`ceiling` argument (char-level truncation at render time). Both must be
+eviction before assembly) and again by `PromptBuilder`'s shared
+`_trim_working_memory()` (char-level trim at render time, factored out
+2026-07-19 so the flattened-text path below and the structured-turns path,
+§3.7d, trim identically). Both must be
 raised together — raising one alone leaves the other silently
 re-truncating back down to its old value.
 
@@ -508,6 +528,20 @@ Turn -1 [assistant]: {most recent prior assistant response}
   doesn't, the cloud profile still delivers the reasoning-quality half of
   the goal (the model can see full history) but not a latency/cost win
   from cache reuse.
+- **oMLX exception, added 2026-07-19 — see §3.7d.** oMLX no longer
+  receives this slot as flattened text. `PromptBuilder.build()`'s opt-in
+  `emit_structured_working_memory=True` (used only on the oMLX call path)
+  omits `[WORKING MEMORY]` from `user_prompt` entirely and returns these
+  same turns as a structured, chronologically-ordered `list[Turn]` instead,
+  which `OMLXRuntimeClient` sends as discrete `messages` array entries —
+  mirroring oMLX's own web UI, and the multi-turn shape §3.7b originally
+  speculated a future engine might use. Ollama/Foundry are unaffected and
+  still receive this slot exactly as described above.
+  `working_memory_tokens`'s ceiling math (§16.11: `max_model_len - 27,000`,
+  floored at 300) is unchanged by this — only the *representation* changed,
+  not the token budget or the drop-oldest-first trim rule, which
+  `_trim_working_memory()` now shares between the flattened and structured
+  paths so both trim identically.
 
 ---
 
@@ -597,13 +631,22 @@ class PromptBuilder:
         rag_snippets:     list[RagSource]        | None = None,
         tool_results:     list[ToolResult]       | None = None,
         working_memory:   list[Turn]             | None = None,
-    ) -> tuple[str, str]:
+        working_memory_ceiling: int              | None = None,
+        emit_structured_working_memory: bool     = False,   # added 2026-07-19, see §3.7d
+    ) -> tuple[str, str] | tuple[str, str, list[Turn]]:
         """
         Assembles the canonical 7-slot prompt (static-first ordering).
 
         current_datetime is required — callers must pass a freshly computed
         `datetime.now().astimezone()` on every call; PromptBuilder never
         reads the system clock itself (see Slot DT).
+
+        emit_structured_working_memory: opt-in, default False (reproduces
+        the 2-tuple return below exactly). When True, Slot 6 is omitted
+        from user_prompt and returned instead as a third tuple element —
+        the same trimmed, chronological list[Turn] — for a caller (oMLX
+        only, today) that sends each turn as its own discrete message
+        rather than flattened text. See §3.7d.
 
         Returns
         -------
@@ -739,6 +782,8 @@ the conditional-slot architecture as originally designed.
 #### Status
 
 Resolved as a documentation/framing correction. No code change was required — `PromptBuilder.build()`'s existing slot order already matches the dynamic-suffix ordering this finding converged on. See §3.7a for the stable-prefix / dynamic-suffix contract and §3.7b for the future APC direction.
+
+*Flagged 2026-07-19: the "Root cause" paragraph above is now stale specifically for oMLX. §3.7d implemented the multi-turn `messages` array §3.7b speculated about — oMLX's working-memory turns are no longer packed into one flattened user message; `OMLXRuntimeClient.infer_stream()` now sends one array entry per turn. This paragraph is left in place as the historical record of the finding that originally justified the dynamic-suffix ordering; see §3.7d for the current oMLX request shape.*
 
 #### Design direction (historical record — both options superseded)
 
@@ -1244,4 +1289,72 @@ can produce a user-message cache hit" line is still flagged inline as
 superseded but not yet corrected — see line 824 of the current doc. That
 edit remains a deliberately separate, unbundled task and was not addressed
 in this update.)*
+
+---
+
+### 3.7d oMLX Multi-Turn `messages` Array Implemented for Slot 6 (2026-07-19)
+
+§3.7b speculatively described a future direction: "if a future engine or plugin sends a growing
+multi-turn `messages` array... the dynamic-suffix ordering already locked here becomes the correct
+stable-history/dynamic-tail shape for it to exploit, with no further prompt-assembly redesign
+needed." This entry implements that shape for oMLX specifically — a working-memory-scoped, opt-in
+change, not a rewrite of the slot contract itself.
+
+**Investigation first (no code change).** Before changing anything, `prompt_builder.py` was read in
+full to confirm exactly how `build()` assembles its return value and where the risk of a breaking
+change actually was. Findings: `build()` returns `tuple[str, str]`; `user_prompt` is 10
+independently-built slot strings joined with `"\n\n".join(s for s in slots if s)` — no slot depends
+on another slot's rendered text, the join is pure string concatenation over already-finished
+strings. The *only* place working-memory turns get flattened into text is one line in
+`_slot6_working_memory()` (`f"Turn {offset} [{role_str}]: {turn.content}"`) — Turn objects arrive
+already structured from `controller_agent.py` (built from DB rows before `build()` is ever called).
+Blast radius of a naive return-shape change: `base_runtime_client.py` and all three concrete runtime
+clients declare `infer(prompt: str, system: str, ...)`; `conversational_agent.py`, `wiki_agent.py`,
+`warmup.py`, and `controller_agent.py`'s retry path all unpack `build()`'s return as a 2-tuple; and
+~8 existing tests assert on literal `"Turn -N"` / `"[WORKING MEMORY]"` text inside `user_prompt`.
+**Verdict: an additive opt-in parameter is a contained change; changing the default return shape
+would not have been.**
+
+**What shipped.** `PromptBuilder.build(emit_structured_working_memory: bool = False)` — default
+`False` reproduces the existing 2-tuple exactly (confirmed: the ~8 pre-existing flattened-text tests
+were run unmodified before and after this change and their pass/fail status never moved). When
+`True`: Slot 6 is omitted from `user_prompt` entirely, and `build()` returns a 3-tuple instead, with
+the trimmed, chronologically-ordered (oldest first) `list[Turn]` as the third element. The
+drop-oldest-first ceiling logic itself didn't change — it was factored out of
+`_slot6_working_memory()` into a new `_trim_working_memory()`, shared by both the flattened-text
+path and this new structured path, so both trim identically against the same
+`working_memory_ceiling` (unaffected by §16.11's ceiling-math change — only which slot supplies the
+ceiling value changed there, not how this method trims against it).
+
+**Wiring (oMLX-only).** `controller_agent.py` passes `emit_structured_working_memory=True` only when
+`isinstance(self._runtime, OMLXRuntimeClient)` — checked independently at both the primary
+`_execute_plan` build() call and the separate-scope empty-answer retry path
+(`_dispatch_conversational_with_empty_guard`, which needed its own recomputed check; a real test
+failure during development caught the missing one). The resulting turns are threaded onto
+`subtask_context["_prebuilt_working_memory_turns"]`, following the same passthrough convention as
+`_prebuilt_prompt`/`_prebuilt_system`. **A plumbing gap was found and closed while wiring this in:**
+`conversational_agent.py`'s prebuilt-prompt passthrough never read that context key at all, so the
+controller-side wiring alone would have been inert — it now forwards
+`working_memory_turns=context.get("_prebuilt_working_memory_turns")` to the runtime's
+`infer()`/`infer_stream()`, but only when that key is present, so Ollama/Foundry — which never
+populate it — call the runtime exactly as before with no new keyword at all.
+
+**Consumption (`OMLXRuntimeClient`) and "Prompt too long" recovery.** See §16.12 in
+`16-runtime-backend-layer.md` for the full detail: the outgoing `messages` array now mirrors oMLX's
+own web UI (system message, one entry per working-memory turn, current query last) instead of one
+flattened user message, and a specific 400 ("Prompt too long", oMLX's `validate_context_window()`)
+triggers a single oldest-turn-drop retry rather than the generic non-200 error path.
+
+**Status: implemented and unit-tested; the actual KV-cache-reuse benefit this shape targets is
+unverified.** All tests use mocked HTTP — no live oMLX server, consistent with `CLAUDE.md`'s testing
+posture. Whether this request shape actually produces more cache-hit-eligible prefill on a real
+oMLX instance (the thing §3.7b's whole speculative direction was for) was not measured this session.
+`/admin/api/cache/probe` (§3.7c) is the existing tool that would answer that — a natural next step,
+not yet done.
+
+**Test suite:** 884 passed / 0 failed after this change (878 baseline from §16.10/§16.11 + 6 new —
+`TestEmitStructuredWorkingMemory` in `test_prompt_builder.py`, covering the default-False 2-tuple
+shape, the True-path 3-tuple shape and text omission, chronological ordering, ceiling-based
+oldest-first trimming, the empty-turns case, and flattened/structured trim-count parity). §16.12's
+`OMLXRuntimeClient` changes add a further 4 tests (888 passed total) — see that section.
 
