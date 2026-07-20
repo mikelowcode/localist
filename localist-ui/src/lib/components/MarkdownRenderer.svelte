@@ -3,7 +3,10 @@
    * MarkdownRenderer.svelte
    *
    * Lightweight Markdown renderer for Localist agent output.
-   * Handles the exact subset the model produces — no third-party deps.
+   * Handles the exact subset the model produces. Kept dependency-free
+   * except for KaTeX, which renders the LaTeX math notation models
+   * routinely emit (e.g. "$\rightarrow$") — that's source syntax for a
+   * symbol, not literal text, so it's rendered rather than hand-rolled.
    *
    * Supported syntax:
    *   ## / ### headings
@@ -13,10 +16,16 @@
    *   > blockquotes
    *   ```lang … ``` fenced code blocks
    *   --- horizontal rules
+   *   $$…$$ / $…$ LaTeX math (KaTeX; single-$ only when it contains a
+   *     backslash command, so plain currency like "$5" is never touched)
    *   Blank lines → paragraph breaks
    *
    * Security: raw text is HTML-escaped before any substitution runs,
    * so user-supplied or model-generated content cannot inject tags.
+   * Math spans are escaped out to KaTeX (throwOnError: false, trust:
+   * false) before that pass, so malformed LaTeX degrades to an inline
+   * error span instead of breaking rendering, and KaTeX's own HTML
+   * output is never re-escaped.
    *
    * Props:
    *   content  — the Markdown string to render
@@ -24,6 +33,8 @@
    */
 
   import { onDestroy } from 'svelte';
+  import katex from 'katex';
+  import 'katex/dist/katex.min.css';
 
   export let content:   string  = '';
   export let streaming: boolean = false;
@@ -42,11 +53,53 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Math (KaTeX)
+  // ---------------------------------------------------------------------------
+
+  // expr is text that has already passed through escape() (see call sites
+  // below), so entities like &lt; survive into the TeX source verbatim
+  // rather than as literal `<` — an accepted limitation, since the LaTeX
+  // models actually emit here (arrows, quote commands, Greek letters) never
+  // contains those characters.
+  function renderMath(expr: string, displayMode: boolean): string {
+    try {
+      return katex.renderToString(expr, { throwOnError: false, trust: false, displayMode });
+    } catch {
+      // KaTeX couldn't degrade gracefully even with throwOnError: false —
+      // fall back to the literal source so rendering never breaks.
+      const delim = displayMode ? '$$' : '$';
+      return `${delim}${expr}${delim}`;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Inline formatting  (runs AFTER escaping)
   // ---------------------------------------------------------------------------
 
   function inlineFormat(text: string): string {
-    return text
+    // Math is extracted to placeholder tokens before the bold/italic/code
+    // regexes run, then swapped back in at the end — otherwise KaTeX's own
+    // HTML output (full of literal < > " ') would get mangled by the later
+    // substitutions or re-escaped downstream. A Private Use Area sentinel
+    // is used because it can't appear in normal model output and none of
+    // the other regexes below can match it.
+    const mathStash: string[] = [];
+    const stash = (html: string): string => {
+      const token = `${mathStash.length}`;
+      mathStash.push(html);
+      return token;
+    };
+
+    let out = text
+      // $$display math$$ — unambiguous, currency is never doubled like this.
+      .replace(/\$\$([^\n]+?)\$\$/g, (_, expr) => stash(renderMath(expr, true)))
+      // $inline math$ — collides with plain currency ("$5", "$10 total"),
+      // so only treat it as math when it contains a backslash command;
+      // plain currency never does, and every LaTeX symbol a model emits
+      // this way (\rightarrow, \'\, \alpha, …) does.
+      .replace(/\$([^\n$]+?)\$/g, (match, expr) =>
+        expr.includes('\\') ? stash(renderMath(expr, false)) : match
+      )
       // **bold** / __bold__
       .replace(/\*\*(.+?)\*\*/g,   '<strong>$1</strong>')
       .replace(/__(.+?)__/g,        '<strong>$1</strong>')
@@ -57,6 +110,12 @@
       .replace(/`([^`\n]+?)`/g,     '<code>$1</code>')
       // [text](url)  →  plain text only (no external links in agent output)
       .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+
+    if (mathStash.length > 0) {
+      out = out.replace(/(\d+)/g, (_, i) => mathStash[Number(i)]);
+    }
+
+    return out;
   }
 
   // ---------------------------------------------------------------------------

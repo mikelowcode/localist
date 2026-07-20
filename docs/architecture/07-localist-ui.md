@@ -499,3 +499,49 @@ shipped without dedicated tests). Flagged as a real gap.
 - No backend test coverage for `/files/download` or `DELETE /files`.
 - `/files/content` and `/files/upload`'s path-containment checks remain on the older, narrower
   string-prefix pattern — not fixed in this pass, worth a consistency sweep later.
+
+### 7.12 Math Rendering (KaTeX) in `MarkdownRenderer.svelte` (2026-07-18)
+
+Live use surfaced literal LaTeX source (e.g. `$\rightarrow$`, quote-escape commands) appearing
+verbatim in assistant replies instead of the symbols they encode. Investigation (full trail:
+`sessions-log.md` §41) traced the entire backend prompt-assembly path — user-profile injection,
+episodic memory, `PromptBuilder`'s slot rendering — and found no formatting bug there; the model
+itself emits real LaTeX/MathJax source (`\rightarrow` is the standard command for →, wrapped in
+`$...$` inline-math delimiters) because its training data biases arrow/symbol notation toward math
+mode even in plain prose. This only surfaces as broken text because `MarkdownRenderer.svelte`
+renders CommonMark, not KaTeX/MathJax — the delimiters previously passed through uninterpreted.
+Since model output can't be controlled from this side, the fix is scoped entirely to the renderer.
+
+**Fix.** `katex` (0.18.0) added as `localist-ui`'s first runtime dependency — a deliberate,
+documented exception to this file's previous "no third-party deps" design comment, not a silent
+violation of it. `katex/dist/katex.min.css` is imported once at the top of the component; Vite
+bundles KaTeX's font files as hashed static assets, so there is no CDN dependency (consistent with
+the project's local-first constraint).
+
+`inlineFormat()` extracts math spans to placeholder tokens *before* the existing bold/italic/
+code/link regexes run, then swaps in the real KaTeX HTML at the end — otherwise KaTeX's own markup
+(full of literal `< > " '`) would get mangled by the later substitutions. Tokens use a
+Private-Use-Area sentinel (`U+E000`) that survives `escape()` untouched and can't collide with
+anything the other regexes match. A new `renderMath()` helper wraps `katex.renderToString()` with
+`throwOnError: false, trust: false`; on any unexpected exception it falls back to the literal
+source, so malformed LaTeX degrades to an inline KaTeX error span rather than breaking the render.
+
+**Currency disambiguation.** `$$…$$` is always treated as display math — plain prose never doubles
+dollar signs like that. Single `$…$` is only treated as inline math when its content contains a
+backslash command, which covers every LaTeX symbol a model emits this way (`\rightarrow`,
+quote/accent commands, `\alpha`, …) while leaving plain currency mentions (`$5`, `$10 total`)
+completely untouched.
+
+**Known gap.** No change to the pre-existing per-line paragraph architecture — a `$$...$$` display
+block spanning multiple lines within one paragraph won't be recognized, since paragraph lines are
+still formatted independently (§ design predates this change). Accepted rather than fixed: the
+reported symptom is always single-line inline math embedded in prose, not multi-line display blocks.
+
+**Verification.** `npm run check` (0 errors) and `npm run build` (succeeds, KaTeX assets bundle
+correctly) both clean. A standalone Node smoke test against the real `katex` package confirmed
+`$\rightarrow$` renders to a proper `→` glyph, `$5 and $10 total` passes through unchanged, and a
+malformed math span degrades to an inline error span without crashing. No browser-automation tool
+was available to screenshot the live UI directly (same limitation noted at §7.3, §7.10) — but the
+user live-confirmed it afterward with a real chat transcript showing LORA's own
+`Request → Tool/Vault Search → Grounding against Local Truth → Cited Response → Memory Update`
+summary rendering with actual `→` glyphs instead of literal `$\rightarrow$` text.
