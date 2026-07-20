@@ -81,7 +81,7 @@ See `backend/.env.example` for the full list (embedding engine, wiki/raw directo
 
 **Memory** — two SQLite-backed stores. Episodic memory captures typed facts (preferences, decisions, corrections, etc.) with confidence scores and a `pending → active → superseded/retracted` lifecycle; retrieval by subject, recency, or cosine similarity; retraction via semantic match; every write scanned for prompt-injection/credential content before storing. A human-readable snapshot regenerates at `wiki/MEMORY.md`. The corpus (RAG) stores embeddings of wiki pages and documents. A user profile (`wiki/users/michael.md`) is embedded line-by-line and injected only where relevant (cosine ≥ 0.45).
 
-**Prompt layout** — fixed 7-slot structure (identity, persona, episodic+profile, RAG, tool results, working memory, instruction) optimized for KV-cache reuse.
+**Prompt layout** — fixed 7-slot structure (identity, persona, episodic+profile, RAG, tool results, working memory, instruction) optimized for KV-cache reuse. Local working-memory budget is now sized from the active model's real context window (oMLX's reported `max_model_len`) rather than a fixed turn count; on oMLX specifically, working-memory turns are sent as discrete messages — mirroring oMLX's own client — instead of flattened into one string, for genuine cross-turn KV-cache reuse.
 
 ---
 
@@ -123,6 +123,6 @@ Tests are organized by phase (memory substrate, routing, controller dispatch, ex
 
 ## Roadmap
 
-**Done:** Localist CLI launcher, MCP migration (tools off legacy dispatcher/Fetcher), identity continuity, user profile injection, generate-then-save file ops, graph retrieval layer (SQLite schema v6), Ollama runtime backend (incl. Cloud) with real `/api/embed` support and a cross-platform local embedding path, chat-model fail-fast validation, wiki diff updates with review/apply UI, episodic memory hardening (real cosine retrieval, write-approval gate, semantic retraction).
+**Done:** Localist CLI launcher, MCP migration (tools off legacy dispatcher/Fetcher), identity continuity, user profile injection, generate-then-save file ops, graph retrieval layer (SQLite schema v6), Ollama runtime backend (incl. Cloud) with real `/api/embed` support and a cross-platform local embedding path, chat-model fail-fast validation, wiki diff updates with review/apply UI, episodic memory hardening (real cosine retrieval, write-approval gate, semantic retraction), KaTeX-rendered math in chat output, and oMLX-specific multi-turn prompt caching (working memory sent as discrete per-turn messages, sized from the model's real context window).
 
 **Open:** generalize the bullet/diff-marker collision edge case; rollback mechanism for wiki writes (currently gitignored, no undo); broader Localist UI rework for episode browsing and tool result display; macOS `.app` packaging via PyInstaller + Tauri.
