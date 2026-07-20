@@ -52,8 +52,6 @@ from typing import Generator, Iterator
 
 import requests
 
-from context_profile import CLOUD_PROFILE, LOCAL_PROFILE
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -217,8 +215,6 @@ class OllamaRuntimeClient:
         self._stream_timeout  = stream_timeout
 
         self.is_local = not _is_cloud_model(chat_model)
-        _profile = LOCAL_PROFILE if self.is_local else CLOUD_PROFILE
-        self._num_ctx = _profile.total_context_tokens
 
         self._chat_endpoint  = self._base_url + _CHAT_PATH
         self._tags_endpoint  = self._base_url + _TAGS_PATH
@@ -226,12 +222,11 @@ class OllamaRuntimeClient:
 
         logger.info(
             "OllamaRuntimeClient initialised — chat: %s  embed: %s  base: %s  "
-            "is_local: %s  num_ctx: %d",
+            "is_local: %s",
             self._chat_model,
             self._embedding_model,
             self._base_url,
             self.is_local,
-            self._num_ctx,
         )
 
     # -----------------------------------------------------------------------
@@ -421,12 +416,13 @@ class OllamaRuntimeClient:
             "options": {
                 "num_predict": max_tokens,
                 "temperature": temperature,
-                # Explicit input context length — without this, Ollama
-                # silently falls back to the Modelfile default (which may
-                # not match either tier's intended ceiling). Sized from
-                # context_profile.py's local/cloud total_context_tokens,
-                # resolved once at construction from is_local.
-                "num_ctx": self._num_ctx,
+                # No "num_ctx" here (deliberately). diagnostics/reports/
+                # ollama_cloud_num_ctx_findings.md confirmed it has zero
+                # observed effect on Ollama, local or cloud, across a 25x
+                # sweep of values — the real enforced ceiling is always
+                # each model's hardcoded native context length. Sending a
+                # dead parameter here would misleadingly suggest this
+                # client controls the context window; it doesn't.
             },
         }
 

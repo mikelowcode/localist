@@ -250,12 +250,19 @@ class TestTimeoutOverride:
 
 class TestIsLocalAndNumCtx:
     """
-    is_local (base_runtime_client.py) and options.num_ctx (2026-07-18):
-    Ollama Cloud models are proxied through the same local daemon
-    (base_url is always localhost:11434 either way — see
+    is_local (base_runtime_client.py, 2026-07-18): Ollama Cloud models are
+    proxied through the same local daemon (base_url is always
+    localhost:11434 either way — see
     docs/architecture/16-runtime-backend-layer.md §16.4's live-verified
     "gemma4:31b-cloud, proxied through ollama.com" configuration), so the
     only signal is the "-cloud" suffix on the model's tag.
+
+    options.num_ctx (2026-07-19): removed. diagnostics/reports/
+    ollama_cloud_num_ctx_findings.md confirmed it has zero observed effect
+    on Ollama, local or cloud — the real ceiling is always each model's
+    native context length. The two tests that used to assert a specific
+    num_ctx value are replaced by test_num_ctx_is_never_sent below, so a
+    future change can't silently reintroduce a dead parameter unnoticed.
     """
 
     def test_cloud_suffixed_model_is_not_local(self):
@@ -271,10 +278,9 @@ class TestIsLocalAndNumCtx:
         client = OllamaRuntimeClient(chat_model="gemma4")
         assert client.is_local is True
 
-    def test_cloud_model_sends_cloud_num_ctx(self):
-        from context_profile import CLOUD_PROFILE
-
-        client = OllamaRuntimeClient(chat_model="gemma4:31b-cloud")
+    @pytest.mark.parametrize("chat_model", ["gemma4:31b-cloud", "gemma4:e4b-mlx"])
+    def test_num_ctx_is_never_sent(self, chat_model):
+        client = OllamaRuntimeClient(chat_model=chat_model)
         response = _fake_response([
             json.dumps({"message": {"content": "hi"}, "done": True}),
         ])
@@ -283,18 +289,4 @@ class TestIsLocalAndNumCtx:
             list(client.infer_stream("prompt"))
 
         sent_payload = json.loads(mock_post.call_args.kwargs["data"])
-        assert sent_payload["options"]["num_ctx"] == CLOUD_PROFILE.total_context_tokens
-
-    def test_local_model_sends_local_num_ctx(self):
-        from context_profile import LOCAL_PROFILE
-
-        client = OllamaRuntimeClient(chat_model="gemma4:e4b-mlx")
-        response = _fake_response([
-            json.dumps({"message": {"content": "hi"}, "done": True}),
-        ])
-
-        with patch.object(_ollama_mod.requests, "post", return_value=response) as mock_post:
-            list(client.infer_stream("prompt"))
-
-        sent_payload = json.loads(mock_post.call_args.kwargs["data"])
-        assert sent_payload["options"]["num_ctx"] == LOCAL_PROFILE.total_context_tokens
+        assert "num_ctx" not in sent_payload["options"]
