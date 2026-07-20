@@ -347,6 +347,79 @@ class TestPlannerP3Chart:
 
 
 # ---------------------------------------------------------------------------
+# Priority 0 — explicit slash-command tool bypass ("/chart", "/research")
+# ---------------------------------------------------------------------------
+
+class TestPlannerP0SlashCommand:
+
+    def test_slash_chart_short_circuits_before_p3_evaluates(self, monkeypatch):
+        """Not just "both paths happen to agree" — spy on _priority3_tool to
+        confirm P0 returns before P3 is ever reached, even though "chart
+        this" alone would also have matched _CHART_KEYWORDS."""
+        p = Planner(runtime=make_runtime())
+        with patch.object(
+            Planner, "_priority3_tool", wraps=p._priority3_tool
+        ) as spy:
+            plan = p.route(
+                "/chart chart this: apples 5, oranges 3, bananas 7", context={}
+            )
+        spy.assert_not_called()
+        assert plan.tools_to_call == ["chart"]
+        assert plan.priority == 0
+        assert plan.tool_signal_source == "slash_command"
+        assert plan.compound is True
+
+    def test_slash_research_bypasses_the_research_loop_flag(self, monkeypatch):
+        """The whole point of the bypass: "research" must enter
+        tools_to_call even though LOCALIST_RESEARCH_LOOP_ENABLED — which
+        normally gates the web_search -> research upgrade entirely (§18.2)
+        — is off/unset."""
+        monkeypatch.delenv("LOCALIST_RESEARCH_LOOP_ENABLED", raising=False)
+        p = Planner(runtime=make_runtime())
+        plan = p.route(
+            "/research what does the enterprise plan cost", context={}
+        )
+        assert plan.tools_to_call == ["research"]
+        assert plan.priority == 0
+        assert plan.tool_signal_source == "slash_command"
+
+    def test_bare_slash_chart_reaches_the_tool_without_crashing(self):
+        """No data/topic following the command — still reaches the tool;
+        empty-content chart requests degrading gracefully is the
+        dispatcher's problem, not Planner's."""
+        p = Planner(runtime=make_runtime())
+        plan = p.route("/chart", context={})
+        assert plan.tools_to_call == ["chart"]
+        assert plan.priority == 0
+
+    @pytest.mark.parametrize("phrase", ["/Chart", "/CHART this data: a 1, b 2"])
+    def test_slash_chart_is_case_insensitive(self, phrase):
+        p = Planner(runtime=make_runtime())
+        plan = p.route(phrase, context={})
+        assert plan.tools_to_call == ["chart"]
+        assert plan.priority == 0
+
+    def test_mid_sentence_slash_chart_does_not_match(self):
+        """Only a LEADING token counts — a mid-sentence occurrence must not
+        trigger the P0 bypass."""
+        p = Planner(runtime=make_runtime(infer_return="no"))
+        plan = p.route(
+            "what's a good site to /chart my finances", context={}
+        )
+        assert plan.priority != 0
+        assert plan.tool_signal_source != "slash_command"
+
+    def test_existing_chart_keyword_routing_unaffected(self):
+        """Additive only — an instruction with no leading slash command
+        still routes via P3's keyword match unchanged."""
+        p = Planner(runtime=make_runtime())
+        plan = p.route("chart this: apples 5, oranges 3, bananas 7", context={})
+        assert plan.tools_to_call == ["chart"]
+        assert plan.priority == 3
+        assert plan.tool_signal_source == "keyword"
+
+
+# ---------------------------------------------------------------------------
 # ControllerAgent integration
 # ---------------------------------------------------------------------------
 

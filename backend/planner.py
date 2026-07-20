@@ -85,10 +85,12 @@ class RoutingPlan:
         to recover the display name.
     tool_signal_source :
         Provenance of tools_to_call, for per-turn auditability: "keyword"
-        when a deterministic P3/P3b/compound match populated it, "classifier_fallback"
-        when the feature-flagged P6-fallthrough tool-need classifier populated
-        it (active mode only), or None when tools_to_call is empty or was set
-        by a code path that predates this attribution (e.g. P3c never sets
+        when a deterministic P3/P3b/compound match populated it,
+        "classifier_fallback" when the feature-flagged P6-fallthrough
+        tool-need classifier populated it (active mode only),
+        "slash_command" when a leading "/chart"/"/research" token (Priority
+        0) forced it, or None when tools_to_call is empty or was set by a
+        code path that predates this attribution (e.g. P3c never sets
         tools_to_call, so it stays None there too).
     file_op_deferred :
         True → Priority 3 detected a file_op-shaped instruction whose
@@ -330,6 +332,18 @@ _CHART_KEYWORDS: frozenset[str] = frozenset({
     "turn this into a graph",
     "turn this into something visual",
 })
+
+# Priority 0 — explicit slash-command tool bypass. A leading "/chart" or
+# "/research" token forces that tool directly, ahead of every other
+# priority: "/chart" bypasses _CHART_KEYWORDS matching, and "/research"
+# bypasses both the research_intent semantic-upgrade threshold AND
+# LOCALIST_RESEARCH_LOOP_ENABLED (normally required for "research" to ever
+# enter tools_to_call at all — see _RESEARCH_LOOP_ENV_VAR below). See
+# _priority0_slash_command().
+_SLASH_COMMAND_TOOL_MAP: dict[str, str] = {
+    "/chart":    "chart",
+    "/research": "research",
+}
 
 # Diagnostic Slot 1 — canonical template groups for semantic search-intent scoring.
 # These strings are embedded at startup and used only for cosine-similarity logging;
@@ -868,10 +882,11 @@ class Planner:
     """
 
     # Class-level aliases so callers can access via instance (e.g. p._WEB_SEARCH_KEYWORDS)
-    _WEB_SEARCH_KEYWORDS: frozenset[str] = _WEB_SEARCH_KEYWORDS
-    _FILE_OP_KEYWORDS:    frozenset[str] = _FILE_OP_KEYWORDS
-    _CHART_KEYWORDS:      frozenset[str] = _CHART_KEYWORDS
-    _GATE1_ENV_VAR:       str            = _GATE1_ENV_VAR
+    _WEB_SEARCH_KEYWORDS:    frozenset[str]    = _WEB_SEARCH_KEYWORDS
+    _FILE_OP_KEYWORDS:       frozenset[str]    = _FILE_OP_KEYWORDS
+    _CHART_KEYWORDS:         frozenset[str]    = _CHART_KEYWORDS
+    _GATE1_ENV_VAR:          str               = _GATE1_ENV_VAR
+    _SLASH_COMMAND_TOOL_MAP: dict[str, str]    = _SLASH_COMMAND_TOOL_MAP
 
     def __init__(
         self,
@@ -1025,6 +1040,49 @@ class Planner:
 
         return None
 
+    def _priority0_slash_command(self, lowered: str) -> RoutingPlan | None:
+        """
+        Priority 0 — explicit slash-command tool bypass.
+
+        A leading "/chart" or "/research" token (case-insensitive, either
+        the entire instruction or followed by whitespace) forces that tool
+        directly, short-circuiting every other priority — including P3's
+        _CHART_KEYWORDS keyword match and the research_intent semantic-
+        upgrade threshold / LOCALIST_RESEARCH_LOOP_ENABLED gate that
+        normally has to be on for "research" to ever enter tools_to_call at
+        all (§18.2). Runs before _detect_compound() and every other
+        priority evaluation, so it wins even on an instruction that would
+        also have matched further down.
+
+        Only a LEADING token counts: a mid-sentence occurrence ("what's a
+        good site to /chart my finances") does not match.
+
+        The leading slash token is deliberately NOT stripped from the
+        instruction text passed down to tools_to_call's dispatch — this
+        RoutingPlan carries only the tool name; instruction stripping is
+        left as a separate concern (see the Claude Code prompt that
+        introduced this feature).
+
+        Returns a RoutingPlan or None if no match.
+        """
+        lowered_stripped = lowered.strip()
+        for command, tool_name in _SLASH_COMMAND_TOOL_MAP.items():
+            if lowered_stripped == command or lowered_stripped.startswith(command + " "):
+                logger.debug(
+                    "Planner: Priority 0 matched — slash command %r forcing "
+                    "tool %r.", command, tool_name,
+                )
+                return RoutingPlan(
+                    agent          = "conversational_agent",
+                    fetch_episodic = False,
+                    fetch_rag      = False,
+                    tools_to_call  = [tool_name],
+                    compound       = True,
+                    priority       = 0,
+                    tool_signal_source = "slash_command",
+                )
+        return None
+
     def route(
         self,
         instruction: str,
@@ -1063,6 +1121,14 @@ class Planner:
     ) -> RoutingPlan:
         """Priority evaluation body for route() — see route() for the public contract."""
         lowered = instruction.lower()
+
+        # Priority 0 — explicit slash-command tool bypass. Must run before
+        # compound detection and every other priority so a leading
+        # "/chart"/"/research" always wins, regardless of what P3 (or the
+        # research-loop flag) would otherwise decide for the same text.
+        plan = self._priority0_slash_command(lowered)
+        if plan is not None:
+            return plan
 
         # Compound detection — must run before priority evaluation
         plan = self._detect_compound(lowered, context)
