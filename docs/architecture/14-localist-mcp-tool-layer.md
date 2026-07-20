@@ -35,6 +35,7 @@ brought this document back in sync.
 | `append_file` | `mcp_server/file_ops.py` | `(path: str, content: str) -> str` | `"OK: appended {n} characters to {name}"` |
 | `fetch_url` | `mcp_server/url_fetch.py` | `(url: str, timeout: float = 10.0) -> dict` | `{url, title, author, date_published, cleaned_text, word_count, fetch_duration_ms}` |
 | `web_search` | `mcp_server/web_search.py` | `(query: str) -> dict` | `{query, result_text, result_count}` — `result_text` is the formatted bullet block, or `"No results found."` |
+| `generate_chart` | `mcp_server/chart.py` | `(chart_type: str, labels: list[str], datasets: list[dict], title: str = "") -> dict` | `{summary, png_path, chart_config}` — see §14.8 |
 
 **`file_op` sandboxing:** every path is resolved against a sandbox root
 and rejected if the resolved absolute path escapes it — same check
@@ -244,6 +245,10 @@ LOCALIST_LOG_LEVEL           localist-mcp's root log level. Default: INFO.
 - `backend/tests/test_mcp_tool_dispatcher.py` — `MCPToolDispatcher` unit
   tests with `_call_mcp_tool` monkeypatched (success/error/connection-
   failure paths for all three tools, plus the unknown-tool path).
+  `TestChart` (§14.8, 2026-07-20) covers `_run_chart`'s three outcomes:
+  successful dispatch, retry-recovery (first attempt malformed, retry
+  valid), and full failure after both attempts (asserts zero `ToolResult`s
+  appended — the accepted-failure contract, not an error path).
 - `backend/tests/test_tool_dispatcher_phase6.py`'s
   `TestControllerToolIntegration` class — real subprocess round trips via
   a `localist-mcp` fixture (`localist_mcp_server` /
@@ -427,6 +432,62 @@ family (model asserting an action occurred that didn't), consistent with
 the existing framing above — **not confirmed to share one mechanism**, and
 this update does not change that. Item remains OPEN.
 
+*Update 2026-07-20 — new repro via the `generate_chart` build (§14.8),
+same failure family, different subsystem and different backend. Still
+OPEN, not resolved by this update.* Live testing surfaced a clean instance
+of shape (1) above (the flat false-completion claim, not the
+`<execute_tool>`-reattempt shape) while building and hardening the chart
+feature (§14.8):
+
+- **Instruction:** `"Turn this into a pie chart: Chrome 65, Safari 19,
+  Firefox 8, Edge 6, Other 2"`.
+- **Context:** at the time of this repro, this instruction was a false
+  negative on the chart P3 keyword gate — `_CHART_KEYWORDS` had no entry
+  covering `"turn this into a..."` phrasing (fixed the same session; see
+  §4.2's 2026-07-20 update and §14.8's own corpus-gap note). Planner fell
+  through P3 (no keyword match) → P4 (corpus miss, top score below
+  threshold) → P5 (no episodic match) → P6 (direct-answer fallback),
+  producing `tools_to_call=[]` for this turn — the exact triggering
+  condition this Open Item has always been about, reached here via a
+  keyword-gate gap rather than Gate 1's cross-conversation leak (item 3
+  in the 2026-07-07 update above).
+- **Observed model output, verbatim:** "I have generated a pie chart
+  titled 'Browser Market Share' based on the data provided: Chrome (65),
+  Safari (19), Firefox (8), Edge (6), and Other (2).\n(Source: Tool
+  output)" — a fully confident, specific, false claim of tool-mediated
+  completion, complete with a citation ("Source: Tool output") attributing
+  the fabrication to a tool that never ran.
+- **Frontend correctly showed nothing chart-shaped** — `ToolResult.artifact`
+  /`metadata["chart"]` were correctly absent, since no tool actually
+  dispatched. The fabrication is entirely in the model's generated text,
+  not a plumbing bug downstream of it.
+- **Runtime:** Ollama Cloud, `gemma4:31b-cloud` — a different model and a
+  different serving stack than every prior repro on this item (the
+  haiku.md and LangSmith Engine repros above were both against different
+  backends). This is additional evidence the failure is not one specific
+  serving stack's quirk.
+- This is the cleanest repro on file so far for shape (1) specifically (the
+  flat false "source: tool output" claim, as opposed to shape (2)'s
+  `<execute_tool>`-reattempt pattern) — a good reference case for whoever
+  picks up the dedicated Open Item 2 investigation session.
+- A narrow, mechanical mitigation for this specific symptom (stripping/
+  flagging a literal tool-attribution phrase on an empty-`tools_to_call`
+  turn) was applied the same session — see `controller_agent.py`'s
+  `_strip_false_tool_attribution()` and its tests. This is explicitly
+  **not** a fix for this Open Item: it only prevents the specific
+  misleading citation pattern this repro showed, not the model fabricating
+  a chart's existence in prose without citing a tool source, which this
+  mitigation would not catch. **This update does not resolve Open Item 2.
+  Item remains OPEN.**
+- **Live re-repro of the pre-mitigation state was not performed** — by the
+  time this mitigation was written, §4.2's keyword-gate fix from the same
+  session was already live, so re-triggering the original empty-`tools_to_call`
+  condition on this exact instruction would have required deliberately
+  reverting that fix first. The mitigation's correctness is instead
+  confirmed via the unit tests referenced above (both the strip-on-empty-
+  tools case and, more importantly, the do-not-strip-when-a-real-tool-fired
+  negative case).
+
 **Open Item 3 — `ERROR:`-prefixed tool-failure results silently dropped
 from the prompt before reaching the model. RESOLVED 2026-07-07.**
 
@@ -504,4 +565,269 @@ addition.
 *Test suite:* 577 tests before and after this change: 575 passed / 2
 failed, identical failures both before and after (same 2 pre-existing,
 network-dependent failures tracked in §14.6) — no regression.
+
+### 14.8 `generate_chart` Tool (2026-07-20)
+
+A fifth MCP tool, `generate_chart` (`mcp_server/chart.py`), renders a
+bar/line/pie chart from structured data server-side (matplotlib PNG) and
+returns a Chart.js-compatible config for interactive client-side
+rendering. Unlike `file_op`/`url_fetch`/`web_search`, whose arguments are
+either explicit `context` values or cheaply regex-derived from the
+instruction, chart arguments (`chart_type`, `labels`, `datasets`, `title`)
+are a small nested JSON object that has to be *extracted from the
+instruction by the model itself* — a materially harder and less reliable
+problem than every prior tool here, which is why this tool was built from
+a measured reliability number rather than shipped on faith. Built and
+live-verified in one session, six steps: MCP tool → Planner P3 gate →
+`MCPToolDispatcher._run_chart` → `ControllerResult.metadata["chart"]` →
+frontend types → `ChartRenderer.svelte`.
+
+**Argument extraction was diagnostic-first, not designed blind.** Before
+any production code was written, a series of read-only diagnostics
+(`diagnostics/diag_shadow_chart_toolcall.py` through `_v4_full.py`) measured
+gemma-4-e4b-it-4bit's (oMLX, 4-bit quantized) reliability at emitting a
+`{"tool_call": {"name": "generate_chart", "arguments": {...}}}` envelope
+for a fixed, deliberately narrow schema (three chart types, flat
+labels/datasets, no colors/options/stacking — the smallest useful nested
+schema that still resembles a real Chart.js config). Three mitigations
+were measured independently, then combined into one per-trial pipeline in
+the `_v4_full` run: (1) a few-shot system prompt with three worked
+examples, including one negative example forcing `{"tool_call": null}`
+over prose for a non-chart instruction (fixing an observed "explains
+instead of emitting null" failure mode); (2) `repair_envelope()`, a
+bracket-balanced repair pass targeting one specific corruption shape
+(stray non-structural tokens — e.g. `"だろう"` — inserted mid-JSON,
+breaking `json.loads()` even though the structure is otherwise intact);
+(3) one retry at `temperature=0.3` (an independent sample, not a repeat of
+the deterministic `temperature=0.0` failure) when the first attempt's
+envelope is malformed, with the retry's outcome final — no second retry.
+**Measured result: 66.7% MATCH on chart-expected instructions (22/33)**,
+with 12.1% (8/66 total trials) still failing after every mitigation. That
+residual failure rate is accepted by design, not treated as a bug to keep
+chasing — see the accepted-failure design below for how the production
+path degrades when it happens. Widening the schema, adding a second retry
+pass, or re-measuring against a different chat backend are all explicitly
+future work, not started (see Open Items).
+
+**Production code — promoted, not reimplemented.** `backend/chart_tool_schema.py`
+(`CHART_TOOL_SCHEMA`, `validate_chart_arguments()`, `SYSTEM_PROMPT_FEWSHOT`)
+and `backend/json_envelope_repair.py` (`repair_envelope()`) are the
+production copies of the diagnostic modules of the same name/purpose —
+moved, not re-derived, since the diagnostic phase already validated this
+exact logic against real model output. The `diagnostics/` copies are left
+in place for reproducibility of the 66.7%/12.1% numbers above; production
+code (`mcp_tool_dispatcher.py`) imports only from `backend/`, never from
+`diagnostics/` (see this file's own project-wide convention: diagnostics
+are read-only live-verification tooling, never a runtime dependency).
+`mcp_server/chart.py` independently duplicates `validate_chart_arguments()`
+rather than importing it from `backend/` — `mcp_server` is a separate
+process/service and has never taken a dependency on the main backend
+package (same reasoning `file_ops.py` gives for duplicating
+`_MAX_FILE_READ_CHARS` instead of importing it).
+
+**`mcp_server/chart.py` — the MCP tool itself.** Validates
+`(chart_type, labels, datasets, title="")` via `validate_chart_arguments()`
+(chart_type ∈ {bar, line, pie}; non-empty labels; non-empty datasets with
+each `data` array matching `labels`' length; pie constrained to exactly
+one dataset), raising `ValueError("ERROR: ...")` on any violation — the
+same convention every other tool here uses, so `MCPToolDispatcher`'s
+`_normalize_mcp_error_text()` continues to work unchanged. Renders the
+chart with matplotlib (`Agg` backend), saved to
+`{project_root}/charts/<uuid>.png` via `file_ops._sandbox_resolve()` reused
+directly rather than a second, independently-implemented sandbox check.
+Categorical series colors are eight fixed hues from the dataviz skill's
+validated palette (CVD-safe ordering), used only for this static
+server-rendered PNG — not shared with the frontend's own color choice (see
+below). Returns `{summary, png_path, chart_config}`; `summary` is a short
+human-readable string (`"Generated bar chart: Fruit Counts"`) and is
+*the only field safe to reach the model's prompt* — `png_path`/
+`chart_config` would blow Slot 5's 500-token ceiling and aren't meant for
+the model to see at all, flagged with a comment at the return statement so
+this doesn't get casually widened later.
+
+**Planner P3 gate — `_CHART_KEYWORDS`.** A new frozenset in `planner.py`,
+same `_any_whole_word()` word-boundary-matched style as
+`_WEB_SEARCH_KEYWORDS`/`_FILE_OP_KEYWORDS`: `"chart this"`, `"make a
+chart"`, `"make a bar/line/pie chart"`, `"plot this/these"`, `"graph
+this/these"`, `"visualize this/these"`. Deliberately narrow and
+imperative-verb-first — matches the diagnostic corpus's
+`chart_keyword_clear` category, which measured cleanly against real model
+behavior; a vaguer/broader gate (bare `"chart"`, `"graph"`, `"plot"`) was
+explicitly not added without re-running that corpus, same caution this
+file's other P3 keyword sets already document (§4.2's `_SEARCH_NEGATIVE_FILTER`
+reasoning). `"explain what a bar chart is"` — no imperative trigger — stays
+negative, confirmed by test. Checked alongside `ws_kw` in
+`_priority3_tool()`; appends `"chart"` to `tools_to_call`, compounding with
+`web_search`/`file_op` the same way those already do (checked in the same
+per-instruction order the function already uses — chart keyword hits
+append after `web_search`'s, so a message matching both gets
+`["web_search", "chart"]`).
+
+**`MCPToolDispatcher._run_chart()` — the production pipeline.** Runs
+exactly the `_v4_full` diagnostic's measured pipeline: infer at
+`temperature=0.0` with `SYSTEM_PROMPT_FEWSHOT` → `repair_envelope()` →
+classify (`malformed` / `no_tool` / `schema_invalid` / `match`); on
+`malformed` only, one retry at `temperature=0.3`, final. `runtime` — this
+class's constructor parameter, whose docstring previously said "unused as
+of Phase 4" (superseded since the research loop's addition, §18) — is used
+here for the extraction inference call, same
+blocking-`infer()`-from-async-context pattern the research loop's
+gate/reformulate calls already use. On a `match`, dispatches to
+`generate_chart` and returns a `ToolResult` whose `.result` is only the
+tool's `summary` (never `png_path`/`chart_config`); the full artifact rides
+in a new `ToolResult.artifact: dict | None = None` field
+(`prompt_builder.py` — default `None` keeps every existing `ToolResult(`
+construction site unchanged, confirmed by grepping all of them before
+adding the field).
+
+**Accepted-failure design — a deliberate deviation from every other tool
+in this file.** `file_op`/`url_fetch`/`web_search` all surface a failure
+to the model as an `"ERROR: ..."`-shaped `ToolResult`, which Slot 5a
+(§14.7, Open Item 3) renders as `[TOOL FAILED]` so the model can hedge
+honestly. Chart does not: on any extraction/dispatch failure (post-retry
+still malformed, schema-invalid, the model legitimately declining via
+`{"tool_call": null}`, or a `generate_chart` MCP-level failure),
+`_run_chart()` returns `None` — not a `ToolResult` at all — and
+`_dispatch_async()`'s chart branch appends nothing to `results`, only
+logging a warning. The turn simply degrades to a normal prose answer with
+no chart and no visible error. Decided this way because a chart-specific
+`[TOOL FAILED]` line would give the model something to narrate around
+(`"I tried to make a chart but couldn't..."`) for a request the user never
+explicitly saw fail — worse UX than just answering the question in prose,
+given the failure rate is a known, accepted 12.1% rather than an
+occasional fluke worth surfacing.
+
+**`ControllerResult.metadata["chart"]`.** `controller_agent.py`'s
+`_execute_plan()` Step 3 extracts the chart `ToolResult.artifact` (if any)
+from `dispatched_tool_results` right after tool dispatch, and
+`_build_conversational_result()` (§4.4a) — now taking an added
+`chart_artifact` parameter, threaded through both its call sites (the
+early `on_answer_ready` callback and the final return) — sets
+`metadata["chart"] = {"png_path": ..., "chart_config": ...}` only when
+non-`None`, omitted entirely otherwise (never a null placeholder — same
+"omit empty slots cleanly" convention `PromptBuilder` uses). Verified this
+survives both `POST /task` (`TaskResponse.metadata: dict[str, Any]`, no
+field-level filtering) and the SSE stream (`on_answer_ready` →
+`event_queue` → `json.dumps(payload)`, a blanket dict pass-through the
+whole way) unchanged.
+
+**Frontend.** `localist-ui/src/lib/stores/tasks.ts`'s `Task.metadata`
+gained an optional `chart: {png_path, chart_config}` field — inherited for
+free by `chatHistory.ts`'s `Turn.metadata` (typed directly as
+`Task['metadata']`) and by `ChatPanel.svelte`'s existing reactive
+metadata-sync block (a direct object-reference assignment, no
+destructuring), so no pass-through code changed, only the type. New
+`ChartRenderer.svelte` (Chart.js, added as a real dependency — no
+`chart.js` had been on this UI before) takes the same `chart_config` shape
+both the PNG (`mcp_server/chart.py`) and the browser consume — one schema,
+nothing to drift apart between the two renderers. Colors are read from
+this app's own CSS custom properties (`--accent`, `--success`, `--warning`,
+`--error` as the four categorical slots; `--text-*`/`--border-*`/
+`--bg-raised` for chrome) rather than a separate chart palette, so charts
+track the app's live light/dark theme like every other surface — a
+deliberately different color source than `mcp_server/chart.py`'s
+dataviz-skill palette above, since the PNG and the interactive render are
+independent artifacts serving different purposes (static export vs.
+themed in-app display), not required to share a palette the way they share
+`chart_config`'s data shape. Wired into `ChatPanel.svelte` right after the
+provenance-bar block. No `<img src={png_path}>` fallback was added — PNG
+mode is scoped for a possible future "export/share as image" feature, not
+needed for in-chat rendering (Open Items).
+
+**Live verification (2026-07-20).** No `chromium-cli` was available in
+this environment; a small Playwright driver script (headless Chromium, not
+committed — ad hoc verification only) drove the real running stack
+end-to-end through the browser: `"chart this: apples 5, oranges 3,
+bananas 7"` → planner gate fired → `_run_chart` pipeline ran →
+`generate_chart` executed (PNG confirmed written to
+`generated_files/charts/`) → an interactive bar chart rendered in-chat,
+screenshotted. Hover-tooltip interactivity confirmed (screenshot shows a
+"apples / Quantity: 5" tooltip on mouseover). A harder instruction with
+messier multi-region/currency-shaped data (`"Make a bar chart of Q3
+revenue by region: North $50k, South $30k, East $20k, West $40k"`) also
+succeeded end-to-end against the currently-active backend (Ollama,
+`gemma4:31b-cloud` — not the 4-bit oMLX model the diagnostic numbers above
+were measured against, so this is a stronger-model data point, not a
+reproduction of the measured rate). A non-keyword-matching instruction
+(`"Show me a trend line of these values over time..."`) correctly fell
+through to a normal P6 prose answer with no chart and no visible error —
+the accepted-degradation path exercised live, not just in unit tests. No
+browser console errors, no tracebacks in `logs/backend.log` /
+`logs/mcp_server.log` across all three turns.
+
+**Test coverage.** `TestGenerateChart` (`test_mcp_server.py`) — valid
+bar/line/pie cases, each `validate_chart_arguments()` rejection case, and
+a check that the PNG actually lands on disk at the returned `png_path`,
+plus in-process MCP tool-call wiring tests. `TestPlannerP3Chart`
+(`test_planner_phase3.py`) — every `_CHART_KEYWORDS` phrase (including the
+2026-07-20 `"turn this into a ..."` additions below) routes to
+`tools_to_call == ["chart"]`; the negative control stays negative; the
+`web_search`-plus-`chart` compound case; two dedicated regression tests
+using the exact `_CORPUS` instruction strings from
+`diagnostics/diag_shadow_chart_toolcall.py` (`chart_keyword_clear`'s pie-
+chart instruction and `chart_semantic_implicit`'s "something visual" one)
+that previously fell through to P6. `TestChart`
+(`test_mcp_tool_dispatcher.py`, §14.6) — successful dispatch,
+retry-recovery, full-failure-appends-nothing. `TestChartArtifactMetadata`
+(`test_controller_phase4.py`) — `metadata["chart"]` present and correctly
+shaped after a successful dispatch, absent (not null) otherwise. Full
+suite grew from 899 (before this feature) to 917 passed across the four
+backend steps, zero regressions at each step; `npm run check` clean
+throughout the frontend step. Grew again to 933 the same session after two
+follow-up fixes (925 after the `_CHART_KEYWORDS` corpus-gap fix below, 933
+after the Open Item 2 narrow mitigation — see both updates in this
+section and in §14.7's Open Item 2).
+
+**Follow-up fix, same session (2026-07-20) — `_CHART_KEYWORDS` corpus-gap
+closed.** Live testing caught a real gap between what the diagnostic
+corpus had already validated and what shipped:
+`"Turn this into a pie chart: Chrome 65, Safari 19, Firefox 8, Edge 6,
+Other 2"` — `chart_keyword_clear`, `expects_tool=True` in `_CORPUS` — fell
+through to P6 (`tools_to_call=[]`) because no `_CHART_KEYWORDS` entry
+covered `"turn this into a ..."` phrasing. Not new unvalidated scope: the
+exact instruction was already measured and marked chart-triggering before
+`_CHART_KEYWORDS` was first written. Fixed by adding
+`"turn this into a chart"`/`"...a bar chart"`/`"...a line chart"`/
+`"...a pie chart"`/`"...a graph"`/`"turn this into something visual"` to
+`_CHART_KEYWORDS` (the first four/fifth are the corpus-validated pie-chart
+phrasing's sibling slots in the same template `"make a {type} chart"`
+already covers four ways; the "something visual" phrase is the literal
+`chart_semantic_implicit` corpus string). Full design and the P3-table
+addendum live at §4.2 (2026-07-20 update); this file's own P3-gate Open
+Item bullet above notes the distinction between this coverage-gap fix and
+that bullet's "stay narrow" guidance. Live-verified: re-sent the exact pie-
+chart instruction through the running UI — `logs/backend.log` shows
+`Planner: Priority 3 — chart signal detected ('turn this into a pie
+chart')`, and a real interactive pie chart rendered (not the P6 fallback
+this gap had previously produced, which is also what surfaced Open Item
+2's new repro immediately below).
+
+**Open Items.**
+
+- **PNG export/attachment fallback not built.** `png_path` is already
+  returned and stashed in `ToolResult.artifact`/`metadata.chart`, but
+  nothing serves or renders it — scoped out of this session deliberately
+  (see "Frontend" above), for a possible future "export/share this chart
+  as an image" feature.
+- **P3 gate stays narrow by design, not re-measured wider.** Vaguer
+  triggers (bare `"chart"`/`"graph"`/`"plot"`, or implicit phrasing like
+  "how do these numbers compare") were deliberately not added — doing so
+  safely would require re-running the diagnostic corpus the same way every
+  other P3 keyword set here was tuned, not just guessing. (2026-07-20: a
+  real *coverage* gap against already-validated corpus entries — not a
+  vagueness problem — was caught live and closed the same session; see
+  §4.2's dated addendum and §14.7's Open Item 2 update for the repro this
+  gap produced. This is a different class of gap than the one this bullet
+  is about, and doesn't change this bullet's guidance.)
+- **Only one retry pass, not re-measured with a second.** The 66.7%/12.1%
+  numbers reflect exactly one retry at `temperature=0.3`; whether a second
+  retry (or a different mitigation, e.g. a smaller/stricter schema) moves
+  the residual failure rate meaningfully has not been measured.
+- **Reliability numbers are 4-bit-oMLX-specific.** The measured 66.7%
+  MATCH rate is for `gemma-4-e4b-it-4bit` only; this session's live
+  verification against Ollama's `gemma4:31b-cloud` succeeded on every
+  trial tried, but that is anecdotal, not a re-measurement — the gate and
+  retry logic are backend-agnostic, but the accepted-failure-rate number
+  in this doc should not be assumed to transfer to a different active
+  runtime backend without a fresh diagnostic run.
 

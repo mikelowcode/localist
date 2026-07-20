@@ -545,3 +545,16 @@ was available to screenshot the live UI directly (same limitation noted at §7.3
 user live-confirmed it afterward with a real chat transcript showing LORA's own
 `Request → Tool/Vault Search → Grounding against Local Truth → Cited Response → Memory Update`
 summary rendering with actual `→` glyphs instead of literal `$\rightarrow$` text.
+
+### 7.13 Chart Rendering (`ChartRenderer.svelte`) (2026-07-20)
+
+New `ChartRenderer.svelte` renders `turn.metadata.chart.chart_config` (bar/line/pie) via Chart.js —
+`chart.js` added as this UI's second runtime dependency after KaTeX (§7.12), same "deliberate,
+documented exception" posture. Full design (schema, color-token choice, wiring position, and the
+end-to-end live verification against the real running stack) lives at §14.8, the `generate_chart`
+MCP tool's own section, not duplicated here — this UI-side piece is the last of six steps in that
+feature, not a standalone one. In short: `Task.metadata`/`Turn.metadata` gained an optional `chart`
+field (§4.4a's `ChartArtifact`), inherited by the existing provenance-sync plumbing with no
+pass-through code changes; the component reads this app's own CSS custom properties for series
+colors rather than a separate palette, so charts track the live theme like every other surface; and
+it's wired into `ChatPanel.svelte` right after the provenance-bar block (§7.3).

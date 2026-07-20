@@ -73,6 +73,8 @@ gate missed.
 
 *Correction 2026-07-06 — bare `"today"`/`"write"`/`"save"` pruned from the keyword lists above.* Live traffic showed the deterministic keyword branch firing independently of, and before, the semantic gate's judgment: an utterance like "Did you know I added a new file read / write / append tool to my Localist app today?" correctly scored non-search by the semantic gate (`lookup_request=0.532 < 0.65`, `gate_fired=False`) but still triggered both `web_search` (on bare `"today"`) and `file_op` (on bare `"write"`) via the keyword branch, which runs unconditionally regardless of the semantic result. Fix: removed `"today"` from `_WEB_SEARCH_KEYWORDS` and `"write"`/`"save"` from `_FILE_OP_KEYWORDS` — all three were too common in ordinary conversational sentences to serve as reliable single-word tool signals. No replacement phrases were added; instructions that used to hit these bare words now fall through to P3b/P4/P5/§15.1's P6 classifier, which is the intended effect, not a gap to be immediately recaptured. Two tests keyed to the removed words (`test_file_op_guard_defers_to_p3`, `test_p3c_beats_web_search_p3` in `test_planner_phase3.py`) were rewritten to use surviving keywords (`"create a file"`, `"recent"`) — same P3c-ordering behavior under test, just a different trigger word; full suite restored to the 572 passed / 2 failed baseline (the 2 being the pre-existing, unrelated failures tracked in §14.6).
 
+*Update 2026-07-20 — chart keyword signal added, third member of the P3 keyword OR.* A new `_CHART_KEYWORDS` frozenset (`"chart this"`, `"make a chart"`, `"make a bar/line/pie chart"`, `"plot this/these"`, `"graph this/these"`, `"visualize this/these"`), checked via `_any_whole_word()` alongside `ws_kw`, appends `"chart"` to `tools_to_call` — full design, the diagnostic corpus behind the keyword choices, the extraction pipeline this feeds, and the accepted-failure behavior when extraction fails are documented at §14.8, not duplicated here. Compounds with `web_search`/`file_op` the same way those two already do.
+
 ---
 
 **PRIORITY 3b — FACTUAL QUERY + CORPUS MISS**
@@ -218,6 +220,22 @@ serialised directly to the HTTP response by `main.py`.
     "file_op_deferred": bool,      # True if a deferred file_op ran this turn
                                     # (§4.4b) — tools_fired stays [] for it,
                                     # since file_op never entered tools_to_call
+    "chart":          ChartArtifact | omitted,  # §14.8 — present only on a
+                                    # successful chart dispatch; the key is
+                                    # omitted entirely (never null) otherwise
+}
+```
+
+**`ChartArtifact`** (§14.8) — present only when this turn's tool dispatch produced a chart:
+```python
+{
+    "png_path":     str,    # relative path under generated_files/charts/
+    "chart_config": {
+        "chart_type": "bar" | "line" | "pie",
+        "title":      str,
+        "labels":     list[str],
+        "datasets":   list[{"label": str, "data": list[float]}],
+    },
 }
 ```
 

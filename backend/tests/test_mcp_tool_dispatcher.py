@@ -55,6 +55,7 @@ import pytest
 
 from mcp_tool_dispatcher import (
     MCPToolDispatcher,
+    _CHART_RETRY_TEMPERATURE,
     _MAX_RESEARCH_ITERATIONS,
     _RESEARCH_CLASSIFIER_TIMEOUT,
     _RESEARCH_GATE_SYSTEM_PROMPT,
@@ -410,6 +411,117 @@ class TestWebSearch:
         assert results[0].tool_name == "web_search"
         assert results[0].success is False
         assert "unreachable" in results[0].result
+
+
+class TestChart:
+    """
+    Coverage for MCPToolDispatcher._run_chart and its extraction pipeline
+    (_extract_chart_arguments / _run_chart_extraction_attempt) — promotes
+    diag_shadow_chart_toolcall_v4_full.py's measured infer->repair->
+    validate(->retry once)->dispatch pipeline to production.
+
+    dispatcher._runtime.infer is used synchronously (same pattern the
+    research loop's gate/reformulate calls already use) to produce the
+    few-shot {"tool_call": ...} envelope; _call_mcp_tool is monkeypatched
+    for the generate_chart dispatch itself, same as every other tool here.
+    """
+
+    _VALID_ENVELOPE = json.dumps({
+        "tool_call": {
+            "name": "generate_chart",
+            "arguments": {
+                "chart_type": "bar",
+                "title":      "Fruit Inventory",
+                "labels":     ["apples", "oranges"],
+                "datasets":   [{"label": "Count", "data": [5, 3]}],
+            },
+        }
+    })
+
+    def test_successful_chart_dispatch(self, dispatcher: MCPToolDispatcher):
+        dispatcher._runtime.infer.return_value = self._VALID_ENVELOPE
+
+        async def fake_call(session, name, arguments):
+            assert name == "generate_chart"
+            assert arguments["chart_type"] == "bar"
+            return json.dumps({
+                "summary":      "Generated bar chart: Fruit Inventory",
+                "png_path":     "charts/abc123.png",
+                "chart_config": arguments,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["chart"],
+                instruction   = "chart this: apples 5, oranges 3",
+                context       = {},
+            )
+
+        assert dispatcher._runtime.infer.call_count == 1
+        assert len(results) == 1
+        r = results[0]
+        assert r.tool_name == "chart"
+        assert r.success is True
+        assert r.result == "Generated bar chart: Fruit Inventory"
+        assert r.artifact == {
+            "png_path":     "charts/abc123.png",
+            "chart_config": {
+                "chart_type": "bar",
+                "title":      "Fruit Inventory",
+                "labels":     ["apples", "oranges"],
+                "datasets":   [{"label": "Count", "data": [5, 3]}],
+            },
+        }
+
+    def test_retry_recovers_from_malformed_first_attempt(self, dispatcher: MCPToolDispatcher):
+        """First infer() call returns plain prose (no JSON at all — the
+        classic "prose instead of null envelope" failure mode); the retry
+        at _CHART_RETRY_TEMPERATURE returns a valid envelope, and that
+        retry's result is final."""
+        responses = iter(["Sure, here's a summary of your data.", self._VALID_ENVELOPE])
+        temperatures_seen: list[float] = []
+
+        def infer_side_effect(**kw):
+            temperatures_seen.append(kw["temperature"])
+            return next(responses)
+
+        dispatcher._runtime.infer.side_effect = infer_side_effect
+
+        async def fake_call(session, name, arguments):
+            return json.dumps({
+                "summary":      "Generated bar chart: Fruit Inventory",
+                "png_path":     "charts/abc123.png",
+                "chart_config": arguments,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["chart"],
+                instruction   = "chart this: apples 5, oranges 3",
+                context       = {},
+            )
+
+        assert dispatcher._runtime.infer.call_count == 2
+        assert temperatures_seen == [0.0, _CHART_RETRY_TEMPERATURE]
+        assert len(results) == 1
+        assert results[0].success is True
+
+    def test_full_failure_after_retry_appends_no_result(self, dispatcher: MCPToolDispatcher):
+        """Both the first attempt and the retry come back malformed — per
+        the accepted-failure design (claude/chart-mcp-tool-scoping.md), no
+        ToolResult is appended at all, and generate_chart is never called."""
+        dispatcher._runtime.infer.return_value = "Sure, here's a summary of your data."
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool") as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["chart"],
+                instruction   = "chart this: apples 5, oranges 3",
+                context       = {},
+            )
+
+        assert dispatcher._runtime.infer.call_count == 2
+        mock_call.assert_not_called()
+        assert results == []
 
 
 class TestUnknownTool:

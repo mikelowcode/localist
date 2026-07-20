@@ -283,6 +283,54 @@ _FILE_OP_KEYWORDS: frozenset[str] = frozenset({
     "create a file",
 })
 
+# Priority 3 — chart generation trigger keywords
+# Deliberately narrow and imperative-verb-first, matching the
+# chart_keyword_clear category from the diagnostic corpus
+# (diagnostics/diag_shadow_chart_toolcall.py) that measured cleanly against
+# real model behavior — same "deterministic, no false-positive-risk" style
+# as _WEB_SEARCH_KEYWORDS/_FILE_OP_KEYWORDS above. Do not add broader/vaguer
+# phrases (e.g. bare "chart", "graph", "plot") without re-running that
+# diagnostic's corpus against them — see the _SEARCH_NEGATIVE_FILTER
+# comments above for why vague triggers cause false positives (e.g. "explain
+# what a bar chart is" must stay negative).
+#
+# 2026-07-20: "turn this into a {chart|bar chart|line chart|pie chart|
+# graph}" and "turn this into something visual" added — a real gap between
+# what the diagnostic corpus had already validated and what shipped.
+# "Turn this into a pie chart: Chrome 65, Safari 19, Firefox 8, Edge 6,
+# Other 2" (chart_keyword_clear, expects_tool=True) and "Turn this into
+# something visual: Q1 100, Q2 150, Q3 130, Q4 180" (chart_semantic_implicit,
+# expects_tool=True) are both in _CORPUS with no keyword covering them —
+# caught live when the pie-chart instruction fell through to P6 instead of
+# firing the chart tool. "turn this into a bar/line chart" and "turn this
+# into a graph" are added alongside the corpus-confirmed pie-chart phrasing
+# as the same template's other chart-type slots (same reasoning
+# "make a chart"/"make a bar chart"/"make a line chart"/"make a pie chart"
+# above already cover all four slots of their own template) — not
+# independently corpus-validated strings, but the same pattern with the
+# type swapped. Do not widen "turn this into a" further (e.g. dropping the
+# chart-type/visual suffix) without a fresh diagnostic run — see the
+# comment above.
+_CHART_KEYWORDS: frozenset[str] = frozenset({
+    "chart this",
+    "make a chart",
+    "make a bar chart",
+    "make a line chart",
+    "make a pie chart",
+    "plot this",
+    "plot these",
+    "graph this",
+    "graph these",
+    "visualize this",
+    "visualize these",
+    "turn this into a chart",
+    "turn this into a bar chart",
+    "turn this into a line chart",
+    "turn this into a pie chart",
+    "turn this into a graph",
+    "turn this into something visual",
+})
+
 # Diagnostic Slot 1 — canonical template groups for semantic search-intent scoring.
 # These strings are embedded at startup and used only for cosine-similarity logging;
 # they do not gate any routing decision until a threshold prompt replaces this comment.
@@ -822,6 +870,7 @@ class Planner:
     # Class-level aliases so callers can access via instance (e.g. p._WEB_SEARCH_KEYWORDS)
     _WEB_SEARCH_KEYWORDS: frozenset[str] = _WEB_SEARCH_KEYWORDS
     _FILE_OP_KEYWORDS:    frozenset[str] = _FILE_OP_KEYWORDS
+    _CHART_KEYWORDS:      frozenset[str] = _CHART_KEYWORDS
     _GATE1_ENV_VAR:       str            = _GATE1_ENV_VAR
 
     def __init__(
@@ -1419,12 +1468,13 @@ class Planner:
     ) -> RoutingPlan | None:
         """
         Match condition: web search keyword, explicit-date pattern, semantic
-        search-intent gate, OR file operation keyword present in lowercased
-        instruction — see _WEB_SEARCH_KEYWORDS, _has_explicit_date(), and
-        _SEMANTIC_GATE_THRESHOLDS respectively; any one alone is sufficient.
+        search-intent gate, chart keyword, OR file operation keyword present
+        in lowercased instruction — see _WEB_SEARCH_KEYWORDS,
+        _has_explicit_date(), _SEMANTIC_GATE_THRESHOLDS, and _CHART_KEYWORDS
+        respectively; any one alone is sufficient.
 
-        Populates tools_to_call with "web_search" or "file_op" as
-        appropriate. Sets compound=True when a tool is scheduled alongside
+        Populates tools_to_call with "web_search", "chart", and/or "file_op"
+        as appropriate. Sets compound=True when a tool is scheduled alongside
         a response agent, since the tool must run before the agent call.
 
         file_op is detected via either a literal _FILE_OP_KEYWORDS hit (read/
@@ -1464,6 +1514,13 @@ class Planner:
             tools.append("web_search")
             logger.debug(
                 "Planner: Priority 3 — web_search signal detected (%r).", ws_kw
+            )
+
+        chart_kw = self._any_whole_word(_CHART_KEYWORDS, lowered)
+        if chart_kw:
+            tools.append("chart")
+            logger.debug(
+                "Planner: Priority 3 — chart signal detected (%r).", chart_kw
             )
 
         semantic_result = self._semantic_search_intent(lowered)

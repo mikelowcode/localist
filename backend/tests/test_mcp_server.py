@@ -17,6 +17,10 @@ Covers:
     inference call), network/timeout error — for both the LangSearch
     provider (default / SEARCH_PROVIDER=langsearch) and the Brave provider
     (SEARCH_PROVIDER=brave), plus the unknown-provider error
+  - chart.generate_chart: valid bar/line/pie cases, each argument-validation
+    rejection case (bad chart_type, empty labels, empty/mismatched datasets,
+    multi-dataset pie), and confirmation that the PNG actually lands on disk
+    at the returned png_path.
   - All tools as registered on the FastMCP instance, exercised through
     an in-process MCP client session (mcp.shared.memory) — no network server
     required.
@@ -34,7 +38,7 @@ import pytest
 
 from mcp.shared.memory import create_connected_server_and_client_session
 
-from mcp_server import file_ops, url_fetch, web_search
+from mcp_server import chart, file_ops, url_fetch, web_search
 from mcp_server.main import mcp as mcp_app
 
 
@@ -437,6 +441,105 @@ class TestWebSearchBraveErrors:
 
 
 # ---------------------------------------------------------------------------
+# chart.generate_chart — direct unit tests
+# ---------------------------------------------------------------------------
+
+_BAR_ARGS = dict(
+    chart_type = "bar",
+    labels     = ["apples", "oranges", "bananas"],
+    datasets   = [{"label": "Fruit count", "data": [5, 3, 7]}],
+    title      = "Fruit Inventory",
+)
+
+_LINE_ARGS = dict(
+    chart_type = "line",
+    labels     = ["Jan", "Feb", "Mar"],
+    datasets   = [{"label": "Revenue", "data": [10, 20, 15]}],
+    title      = "",
+)
+
+_PIE_ARGS = dict(
+    chart_type = "pie",
+    labels     = ["A", "B", "C"],
+    datasets   = [{"label": "Share", "data": [1, 2, 3]}],
+    title      = "Distribution",
+)
+
+
+class TestGenerateChart:
+    def test_bar_chart_success(self, tmp_path: Path):
+        file_ops.set_project_root(tmp_path)
+        result = chart.generate_chart(**_BAR_ARGS)
+
+        assert result["summary"] == "Generated bar chart: Fruit Inventory"
+        assert result["png_path"].startswith("charts/") and result["png_path"].endswith(".png")
+        assert result["chart_config"] == {
+            "chart_type": "bar",
+            "title":      "Fruit Inventory",
+            "labels":     _BAR_ARGS["labels"],
+            "datasets":   _BAR_ARGS["datasets"],
+        }
+        png_file = tmp_path / result["png_path"]
+        assert png_file.exists()
+        assert png_file.stat().st_size > 0
+
+    def test_line_chart_success(self, tmp_path: Path):
+        file_ops.set_project_root(tmp_path)
+        result = chart.generate_chart(**_LINE_ARGS)
+        assert result["summary"] == "Generated line chart: Jan, Feb, Mar"
+        assert (tmp_path / result["png_path"]).exists()
+
+    def test_pie_chart_success(self, tmp_path: Path):
+        file_ops.set_project_root(tmp_path)
+        result = chart.generate_chart(**_PIE_ARGS)
+        assert result["summary"] == "Generated pie chart: Distribution"
+        assert (tmp_path / result["png_path"]).exists()
+
+    def test_invalid_chart_type_raises(self, tmp_path: Path):
+        file_ops.set_project_root(tmp_path)
+        with pytest.raises(ValueError, match="ERROR:.*chart_type invalid or missing"):
+            chart.generate_chart(chart_type="scatter", labels=["a"], datasets=[{"label": "x", "data": [1]}])
+
+    def test_empty_labels_raises(self, tmp_path: Path):
+        file_ops.set_project_root(tmp_path)
+        with pytest.raises(ValueError, match="ERROR:.*labels is an empty array"):
+            chart.generate_chart(chart_type="bar", labels=[], datasets=[{"label": "x", "data": []}])
+
+    def test_empty_datasets_raises(self, tmp_path: Path):
+        file_ops.set_project_root(tmp_path)
+        with pytest.raises(ValueError, match="ERROR:.*datasets missing, not an array, or empty"):
+            chart.generate_chart(chart_type="bar", labels=["a"], datasets=[])
+
+    def test_dataset_length_mismatch_raises(self, tmp_path: Path):
+        file_ops.set_project_root(tmp_path)
+        with pytest.raises(ValueError, match="ERROR:.*data length .* != labels length"):
+            chart.generate_chart(
+                chart_type = "bar",
+                labels     = ["a", "b"],
+                datasets   = [{"label": "x", "data": [1]}],
+            )
+
+    def test_pie_with_multiple_datasets_raises(self, tmp_path: Path):
+        file_ops.set_project_root(tmp_path)
+        with pytest.raises(ValueError, match="ERROR:.*pie chart_type should have exactly one dataset"):
+            chart.generate_chart(
+                chart_type = "pie",
+                labels     = ["a", "b"],
+                datasets   = [
+                    {"label": "x", "data": [1, 2]},
+                    {"label": "y", "data": [3, 4]},
+                ],
+            )
+
+    def test_no_chart_written_on_validation_failure(self, tmp_path: Path):
+        file_ops.set_project_root(tmp_path)
+        with pytest.raises(ValueError):
+            chart.generate_chart(chart_type="bad", labels=[], datasets=[])
+        charts_dir = tmp_path / "charts"
+        assert not charts_dir.exists() or not list(charts_dir.iterdir())
+
+
+# ---------------------------------------------------------------------------
 # MCP tool wiring — in-process client session (no network)
 # ---------------------------------------------------------------------------
 
@@ -519,3 +622,19 @@ class TestMCPToolsInProcess:
         text, is_error = asyncio.run(_call_tool("web_search", {"query": "test query"}))
         assert is_error is True
         assert "LANGSEARCH_API_KEY not configured" in text
+
+    def test_generate_chart_tool_success(self, tmp_path: Path):
+        file_ops.set_project_root(tmp_path)
+        text, is_error = asyncio.run(_call_tool("generate_chart", _BAR_ARGS))
+        assert is_error is False
+        data = json.loads(text)
+        assert data["summary"] == "Generated bar chart: Fruit Inventory"
+        assert (tmp_path / data["png_path"]).exists()
+
+    def test_generate_chart_tool_error_surfaces_as_is_error(self, tmp_path: Path):
+        file_ops.set_project_root(tmp_path)
+        text, is_error = asyncio.run(
+            _call_tool("generate_chart", {"chart_type": "scatter", "labels": ["a"], "datasets": [{"label": "x", "data": [1]}]})
+        )
+        assert is_error is True
+        assert "chart_type invalid or missing" in text

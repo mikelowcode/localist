@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +58,14 @@ class ToolResult:
     parameters: str
     result:     str
     success:    bool = True
+    # Non-prompt-facing payload for tools whose full output must never reach
+    # Slot 5 ([TOOL RESULTS]) — e.g. chart's png_path/chart_config, which
+    # would blow the 500-token ceiling and aren't meant for the model to see
+    # at all. _slot5_tools() only ever reads .tool_name/.parameters/.result,
+    # so this field is naturally excluded from the prompt; callers that need
+    # it (controller_agent.py, to populate ControllerResult.metadata) read it
+    # directly off the ToolResult instead.
+    artifact:   dict[str, Any] | None = None
 
 
 @dataclass

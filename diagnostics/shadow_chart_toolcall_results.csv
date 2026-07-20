@@ -1,0 +1,157 @@
+instruction,category,run,planner_tools_to_call,planner_priority,gemma_raw_output,gemma_parsed_tool,gemma_parsed_args,schema_problems,classification
+"Chart this data for me: apples 5, oranges 3, bananas 7",chart_keyword_clear,1,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""title"": ""Fruit Counts"", ""labels"": [""apples"", ""oranges"", ""bananas""], ""datasets"": [{""label"": ""Count"", ""data"": [5, 3, 7]}]}}}",generate_chart,"{""chart_type"": ""pie"", ""title"": ""Fruit Counts"", ""labels"": [""apples"", ""oranges"", ""bananas""], ""datasets"": [{""label"": ""Count"", ""data"": [5, 3, 7]}]}",,MATCH
+"Chart this data for me: apples 5, oranges 3, bananas 7",chart_keyword_clear,2,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""title"": ""Fruit Counts"", ""labels"": [""apples"", ""oranges"", ""bananas""], ""datasets"": [{""label"": ""Count"", ""data"": [5, 3, 7]}]}}}",generate_chart,"{""chart_type"": ""pie"", ""title"": ""Fruit Counts"", ""labels"": [""apples"", ""oranges"", ""bananas""], ""datasets"": [{""label"": ""Count"", ""data"": [5, 3, 7]}]}",,MATCH
+"Chart this data for me: apples 5, oranges 3, bananas 7",chart_keyword_clear,3,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""title"": ""Fruit Counts"", ""labels"": [""apples"", ""oranges"", ""bananas""], ""datasets"": [{""label"": ""Count"", ""data"": [5, 3, 7]}]}}}",generate_chart,"{""chart_type"": ""pie"", ""title"": ""Fruit Counts"", ""labels"": [""apples"", ""oranges"", ""bananas""], ""datasets"": [{""label"": ""Count"", ""data"": [5, 3, 7]}]}",,MATCH
+"Make a bar chart of Q3 revenue by region: North 120, South 90, East 150, West 80",chart_keyword_clear,1,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Q3 Revenue by Region"", ""labels"": [""North"", ""South"", ""East"", ""West""], ""datasets"": [{""label"": ""Revenue"", ""data"": [120, 90, 150, 80]}]だろう}}}",,,,MALFORMED_ENVELOPE
+"Make a bar chart of Q3 revenue by region: North 120, South 90, East 150, West 80",chart_keyword_clear,2,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Q3 Revenue by Region"", ""labels"": [""North"", ""South"", ""East"", ""West""], ""datasets"": [{""label"": ""Revenue"", ""data"": [120, 90, 150, 80]}]だろう}}}",,,,MALFORMED_ENVELOPE
+"Make a bar chart of Q3 revenue by region: North 120, South 90, East 150, West 80",chart_keyword_clear,3,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Q3 Revenue by Region"", ""labels"": [""North"", ""South"", ""East"", ""West""], ""datasets"": [{""label"": ""Revenue"", ""data"": [120, 90, 150, 80]}]だろう}}}",,,,MALFORMED_ENVELOPE
+"Plot the last 5 months of signups: Jan 10, Feb 15, Mar 22, Apr 18, May 30",chart_keyword_clear,1,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Last 5 Months Signups"", ""labels"": [""Jan"", ""Feb"", ""Mar"", ""Apr"", ""May""], ""datasets"": [{""label"": ""Signups"", ""data"": [10, 15",,,,MALFORMED_ENVELOPE
+"Plot the last 5 months of signups: Jan 10, Feb 15, Mar 22, Apr 18, May 30",chart_keyword_clear,2,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Last 5 Months Signups"", ""labels"": [""Jan"", ""Feb"", ""Mar"", ""Apr"", ""May""], ""datasets"": [{""label"": ""Signups"", ""data"": [10, 15",,,,MALFORMED_ENVELOPE
+"Plot the last 5 months of signups: Jan 10, Feb 15, Mar 22, Apr 18, May 30",chart_keyword_clear,3,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Last 5 Months Signups"", ""labels"": [""Jan"", ""Feb"", ""Mar"", ""Apr"", ""May""], ""datasets"": [{""label"": ""Signups"", ""data"": [10, 15",,,,MALFORMED_ENVELOPE
+"Can you graph these numbers? 12, 19, 8, 24, 16",chart_keyword_clear,1,,6,"
+{""tool_call"": null}",,,,MISS
+"Can you graph these numbers? 12, 19, 8, 24, 16",chart_keyword_clear,2,,6,"
+{""tool_call"": null}",,,,MISS
+"Can you graph these numbers? 12, 19, 8, 24, 16",chart_keyword_clear,3,,6,"
+{""tool_call"": null}",,,,MISS
+"Visualize this: rent 40, food 25, transport 15, other 20",chart_keyword_clear,1,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""labels"": [""Rent"", ""Food"", ""Transport"", ""Other""], ""datasets"": [{""label"": ""Expenses"", ""data"": [40, 25, 15, 20]}]}}}",generate_chart,"{""chart_type"": ""pie"", ""labels"": [""Rent"", ""Food"", ""Transport"", ""Other""], ""datasets"": [{""label"": ""Expenses"", ""data"": [40, 25, 15, 20]}]}",,MATCH
+"Visualize this: rent 40, food 25, transport 15, other 20",chart_keyword_clear,2,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""labels"": [""Rent"", ""Food"", ""Transport"", ""Other""], ""datasets"": [{""label"": ""Expenses"", ""data"": [40, 25, 15, 20]}]}}}",generate_chart,"{""chart_type"": ""pie"", ""labels"": [""Rent"", ""Food"", ""Transport"", ""Other""], ""datasets"": [{""label"": ""Expenses"", ""data"": [40, 25, 15, 20]}]}",,MATCH
+"Visualize this: rent 40, food 25, transport 15, other 20",chart_keyword_clear,3,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""labels"": [""Rent"", ""Food"", ""Transport"", ""Other""], ""datasets"": [{""label"": ""Expenses"", ""data"": [40, 25, 15, 20]}]}}}",generate_chart,"{""chart_type"": ""pie"", ""labels"": [""Rent"", ""Food"", ""Transport"", ""Other""], ""datasets"": [{""label"": ""Expenses"", ""data"": [40, 25, 15, 20]}]}",,MATCH
+"Turn this into a pie chart: Chrome 65, Safari 19, Firefox 8, Edge 6, Other 2",chart_keyword_clear,1,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""labels"": [""Chrome"", ""Safari"", ""Firefox"", ""Edge"", ""Other""], ""datasets"": [{""label"": ""Usage Percentage"", ""data"": [65, 19, 8, 6, 2]}]だろう}}}",,,,MALFORMED_ENVELOPE
+"Turn this into a pie chart: Chrome 65, Safari 19, Firefox 8, Edge 6, Other 2",chart_keyword_clear,2,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""labels"": [""Chrome"", ""Safari"", ""Firefox"", ""Edge"", ""Other""], ""datasets"": [{""label"": ""Usage Percentage"", ""data"": [65, 19, 8, 6, 2]}]だろう}}}",,,,MALFORMED_ENVELOPE
+"Turn this into a pie chart: Chrome 65, Safari 19, Firefox 8, Edge 6, Other 2",chart_keyword_clear,3,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""labels"": [""Chrome"", ""Safari"", ""Firefox"", ""Edge"", ""Other""], ""datasets"": [{""label"": ""Usage Percentage"", ""data"": [65, 19, 8, 6, 2]}]だろう}}}",,,,MALFORMED_ENVELOPE
+"Graph the temperature readings over the week: Mon 68, Tue 71, Wed 69, Thu 74, Fri 77",chart_keyword_clear,1,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""line"", ""title"": ""Weekly Temperature Readings"", ""labels"": [""Mon"", ""Tue"", ""Wed"", ""Thu"", ""Fri""], ""datasets"": [{""label"": ""Temperature"", ""data"": [68, 71, 69, 74, 77的比}]}}}}",,,,MALFORMED_ENVELOPE
+"Graph the temperature readings over the week: Mon 68, Tue 71, Wed 69, Thu 74, Fri 77",chart_keyword_clear,2,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""line"", ""title"": ""Weekly Temperature Readings"", ""labels"": [""Mon"", ""Tue"", ""Wed"", ""Thu"", ""Fri""], ""datasets"": [{""label"": ""Temperature"", ""data"": [68, 71, 69, 74, 77的比}]}}}}",,,,MALFORMED_ENVELOPE
+"Graph the temperature readings over the week: Mon 68, Tue 71, Wed 69, Thu 74, Fri 77",chart_keyword_clear,3,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""line"", ""title"": ""Weekly Temperature Readings"", ""labels"": [""Mon"", ""Tue"", ""Wed"", ""Thu"", ""Fri""], ""datasets"": [{""label"": ""Temperature"", ""data"": [68, 71, 69, 74, 77的比}]}}}}",,,,MALFORMED_ENVELOPE
+"Show me a trend line of these values over time: 10, 20, 15, 25, 30",chart_semantic_implicit,1,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""line"", ""labels"": [""Point 1"", ""Point 2"", ""Point 3"", ""Point",,,,MALFORMED_ENVELOPE
+"Show me a trend line of these values over time: 10, 20, 15, 25, 30",chart_semantic_implicit,2,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""line"", ""labels"": [""Point 1"", ""Point 2"", ""Point 3"", ""Point",,,,MALFORMED_ENVELOPE
+"Show me a trend line of these values over time: 10, 20, 15, 25, 30",chart_semantic_implicit,3,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""line"", ""labels"": [""Point 1"", ""Point 2"", ""Point 3"", ""Point",,,,MALFORMED_ENVELOPE
+"I want to see this as a breakdown: rent 40%, food 25%, transport 15%, other 20%",chart_semantic_implicit,1,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""labels"": [""rent"", ""food"", ""transport"", ""other""], ""datasets"": [{""label"": ""Expense Breakdown"", ""data"": [40, 25, 15, 20]}]だろう}}}",,,,MALFORMED_ENVELOPE
+"I want to see this as a breakdown: rent 40%, food 25%, transport 15%, other 20%",chart_semantic_implicit,2,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""labels"": [""rent"", ""food"", ""transport"", ""other""], ""datasets"": [{""label"": ""Expense Breakdown"", ""data"": [40, 25, 15, 20]}]だろう}}}",,,,MALFORMED_ENVELOPE
+"I want to see this as a breakdown: rent 40%, food 25%, transport 15%, other 20%",chart_semantic_implicit,3,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""labels"": [""rent"", ""food"", ""transport"", ""other""], ""datasets"": [{""label"": ""Expense Breakdown"", ""data"": [40, 25, 15, 20]}]だろう}}}",,,,MALFORMED_ENVELOPE
+"Turn this into something visual: Q1 100, Q2 150, Q3 130, Q4 180",chart_semantic_implicit,1,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Quarterly Performance"", ""labels"": [""Q1"", ""Q2"", ""Q3"", ""Q4""], ""datasets"": [{""label"": ""Value"", ""data"": [100, 150, 130, 180]}]}}}",generate_chart,"{""chart_type"": ""bar"", ""title"": ""Quarterly Performance"", ""labels"": [""Q1"", ""Q2"", ""Q3"", ""Q4""], ""datasets"": [{""label"": ""Value"", ""data"": [100, 150, 130, 180]}]}",,MATCH
+"Turn this into something visual: Q1 100, Q2 150, Q3 130, Q4 180",chart_semantic_implicit,2,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Quarterly Performance"", ""labels"": [""Q1"", ""Q2"", ""Q3"", ""Q4""], ""datasets"": [{""label"": ""Value"", ""data"": [100, 150, 130, 180]}]}}}",generate_chart,"{""chart_type"": ""bar"", ""title"": ""Quarterly Performance"", ""labels"": [""Q1"", ""Q2"", ""Q3"", ""Q4""], ""datasets"": [{""label"": ""Value"", ""data"": [100, 150, 130, 180]}]}",,MATCH
+"Turn this into something visual: Q1 100, Q2 150, Q3 130, Q4 180",chart_semantic_implicit,3,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Quarterly Performance"", ""labels"": [""Q1"", ""Q2"", ""Q3"", ""Q4""], ""datasets"": [{""label"": ""Value"", ""data"": [100, 150, 130, 180]}]}}}",generate_chart,"{""chart_type"": ""bar"", ""title"": ""Quarterly Performance"", ""labels"": [""Q1"", ""Q2"", ""Q3"", ""Q4""], ""datasets"": [{""label"": ""Value"", ""data"": [100, 150, 130, 180]}]}",,MATCH
+"Compare these three products' sales side by side: A 45, B 60, C 38",chart_semantic_implicit,1,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Product Sales Comparison"", ""labels"": [""A"", ""B"", ""C""], ""datasets"": [{""label"": ""Sales"", ""data"": [45, 60, 38]}]}}}",generate_chart,"{""chart_type"": ""bar"", ""title"": ""Product Sales Comparison"", ""labels"": [""A"", ""B"", ""C""], ""datasets"": [{""label"": ""Sales"", ""data"": [45, 60, 38]}]}",,MATCH
+"Compare these three products' sales side by side: A 45, B 60, C 38",chart_semantic_implicit,2,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Product Sales Comparison"", ""labels"": [""A"", ""B"", ""C""], ""datasets"": [{""label"": ""Sales"", ""data"": [45, 60, 38]}]}}}",generate_chart,"{""chart_type"": ""bar"", ""title"": ""Product Sales Comparison"", ""labels"": [""A"", ""B"", ""C""], ""datasets"": [{""label"": ""Sales"", ""data"": [45, 60, 38]}]}",,MATCH
+"Compare these three products' sales side by side: A 45, B 60, C 38",chart_semantic_implicit,3,,6,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Product Sales Comparison"", ""labels"": [""A"", ""B"", ""C""], ""datasets"": [{""label"": ""Sales"", ""data"": [45, 60, 38]}]}}}",generate_chart,"{""chart_type"": ""bar"", ""title"": ""Product Sales Comparison"", ""labels"": [""A"", ""B"", ""C""], ""datasets"": [{""label"": ""Sales"", ""data"": [45, 60, 38]}]}",,MATCH
+What's the capital of France?,negative_control,1,,6,"
+{""tool_call"": null}",,,,NULL_CORRECT
+What's the capital of France?,negative_control,2,,6,"
+{""tool_call"": null}",,,,NULL_CORRECT
+What's the capital of France?,negative_control,3,,6,"
+{""tool_call"": null}",,,,NULL_CORRECT
+Summarize this article for me.,negative_control,1,,6,"
+Please provide the article you would like me to summarize.",,,,MALFORMED_ENVELOPE
+Summarize this article for me.,negative_control,2,,6,"
+Please provide the article you would like me to summarize.",,,,MALFORMED_ENVELOPE
+Summarize this article for me.,negative_control,3,,6,"
+Please provide the article you would like me to summarize.",,,,MALFORMED_ENVELOPE
+Remember that I prefer dark mode.,negative_control,1,,2,"
+{""tool_call"": null}",,,,NULL_CORRECT
+Remember that I prefer dark mode.,negative_control,2,,2,"
+{""tool_call"": null}",,,,NULL_CORRECT
+Remember that I prefer dark mode.,negative_control,3,,2,"
+{""tool_call"": null}",,,,NULL_CORRECT
+What did I tell you about my project setup?,negative_control,1,,5,"
+{""tool_call"": null}",,,,NULL_CORRECT
+What did I tell you about my project setup?,negative_control,2,,5,"
+{""tool_call"": null}",,,,NULL_CORRECT
+What did I tell you about my project setup?,negative_control,3,,5,"
+{""tool_call"": null}",,,,NULL_CORRECT
+Search the web for the latest AI news.,negative_control,1,web_search,3,"
+{""tool_call"": null}",,,,NULL_CORRECT
+Search the web for the latest AI news.,negative_control,2,web_search,3,"
+{""tool_call"": null}",,,,NULL_CORRECT
+Search the web for the latest AI news.,negative_control,3,web_search,3,"
+{""tool_call"": null}",,,,NULL_CORRECT
+Read the file at notes/todo.md,negative_control,1,file_op,3,"
+{""tool_call"": null}",,,,NULL_CORRECT
+Read the file at notes/todo.md,negative_control,2,file_op,3,"
+{""tool_call"": null}",,,,NULL_CORRECT
+Read the file at notes/todo.md,negative_control,3,file_op,3,"
+{""tool_call"": null}",,,,NULL_CORRECT
+What is the current CEO of OpenAI?,negative_control,1,web_search,3,"
+{""tool_call"": null}",,,,NULL_CORRECT
+What is the current CEO of OpenAI?,negative_control,2,web_search,3,"
+{""tool_call"": null}",,,,NULL_CORRECT
+What is the current CEO of OpenAI?,negative_control,3,web_search,3,"
+{""tool_call"": null}",,,,NULL_CORRECT
+Explain what a bar chart is.,negative_control,1,,6,"
+A bar chart is a graphical display of information using rectangular bars. The height or length of each bar is proportional to the value it represents.
+
+They are used to compare different categories or groups. For example, you could use a bar chart to compare the sales figures of different products in a given month.
+
+**Key components:**
+
+*   **X-axis (Horizontal Axis):** Usually represents the categories (e.g., different products, months, countries).
+*   **Y-axis (Vertical Axis):** Represents the measured values or frequency (e.g., sales amount, number of people).
+*   **Bars:** The rectangular bars whose length corresponds to the value on the Y-axis.",,,,MALFORMED_ENVELOPE
+Explain what a bar chart is.,negative_control,2,,6,"
+A bar chart is a graphical display of information using rectangular bars. The height or length of each bar is proportional to the value it represents.
+
+They are used to compare different categories or groups. For example, you could use a bar chart to compare the sales figures of different products in a given month.
+
+**Key components:**
+
+*   **X-axis (Horizontal Axis):** Usually represents the categories (e.g., different products, months, countries).
+*   **Y-axis (Vertical Axis):** Represents the measured values or frequency (e.g., sales amount, number of people).
+*   **Bars:** The rectangular bars whose length corresponds to the value on the Y-axis.",,,,MALFORMED_ENVELOPE
+Explain what a bar chart is.,negative_control,3,,6,"
+A bar chart is a graphical display of information using rectangular bars. The height or length of each bar is proportional to the value it represents.
+
+They are used to compare different categories or groups. For example, you could use a bar chart to compare the sales figures of different products in a given month.
+
+**Key components:**
+
+*   **X-axis (Horizontal Axis):** Usually represents the categories (e.g., different products, months, countries).
+*   **Y-axis (Vertical Axis):** Represents the measured values or frequency (e.g., sales amount, number of people).
+*   **Bars:** The rectangular bars whose length corresponds to the value on the Y-axis.",,,,MALFORMED_ENVELOPE
+Can you show me this data?,ambiguous,1,,6,"
+{""tool_call"": null}",,,,NULL_CORRECT
+Can you show me this data?,ambiguous,2,,6,"
+{""tool_call"": null}",,,,NULL_CORRECT
+Can you show me this data?,ambiguous,3,,6,"
+{""tool_call"": null}",,,,NULL_CORRECT
+"I have some numbers, what should I do with them?",ambiguous,1,,6,"
+",,,,MALFORMED_ENVELOPE
+"I have some numbers, what should I do with them?",ambiguous,2,,6,"
+",,,,MALFORMED_ENVELOPE
+"I have some numbers, what should I do with them?",ambiguous,3,,6,"
+",,,,MALFORMED_ENVELOPE
+"Here's my budget: rent 1200, food 400, transport 200. Thoughts?",ambiguous,1,,6,"
+{""tool_call"": null}",,,,NULL_CORRECT
+"Here's my budget: rent 1200, food 400, transport 200. Thoughts?",ambiguous,2,,6,"
+{""tool_call"": null}",,,,NULL_CORRECT
+"Here's my budget: rent 1200, food 400, transport 200. Thoughts?",ambiguous,3,,6,"
+{""tool_call"": null}",,,,NULL_CORRECT

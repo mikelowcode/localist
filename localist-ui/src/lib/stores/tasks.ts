@@ -36,6 +36,15 @@ export interface Task {
     grounded?:         boolean;
     file_op_deferred?: boolean;
     pending_diffs?:    PendingDiff[];
+    chart?: {
+      png_path: string;
+      chart_config: {
+        chart_type: 'bar' | 'line' | 'pie';
+        title: string;
+        labels: string[];
+        datasets: { label: string; data: number[] }[];
+      };
+    };
   };
 }
 

@@ -21,6 +21,7 @@
   },
   "type": "module",
   "dependencies": {
+    "chart.js": "^4.5.1",
     "katex": "^0.18.0"
   }
 }

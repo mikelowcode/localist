@@ -288,6 +288,65 @@ class TestCompoundDetection:
 
 
 # ---------------------------------------------------------------------------
+# Priority 3 — chart generation trigger keywords
+# ---------------------------------------------------------------------------
+
+class TestPlannerP3Chart:
+
+    @pytest.mark.parametrize("phrase", sorted(Planner._CHART_KEYWORDS))
+    def test_chart_keyword_routes_to_chart(self, phrase):
+        p = Planner(runtime=make_runtime())
+        plan = p.route(f"{phrase}: apples 5, oranges 3, bananas 7", context={})
+        assert plan.tools_to_call == ["chart"]
+        assert plan.compound is True
+
+    def test_explain_bar_chart_does_not_route_to_chart(self):
+        """Negative control from the diagnostic corpus (negative_control
+        category, diagnostics/diag_shadow_chart_toolcall.py) — no imperative
+        chart trigger present, must stay negative."""
+        p = Planner(runtime=make_runtime(infer_return="no"))
+        plan = p.route("explain what a bar chart is", context={})
+        assert "chart" not in plan.tools_to_call
+
+    def test_chart_compounds_with_web_search(self):
+        """Same combination-ordering behavior _WEB_SEARCH_KEYWORDS /
+        _FILE_OP_KEYWORDS already compound with (TestCompoundDetection
+        above) — a message matching both a chart keyword and a web_search
+        keyword gets both tools, in the order _priority3_tool() checks them
+        (web_search before chart)."""
+        p = Planner(runtime=make_runtime())
+        plan = p.route(
+            "make a bar chart of the latest oMLX release notes", context={}
+        )
+        assert plan.tools_to_call == ["web_search", "chart"]
+        assert plan.compound is True
+
+    def test_diagnostic_corpus_turn_into_pie_chart_routes_to_chart(self):
+        """Regression test for the exact chart_keyword_clear corpus
+        instruction (diagnostics/diag_shadow_chart_toolcall.py,
+        expects_tool=True) that fell through to P6 (tools=[]) before
+        "turn this into a {chart type}" was added to _CHART_KEYWORDS —
+        caught live 2026-07-20."""
+        p = Planner(runtime=make_runtime())
+        plan = p.route(
+            "Turn this into a pie chart: Chrome 65, Safari 19, Firefox 8, "
+            "Edge 6, Other 2",
+            context={},
+        )
+        assert "chart" in plan.tools_to_call
+
+    def test_diagnostic_corpus_turn_into_something_visual_routes_to_chart(self):
+        """Same gap, the chart_semantic_implicit corpus instruction
+        (expects_tool=True) — "turn this into something visual" phrasing."""
+        p = Planner(runtime=make_runtime())
+        plan = p.route(
+            "Turn this into something visual: Q1 100, Q2 150, Q3 130, Q4 180",
+            context={},
+        )
+        assert "chart" in plan.tools_to_call
+
+
+# ---------------------------------------------------------------------------
 # ControllerAgent integration
 # ---------------------------------------------------------------------------
 

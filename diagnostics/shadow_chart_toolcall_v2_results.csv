@@ -1,0 +1,133 @@
+instruction,category,run,gemma_raw_output,pre_repair_classification,repair_outcome,post_repair_classification,improved_by_repair
+"Chart this data for me: apples 5, oranges 3, bananas 7",chart_keyword_clear,1,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Fruit Counts"", ""labels"": [""apples"", ""oranges"", ""bananas""], ""datasets"": [{""label"": ""Count"", ""data"": [5, 3, 7]}]だろう}}}",MALFORMED_ENVELOPE,trailing_garbage_removed,MATCH,True
+"Chart this data for me: apples 5, oranges 3, bananas 7",chart_keyword_clear,2,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Fruit Counts"", ""labels"": [""apples"", ""oranges"", ""bananas""], ""datasets"": [{""label"": ""Count"", ""data"": [5, 3, 7]}]だろう}}}",MALFORMED_ENVELOPE,trailing_garbage_removed,MATCH,True
+"Chart this data for me: apples 5, oranges 3, bananas 7",chart_keyword_clear,3,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Fruit Counts"", ""labels"": [""apples"", ""oranges"", ""bananas""], ""datasets"": [{""label"": ""Count"", ""data"": [5, 3, 7]}]だろう}}}",MALFORMED_ENVELOPE,trailing_garbage_removed,MATCH,True
+"Make a bar chart of Q3 revenue by region: North 120, South 90, East 150, West 80",chart_keyword_clear,1,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Q3 Revenue by Region"", ""labels"": [""North"", ""South"", ""East"", ""West""], ""datasets"": [{""label"": ""Revenue"", ""data"": [120, 90, 150, 80]}] ago}}",MALFORMED_ENVELOPE,unrepairable,MALFORMED_ENVELOPE,False
+"Make a bar chart of Q3 revenue by region: North 120, South 90, East 150, West 80",chart_keyword_clear,2,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Q3 Revenue by Region"", ""labels"": [""North"", ""South"", ""East"", ""West""], ""datasets"": [{""label"": ""Revenue"", ""data"": [120, 90, 150, 80]}] ago}}",MALFORMED_ENVELOPE,unrepairable,MALFORMED_ENVELOPE,False
+"Make a bar chart of Q3 revenue by region: North 120, South 90, East 150, West 80",chart_keyword_clear,3,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Q3 Revenue by Region"", ""labels"": [""North"", ""South"", ""East"", ""West""], ""datasets"": [{""label"": ""Revenue"", ""data"": [120, 90, 150, 80]}] ago}}",MALFORMED_ENVELOPE,unrepairable,MALFORMED_ENVELOPE,False
+"Plot the last 5 months of signups: Jan 10, Feb 15, Mar 22, Apr 18, May 30",chart_keyword_clear,1,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Last 5 Months Signups"", ""labels"": [""Jan"", ""Feb"", ""Mar"", ""Apr"", ""May""], ""datasets"": [{""label"": ""Signups"", ""data"": [10, 15, 22, 18, 30]}] ago}}",MALFORMED_ENVELOPE,unrepairable,MALFORMED_ENVELOPE,False
+"Plot the last 5 months of signups: Jan 10, Feb 15, Mar 22, Apr 18, May 30",chart_keyword_clear,2,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Last 5 Months Signups"", ""labels"": [""Jan"", ""Feb"", ""Mar"", ""Apr"", ""May""], ""datasets"": [{""label"": ""Signups"", ""data"": [10, 15, 22, 18, 30]}] ago}}",MALFORMED_ENVELOPE,unrepairable,MALFORMED_ENVELOPE,False
+"Plot the last 5 months of signups: Jan 10, Feb 15, Mar 22, Apr 18, May 30",chart_keyword_clear,3,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Last 5 Months Signups"", ""labels"": [""Jan"", ""Feb"", ""Mar"", ""Apr"", ""May""], ""datasets"": [{""label"": ""Signups"", ""data"": [10, 15, 22, 18, 30]}] ago}}",MALFORMED_ENVELOPE,unrepairable,MALFORMED_ENVELOPE,False
+"Can you graph these numbers? 12, 19, 8, 24, 16",chart_keyword_clear,1,"
+{""tool_call"": null}",MISS,no_repair_needed,MISS,False
+"Can you graph these numbers? 12, 19, 8, 24, 16",chart_keyword_clear,2,"
+{""tool_call"": null}",MISS,no_repair_needed,MISS,False
+"Can you graph these numbers? 12, 19, 8, 24, 16",chart_keyword_clear,3,"
+{""tool_call"": null}",MISS,no_repair_needed,MISS,False
+"Visualize this: rent 40, food 25, transport 15, other 20",chart_keyword_clear,1,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""title"": ""Budget Breakdown"", ""labels"": [""rent"", ""food"", ""transport"", ""other""], ""datasets"": [{""label"": ""Amount"", ""data"": [40, 25, 15, 20]}]}}}",MATCH,no_repair_needed,MATCH,False
+"Visualize this: rent 40, food 25, transport 15, other 20",chart_keyword_clear,2,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""title"": ""Budget Breakdown"", ""labels"": [""rent"", ""food"", ""transport"", ""other""], ""datasets"": [{""label"": ""Amount"", ""data"": [40, 25, 15, 20]}]}}}",MATCH,no_repair_needed,MATCH,False
+"Visualize this: rent 40, food 25, transport 15, other 20",chart_keyword_clear,3,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""title"": ""Budget Breakdown"", ""labels"": [""rent"", ""food"", ""transport"", ""other""], ""datasets"": [{""label"": ""Amount"", ""data"": [40, 25, 15, 20]}]}}}",MATCH,no_repair_needed,MATCH,False
+"Turn this into a pie chart: Chrome 65, Safari 19, Firefox 8, Edge 6, Other 2",chart_keyword_clear,1,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""title"": ""Browser Usage"", ""labels"": [""Chrome"", ""Safari"", ""Firefox"", ""Edge"", ""Other""], ""datasets"": [{""label"": ""Count"", ""data"": [65, 19, 8, 6, 2]}]}}}",MATCH,no_repair_needed,MATCH,False
+"Turn this into a pie chart: Chrome 65, Safari 19, Firefox 8, Edge 6, Other 2",chart_keyword_clear,2,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""title"": ""Browser Usage"", ""labels"": [""Chrome"", ""Safari"", ""Firefox"", ""Edge"", ""Other""], ""datasets"": [{""label"": ""Count"", ""data"": [65, 19, 8, 6, 2]}]}}}",MATCH,no_repair_needed,MATCH,False
+"Turn this into a pie chart: Chrome 65, Safari 19, Firefox 8, Edge 6, Other 2",chart_keyword_clear,3,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""title"": ""Browser Usage"", ""labels"": [""Chrome"", ""Safari"", ""Firefox"", ""Edge"", ""Other""], ""datasets"": [{""label"": ""Count"", ""data"": [65, 19, 8, 6, 2]}]}}}",MATCH,no_repair_needed,MATCH,False
+"Graph the temperature readings over the week: Mon 68, Tue 71, Wed 69, Thu 74, Fri 77",chart_keyword_clear,1,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""line"", ""title"": ""Weekly Temperature Readings"", ""labels"": [""Mon"", ""Tue"", ""Wed"", ""Thu"", ""Fri""], ""datasets"": [{""label"": ""Temperature"", ""data"": [68, 71, 69, 74, 77]}]}}}",MATCH,no_repair_needed,MATCH,False
+"Graph the temperature readings over the week: Mon 68, Tue 71, Wed 69, Thu 74, Fri 77",chart_keyword_clear,2,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""line"", ""title"": ""Weekly Temperature Readings"", ""labels"": [""Mon"", ""Tue"", ""Wed"", ""Thu"", ""Fri""], ""datasets"": [{""label"": ""Temperature"", ""data"": [68, 71, 69, 74, 77]}]}}}",MATCH,no_repair_needed,MATCH,False
+"Graph the temperature readings over the week: Mon 68, Tue 71, Wed 69, Thu 74, Fri 77",chart_keyword_clear,3,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""line"", ""title"": ""Weekly Temperature Readings"", ""labels"": [""Mon"", ""Tue"", ""Wed"", ""Thu"", ""Fri""], ""datasets"": [{""label"": ""Temperature"", ""data"": [68, 71, 69, 74, 77]}]}}}",MATCH,no_repair_needed,MATCH,False
+"Show me a trend line of these values over time: 10, 20, 15, 25, 30",chart_semantic_implicit,1,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""line"", ""title"": ""Value Trend Over Time"", ""labels"": [""Time 1"", ""Time 2"", ""Time 3"", ""Time 4"",",MALFORMED_ENVELOPE,truncated,MALFORMED_ENVELOPE,False
+"Show me a trend line of these values over time: 10, 20, 15, 25, 30",chart_semantic_implicit,2,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""line"", ""title"": ""Value Trend Over Time"", ""labels"": [""Time 1"", ""Time 2"", ""Time 3"", ""Time 4"",",MALFORMED_ENVELOPE,truncated,MALFORMED_ENVELOPE,False
+"Show me a trend line of these values over time: 10, 20, 15, 25, 30",chart_semantic_implicit,3,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""line"", ""title"": ""Value Trend Over Time"", ""labels"": [""Time 1"", ""Time 2"", ""Time 3"", ""Time 4"",",MALFORMED_ENVELOPE,truncated,MALFORMED_ENVELOPE,False
+"I want to see this as a breakdown: rent 40%, food 25%, transport 15%, other 20%",chart_semantic_implicit,1,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""title"": ""Budget Breakdown"", ""labels"": [""rent"", ""food"", ""transport"", ""other""], ""datasets"": [{""label"": ""Percentage"", ""data"": [40, 25, 15, 20]}]}}}",MATCH,no_repair_needed,MATCH,False
+"I want to see this as a breakdown: rent 40%, food 25%, transport 15%, other 20%",chart_semantic_implicit,2,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""title"": ""Budget Breakdown"", ""labels"": [""rent"", ""food"", ""transport"", ""other""], ""datasets"": [{""label"": ""Percentage"", ""data"": [40, 25, 15, 20]}]}}}",MATCH,no_repair_needed,MATCH,False
+"I want to see this as a breakdown: rent 40%, food 25%, transport 15%, other 20%",chart_semantic_implicit,3,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""pie"", ""title"": ""Budget Breakdown"", ""labels"": [""rent"", ""food"", ""transport"", ""other""], ""datasets"": [{""label"": ""Percentage"", ""data"": [40, 25, 15, 20]}]}}}",MATCH,no_repair_needed,MATCH,False
+"Turn this into something visual: Q1 100, Q2 150, Q3 130, Q4 180",chart_semantic_implicit,1,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Quarterly Values"", ""labels"": [""Q1"", ""Q2"", ""Q3"", ""Q4""], ""datasets"": [{""label"": ""Value"", ""data"": [100, 150, 130, 180]}] ago}}",MALFORMED_ENVELOPE,unrepairable,MALFORMED_ENVELOPE,False
+"Turn this into something visual: Q1 100, Q2 150, Q3 130, Q4 180",chart_semantic_implicit,2,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Quarterly Values"", ""labels"": [""Q1"", ""Q2"", ""Q3"", ""Q4""], ""datasets"": [{""label"": ""Value"", ""data"": [100, 150, 130, 180]}] ago}}",MALFORMED_ENVELOPE,unrepairable,MALFORMED_ENVELOPE,False
+"Turn this into something visual: Q1 100, Q2 150, Q3 130, Q4 180",chart_semantic_implicit,3,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Quarterly Values"", ""labels"": [""Q1"", ""Q2"", ""Q3"", ""Q4""], ""datasets"": [{""label"": ""Value"", ""data"": [100, 150, 130, 180]}] ago}}",MALFORMED_ENVELOPE,unrepairable,MALFORMED_ENVELOPE,False
+"Compare these three products' sales side by side: A 45, B 60, C 38",chart_semantic_implicit,1,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Product Sales Comparison"", ""labels"": [""A"", ""B"", ""C""], ""datasets"": [{""label"": ""Sales"", ""data"": [45, 60, 38]}]}}}",MATCH,no_repair_needed,MATCH,False
+"Compare these three products' sales side by side: A 45, B 60, C 38",chart_semantic_implicit,2,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Product Sales Comparison"", ""labels"": [""A"", ""B"", ""C""], ""datasets"": [{""label"": ""Sales"", ""data"": [45, 60, 38]}]}}}",MATCH,no_repair_needed,MATCH,False
+"Compare these three products' sales side by side: A 45, B 60, C 38",chart_semantic_implicit,3,"
+{""tool_call"": {""name"": ""generate_chart"", ""arguments"": {""chart_type"": ""bar"", ""title"": ""Product Sales Comparison"", ""labels"": [""A"", ""B"", ""C""], ""datasets"": [{""label"": ""Sales"", ""data"": [45, 60, 38]}]}}}",MATCH,no_repair_needed,MATCH,False
+What's the capital of France?,negative_control,1,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+What's the capital of France?,negative_control,2,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+What's the capital of France?,negative_control,3,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Summarize this article for me.,negative_control,1,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Summarize this article for me.,negative_control,2,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Summarize this article for me.,negative_control,3,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Remember that I prefer dark mode.,negative_control,1,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Remember that I prefer dark mode.,negative_control,2,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Remember that I prefer dark mode.,negative_control,3,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+What did I tell you about my project setup?,negative_control,1,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+What did I tell you about my project setup?,negative_control,2,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+What did I tell you about my project setup?,negative_control,3,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Search the web for the latest AI news.,negative_control,1,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Search the web for the latest AI news.,negative_control,2,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Search the web for the latest AI news.,negative_control,3,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Read the file at notes/todo.md,negative_control,1,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Read the file at notes/todo.md,negative_control,2,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Read the file at notes/todo.md,negative_control,3,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+What is the current CEO of OpenAI?,negative_control,1,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+What is the current CEO of OpenAI?,negative_control,2,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+What is the current CEO of OpenAI?,negative_control,3,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Explain what a bar chart is.,negative_control,1,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Explain what a bar chart is.,negative_control,2,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Explain what a bar chart is.,negative_control,3,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Can you show me this data?,ambiguous,1,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Can you show me this data?,ambiguous,2,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+Can you show me this data?,ambiguous,3,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+"I have some numbers, what should I do with them?",ambiguous,1,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+"I have some numbers, what should I do with them?",ambiguous,2,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+"I have some numbers, what should I do with them?",ambiguous,3,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+"Here's my budget: rent 1200, food 400, transport 200. Thoughts?",ambiguous,1,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+"Here's my budget: rent 1200, food 400, transport 200. Thoughts?",ambiguous,2,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False
+"Here's my budget: rent 1200, food 400, transport 200. Thoughts?",ambiguous,3,"
+{""tool_call"": null}",NULL_CORRECT,no_repair_needed,NULL_CORRECT,False

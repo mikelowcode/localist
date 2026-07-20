@@ -39,6 +39,9 @@ httpx>=0.28.1
 # localist-mcp service — MCP (Model Context Protocol) SDK, SSE transport
 mcp>=1.28.1
 
+# localist-mcp service — generate_chart tool (server-side PNG rendering)
+matplotlib>=3.9.0
+
 # System memory introspection — context_profile.py's startup RAM headroom
 # check (local backends only), and diagnostics/diag_local_working_memory_ram_probe.py
 psutil>=7.0.0

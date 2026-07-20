@@ -38,6 +38,7 @@ from controller_agent import (
     _memory_key,
     _extract_file_op_content,
     _file_op_confirmation_line,
+    _strip_false_tool_attribution,
 )
 from memory_manager import (
     MemoryManager,
@@ -927,6 +928,176 @@ class TestToolStubPath:
 
         prompt = conv._received[0].context["_prebuilt_prompt"]
         assert "[TOOL RESULTS]" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Chart artifact -> ControllerResult.metadata["chart"] (_execute_plan Step 3)
+# ---------------------------------------------------------------------------
+
+class TestChartArtifactMetadata:
+    """
+    ToolResult.artifact (mcp_tool_dispatcher.py's _run_chart, Phase 3) must
+    reach ControllerResult.metadata["chart"] on a successful chart dispatch,
+    and the key must be absent entirely (not null) on any other turn — see
+    _build_conversational_result's chart_artifact parameter.
+
+    Same wholesale-MCPToolDispatcher-mock pattern as
+    TestDeferredFileOpDispatch above; dispatch()'s own MCP-session behavior
+    is already covered by test_mcp_tool_dispatcher.py.
+    """
+
+    def _make_chart_plan(self) -> RoutingPlan:
+        return RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = False,
+            priority       = 3,
+            compound       = True,
+            tools_to_call  = ["chart"],
+        )
+
+    def test_successful_chart_dispatch_populates_metadata_chart(self, mm):
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent("Here's your chart.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = self._make_chart_plan()
+
+        chart_config = {
+            "chart_type": "bar",
+            "title":      "Fruit Inventory",
+            "labels":     ["apples", "oranges"],
+            "datasets":   [{"label": "Count", "data": [5, 3]}],
+        }
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.return_value = [
+            _ToolResult(
+                tool_name  = "chart",
+                parameters = "chart_type='bar'",
+                result     = "Generated bar chart: Fruit Inventory",
+                success    = True,
+                artifact   = {"png_path": "charts/abc123.png", "chart_config": chart_config},
+            )
+        ]
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch("controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            result = ctrl.handle_task(
+                {"instruction": "chart this: apples 5, oranges 3"}
+            )
+
+        assert result["metadata"]["chart"] == {
+            "png_path":     "charts/abc123.png",
+            "chart_config": chart_config,
+        }
+
+    def test_non_chart_turn_omits_chart_key_entirely(self, mm):
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent("Test answer.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        result = ctrl.handle_task({"instruction": "What is 2+2?"})
+
+        assert "chart" not in result["metadata"]
+
+
+# ---------------------------------------------------------------------------
+# _strip_false_tool_attribution — narrow mitigation for Open Item 2's
+# 2026-07-20 repro (docs/architecture/14-localist-mcp-tool-layer.md §14.7):
+# a model claiming "(Source: Tool output)" on a turn where tools_to_call
+# was empty. Not a fix for Open Item 2 itself — see the function's own
+# docstring and the doc update.
+# ---------------------------------------------------------------------------
+
+class TestStripFalseToolAttribution:
+
+    def test_strips_parenthetical_source_tool_output(self):
+        answer = (
+            "I have generated a pie chart showing the Browser Market Share: "
+            "Chrome (65), Safari (19), Firefox (8), Edge (6), and Other (2).\n"
+            "(Source: Tool output)"
+        )
+        result = _strip_false_tool_attribution(answer)
+        assert "(Source: Tool output)" not in result
+        assert "Browser Market Share" in result
+
+    def test_strips_bare_source_tool_output_phrase(self):
+        answer = "Here is the summary. Source: Tool output"
+        result = _strip_false_tool_attribution(answer)
+        assert "tool output" not in result.lower()
+
+    def test_strips_via_tool_output_phrase(self):
+        answer = "The result was computed via tool output."
+        result = _strip_false_tool_attribution(answer)
+        assert "tool output" not in result.lower()
+
+    def test_case_insensitive_match(self):
+        answer = "Done. (SOURCE: TOOL OUTPUT)"
+        result = _strip_false_tool_attribution(answer)
+        assert "tool output" not in result.lower()
+
+    def test_no_match_returns_answer_unchanged(self):
+        answer = "Just a normal answer with no tool citation."
+        assert _strip_false_tool_attribution(answer) == answer
+
+    def test_falls_back_to_caveat_when_stripping_would_empty_the_answer(self):
+        answer = "(Source: Tool output)"
+        result = _strip_false_tool_attribution(answer)
+        assert "(Source: Tool output)" not in result
+        assert "no tool actually ran" in result
+
+
+class TestFalseToolAttributionIntegration:
+    """
+    Wiring into _build_conversational_result — only strips when
+    plan.tools_to_call is empty for the turn.
+    """
+
+    def test_empty_tools_turn_strips_false_attribution(self, mm):
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent(
+            "I have generated a pie chart. (Source: Tool output)"
+        )
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        result = ctrl.handle_task({"instruction": "What is 2+2?"})
+
+        assert "(Source: Tool output)" not in result["answer"]
+
+    def test_real_tool_fired_citation_not_stripped(self, mm):
+        """The more important test: a legitimate tool citation on a turn
+        where a tool actually ran (tools_to_call non-empty) must survive
+        untouched — a false positive here would strip real citations."""
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent(
+            "I have generated a pie chart. (Source: Tool output)"
+        )
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = False,
+            priority       = 3,
+            compound       = True,
+            tools_to_call  = ["chart"],
+        )
+
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.return_value = [
+            _ToolResult(
+                tool_name  = "chart",
+                parameters = "chart_type='pie'",
+                result     = "Generated pie chart: Browser Market Share",
+                success    = True,
+            )
+        ]
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch("controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            result = ctrl.handle_task(
+                {"instruction": "chart this: apples 5, oranges 3"}
+            )
+
+        assert "(Source: Tool output)" in result["answer"]
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,67 @@
+instruction,category,run,first_pass_classification,first_pass_repair_outcome,retry_attempted,retry_classification,retry_repair_outcome,final_classification
+"Chart this data for me: apples 5, oranges 3, bananas 7",chart_keyword_clear,1,MATCH,trailing_garbage_removed,False,,,MATCH
+"Chart this data for me: apples 5, oranges 3, bananas 7",chart_keyword_clear,2,MATCH,trailing_garbage_removed,False,,,MATCH
+"Chart this data for me: apples 5, oranges 3, bananas 7",chart_keyword_clear,3,MATCH,trailing_garbage_removed,False,,,MATCH
+"Make a bar chart of Q3 revenue by region: North 120, South 90, East 150, West 80",chart_keyword_clear,1,MALFORMED_ENVELOPE,unrepairable,True,MALFORMED_ENVELOPE,unrepairable,MALFORMED_ENVELOPE
+"Make a bar chart of Q3 revenue by region: North 120, South 90, East 150, West 80",chart_keyword_clear,2,MALFORMED_ENVELOPE,unrepairable,True,MATCH,trailing_garbage_removed,MATCH
+"Make a bar chart of Q3 revenue by region: North 120, South 90, East 150, West 80",chart_keyword_clear,3,MALFORMED_ENVELOPE,unrepairable,True,MALFORMED_ENVELOPE,unrepairable,MALFORMED_ENVELOPE
+"Plot the last 5 months of signups: Jan 10, Feb 15, Mar 22, Apr 18, May 30",chart_keyword_clear,1,MALFORMED_ENVELOPE,unrepairable,True,MATCH,no_repair_needed,MATCH
+"Plot the last 5 months of signups: Jan 10, Feb 15, Mar 22, Apr 18, May 30",chart_keyword_clear,2,MALFORMED_ENVELOPE,unrepairable,True,MATCH,no_repair_needed,MATCH
+"Plot the last 5 months of signups: Jan 10, Feb 15, Mar 22, Apr 18, May 30",chart_keyword_clear,3,MALFORMED_ENVELOPE,unrepairable,True,MALFORMED_ENVELOPE,unrepairable,MALFORMED_ENVELOPE
+"Can you graph these numbers? 12, 19, 8, 24, 16",chart_keyword_clear,1,MISS,no_repair_needed,False,,,MISS
+"Can you graph these numbers? 12, 19, 8, 24, 16",chart_keyword_clear,2,MISS,no_repair_needed,False,,,MISS
+"Can you graph these numbers? 12, 19, 8, 24, 16",chart_keyword_clear,3,MISS,no_repair_needed,False,,,MISS
+"Visualize this: rent 40, food 25, transport 15, other 20",chart_keyword_clear,1,MATCH,no_repair_needed,False,,,MATCH
+"Visualize this: rent 40, food 25, transport 15, other 20",chart_keyword_clear,2,MATCH,no_repair_needed,False,,,MATCH
+"Visualize this: rent 40, food 25, transport 15, other 20",chart_keyword_clear,3,MATCH,no_repair_needed,False,,,MATCH
+"Turn this into a pie chart: Chrome 65, Safari 19, Firefox 8, Edge 6, Other 2",chart_keyword_clear,1,MATCH,no_repair_needed,False,,,MATCH
+"Turn this into a pie chart: Chrome 65, Safari 19, Firefox 8, Edge 6, Other 2",chart_keyword_clear,2,MATCH,no_repair_needed,False,,,MATCH
+"Turn this into a pie chart: Chrome 65, Safari 19, Firefox 8, Edge 6, Other 2",chart_keyword_clear,3,MATCH,no_repair_needed,False,,,MATCH
+"Graph the temperature readings over the week: Mon 68, Tue 71, Wed 69, Thu 74, Fri 77",chart_keyword_clear,1,MATCH,no_repair_needed,False,,,MATCH
+"Graph the temperature readings over the week: Mon 68, Tue 71, Wed 69, Thu 74, Fri 77",chart_keyword_clear,2,MATCH,no_repair_needed,False,,,MATCH
+"Graph the temperature readings over the week: Mon 68, Tue 71, Wed 69, Thu 74, Fri 77",chart_keyword_clear,3,MATCH,no_repair_needed,False,,,MATCH
+"Show me a trend line of these values over time: 10, 20, 15, 25, 30",chart_semantic_implicit,1,MALFORMED_ENVELOPE,truncated,True,MALFORMED_ENVELOPE,truncated,MALFORMED_ENVELOPE
+"Show me a trend line of these values over time: 10, 20, 15, 25, 30",chart_semantic_implicit,2,MALFORMED_ENVELOPE,truncated,True,MALFORMED_ENVELOPE,truncated,MALFORMED_ENVELOPE
+"Show me a trend line of these values over time: 10, 20, 15, 25, 30",chart_semantic_implicit,3,MALFORMED_ENVELOPE,truncated,True,MALFORMED_ENVELOPE,truncated,MALFORMED_ENVELOPE
+"I want to see this as a breakdown: rent 40%, food 25%, transport 15%, other 20%",chart_semantic_implicit,1,MATCH,no_repair_needed,False,,,MATCH
+"I want to see this as a breakdown: rent 40%, food 25%, transport 15%, other 20%",chart_semantic_implicit,2,MATCH,no_repair_needed,False,,,MATCH
+"I want to see this as a breakdown: rent 40%, food 25%, transport 15%, other 20%",chart_semantic_implicit,3,MATCH,no_repair_needed,False,,,MATCH
+"Turn this into something visual: Q1 100, Q2 150, Q3 130, Q4 180",chart_semantic_implicit,1,MALFORMED_ENVELOPE,unrepairable,True,MALFORMED_ENVELOPE,unrepairable,MALFORMED_ENVELOPE
+"Turn this into something visual: Q1 100, Q2 150, Q3 130, Q4 180",chart_semantic_implicit,2,MALFORMED_ENVELOPE,unrepairable,True,MALFORMED_ENVELOPE,unrepairable,MALFORMED_ENVELOPE
+"Turn this into something visual: Q1 100, Q2 150, Q3 130, Q4 180",chart_semantic_implicit,3,MALFORMED_ENVELOPE,unrepairable,True,MATCH,no_repair_needed,MATCH
+"Compare these three products' sales side by side: A 45, B 60, C 38",chart_semantic_implicit,1,MATCH,no_repair_needed,False,,,MATCH
+"Compare these three products' sales side by side: A 45, B 60, C 38",chart_semantic_implicit,2,MATCH,no_repair_needed,False,,,MATCH
+"Compare these three products' sales side by side: A 45, B 60, C 38",chart_semantic_implicit,3,MATCH,no_repair_needed,False,,,MATCH
+What's the capital of France?,negative_control,1,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+What's the capital of France?,negative_control,2,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+What's the capital of France?,negative_control,3,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Summarize this article for me.,negative_control,1,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Summarize this article for me.,negative_control,2,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Summarize this article for me.,negative_control,3,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Remember that I prefer dark mode.,negative_control,1,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Remember that I prefer dark mode.,negative_control,2,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Remember that I prefer dark mode.,negative_control,3,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+What did I tell you about my project setup?,negative_control,1,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+What did I tell you about my project setup?,negative_control,2,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+What did I tell you about my project setup?,negative_control,3,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Search the web for the latest AI news.,negative_control,1,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Search the web for the latest AI news.,negative_control,2,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Search the web for the latest AI news.,negative_control,3,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Read the file at notes/todo.md,negative_control,1,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Read the file at notes/todo.md,negative_control,2,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Read the file at notes/todo.md,negative_control,3,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+What is the current CEO of OpenAI?,negative_control,1,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+What is the current CEO of OpenAI?,negative_control,2,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+What is the current CEO of OpenAI?,negative_control,3,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Explain what a bar chart is.,negative_control,1,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Explain what a bar chart is.,negative_control,2,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Explain what a bar chart is.,negative_control,3,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Can you show me this data?,ambiguous,1,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Can you show me this data?,ambiguous,2,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+Can you show me this data?,ambiguous,3,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+"I have some numbers, what should I do with them?",ambiguous,1,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+"I have some numbers, what should I do with them?",ambiguous,2,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+"I have some numbers, what should I do with them?",ambiguous,3,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+"Here's my budget: rent 1200, food 400, transport 200. Thoughts?",ambiguous,1,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+"Here's my budget: rent 1200, food 400, transport 200. Thoughts?",ambiguous,2,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT
+"Here's my budget: rent 1200, food 400, transport 200. Thoughts?",ambiguous,3,NULL_CORRECT,no_repair_needed,False,,,NULL_CORRECT

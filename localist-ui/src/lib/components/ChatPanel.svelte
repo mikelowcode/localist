@@ -6,6 +6,7 @@
   import { currentConversationId, isFirstTurnOfConversation } from '$lib/stores/conversation';
   import { applyDiff } from '$lib/stores/wiki';
   import MarkdownRenderer from '$lib/components/MarkdownRenderer.svelte';
+  import ChartRenderer from '$lib/components/ChartRenderer.svelte';
 
   let instruction = '';
   let messagesEl: HTMLElement;
@@ -397,6 +398,10 @@
                     {/if}
                   </div>
                 {/if}
+              {/if}
+
+              {#if turn.status === 'complete' && turn.metadata?.chart}
+                <ChartRenderer config={turn.metadata.chart.chart_config} />
               {/if}
 
               {#if turn.status === 'complete' && turn.metadata?.pending_diffs}

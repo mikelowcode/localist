@@ -4,10 +4,10 @@ LORA — MCP Tool Dispatcher
 Was originally a drop-in replacement for the now-deleted ToolDispatcher
 (tool_dispatcher.py) at the controller_agent.py dispatch seam; as of Phase
 4 (cleanup, 2026-07-03) that legacy class is gone entirely — "file_op",
-"url_fetch", "web_search", and "research" are the only tool names Planner
-ever routes to tools_to_call (see planner.py's P3/P3b), and all are served
-over the localist-mcp service (mcp_server/, port 8003) via the MCP SSE
-transport (research is a client-side loop over the same web_search/
+"url_fetch", "web_search", "research", and "chart" are the only tool names
+Planner ever routes to tools_to_call (see planner.py's P3/P3b), and all are
+served over the localist-mcp service (mcp_server/, port 8003) via the MCP
+SSE transport (research is a client-side loop over the same web_search/
 url_fetch MCP tools, not a distinct MCP tool of its own). Any other tool
 name is unrecognized and produces an inline error ToolResult — the one
 remaining piece of what used to be ToolDispatcher's "else" branch, ported
@@ -43,6 +43,21 @@ reformulation before retrying. Every ToolResult produced along the way is
 returned — not just the winning one — so it drops into the same
 dispatched_tool_results handling web_search already uses.
 
+chart (_run_chart): promotes diagnostics/diag_shadow_chart_toolcall_v4_full.
+py's measured pipeline to production — a bounded runtime.infer() call with
+chart_tool_schema.SYSTEM_PROMPT_FEWSHOT at temperature=0.0 to extract
+generate_chart arguments from the instruction, repaired via
+json_envelope_repair.repair_envelope() and validated via
+chart_tool_schema.validate_chart_arguments(); on a malformed envelope, one
+retry at temperature=0.3 (final). On success, dispatches to the
+generate_chart MCP tool and returns a ToolResult whose .result is only the
+tool's "summary" field (png_path/chart_config ride in .artifact instead —
+see prompt_builder.ToolResult.artifact — never in the prompt-facing
+.result). On failure (post-retry still malformed, schema-invalid, or the
+model legitimately declines), returns None rather than an ERROR-shaped
+ToolResult — a deliberate deviation from every other tool here, see
+_dispatch_async's chart branch for why.
+
 Session lifecycle: dispatch() opens one MCP ClientSession (SSE transport)
 and reuses it for every tool invocation made during that dispatch() call —
 including multiple web_search queries and a research loop's internal
@@ -71,6 +86,8 @@ from typing import Any
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 
+from chart_tool_schema import KNOWN_TOOL_NAMES, SYSTEM_PROMPT_FEWSHOT, validate_chart_arguments
+from json_envelope_repair import repair_envelope
 from prompt_builder import ToolResult
 
 logger = logging.getLogger(__name__)
@@ -110,6 +127,13 @@ _MAX_WEB_QUERIES: int = 3
 # Same rationale as _MAX_WEB_QUERIES: an unbounded loop against a live
 # search provider is a cost and latency risk, not just a correctness one.
 _MAX_RESEARCH_ITERATIONS: int = 3
+
+# Chart argument extraction — matches diag_shadow_chart_toolcall_v4_full.py's
+# measured pipeline exactly. _CHART_RETRY_TEMPERATURE is a second,
+# independent inference sample on a MALFORMED_ENVELOPE first pass, not a
+# repeat of the deterministic temperature=0.0 attempt.
+_CHART_MAX_TOKENS:        int   = 400
+_CHART_RETRY_TEMPERATURE: float = 0.3
 
 # 2026-07-17: live testing showed a gate-check call inside
 # _evaluate_pricing_gate (max_tokens=10) stall for the full 60s
@@ -225,23 +249,24 @@ def _normalize_mcp_error_text(text: str) -> str:
 
 class MCPToolDispatcher:
     """
-    "file_op", "url_fetch", and "web_search" are served by the localist-mcp
-    MCP server; any other tool name is unrecognized (Planner never routes
-    tools_to_call to anything else — see planner.py's P3/P3b) and produces
-    an inline error ToolResult, same shape the legacy ToolDispatcher's
-    "else" branch used to produce.
+    "file_op", "url_fetch", "web_search", and "chart" are served by the
+    localist-mcp MCP server; any other tool name is unrecognized (Planner
+    never routes tools_to_call to anything else — see planner.py's P3/P3b)
+    and produces an inline error ToolResult, same shape the legacy
+    ToolDispatcher's "else" branch used to produce.
 
     Parameters
     ----------
     runtime :
         RuntimeClient. Used by the research loop's pricing-gate evaluation
-        and query reformulation (see _run_research_loop) via a blocking
-        runtime.infer() call — the same synchronous-call-from-async-context
-        pattern planner.py's _classify_tool_fallback already uses, accepted
-        here for the same reason (single-user, non-production app). Prior
-        to the research loop's addition, this parameter was accepted but
-        never stored — web_search's runtime.infer() hallucination fallback
-        was removed in Phase 3 and nothing else here used it.
+        and query reformulation (see _run_research_loop) and by chart
+        argument extraction (see _run_chart) via a blocking runtime.infer()
+        call — the same synchronous-call-from-async-context pattern
+        planner.py's _classify_tool_fallback already uses, accepted here for
+        the same reason (single-user, non-production app). Prior to the
+        research loop's addition, this parameter was accepted but never
+        stored — web_search's runtime.infer() hallucination fallback was
+        removed in Phase 3 and nothing else here used it.
     project_root :
         Accepted for interface stability; not currently used by any tool
         path here. (file_op's actual sandbox root lives on the MCP server
@@ -322,6 +347,24 @@ class MCPToolDispatcher:
                     results.extend(
                         await self._run_research_loop(session, connect_error, instruction, ctx)
                     )
+                elif tool_name == "chart":
+                    chart_result = await self._run_chart(session, connect_error, instruction, ctx)
+                    # A failed chart extraction/dispatch degrades to a normal
+                    # prose answer rather than surfacing an ERROR: result to
+                    # the model — see _run_chart's docstring and
+                    # claude/chart-mcp-tool-scoping.md's "Failure handling"
+                    # section. Every other tool branch here appends an
+                    # ERROR-shaped ToolResult on failure (visible to the
+                    # model in Slot 5a); chart deliberately does not.
+                    if chart_result is not None:
+                        results.append(chart_result)
+                    else:
+                        logger.warning(
+                            "MCPToolDispatcher: chart — extraction/dispatch "
+                            "failed; no ToolResult appended (accepted "
+                            "residual failure rate — see "
+                            "claude/chart-mcp-tool-scoping.md)."
+                        )
                 else:
                     logger.warning(
                         "MCPToolDispatcher: unknown tool %r — skipping.", tool_name
@@ -795,6 +838,159 @@ class MCPToolDispatcher:
             if url not in exclude:
                 return url
         return None
+
+    # -----------------------------------------------------------------------
+    # chart — served by localist-mcp (generate_chart)
+    # -----------------------------------------------------------------------
+
+    async def _run_chart(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        instruction:   str,
+        context:       dict[str, Any],
+    ) -> ToolResult | None:
+        """
+        Extract generate_chart arguments from `instruction` via a bounded
+        few-shot inference call, then dispatch to the generate_chart MCP
+        tool. Promotes diag_shadow_chart_toolcall_v4_full.py's measured
+        pipeline to production, unchanged — see the module docstring's
+        "chart" paragraph and claude/chart-mcp-tool-scoping.md for the
+        reliability numbers this is based on (66.7% MATCH on
+        chart-expected instructions, 12.1% residual failure accepted by
+        design).
+
+        Returns None — not an ERROR-shaped ToolResult — on any failure
+        (post-retry still malformed, schema-invalid, the model legitimately
+        declining via {"tool_call": null}, an unreachable localist-mcp
+        server, or the generate_chart tool call itself failing). See
+        _dispatch_async's chart branch: a failed chart never reaches the
+        model as a visible tool error, it just means the turn ends up with
+        no chart — the accepted residual-failure behavior.
+        """
+        arguments = await self._extract_chart_arguments(instruction)
+        if arguments is None:
+            return None
+
+        params_str = f"chart_type={arguments.get('chart_type')!r}"
+
+        if session is None:
+            logger.warning(
+                "MCPToolDispatcher: chart — localist-mcp unreachable (%s).",
+                connect_error,
+            )
+            return None
+
+        try:
+            text, is_error = await self._call_mcp_tool(session, "generate_chart", arguments)
+        except Exception as exc:
+            logger.warning("MCPToolDispatcher: chart — localist-mcp call failed: %s", exc)
+            return None
+
+        if is_error:
+            logger.warning(
+                "MCPToolDispatcher: chart — generate_chart tool failed: %s",
+                _normalize_mcp_error_text(text),
+            )
+            return None
+
+        try:
+            data = json.loads(text)
+        except Exception as exc:
+            logger.warning(
+                "MCPToolDispatcher: chart — failed to parse generate_chart response: %s", exc
+            )
+            return None
+
+        logger.info(
+            "MCPToolDispatcher: chart complete — %s", params_str,
+        )
+        return ToolResult(
+            tool_name  = "chart",
+            parameters = params_str,
+            # Only "summary" ever reaches the model (Slot 5's 500-token
+            # ceiling) — png_path/chart_config ride in .artifact instead,
+            # read directly by controller_agent.py, never rendered into
+            # prompt-facing text. See prompt_builder.ToolResult.artifact.
+            result     = data.get("summary", ""),
+            success    = True,
+            artifact   = {
+                "png_path":     data.get("png_path"),
+                "chart_config": data.get("chart_config"),
+            },
+        )
+
+    async def _extract_chart_arguments(self, instruction: str) -> dict[str, Any] | None:
+        """
+        Run the infer -> repair -> validate pipeline at temperature=0.0; on
+        a malformed envelope, retry once at _CHART_RETRY_TEMPERATURE. The
+        retry's outcome is final — no second retry (matches the "one
+        retry" scope diag_shadow_chart_toolcall_v4_full.py measured).
+
+        Returns valid chart arguments, or None on any other outcome
+        (schema-invalid, the model declining via null, or still malformed
+        after the retry).
+        """
+        attempt = await self._run_chart_extraction_attempt(instruction, temperature=0.0)
+        if attempt["outcome"] == "malformed":
+            attempt = await self._run_chart_extraction_attempt(
+                instruction, temperature=_CHART_RETRY_TEMPERATURE
+            )
+        return attempt["arguments"] if attempt["outcome"] == "match" else None
+
+    async def _run_chart_extraction_attempt(
+        self, instruction: str, temperature: float
+    ) -> dict[str, Any]:
+        """
+        One infer -> repair -> classify pass. Returns
+        {"outcome": ..., "arguments": ...}, where outcome is one of:
+          "malformed"      — envelope missing/wrong-shaped/unknown tool
+                              name (retry-eligible on the first attempt).
+          "no_tool"        — well-formed {"tool_call": null} — the model
+                              declined to chart.
+          "schema_invalid" — well-formed tool_call, but
+                              validate_chart_arguments() found problems.
+          "match"          — valid chart arguments ready to dispatch.
+
+        Ported verbatim from diag_shadow_chart_toolcall_v4_full.py's
+        _run_one()/_classify_envelope() — same envelope-shape checks,
+        same KNOWN_TOOL_NAMES/validate_chart_arguments() calls.
+        """
+        try:
+            raw = self._runtime.infer(
+                prompt      = instruction,
+                system      = SYSTEM_PROMPT_FEWSHOT,
+                max_tokens  = _CHART_MAX_TOKENS,
+                temperature = temperature,
+            )
+        except Exception as exc:
+            logger.debug("MCPToolDispatcher: chart — infer() failed (%s).", exc)
+            return {"outcome": "malformed", "arguments": None}
+
+        obj, _repair_outcome = repair_envelope(raw)
+
+        if not isinstance(obj, dict) or "tool_call" not in obj:
+            return {"outcome": "malformed", "arguments": None}
+
+        call = obj["tool_call"]
+        if call is None:
+            return {"outcome": "no_tool", "arguments": None}
+
+        if (
+            not isinstance(call, dict)
+            or "name" not in call
+            or "arguments" not in call
+            or not isinstance(call["name"], str)
+            or not isinstance(call["arguments"], dict)
+            or call["name"] not in KNOWN_TOOL_NAMES
+        ):
+            return {"outcome": "malformed", "arguments": None}
+
+        problems = validate_chart_arguments(call["arguments"])
+        if problems:
+            return {"outcome": "schema_invalid", "arguments": None}
+
+        return {"outcome": "match", "arguments": call["arguments"]}
 
     async def _call_mcp_tool(
         self, session: ClientSession, name: str, arguments: dict[str, Any]

@@ -339,6 +339,69 @@ def _file_op_confirmation_line(result: "_ToolResult", fallback_path: str | None)
     return f"\n\n*(Could not save — {reason})*"
 
 
+# Narrow, mechanical mitigation for one specific symptom of Open Item 2
+# (docs/architecture/14-localist-mcp-tool-layer.md §14.7 — model hallucinates
+# tool completion when tools_to_call is empty), not a fix for that item —
+# see the 2026-07-20 update there for the repro this was added for (a
+# generate_chart instruction that fell through to P6, tools_to_call=[], and
+# the model claimed "(Source: Tool output)" for a chart that never rendered).
+# Deliberately a small, explicit phrase list — not a fuzzy/general
+# hallucination detector, which is out of scope for this mitigation and
+# remains Open Item 2's unsolved problem. A phrase here is deterministically
+# false whenever tools_to_call was empty for the turn, so removing it is
+# safe by construction; it does not catch the model fabricating a result's
+# existence in prose without citing a tool source.
+_FALSE_TOOL_ATTRIBUTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\(\s*source:\s*tool output\s*\)", re.IGNORECASE),
+    re.compile(r"\bsource:\s*tool output\b", re.IGNORECASE),
+    re.compile(r"\bvia tool output\b", re.IGNORECASE),
+)
+
+_FALSE_TOOL_ATTRIBUTION_CAVEAT = (
+    "\n\n*(Note: no tool actually ran on this turn — this response may be "
+    "based on my own reasoning rather than a real chart/file/search result.)*"
+)
+
+
+def _strip_false_tool_attribution(answer: str) -> str:
+    """
+    Remove a literal tool-attribution phrase (see
+    _FALSE_TOOL_ATTRIBUTION_PATTERNS) from `answer`. Only ever called when
+    plan.tools_to_call was empty for this turn — see
+    _build_conversational_result — so any match is deterministically false
+    and safe to remove outright, unlike a legitimate "(Source: Tool
+    output ...)" citation on a turn where a tool actually ran, which this
+    function never sees.
+
+    Prefers stripping just the false phrase over discarding the whole
+    answer, so real content the model generated survives. Falls back to
+    appending an explicit caveat only if stripping would leave nothing
+    (or next to nothing) behind — the one case where silently removing the
+    match would make the answer more confusing, not less.
+
+    Returns `answer` unchanged if no pattern matches.
+    """
+    stripped = answer
+    matched = False
+    for pattern in _FALSE_TOOL_ATTRIBUTION_PATTERNS:
+        if pattern.search(stripped):
+            matched = True
+            stripped = pattern.sub("", stripped)
+
+    if not matched:
+        return answer
+
+    stripped = re.sub(r"[ \t]+\n", "\n", stripped)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+    stripped = stripped.strip()
+
+    if len(stripped) < 10:
+        if stripped:
+            return stripped + _FALSE_TOOL_ATTRIBUTION_CAVEAT
+        return _FALSE_TOOL_ATTRIBUTION_CAVEAT.strip()
+    return stripped
+
+
 # ---------------------------------------------------------------------------
 # Ephemeral memory shim
 # ---------------------------------------------------------------------------
@@ -1219,6 +1282,18 @@ class ControllerAgent:
                     "continuing without tool results.", exc,
                 )
 
+        # chart's full artifact (png_path + chart_config) never reaches the
+        # prompt (see prompt_builder.ToolResult.artifact) — pulled out here
+        # so it can ride into ControllerResult.metadata via
+        # _build_conversational_result() instead, for the frontend to render.
+        chart_artifact = next(
+            (
+                r.artifact for r in dispatched_tool_results
+                if r.tool_name == "chart" and r.artifact is not None
+            ),
+            None,
+        )
+
         # -- Step 3b: Corpus fallback when web_search fails -----------------
         # Runs only when the P3 tool path was taken and every web_search
         # result came back failed. Queries the corpus with the original
@@ -1697,7 +1772,9 @@ class ControllerAgent:
         # endpoint can emit 'sources'/'done' and unblock the client immediately
         # after the answer is ready, rather than waiting 18-23 s for hooks.
         if on_answer_ready is not None:
-            _early = self._build_conversational_result(task, plan, effective_agent_name, results)
+            _early = self._build_conversational_result(
+                task, plan, effective_agent_name, results, chart_artifact
+            )
             if _early is not None:
                 on_answer_ready(_early.to_dict())
 
@@ -1774,7 +1851,9 @@ class ControllerAgent:
             logger.info("TIMING working_state_end t=%.4f", time.monotonic())
 
         logger.info("TIMING execute_plan_end t=%.4f", time.monotonic())
-        final_result = self._build_conversational_result(task, plan, effective_agent_name, results)
+        final_result = self._build_conversational_result(
+            task, plan, effective_agent_name, results, chart_artifact
+        )
         if final_result is not None:
             return final_result
         wiki_diff_result = self._build_wiki_diff_result(task, plan, effective_agent_name, results)
@@ -1806,6 +1885,7 @@ class ControllerAgent:
         plan:                 "RoutingPlan",
         effective_agent_name: str,
         results:              list[AgentResult],
+        chart_artifact:       dict[str, Any] | None = None,
     ) -> "ControllerResult | None":
         """
         Build a ControllerResult for a successful single-agent conversational dispatch.
@@ -1814,16 +1894,59 @@ class ControllerAgent:
 
         Used by both the early on_answer_ready callback and the final return path so
         the answer-extraction logic is never duplicated.
+
+        chart_artifact :
+            The chart ToolResult's .artifact (png_path + chart_config), if
+            Step 3's tool dispatch produced one — see _execute_plan's
+            chart_artifact extraction, right after Step 3. None on any
+            non-chart turn, in which case metadata omits the "chart" key
+            entirely (same "omit empty slots cleanly" convention
+            PromptBuilder uses elsewhere) rather than emitting a null.
+
+        When plan.tools_to_call is empty, the answer is passed through
+        _strip_false_tool_attribution() before being returned — a narrow
+        mitigation for Open Item 2 (docs/architecture/14-localist-mcp-
+        tool-layer.md §14.7), not a fix for it; see that function's
+        docstring.
         """
         if not (effective_agent_name == "conversational_agent" and len(results) == 1):
             return None
         r = results[0]
         if r.status != TaskStatus.COMPLETE:
             return None
+        metadata: dict[str, Any] = {
+            "agent":              effective_agent_name,
+            "priority":           plan.priority,
+            "fetch_rag":          plan.fetch_rag,
+            "fetch_episodic":     plan.fetch_episodic,
+            "tools_fired":        plan.tools_to_call,
+            "tool_signal_source": plan.tool_signal_source,
+            "grounded":           r.output.get("grounded", False),
+            "file_op_deferred":   plan.file_op_deferred,
+        }
+        if chart_artifact is not None:
+            metadata["chart"] = chart_artifact
+
+        answer = r.output.get("answer", "")
+        if not plan.tools_to_call:
+            # No tool ran this turn — any "(Source: Tool output)"-shaped
+            # citation in the answer is deterministically false. Narrow
+            # mitigation for Open Item 2's 2026-07-20 repro (§14.7); does
+            # not fix the underlying hallucination — see
+            # _strip_false_tool_attribution's docstring.
+            deattributed = _strip_false_tool_attribution(answer)
+            if deattributed != answer:
+                logger.warning(
+                    "_build_conversational_result: stripped/flagged false "
+                    "tool-attribution claim on empty-tools turn (task_id=%s).",
+                    task.task_id,
+                )
+                answer = deattributed
+
         return ControllerResult(
             task_id  = task.task_id,
             status   = TaskStatus.COMPLETE,
-            answer   = r.output.get("answer", ""),
+            answer   = answer,
             sources  = [
                 (
                     {
@@ -1840,16 +1963,7 @@ class ControllerAgent:
                 )
                 for s in r.output.get("sources", [])
             ],
-            metadata = {
-                "agent":              effective_agent_name,
-                "priority":           plan.priority,
-                "fetch_rag":          plan.fetch_rag,
-                "fetch_episodic":     plan.fetch_episodic,
-                "tools_fired":        plan.tools_to_call,
-                "tool_signal_source": plan.tool_signal_source,
-                "grounded":           r.output.get("grounded", False),
-                "file_op_deferred":   plan.file_op_deferred,
-            },
+            metadata = metadata,
         )
 
     def _build_wiki_diff_result(
