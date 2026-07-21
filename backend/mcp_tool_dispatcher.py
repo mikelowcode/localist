@@ -151,11 +151,16 @@ _RESEARCH_CLASSIFIER_TIMEOUT: float = 15.0
 
 _RESEARCH_GATE_SYSTEM_PROMPT: str = (
     "You are a fact-extraction classifier, not a conversational assistant. "
-    "Given a block of search-result or page text, decide whether it "
-    "contains concrete, specific pricing information — dollar amounts, "
-    "plan/tier names with prices, or per-unit costs. A page that only "
-    "says pricing exists, or links to a pricing page, without stating "
-    "numbers does NOT count. Respond with exactly one word: yes or no."
+    "You will be given the ORIGINAL QUESTION the user asked, and a block of "
+    "search-result or page TEXT. Decide whether the TEXT contains concrete, "
+    "specific information that directly answers the ORIGINAL QUESTION — not "
+    "just any pricing-shaped or spec-shaped content in general. A page that "
+    "mentions a price or number for a DIFFERENT product, a different "
+    "tier/trim than the one asked about, or that only says pricing exists "
+    "without stating the number, does NOT count. If the question asks about "
+    "a specific tier, trim, plan, or variant, the text must address THAT "
+    "specific one, not a different one. Respond with exactly one word: yes "
+    "or no."
 )
 
 _RESEARCH_REFORMULATE_SYSTEM_PROMPT: str = (
@@ -724,7 +729,7 @@ class MCPToolDispatcher:
                 connectivity_failed = True
                 break
 
-            gate_pass = await self._evaluate_pricing_gate(search_result.result)
+            gate_pass = await self._evaluate_pricing_gate(instruction, search_result.result)
 
             candidate_url = self._extract_first_url(search_result.result, tried_urls)
 
@@ -738,7 +743,7 @@ class MCPToolDispatcher:
                 )
                 results.append(fetch_result)
                 if fetch_result.success:
-                    gate_pass = await self._evaluate_pricing_gate(fetch_result.result)
+                    gate_pass = await self._evaluate_pricing_gate(instruction, fetch_result.result)
 
             if gate_pass:
                 logger.info(
@@ -790,14 +795,29 @@ class MCPToolDispatcher:
                 break
         return derived[:120]
 
-    async def _evaluate_pricing_gate(self, text: str) -> bool:
+    async def _evaluate_pricing_gate(self, instruction: str, text: str) -> bool:
         """Single bounded yes/no inference call. Never raises — a failed
         gate check is treated as "no", same fail-open-to-continue posture
-        as every other try/except in this file."""
+        as every other try/except in this file.
+
+        `instruction` is the original question, passed alongside `text` so
+        the classifier can judge relevance (does this text specifically
+        answer THIS question) rather than merely detecting that some
+        pricing/spec-shaped content is present somewhere in `text` — see
+        _RESEARCH_GATE_SYSTEM_PROMPT and
+        diagnostics/reports/research_loop_qa_assessment_2026-07-20.md for
+        the false-positive pattern this fixes (e.g. gate-passing on a
+        different product's price, or on content that never actually
+        states the requested number)."""
         try:
             raw = self._runtime.infer(
                 system      = _RESEARCH_GATE_SYSTEM_PROMPT,
-                prompt      = f"Text:\n\n{text[:3000]}\n\nContains concrete pricing (yes/no):",
+                prompt      = (
+                    f"Original question:\n\n{instruction}\n\n"
+                    f"Text:\n\n{text[:3000]}\n\n"
+                    f"Does the text directly answer the original question with a "
+                    f"specific number (yes/no):"
+                ),
                 max_tokens  = 10,
                 temperature = 0.1,
                 timeout     = _RESEARCH_CLASSIFIER_TIMEOUT,

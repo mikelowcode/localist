@@ -906,9 +906,122 @@ class TestResearchLoop:
         dispatcher._runtime.infer.side_effect = RuntimeError("model unavailable")
 
         result = asyncio.run(
-            dispatcher._evaluate_pricing_gate("The Basic plan costs $10/month.")
+            dispatcher._evaluate_pricing_gate(
+                "what does the Basic plan cost", "The Basic plan costs $10/month."
+            )
         )
         assert result is False
+
+    # ------------------------------------------------------------------
+    # Relevance-aware gate (2026-07-20 fix) — _evaluate_pricing_gate now
+    # takes `instruction` alongside `text` so it can judge whether the text
+    # answers THIS question, not just whether pricing-shaped content is
+    # present anywhere. See diagnostics/reports/
+    # research_loop_qa_assessment_2026-07-20.md for the false-positive
+    # pattern this closes (e.g. gate-passing on a different product/tier's
+    # price, or on content that never actually states the requested fact).
+    # ------------------------------------------------------------------
+
+    def test_evaluate_pricing_gate_prompt_includes_original_question(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """Structural check that the original question is actually threaded
+        into the classifier prompt alongside the candidate text — the crux
+        of this fix, since the classifier can only be relevance-aware if it
+        can see what was asked."""
+        captured: dict = {}
+
+        def infer_side_effect(**kw):
+            captured.update(kw)
+            return "yes"
+
+        dispatcher._runtime.infer.side_effect = infer_side_effect
+
+        asyncio.run(
+            dispatcher._evaluate_pricing_gate(
+                "What does GitHub Copilot Individual cost per month?",
+                "1 AI credit = $0.01 USD. No monthly plan price stated.",
+            )
+        )
+
+        assert "What does GitHub Copilot Individual cost per month?" in captured["prompt"]
+        assert "1 AI credit = $0.01 USD" in captured["prompt"]
+
+    def test_loop_exhausts_on_wrong_tier_content_instead_of_false_positive(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """The false-positive case from the QA pass: every search result
+        found a real price, but for the WRONG tier/product relative to what
+        was asked (here: "Enterprise" asked, only "Starter"/"Pro" prices
+        found). A relevance-aware gate must say "no" throughout, and the
+        loop should exhaust honestly rather than gate-pass on a
+        wrong-but-confident-looking answer."""
+        call_n = 0
+
+        def infer_side_effect(**kw):
+            nonlocal call_n
+            if kw["system"] == _RESEARCH_GATE_SYSTEM_PROMPT:
+                assert "exact enterprise contract price" in kw["prompt"]
+                return "no"  # wrong tier every time — never the Enterprise price asked for
+            if kw["system"] == _RESEARCH_REFORMULATE_SYSTEM_PROMPT:
+                call_n += 1
+                return f"reformulated query {call_n}"
+            raise AssertionError(f"unexpected system prompt {kw['system']!r}")
+
+        dispatcher._runtime.infer.side_effect = infer_side_effect
+
+        async def fake_call(session, name, arguments):
+            assert name == "web_search"
+            return json.dumps({
+                "query": arguments["query"],
+                "result_text": "Starter plan: $25/user/month. Pro Suite: $100/user/month.",
+                "result_count": 1,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["research"],
+                instruction   = "What is the exact enterprise contract price for Salesforce?",
+                context       = {},
+            )
+
+        assert mock_call.call_count == _MAX_RESEARCH_ITERATIONS
+        synthetic = results[-1]
+        assert synthetic.tool_name == "research"
+        assert synthetic.success is False
+        assert "exhausted" in synthetic.result
+
+    def test_loop_gate_passes_when_text_answers_the_specific_tier_asked(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """Same shape as the wrong-tier case above, but the search result
+        this time names the SPECIFIC tier asked about — confirms the
+        signature change didn't break the ordinary passing path."""
+        def infer_side_effect(**kw):
+            assert kw["system"] == _RESEARCH_GATE_SYSTEM_PROMPT
+            assert "Enterprise" in kw["prompt"]
+            return "yes"
+
+        dispatcher._runtime.infer.side_effect = infer_side_effect
+
+        async def fake_call(session, name, arguments):
+            assert name == "web_search"
+            return json.dumps({
+                "query": arguments["query"],
+                "result_text": "Enterprise plan: $175/user/month.",
+                "result_count": 1,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["research"],
+                instruction   = "What does the Enterprise plan cost?",
+                context       = {},
+            )
+
+        assert mock_call.call_count == 1
+        assert len(results) == 1
+        assert results[0].success is True
 
     def test_reformulate_failure_falls_through_to_repeat_guard(
         self, dispatcher: MCPToolDispatcher
@@ -965,7 +1078,9 @@ class TestResearchLoop:
     ):
         dispatcher._runtime.infer.return_value = "no"
 
-        asyncio.run(dispatcher._evaluate_pricing_gate("some search result text"))
+        asyncio.run(
+            dispatcher._evaluate_pricing_gate("some question", "some search result text")
+        )
 
         assert dispatcher._runtime.infer.call_args.kwargs["timeout"] == _RESEARCH_CLASSIFIER_TIMEOUT
 

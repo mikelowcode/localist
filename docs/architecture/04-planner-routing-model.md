@@ -16,6 +16,17 @@ All lower priorities are skipped.
 
 ---
 
+**PRIORITY 0 — EXPLICIT SLASH-COMMAND TOOL BYPASS** *(added 2026-07-20)*
+
+| | |
+|---|---|
+| **Condition** | Instruction, after stripping surrounding whitespace and lowercasing, either equals or begins with a leading `/chart` or `/research` token (`_SLASH_COMMAND_TOOL_MAP`, `Planner._priority0_slash_command()`). A mid-sentence occurrence (not a leading token) does not match. |
+| **Action** | Route directly to `ConversationalAgent` with `tools_to_call = [<mapped tool>]`, `compound = True`, `priority = 0`, `tool_signal_source = "slash_command"`. Runs before `_detect_compound()` and every other priority — nothing below Priority 0 is evaluated once it matches. |
+| **Rationale** | An explicit, user-invoked escape hatch to force a specific tool regardless of what the normal detection paths would otherwise decide. `/chart` bypasses `_CHART_KEYWORDS` keyword matching entirely (fires even on a bare `/chart` with no data). `/research` bypasses **both** the `research_intent` semantic-upgrade threshold and `LOCALIST_RESEARCH_LOOP_ENABLED` (§18.2) — the research loop runs even when that flag is off, since the user asked for it directly. |
+| **Notes** | The leading slash token is deliberately **not** stripped from the instruction text passed downstream in this version — `task.instruction` is used as-is by dispatch-time argument/query derivation and prompt slots. Live-tested and found not to cause observable extraction/query-derivation problems for either command; revisit only if a future case shows otherwise. `tool_signal_source` joins the existing `"keyword"`/`"classifier_fallback"` provenance values (§15.1) — same field, one more value, not a parallel mechanism. Full research-loop-side detail and live verification (including a real `/research` request executing the loop with the flag off) at §18.2. |
+
+---
+
 **PRIORITY 1 — INGEST SIGNAL**
 
 | | |

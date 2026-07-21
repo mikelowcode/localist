@@ -1,0 +1,51 @@
+num,category,query,iteration_count,fetch_occurred,reformulated,queries_tried,outcome,elapsed_seconds,final_success,final_answer
+2,A,What does GitHub Copilot Individual cost per month?,2,True,True,What does GitHub Copilot Individual cost per month? | GitHub Copilot Individual pricing plans per month,gate_passed_after_fetch,8.61,True,"Title: About individual GitHub Copilot plans and benefits - GitHub Docs
+Source: https://docs.github.com/en/copilot/concepts/billing/individual-plans
+Words: 417
+
+GitHub offers multiple Copilot plans for individual developers, as well as a dedicated student offering, each designed to meet different needs based on your coding habits, interest in AI models, and desired level of flexibility. You can choose from the following plans. For developers looking to get started with Copilot. Includes up to 2,000 code completions and an allowance of GitHub AI Credits Limited chat and agent usage with models available through auto model selection only Designed to give you a limited taste of Copilot's capabilities No subscription or payment required Intended for personal use only, not for users managed by an organization or enterprise Great for developers who want to explore Copilot's capabilities before upgrading to a paid plan Verified students can access unlimited completions and additional models at no cost. Includes unlimited code completions and an allowance of GitHub AI Credits Limited chat and agent usage with models available through auto model selection only Free for verified students For developers who want more flexibility, including unlimited completions and access to additional models. Includes unlimited completions in IDEs Access to Copilot Chat and a selection of models A monthly allowance of AI credits. See GitHub AI Credits allowance by plan. Free for verified teachers and maintainers of popular open source projects For developers who need maximum flexibility, premium access to available models, and expanded limits. Designed for sustained, high-volume Copilot users. Everything in Copilot Pro+, and: Ideal for high-volume AI power users who want access to the most AI credits available to them The following table highlights the key differences between individual Copilot plans. The following table shows what's included with each paid plan. PlanPrice per monthBase creditsFlex allotmentTotal monthly AI creditsCopilot Pro$10 USD1,0005001,500Copilot Pro+$39 USD3,9003,1007,000Copilot Max$100 USD10,00010,00020,000 Copilot Free and Copilot Student both have an allowance of AI credits and access to models through auto model selection only. Copilot Free includes 2000 code completions per month and Copilot Student includes unlimited code completions. For more information on how GitHub AI Credits work, see Usage-based billing for individuals and Usage-based billing for organizations and enterprises. For a detailed comparison of features and benefits, see Plans for GitHub Copilot. Consider the following to decide which plan is right for you: To learn how to set up the plan that’s right for you, see Getting started with a GitHub Copilot plan. Copilot Free is not suitable for enterprises, as it does not include the following features: Access management Audit logs Policy management File exclusion Usage data Indemnification coverage"
+11,D,What's the price of an iPhone 16?,1,False,False,What's the price of an iPhone 16?,gate_passed_on_snippet,1.1,True,"• Buy iPhone 16 and iPhone 16 Plus - Apple
+  Get <strong>$35 - $695</strong> off a new iPhone 16 or iPhone 16 Plus when you trade in an iPhone 8 or newer. 0% financing available. Buy now with free shipping.
+  [https://www.apple.com/shop/buy-iphone/iphone-16]
+
+• iPhone 16 Price: How Much Should You Pay? — GHOSTEK
+  The Pro line, including the iPhone ... cameras. However, these upgrades are heavily reflected in the price, costing <strong>$100 more than the previous model</strong>....
+  [https://ghostek.com/blogs/ghostek-insider/iphone-16-price-how-much-should-you-pay]
+
+• iPhone 16 Price In 2026: Here's How Much You Should Pay
+  Generally speaking, the cost of a base model iPhone 16 comes in at <strong>around $564 for a Grade A condition model and tops out at around $750 for an iPhone 16 Pro Max</strong> (again, in Grade A condition).
+  [https://www.knowyourmobile.com/phones/refurbished-smartphones/iphone-16-price/]"
+12,E,What is the exact enterprise contract price for Salesforce?,1,False,False,exact enterprise contract price for Salesforce?,gate_passed_on_snippet,1.39,True,"• Salesforce Pricing 2026: Plans from $25/User/Month
+  Salesforce pricing: Starter $25, Pro Suite $100, <strong>Enterprise $175</strong>, Unlimited $350/user/mo. Free tier available. Verified from 11 sources, March 2026.
+  [https://costbench.com/software/crm/salesforce/]
+
+• Salesforce Pricing 2026: Plans, Add-Ons & Hidden Costs
+  Salesforce pricing starts at <strong>$25/user/month</strong>, but real costs rise with API access, support, AI, security, and add-ons. See every 2026 plan.
+  [https://saascrmreview.com/salesforce-pricing/]
+
+• Salesforce Contracts Pricing | Salesforce
+  This page is provided for information ... is part of the product.agentfoce Revenue Management product. It&#x27;s available for <strong>$50 per user per month</strong>....
+  [https://www.salesforce.com/sales/revenue-lifecycle-management/contracts-pricing/]"
+14,E,What is the current spot price of a specific obscure NFT collection's floor price?,2,True,True,"current spot price of a specific obscure NFT collection's floor price? | NFT floor price"" tracker ""current price"" site:opensea.io OR site:magic.store OR site:blur.io",gate_passed_on_snippet,5.92,True,"• Blur: NFT Marketplace for Pro Traders
+  Floor Price0.04 · 1D Volume0.65 · 1606 owners · Floor Price0.01 · 1D Volume0.01 · 3454 owners · Floor Price0.20 · 1D Volume0.00 · 2425 owners · Floor Price0.08 · 1D Volume0.79 · 605 owners · Floor Price0.31 · 1D Volume2.17 · Faster Sweeping · Marketplace fees ·
+  [https://blur.io/]
+
+• How can I explore my Portfolio? | OpenSea Help Center
+  Highest movers are NFTs and tokens with the biggest price changes in the last day. This provides a list of all the collections that you own items from, the number of items held, the cumulative value of those items by collection, the floor price, the top offer, and the last 7D trend. This provides a
+  [https://support.opensea.io/en/articles/12417631-how-can-i-explore-my-portfolio]
+
+• Ξ 0.0018 SUPER SAPIENSS NFT | Blur
+  SUPER SAPIENSS NFT #3914 · <strong>- 0.0018</strong> · 0.0009 · - 666AA2 · 1 · 15m ago · buy floor · 0.0018 · Optimize sweep · 1D · 1W · 1M · 0.0016 · 0.0017 · 0.0018 · 0.0019 · 0.0020 · 10 PM · 3 AM · 8 AM · 1 PM · 0 · all · sales · ...
+  [https://blur.io/collection/0x419027459b98465ac091066c01818c8b3c4e7ac0]"
+15,F,What is the max payload capacity of a Ford F-150 Lightning?,1,False,False,max payload capacity of a Ford F-150 Lightning?,gate_passed_on_snippet,1.57,True,"• Ford F-150 Lightning - Wikipedia
+  The <strong>Ford</strong> <strong>F</strong>-<strong>150</strong> <strong>Lightning</strong> was also evaluated to reach 62 mph (100 km/h) in 4.5 seconds. Maximum available <strong>payload</strong> is 2,235 pounds (1,014 kg), which includes the 400-pound (180 kg) <strong>payload</strong>
+  [https://en.wikipedia.org/wiki/Ford_F-150_Lightning]
+
+• Ford F-150 Lightning Towing Capacity: How Much Can It Pull?
+  The Ford F-150 Lightning truck has a maximum towing capacity of <strong>10,000 pounds</strong>,1 while the gas-powered Ford F-150 has a maximum towing capacity of 14,000 pounds.1 Both the gas-powered and electric models of the Ford F-150 trucks are capable towing vehicles that have many towing
+  [https://veteransfordtampa.com/ford-f-150-lightning-towing-capacity]
+
+• 2025 Ford F-150 Lightning Review, Pricing, and Specs
+  The maximum towing capacity of ... Range battery models are limited to 7700 pounds. Payload capacity is as high as <strong>2000 pounds</strong> for the Standard Range model and as low as 1800 pounds for the Extended Range....
+  [https://www.caranddriver.com/ford/f-150-lightning]"
+17,G,Do you think the new iPhone is worth the price?,3,True,True,Do you think the new iPhone is worth the price? | iPhone 16 pricing plans and official cost by model | iPhone 16 official price list by storage capacity apple.com,exhausted_honestly,9.91,False,"ERROR: research loop exhausted 3 iteration(s) without finding concrete pricing information (queries tried: ['Do you think the new iPhone is worth the price?', 'iPhone 16 pricing plans and official cost by model', 'iPhone 16 official price list by storage capacity apple.com'])."

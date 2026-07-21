@@ -64,6 +64,25 @@ value other than `"true"` case-insensitively) is disabled — the same
 fail-safe-to-existing-behavior direction every gate in this file already
 defaults to.
 
+*Update 2026-07-20 — Priority 0 `/research` slash-command bypass.* A new
+Priority 0 in `route()` (`Planner._priority0_slash_command()`, ahead of
+every other priority including compound detection — see §4.2's Priority 0
+entry, shared design with `/chart`) lets a user force
+`tools_to_call = ["research"]` directly by leading an instruction with
+`/research`, short-circuiting **both** gates described above: the
+`research_intent` threshold check above is never evaluated, and
+`_research_loop_enabled()` is never consulted — the loop runs regardless of
+`LOCALIST_RESEARCH_LOOP_ENABLED`'s value. `RoutingPlan.tool_signal_source`
+is set to `"slash_command"` for this path (alongside the existing
+`"keyword"`/`"classifier_fallback"` values — see §4.4/§15.1). Live-verified:
+with `LOCALIST_RESEARCH_LOOP_ENABLED=false` in `backend/.env`, a real
+`/research ...` request against the running backend produced the log line
+`research loop — pricing found after 1 iteration(s)`, confirming the loop
+genuinely executed rather than the flag silently no-op'ing the bypass.
+This is an explicit user-invoked escape hatch, not a change to the ambient
+flag's own default-off behavior for ordinary (non-slash-command)
+instructions, which is unchanged.
+
 The `semantic_result` computation itself (the embedding call and
 per-group cosine scores) is shared with the existing
 `explicit_search_action`/`lookup_request` gating — no second embed call
@@ -145,10 +164,13 @@ search+evaluate+reformulate cycles, same cost/latency rationale as
 2. If the search call itself fails (provider/connectivity error, not "no
    pricing found"), stop immediately — no reformulation, no synthetic
    result (see below).
-3. `_evaluate_pricing_gate()` — a single bounded `runtime.infer()` call
-   (`max_tokens=10`, `_RESEARCH_GATE_SYSTEM_PROMPT`) asking whether the
-   search snippet already contains concrete pricing. Fails closed to
-   `False` on any exception.
+3. `_evaluate_pricing_gate(instruction, text)` — a single bounded
+   `runtime.infer()` call (`max_tokens=10`, `_RESEARCH_GATE_SYSTEM_PROMPT`)
+   asking whether `text` specifically answers `instruction` with a
+   concrete number — not merely whether pricing/spec-shaped content is
+   present anywhere in `text` (see the 2026-07-20 update below for why the
+   signature carries `instruction` at all). Fails closed to `False` on any
+   exception.
 4. If the gate is inconclusive but the snippet names a URL
    (`_extract_first_url()`), `url_fetch` that page and re-run the gate on
    the full page text.
@@ -182,6 +204,62 @@ contrast, already produces a normal `tool_name="web_search"`,
 `success=False` entry indistinguishable from a plain `web_search`
 failure — Step 3b's original clause catches that case unmodified, so no
 synthetic entry is appended for it.
+
+*Update 2026-07-20 — `_evaluate_pricing_gate()` made relevance-aware,
+closing the dominant false-positive pattern §18.9's QA pass found.*
+`diagnostics/reports/research_loop_qa_assessment_2026-07-20.md` (an
+18-query, 7-category live QA pass against Ollama Cloud/`gemma4:31b-cloud`
+— see §18.9 for full corpus/results) found the gate's dominant failure mode
+was accepting *any* pricing/spec-shaped content as sufficient regardless of
+whether it actually answered the question asked — e.g. gate-passing on a
+GitHub Copilot per-credit rate for a "what does Copilot Individual cost"
+query, on a published Salesforce list-tier price for an "exact enterprise
+**contract** price" query, and on a legal-boilerplate page containing zero
+payload figures for a Ford Lightning payload-capacity query. Root cause:
+`_evaluate_pricing_gate(self, text: str)` structurally had no parameter for
+the original question at all, so it could not have been relevance-aware in
+any form.
+
+Fix: signature changed to `_evaluate_pricing_gate(self, instruction: str,
+text: str)`, both call sites in `_run_research_loop()` (the search-result
+gate check and the fetch-result gate check) updated to pass `instruction`
+through, and `_RESEARCH_GATE_SYSTEM_PROMPT` rewritten to require the text
+"directly answer[s] the ORIGINAL QUESTION... not just any pricing-shaped or
+spec-shaped content in general," explicitly calling out that a different
+product, a different tier/trim, or a page that only says pricing exists
+without stating it does NOT count. The gate's relevance check is anchored
+to the *original* `instruction` throughout the loop, not to whatever a
+reformulated query narrows to — confirmed load-bearing by the delta re-run
+below, where reformulation kept proposing factual pricing substitutes for a
+subjective question and the gate correctly kept rejecting them against the
+unchanged original instruction.
+
+**Delta re-run** (`diagnostics/reports/research_loop_gate_fix_delta_2026-07-20.md`,
+same runtime, the 6 queries §18.9's QA pass flagged as clearest false
+positives, before/after data pulled directly from the original CSV, not
+re-derived): 4 of 6 improved, 2 of 6 unchanged, 0 of 6 regressed in this
+sample. The cleanest win: a "do you think the new iPhone is worth the
+price?" query, which previously had reformulation silently substitute a
+factual pricing query and gate-pass on real-but-non-responsive numbers, now
+correctly exhausts honestly after all 3 iterations. Two gaps confirmed
+still open: the Salesforce "exact contract price" case is unchanged (the
+gate still accepts a published list-tier price when the tier *name* is
+literally present, even though "contract price" implies negotiated pricing
+the prompt doesn't clearly distinguish), and an iPhone 16 base-price query
+is unchanged (no single stated retail price in the accepted content, only
+trade-in/refurb deltas — a "wrong price *type*", not the "wrong tier/
+product" shape the new prompt wording targets). **Scope note, stated
+explicitly in the delta report:** only the 6 flagged queries were re-run;
+the other 12 (including Categories A/B/C's originally-correct immediate
+passes) were not re-verified, so a new false-negative introduced by the
+stricter gate on a previously-fine case can't be ruled out without a full
+18-query re-run — not done as part of this fix.
+
+Test coverage: `test_mcp_tool_dispatcher.py`'s `TestResearchLoop` gained 3
+new tests (prompt correctly threads `instruction` alongside `text`; a
+wrong-tier snippet now exhausts instead of false-passing; a snippet
+naming the specific tier asked about still passes) — full suite 940 → 943
+passed, zero regressions.
 
 **`_RESEARCH_CLASSIFIER_TIMEOUT = 15.0`**, applied only to
 `_evaluate_pricing_gate()` and `_reformulate_query()`'s `infer()` calls —
@@ -332,11 +410,82 @@ every other feature-flagged mechanism (§15).
   for this single-user, non-production app.
 - No dedicated test exercises the `web_search` → `"research"` upgrade
   branch in `_priority3_tool()` itself (§18.6).
-- No live human QA of the research loop's actual *answer quality* beyond
-  the specific queries exercised during this session's live testing —
-  the bugs found and fixed (§18.7) were mechanical (URL parsing, stream
-  handling, timeouts), not an evaluation of whether the loop reliably
-  converges on correct pricing/spec answers across a broad query set.
+- ~~No live human QA of the research loop's actual *answer quality* beyond
+  the specific queries exercised during this session's live testing~~ —
+  **CLOSED 2026-07-20, see §18.9.** An 18-query, 7-category QA pass found
+  and a follow-up fix addressed the gate's dominant false-positive pattern.
+  Not fully closed, however — two of §18.9's re-run gaps remain open (see
+  below).
+- **New, 2026-07-20 — the relevance-aware gate fix doesn't catch a
+  "published list price vs. negotiated/exact price" distinction**, nor a
+  "wrong price *type* stated (trade-in/refurb/delta) vs. no price stated at
+  all" distinction — both confirmed still-open on re-run in §18.9. Neither
+  is a regression (both were equally wrong before the fix); both are
+  candidates for a further-refined gate prompt if this exact question shape
+  matters enough to invest in.
+- **New, 2026-07-20 — the gate-fix delta re-run was scoped to only the 6
+  flagged queries**, not the full original 18-query corpus (§18.9). A new
+  false-negative introduced by the stricter gate prompt on a
+  previously-fine case (e.g. one of Categories A/B/C's originally-correct
+  immediate passes) has not been ruled out.
+- Categories B and C of the QA corpus (`diagnostics/research_loop_qa_corpus.md`)
+  currently provide **zero live coverage of the fetch and reformulation
+  code paths** — every query in both categories gate-passed on the first
+  snippet against current live Brave search-result quality, contrary to
+  the corpus's own "needs a fetch"/"needs reformulation" design intent
+  (§18.9). Not a code defect; a corpus-design gap worth revisiting if
+  fetch/reformulate-path QA coverage specifically is wanted again.
 - `MemoryManager`'s corpus/episodic embedding-provenance gap is now
   closed (§16.4); the oMLX `embedding_model` wiring gap noted in §16.4
   is unrelated to this feature and remains separately open.
+
+### 18.9 Answer-Quality QA Pass and Gate Fix (2026-07-20)
+
+Closes the §18.8 open item on live human QA of answer quality. Two
+sessions of work, both read-only-diagnostic-first per this repo's
+discipline (`CLAUDE.md`) before any production code changed.
+
+**QA pass.** `diagnostics/research_loop_qa_pass.py` calls
+`MCPToolDispatcher.dispatch(["research"], ...)` directly — bypassing
+`Planner`/`ControllerAgent` entirely, since routing was already covered by
+§18.2's slash-command tests and this pass targets the loop's own mechanics
+— against 18 queries across 7 categories
+(`diagnostics/research_loop_qa_corpus.md`: easy/needs-fetch/needs-
+reformulation/ambiguous-multiple-tiers/should-fail-honestly/spec-not-
+pricing/subjective-opinion), live on Ollama Cloud `gemma4:31b-cloud` with
+real Brave Search traffic. Full results and per-category analysis:
+`diagnostics/reports/research_loop_qa_assessment_2026-07-20.md`. Headline
+finding: the "should fail honestly" category had a **0/3 honest-exhaustion
+rate** — all three deliberately-unanswerable queries gate-passed on the
+first snippet, including one (an obscure NFT collection's floor price)
+where the accepted content contained no floor-price data for any actual
+collection at all, only generic definitional text. The dominant pattern
+across categories: the gate accepted *any* pricing/spec-shaped content as
+sufficient without checking it actually answered the specific question
+asked — a structural gap, since `_evaluate_pricing_gate()` at the time took
+only the candidate text, with no parameter for the original question at
+all.
+
+**Methodological caveat, stated in the report and repeated here:** because
+this direct-dispatch pass never invokes `ConversationalAgent`'s answer-
+synthesis step, "final answer" in the report is the raw winning
+`ToolResult` text (a search snippet, a fetched page, or the synthetic
+exhaustion message) — never a model-composed reply. Ambiguity-
+acknowledgment and fabrication questions the corpus poses at the synthesis
+layer are answered here only at the raw-material level: what the loop
+hands upstream, not what a user would ultimately see.
+
+**Fix.** See §18.4's 2026-07-20 update for the full before/after —
+`_evaluate_pricing_gate()`'s signature and system prompt were changed to
+take the original `instruction` alongside `text` and judge relevance, not
+just content-shape. Delta re-run on the 6 clearest-false-positive queries:
+4 improved, 2 unchanged (both are narrower gaps than plain tier/product
+mismatch — see §18.8's two new open items), 0 regressed in that sample.
+Test suite 940 → 943 passed.
+
+**What this closes and what it doesn't.** The open item is closed in the
+sense that a real, live, categorized QA pass now exists and a concrete
+defect it found was fixed and re-verified. It is not a claim that the loop
+now reliably converges on correct answers across a broad query set — see
+§18.8's three new open items (two specific gate-prompt gaps, and the
+scope-limited 6-of-18 re-run) for what remains genuinely open.

@@ -1,0 +1,173 @@
+num,category,query,iteration_count,fetch_occurred,reformulated,queries_tried,outcome,elapsed_seconds,final_success,final_answer
+1,A,What is the monthly price of Netflix's Standard plan?,1,False,False,monthly price of Netflix's Standard plan?,gate_passed_on_snippet,0.71,True,"• How much does Netflix cost per month? | Mashable
+  SEE ALSO: The best Netflix TV shows of 2025 (so far) Netflix&#x27;s standard plan costs <strong>$17.99 per month</strong>. With that, you lose the ads and get access to unlimited movies, TV shows, and mobile games.
+  [https://mashable.com/article/how-much-does-netflix-cost-per-month]
+
+• How Much Does Netflix Cost? And Is It Worth It? - NerdWallet
+  Prices for Netflix&#x27;s plans range from <strong>$8.99 to $26.99</strong> per month. The three Netflix subscription plans are Standard with ads, Standard and Premium. With the Standard with ads plan, subscribers can access the majority of Netflix’s library, with ...
+  [https://www.nerdwallet.com/finance/learn/how-much-does-netflix-cost]
+
+• Plans and Pricing | Netflix Help Center
+  Note: Extra members have their own account and password, but their membership is paid for by the person who invited them to share their Netflix account. Your plan determines how many extra member slots you can add. The Basic plan has been discontinued. You can change your plan at any time.
+  [https://help.netflix.com/en/node/24926]"
+2,A,What does GitHub Copilot Individual cost per month?,1,False,False,What does GitHub Copilot Individual cost per month?,gate_passed_on_snippet,1.03,True,"• GitHub Copilot · Plans & pricing
+  Every plan includes a monthly allowance: <strong>1 AI credit = $0.01 USD</strong>. You use credits when you chat with Copilot, work with agents, or use Copilot CLI, Spaces, and Spark. Code completions and next edit suggestions don&#x27;t use credits.
+  [https://github.com/features/copilot/plans]
+
+• GitHub Copilot licenses - GitHub Docs
+  You will receive a prorated refund for any remaining portion of your personal plan&#x27;s current billing cycle. You will then be able to continue using Copilot according to the policies set by your company. There are several ways to use Copilot for free. Provides limited access to Copilot features
+  [https://docs.github.com/en/billing/concepts/product-billing/github-copilot-licenses]
+
+• About individual GitHub Copilot plans and benefits - GitHub Docs
+  Designed to give you a limited taste of Copilot&#x27;s capabilities ... Verified students can access unlimited completions and additional models at no cost. Includes unlimited code completions and an allowance of GitHub AI Credits · Limited chat and agent usage with models available through auto
+  [https://docs.github.com/en/copilot/concepts/billing/individual-plans]"
+3,A,What is the base price of a 2024 Honda Civic LX?,1,False,False,base price of a 2024 Honda Civic LX?,gate_passed_on_snippet,1.07,True,"• 2024 Honda Civic LX 4dr Sedan Pricing and Options - Autoblog
+  Select colors, packages and other vehicle options to get the MSRP, Book Value and invoice price for the 2024 Civic LX 4dr Sedan.
+  [https://www.autoblog.com/buy/2024-Honda-Civic-LX__4dr_Sedan/pricing/]
+
+• 2024 Honda Civic Price, Cost-to-Own, Reviews & More | Kelley Blue Book
+  The cheapest 2024 Honda Civic is the LX Hatchback 4D, with a Kelley Blue Book Fair Purchase Price of <strong>$22,700</strong>.
+  [https://www.kbb.com/honda/civic/2024/]
+
+• 2024 Honda Civic MSRP and Invoice Prices | Edmunds
+  Based on Edmunds analysis of recent prices paid in your area, the Edmunds Suggested Price for the 2024 Honda Civic LX base trim is <strong>$22,673</strong>.
+  [https://www.edmunds.com/honda/civic/2024/msrp/]"
+4,B,What is the storage price per GB for Backblaze B2?,1,False,False,storage price per GB for Backblaze B2?,gate_passed_on_snippet,1.02,True,"• r/backblaze on Reddit: Super confused about Backblaze B2 pricing
+  You&#x27;ll pay <strong>$0.025 per month</strong> for storage (because 10 GB are free, actually you&#x27;re paying for 5GB) and enjoy 45 GB of free outbound traffic (egress x3). If each MP3 is 5 MB, you can deliver up to 9,000 downloads monthly for just $0.025.
+  [https://www.reddit.com/r/backblaze/comments/18r2pcg/super_confused_about_backblaze_b2_pricing/]
+
+• Cloud Storage Pricing Comparison: AWS S3, GCP, Azure, and B2
+  Built on top of Backblaze B2, pricing starts at <strong>$15 per TB/month</strong> for increased storage and networking throughput, and includes unlimited free egress to facilitate intensive data operations without prohibitive costs.
+  [https://www.backblaze.com/cloud-storage/pricing]
+
+• B2 + Cloudflare Trick: 18x Cheaper Than S3 | LeanOps
+  Backblaze B2 has the lowest per-GB storage cost among major S3-compatible providers: <strong>$0.006/GB/month</strong>, or $6 per TB. That alone makes it attractive for large-scale storage.
+  [https://leanopstech.com/blog/backblaze-b2-pricing-2026/]"
+5,B,What's the price of the entry-level Tesla Model 3 in the US?,1,False,False,What's the price of the entry-level Tesla Model 3 in the US?,gate_passed_on_snippet,1.14,True,"• 2026 Tesla Model 3 Prices, Reviews, and Pictures | Edmunds
+  More divisively, the turn signal stalk disappeared and was replaced by turn signal buttons on the steering wheel. For 2026, Tesla is making the Model 3 less expensive to start by way of the new Model 3 Standard. This entry-level version costs thousands of dollars less than the Long Range Rear-Wheel
+  [https://www.edmunds.com/tesla/model-3/]
+
+• How Much is a Tesla? Cost for All 2026 Tesla Models
+  The Tesla Model 3 is the cheapest Tesla car currently offered. The base rear-wheel drive (RWD) trim level has an official starting price of <strong>$39,990</strong>, while the Premium version is priced at $42,490.
+  [https://www.solarreviews.com/blog/how-much-do-teslas-electric-vehicles-cost]
+
+• 2026 Tesla Model 3 Price, Reviews, Pictures & More | Kelley Blue Book
+  It retains its smoother, quieter, and more polished ride over the previous generation, while still delivering the tech-forward feel buyers expect from Tesla. A new lower-cost entry-level trim broadens its appeal, while the highest-end Performance model goes in the opposite direction with power and
+  [https://www.kbb.com/tesla/model-3/]"
+6,B,What does the Notion Business plan cost per user per month?,1,False,False,What does the Notion Business plan cost per user per month?,gate_passed_on_snippet,1.35,True,"• Notion Pricing Plans: Free, Plus, Business, & Enterprise.
+  Advanced page analytics (Business Plan): Includes everything above as well as a list of page editors. Workspace analytics (Enterprise Plan): Includes everything above as well as user level analytics, analytics on all pages in your workspace, and search analytics for content in your workspace. ...
+  [https://www.notion.com/pricing]
+
+• Notion pricing 2026: Which plan is actually worth it? | eesel AI
+  Notion pricing in 2026 has four tiers: Free ($0), Plus ($10 per user/month), Business <strong>($20 per user/month</strong>), and Enterprise (custom). Full Notion AI, including the Notion Agent, only comes with the Business plan, and autonomous Custom Agents ...
+  [https://www.eesel.ai/blog/notion-pricing]
+
+• Notion Pricing Plans Guide 2026 - Which One to Choose
+  Here’s how much Notion costs based on the plan you choose: ... 2. Plus Plan: $10 per user per month when billed annually, $12 per user per month when billed monthly · 3. Business Plan: <strong>$15 per user per month when billed annually, $18 per user per month when billed monthly</strong>
+  [https://super.so/blog/notion-pricing-plans-which-one-to-choose]"
+7,C,How much does it cost to run a t3.medium EC2 instance in us-east-1?,1,False,False,How much does it cost to run a t3.medium EC2 instance in us-east-1?,gate_passed_on_snippet,2.05,True,"• t3.medium pricing: $30.3680 monthly - AWS EC2
+  The t3.medium instance is in the t3 family with 2 vCPUs and 4 GiB of memory, priced from <strong>$0.0416/hr or $30.3680/mo</strong>.
+  [https://www.economize.cloud/resources/aws/pricing/ec2/t3.medium/]
+
+• t3.medium pricing and specs - AWS EC2 Pricing - Holori
+  The t3.medium is a T3 instance with 2 vCPUs and 4 GiB of memory with Up to 5 Gigabit networking, starting at <strong>$0.042 per hour</strong>.
+  [https://calculator.holori.com/aws/ec2/t3.medium]
+
+• t3.medium pricing and specs - Vantage
+  The t3.medium instance is in the General purpose family with 2 vCPUs, 4 GiB of memory and up to 5 Gibps of bandwidth starting at <strong>$0.0416 per hour</strong>.
+  [https://instances.vantage.sh/aws/ec2/t3.medium]"
+8,C,What's the per-seat price for Figma's Enterprise tier?,1,False,False,What's the per-seat price for Figma's Enterprise tier?,gate_passed_on_snippet,1.0,True,"• Plans & Pricing | Figma
+  You will continue to get monthly invoices for newly added seats unless you proactively add those seats to your annual subscription or remove the seats. If you’re on an Organization or Enterprise plan, admins need to approve new seats that incur costs. By default, approved seats are included in your
+  [https://www.figma.com/pricing/]
+
+• Figma Pricing 2026: Plans, Seats, Real Costs + Calculator
+  Paid plans start at $3/mo per Collab seat on the Professional plan. Full seats (which include all products) cost $16/mo (Professional), $55/mo (Organization), or <strong>$90/mo</strong> (Enterprise). View seats are free on all plans.
+  [https://saascrmreview.com/figma-pricing/]
+
+• Figma Pricing 2026: Free & Professional Plans from $20/user/mo
+  Figma&#x27;s per-seat pricing runs from a free Starter plan up to <strong>$90/mo</strong> for Enterprise, four plans in total, with paid tiers billed annually.
+  [https://comparedge.com/tools/figma/pricing]"
+9,C,What does a Ford F-150 XLT crew cab start at?,1,False,False,What does a Ford F-150 XLT crew cab start at?,gate_passed_on_snippet,1.07,True,"• 2026 Ford F-150® XLT Truck | Model Details & Specs | Ford.com
+  The 2026 F-150 XLT comes standard with the 3.5L EcoBoost® V6 engine with three additional options, including the 3.5L PowerBoost™ Full Hybrid V6 engine.
+  [https://www.ford.com/trucks/f150/models/xlt/]
+
+• New 2025 Ford F150 SuperCrew Cab XLT Prices | Kelley Blue Book
+  A 2025 Ford F150 SuperCrew Cab XLT has a <strong>5-year cost-to-own of $71,585.</strong> After 5 years a 2025 F150 SuperCrew Cab XLT will depreciate $25,627 and have a residual value of $25,023.
+  [https://www.kbb.com/ford/f150-supercrew-cab/2025/xlt/]
+
+• 2025 Ford F-150 XLT Package: Specs, Dimensions & Colors
+  The 2025 Ford F-150 XLT size varies depending on several factors, including the cab style, cargo box, and drivetrain selected. For starters, the F-150 XLT is available with the SuperCab and SuperCrew.
+  [https://www.tomwoodford.com/ford-f-150-xlt-package.htm]"
+10,D,What does Adobe Creative Cloud cost?,1,False,False,What does Adobe Creative Cloud cost?,gate_passed_on_snippet,1.15,True,"• Adobe Creative Cloud Plans, Pricing, and Membership
+  Discover Adobe Creative Cloud membership plans and monthly prices for our full suite of applications including Photoshop, Premiere, Illustrator, and more.
+  [https://www.adobe.com/creativecloud/plans.html]
+
+• Adobe Creative Cloud prices: A breakdown of every Adobe app's cost, from Photoshop to Lightroom
+  Adobe offers four different bundles that are considerably cheaper than paying for each app individually. Creative Cloud (<strong>from $60/month</strong>): Everything except for Substance 3D apps
+  [https://www.businessinsider.com/guides/learning/adobe-creative-cloud-photoshop-premiere-pro-price]
+
+• Adobe Creative Cloud Pricing Guide (July 2026) inc. Photoshop & Illustrator Cost
+  ... If you need Photoshop plus ... value than buying several single apps separately. Creative Cloud Standard costs <strong>US$54.99 per month</strong>, while Creative Cloud Pro costs US$69.99 per month on annual billed monthly ...
+  [https://justcreative.com/adobe-creative-cloud-photoshop-illustrator-cost/]"
+11,D,What's the price of an iPhone 16?,1,False,False,What's the price of an iPhone 16?,gate_passed_on_snippet,1.13,True,"• Buy iPhone 16 and iPhone 16 Plus - Apple
+  Get <strong>$35 - $695</strong> off a new iPhone 16 or iPhone 16 Plus when you trade in an iPhone 8 or newer. 0% financing available. Buy now with free shipping.
+  [https://www.apple.com/shop/buy-iphone/iphone-16]
+
+• iPhone 16 Price: How Much Should You Pay? — GHOSTEK
+  The Pro line, including the iPhone ... cameras. However, these upgrades are heavily reflected in the price, costing <strong>$100 more than the previous model</strong>....
+  [https://ghostek.com/blogs/ghostek-insider/iphone-16-price-how-much-should-you-pay]
+
+• iPhone 16 Price In 2026: Here's How Much You Should Pay
+  Generally speaking, the cost of a base model iPhone 16 comes in at <strong>around $564 for a Grade A condition model and tops out at around $750 for an iPhone 16 Pro Max</strong> (again, in Grade A condition).
+  [https://www.knowyourmobile.com/phones/refurbished-smartphones/iphone-16-price/]"
+12,E,What is the exact enterprise contract price for Salesforce?,1,False,False,exact enterprise contract price for Salesforce?,gate_passed_on_snippet,5.69,True,"• Salesforce Pricing 2026: Plans from $25/User/Month
+  Salesforce pricing: Starter $25, Pro Suite $100, <strong>Enterprise $175</strong>, Unlimited $350/user/mo. Free tier available. Verified from 11 sources, March 2026.
+  [https://costbench.com/software/crm/salesforce/]
+
+• Salesforce Pricing 2026: Plans, Add-Ons & Hidden Costs
+  Salesforce pricing starts at <strong>$25/user/month</strong>, but real costs rise with API access, support, AI, security, and add-ons. See every 2026 plan.
+  [https://saascrmreview.com/salesforce-pricing/]
+
+• Salesforce Contracts Pricing | Salesforce
+  This page is provided for information ... is part of the product.agentfoce Revenue Management product. It&#x27;s available for <strong>$50 per user per month</strong>....
+  [https://www.salesforce.com/sales/revenue-lifecycle-management/contracts-pricing/]"
+13,E,What does the discontinued Google Stadia controller cost new from Google?,1,False,False,What does the discontinued Google Stadia controller cost new from Google?,gate_passed_on_snippet,1.0,True,"• [Update: Or not] Google giving Stadia Controller a permanent price cut to $59.99
+  The company is presumably trying ... edition is a “Play and Watch with Google TV Package.” It costs <strong>$99.99 with a Controller and Chromecast with Google TV</strong>....
+  [https://9to5google.com/2021/08/03/google-stadia-controller-price-cut/]
+
+• r/Stadia on Reddit: Are two new in the box, Stadia controllers for $15 each worth it?
+  I only say it because i saw MKBHDs video about original unopened iphones going for multiple thousands of dollars, and maybe 10 years from now a collector will pay a respectable amount in pocket change for an unopened stadia controller.
+  [https://www.reddit.com/r/Stadia/comments/13gumxi/are_two_new_in_the_box_stadia_controllers_for_15/]
+
+• Google Stadia - Wikipedia
+  Both tiers allowed users to play ... <strong>costs</strong>. <strong>Stadia</strong> was integrated with YouTube, and its &quot;state share&quot; feature allowed players to launch a supported game from a save state shared by another player via permalink. The service supported
+  [https://en.wikipedia.org/wiki/Google_Stadia]"
+14,E,What is the current spot price of a specific obscure NFT collection's floor price?,1,False,False,current spot price of a specific obscure NFT collection's floor price?,gate_passed_on_snippet,1.11,True,"• NFT Price Floor - NFT Collections Ranking by market cap, prices & trading stats
+  Our NFT platform tracks the price floor of 1798 NFT collections with a total trading volume of <strong>3,113,238 USD</strong> and 31593 total sales over the last day.
+  [https://nftpricefloor.com/]
+
+• Top NFT Collections by Market Cap: Floor Price & Volume | CoinGecko
+  NFT floor price is <strong>the lowest price an individual is willing to sell an NFT for</strong>. Alternatively, the NFT floor price can also be the lowest amount of ETH a person is able to spend to own an NFT or become a member of an NFT project. NFT floor price is often determined and set by the
+  [https://www.coingecko.com/en/nft]
+
+• Top NFT Collection Prices, Charts & Tracker | Forbes Digital Assets
+  Forbes Digital Assets&#x27;s NFT collection tracker shows a summary of daily top NFT prices and charts by trading volume. Uncover the latest prices to inform your NFT strategy.
+  [https://www.forbes.com/digital-assets/nft-prices/]"
+15,F,What is the max payload capacity of a Ford F-150 Lightning?,2,True,True,max payload capacity of a Ford F-150 Lightning? | Ford F-150 Lightning payload capacity specifications by trim level,gate_passed_after_fetch,15.8,True,"Title: 2025 Ford F-150 Lightning Specs, Review, Price, & Trims | Sarchione Ford
+Source: https://sarchioneford.com/ford-f-150-lightning-model-review
+Words: 180
+
+*Manufacturer’s Suggested Retail Price (also referred to as “MSRP”, “Base MSRP”, “Base Price” or the “Starting At” price), excludes destination/delivery charge, taxes, title, license, and registration and/or electronic filing fees, dealer fees, and total of options. For authenticated AXZ Plan customers, the price displayed may represent Plan pricing. Not all AXZ Plan customers will qualify for the Plan pricing shown and not all offers or incentives are available to AXZ Plan customers. Although every reasonable effort has been made to ensure the accuracy of the information contained on this site, absolute accuracy cannot be guaranteed. This site, and all information and materials appearing on it, are presented to the user ""as is"" without warranty of any kind, either express or implied. All vehicles are subject to prior sale. Price does not include applicable tax, Doc Fee ($250), and title/license charges ($33.50). ‡Vehicles shown at different locations are not currently in our inventory (Not in Stock) but can be made available to you at our location within a reasonable date from the time of your request, not to exceed one week."
+16,F,What is the battery capacity in kWh of a Tesla Model Y Long Range?,3,True,True,battery capacity in kWh of a Tesla Model Y Long Range? | Tesla Model Y Long Range battery capacity kWh specifications official | Tesla Model Y Long Range battery capacity kWh official specifications site:tesla.com,exhausted_honestly,9.26,False,"ERROR: research loop exhausted 3 iteration(s) without finding concrete pricing information (queries tried: ['battery capacity in kWh of a Tesla Model Y Long Range?', 'Tesla Model Y Long Range battery capacity kWh specifications official', 'Tesla Model Y Long Range battery capacity kWh official specifications site:tesla.com'])."
+17,G,Do you think the new iPhone is worth the price?,2,True,True,Do you think the new iPhone is worth the price? | iPhone 16 price plans and models cost official Apple store,gate_passed_on_snippet,3.79,True,"• Buy iPhone 16 and iPhone 16 Plus - Apple
+  Get <strong>$35 - $695</strong> off a new iPhone 16 or iPhone 16 Plus when you trade in an iPhone 8 or newer. 0% financing available. Buy now with free shipping.
+  [https://www.apple.com/shop/buy-iphone/iphone-16]
+
+• iPhone 16 Release Price Guide: What to Pay & When
+  If you’re a typical user, you don’t need to overthink this: the <strong>iPhone 16 (128GB) at $699</strong> — now widely available at Apple’s official store and major carriers — delivers the strongest balance of feature access, longevity, and cost in ...
+  [https://electronics.alibaba.com/buyingguides/iphone-16-price-guide-when-to-buy-which-model]
+
+• iPhone 16 USA Price Guide: How Much to Pay & Where to Buy
+  <strong>New, unlocked, Apple Store: $799 (16, 128GB) → $1,199 (Pro Max, 512GB) Refurbished (Back Market): $629–$699 (16, 128–256GB)</strong> 4 · Used, unlocked (Swappa): $443 (16, 128GB, Fair condition) → $680 (16, 256GB, Excellent) 2 · Carrier deal ...
+  [https://electronics.alibaba.com/buyingguides/iphone-16-usa-price-guide-what-to-pay-in-2026]"
+18,G,Is the Tesla Model 3 overpriced compared to competitors?,1,True,False,Is the Tesla Model 3 overpriced compared to competitors?,exhausted_honestly,16.22,False,ERROR: research loop exhausted 1 iteration(s) without finding concrete pricing information (queries tried: ['Is the Tesla Model 3 overpriced compared to competitors?']).
