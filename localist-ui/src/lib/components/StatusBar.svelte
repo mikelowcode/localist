@@ -9,7 +9,7 @@
     '/conversation': 'Conversation',
     '/memory':       'Episodic Memory',
     '/files':        'Files',
-    '/history':      'History',
+    '/episodes':     'Episodes',
     '/settings':     'Settings',
     '/research':     'Research'
   };

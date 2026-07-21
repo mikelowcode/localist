@@ -67,6 +67,13 @@ class ToolResult:
     # it (controller_agent.py, to populate ControllerResult.metadata) read it
     # directly off the ToolResult instead.
     artifact:   dict[str, Any] | None = None
+    # Correlation key grouping every ToolResult produced by one bounded
+    # multi-step tool call (currently only MCPToolDispatcher._run_research_loop)
+    # into a single "workflow" — read by controller_agent.py to populate
+    # ControllerResult.metadata["workflow_id"]/["workflow_steps"] for the
+    # Episode Browsing UI's step-chain view. None for every other tool (a
+    # single web_search or url_fetch is not a workflow on its own).
+    workflow_id: str | None = None
 
 
 @dataclass

@@ -489,3 +489,43 @@ defect it found was fixed and re-verified. It is not a claim that the loop
 now reliably converges on correct answers across a broad query set — see
 §18.8's three new open items (two specific gate-prompt gaps, and the
 scope-limited 6-of-18 re-run) for what remains genuinely open.
+
+### 18.10 `workflow_id` — Episode Browsing UI Phase 2 (2026-07-21)
+
+`ToolResult` (`prompt_builder.py`) gains a `workflow_id: str | None = None`
+field. `_run_research_loop()` generates one `uuid.uuid4()` per call and
+stamps it onto every `ToolResult` it produces or appends — every
+`web_search`/`url_fetch` attempt along the way, and the synthetic
+`tool_name="research"` exhaustion result (§18.4) when the loop runs out
+without finding a concrete number. No other tool (`chart`, `file_op`, a
+plain `web_search` not routed through the loop) ever sets this field —
+it exists specifically to correlate every `ToolResult` a single bounded
+multi-step tool call produced, and `_run_research_loop` is currently the
+only such call.
+
+`controller_agent.py`'s `_execute_plan` reads it back out right after
+Step 3's `chart_artifact` extraction (same pattern, same "pull it out of
+`dispatched_tool_results`, thread it through `_build_conversational_result`"
+shape): the first non-`None` `workflow_id` found becomes
+`metadata["workflow_id"]`, and every `ToolResult` sharing that id becomes
+an ordered `metadata["workflow_steps"]` list (`tool_name`, `parameters`,
+`success`, `result` truncated to 500 chars — mirrors the existing
+`[TOOL RESULTS]` truncation discipline, not the raw `ToolResult.result`).
+Both keys are omitted from `metadata` entirely on any non-research turn,
+same "omit empty slots cleanly" convention as `chart_artifact`/`"chart"`.
+
+This is groundwork for the Episode Browsing UI's step-chain view
+(`episode-browsing-ui-plan.md`, Phase 2) — a multi-turn research run
+collapses into one browsable episode instead of N indistinguishable
+`web_search`/`url_fetch` rows. Planner routes at most one tool-call set
+per turn today, so at most one `workflow_id` can appear per
+`dispatched_tool_results` list; the extraction logic does not attempt to
+handle multiple concurrent workflows in one turn.
+
+Test coverage: `test_mcp_tool_dispatcher.py::TestResearchLoop` (id shared
+across all results in one loop run, including the synthetic failure
+result; two separate `dispatch()` calls get different ids; a plain
+`web_search` never sets one) and
+`test_controller_phase4.py::TestWorkflowStepsMetadata` (metadata
+populated on a research turn, omitted entirely on a non-research turn and
+on a plain-`web_search` turn without a `workflow_id`).

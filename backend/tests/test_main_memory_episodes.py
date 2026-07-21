@@ -134,3 +134,31 @@ class TestGetEpisodesTotalCount:
         resp = client.get("/memory/episodes", params={"status": "pending", "limit": 1})
         assert resp.status_code == 200
         assert resp.json()["total"] == 0
+
+
+class TestGetEpisodesTaskIdFilter:
+    """
+    task_id filtering (episode-browsing-ui-plan.md Phase 6) backs the
+    Episode Browsing UI's per-turn "related memory" overlay.
+    """
+
+    def test_filters_to_matching_task_id_only(self, client):
+        writer = EpisodicMemoryWriter(db_path=main._state.memory_manager._db_path)
+        writer.insert("preference", "a", "A.", "explicit", task_id="task-1")
+        writer.insert("decision", "b", "B.", "explicit", task_id="task-2")
+
+        resp = client.get("/memory/episodes", params={"task_id": "task-1"})
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 1
+        assert body["episodes"][0]["task_id"] == "task-1"
+
+    def test_no_task_id_returns_all(self, client):
+        writer = EpisodicMemoryWriter(db_path=main._state.memory_manager._db_path)
+        writer.insert("preference", "a", "A.", "explicit", task_id="task-1")
+        writer.insert("decision", "b", "B.", "explicit", task_id="task-2")
+
+        resp = client.get("/memory/episodes")
+
+        assert resp.json()["total"] == 2

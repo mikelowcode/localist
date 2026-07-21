@@ -767,6 +767,20 @@ class TestCountEpisodes:
     def test_count_zero_on_empty_db(self, mm):
         assert mm.count_episodes(status="pending") == 0
 
+    def test_count_respects_task_id_filter(self, mm, writer):
+        """
+        task_id filtering (episode-browsing-ui-plan.md Phase 6) backs the
+        Episode Browsing UI's per-turn "related memory" overlay — episodes
+        implicit extraction stamped with the same task_id as a selected
+        chat_turns row.
+        """
+        writer.insert("preference", "a", "A.", "explicit", task_id="task-1")
+        writer.insert("decision", "b", "B.", "explicit", task_id="task-1")
+        writer.insert("preference", "c", "C.", "explicit", task_id="task-2")
+        assert mm.count_episodes(status="active", task_id="task-1") == 2
+        assert mm.count_episodes(status="active", task_id="task-2") == 1
+        assert mm.count_episodes(status="active", task_id="nonexistent") == 0
+
 
 # ---------------------------------------------------------------------------
 # format_episodic_summary

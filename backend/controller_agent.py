@@ -1294,6 +1294,30 @@ class ControllerAgent:
             None,
         )
 
+        # research (_run_research_loop) stamps every ToolResult it produces
+        # with the same workflow_id — pulled out here, same pattern as
+        # chart_artifact above, so the step chain can ride into
+        # ControllerResult.metadata for the Episode Browsing UI's step-chain
+        # view (episode-browsing-ui-plan.md, Phase 2). Planner routes at
+        # most one tool-call set per turn today, so at most one workflow_id
+        # is ever present; next()/the first id found is all that's needed.
+        workflow_id = next(
+            (r.workflow_id for r in dispatched_tool_results if r.workflow_id is not None),
+            None,
+        )
+        workflow_steps = None
+        if workflow_id is not None:
+            workflow_steps = [
+                {
+                    "tool_name":  r.tool_name,
+                    "parameters": r.parameters,
+                    "success":    r.success,
+                    "result":     r.result[:500],
+                }
+                for r in dispatched_tool_results
+                if r.workflow_id == workflow_id
+            ]
+
         # -- Step 3b: Corpus fallback when web_search fails -----------------
         # Runs only when the P3 tool path was taken and every web_search
         # result came back failed. Queries the corpus with the original
@@ -1784,7 +1808,8 @@ class ControllerAgent:
         # after the answer is ready, rather than waiting 18-23 s for hooks.
         if on_answer_ready is not None:
             _early = self._build_conversational_result(
-                task, plan, effective_agent_name, results, chart_artifact
+                task, plan, effective_agent_name, results, chart_artifact,
+                workflow_id, workflow_steps,
             )
             if _early is not None:
                 on_answer_ready(_early.to_dict())
@@ -1863,7 +1888,8 @@ class ControllerAgent:
 
         logger.info("TIMING execute_plan_end t=%.4f", time.monotonic())
         final_result = self._build_conversational_result(
-            task, plan, effective_agent_name, results, chart_artifact
+            task, plan, effective_agent_name, results, chart_artifact,
+            workflow_id, workflow_steps,
         )
         if final_result is not None:
             return final_result
@@ -1897,6 +1923,8 @@ class ControllerAgent:
         effective_agent_name: str,
         results:              list[AgentResult],
         chart_artifact:       dict[str, Any] | None = None,
+        workflow_id:          str | None = None,
+        workflow_steps:       list[dict[str, Any]] | None = None,
     ) -> "ControllerResult | None":
         """
         Build a ControllerResult for a successful single-agent conversational dispatch.
@@ -1913,6 +1941,14 @@ class ControllerAgent:
             non-chart turn, in which case metadata omits the "chart" key
             entirely (same "omit empty slots cleanly" convention
             PromptBuilder uses elsewhere) rather than emitting a null.
+
+        workflow_id / workflow_steps :
+            Set together (both None, or both populated) when Step 3's tool
+            dispatch included a research-loop run — see _execute_plan's
+            workflow_id/workflow_steps extraction, same "pull it out right
+            after Step 3" pattern as chart_artifact. Omitted from metadata
+            entirely on any non-research turn, for the Episode Browsing
+            UI's step-chain view (episode-browsing-ui-plan.md, Phase 2).
 
         When plan.tools_to_call is empty, the answer is passed through
         _strip_false_tool_attribution() before being returned — a narrow
@@ -1937,6 +1973,9 @@ class ControllerAgent:
         }
         if chart_artifact is not None:
             metadata["chart"] = chart_artifact
+        if workflow_id is not None:
+            metadata["workflow_id"] = workflow_id
+            metadata["workflow_steps"] = workflow_steps
 
         answer = r.output.get("answer", "")
         if not plan.tools_to_call:

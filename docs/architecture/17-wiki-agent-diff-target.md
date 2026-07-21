@@ -203,9 +203,7 @@ conversations left untouched).
 - **Wiki write safety net — CLOSED, see §17.9.**
 - **Bullet/diff-marker collision on context lines.** See §17.7 point 3 — confirmed, fails safely
   (409, no corruption), intentionally left unfixed for now.
-- **Multi-diff turns.** The model has only ever proposed one diff per instruction to date; the
-  `pending_diffs` data shape accommodates a list, but the UI only renders/exercises the single-diff
-  case.
+- **Multi-diff turns — CLOSED (verified, not a code change), see §17.11.**
 
 ### 17.9 Wiki write safety net — Added 2026-07-10 (closes the item above)
 
@@ -346,3 +344,52 @@ Fixed by adding `"apply diffs"`, `"apply this diff"`, `"propose diffs"`,
 both consume the same frozenset, so P1b's lead-phrase matching gains the
 same coverage. Regression tests added for both exact phrasings.
 **Test suite: 967 → 969 passed, 0 failed.**
+
+### 17.11 Multi-Diff Turns — Closed, Verified Not a Code Change (2026-07-21)
+
+Closes §17.8's "Multi-diff turns" open item, investigated as part of
+scoping the Episode Browsing UI's tool-result-episode detail pane
+(`episode-browsing-ui-plan.md` §"Open question 5"), which named this item
+as a likely prerequisite. A full read of every layer in the pipeline —
+`WikiAgent._run_diff_only()`'s `output["diffs"]` list,
+`controller_agent.py`'s `_build_wiki_diff_result()` (a plain list
+comprehension over `diffs`, no `[0]`/single-item assumption anywhere),
+`MemoryManager.mark_diff_applied()` (matches by `page_name` within the
+list, not "the diff" singular), `POST /wiki/apply-diff` (already keyed by
+`page_name`, not turn-level), and `ChatPanel.svelte`'s rendering
+(`{#each turn.metadata.pending_diffs as diff (diff.page_name)}`, with
+per-`(task_id, page_name)`-keyed `diffState` for independent
+apply/discard/error state per diff) — found no single-diff assumption
+anywhere. Every layer already operates on the full list independently, keyed
+by `page_name`.
+
+**What was actually true.** The open item's own wording was accurate but
+easy to over-read: "the model has only ever proposed one diff... the UI
+only renders/exercises the single-diff case" describes a *live-usage*
+fact (WikiAgent has never been observed emitting 2+ diffs for one
+instruction, so this code path had literally never executed against real
+data), not a code limitation. Nothing needed generalizing because nothing
+was ever specialized to one diff in the first place.
+
+**Verification, not a fix.** Three tests added proving the full pipeline
+end to end with 2 diffs sharing one turn:
+`test_controller_phase4.py::TestWikiDiffResultPath::
+test_multiple_diffs_in_one_turn_all_reach_metadata` (both diffs reach
+`metadata["pending_diffs"]` intact),
+`test_chat_turns_schema.py::TestMarkDiffApplied::
+test_multiple_pending_diffs_only_the_matching_page_flips_to_applied`
+(applying one page's diff leaves the other's status untouched in
+persisted `metadata_json`), and
+`test_wiki_apply_diff_endpoint.py::TestApplyDiffEndpoint::
+test_applying_one_of_two_pending_diffs_leaves_the_other_untouched` (a real
+`POST /wiki/apply-diff` call against two real on-disk pages — one gets
+written and marked applied, the other is untouched on disk and stays
+"pending" in persisted metadata). **Test suite: 1028 → 1031 passed, 0
+failed.**
+
+**Consequence for the Episode Browsing UI.** Phase 5's tool-result-episode
+detail pane can reuse `ChatPanel.svelte`'s existing diff-block
+rendering/apply/discard logic directly for multi-diff episodes — no
+separate generalization work was a real prerequisite, contrary to what
+`episode-browsing-ui-plan.md`'s "Open question 5" flagged as an open risk
+before this investigation.

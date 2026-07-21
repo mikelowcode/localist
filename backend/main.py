@@ -807,6 +807,7 @@ class MemoryStatsResponse(BaseModel):
     cache_invalid:    int
     embeddings_pct:   float
     corpus_stale:     bool   # True when the wiki/raw corpus needs POST /memory/reembed
+    chat_turns_stale: bool   # True when chat_turns needs POST /memory/reembed-chat-turns
     available:        bool   # False when MemoryManager is not initialised
 
 
@@ -817,6 +818,18 @@ class ReembedCorpusResponse(BaseModel):
     16-runtime-backend-layer.md §16.4's confirmed embedding-provenance
     follow-up). Episodes get no equivalent endpoint — a genuine embedding-
     model mismatch there is auto-corrected at startup, not left pending.
+    """
+    reembedded: int
+    total:      int
+    model:      str | None
+
+
+class ReembedChatTurnsResponse(BaseModel):
+    """
+    Response body for POST /memory/reembed-chat-turns — the chat_turns
+    counterpart to ReembedCorpusResponse/POST /memory/reembed. chat_turns
+    can grow arbitrarily large under the "forever" eviction preset, so a
+    detected embedding-model mismatch never re-embeds it automatically.
     """
     reembedded: int
     total:      int
@@ -907,6 +920,7 @@ class ChatTurnItem(BaseModel):
     conversation_id:    str
     conversation_title: str | None = None
     created_at:         float
+    score:              float | None = None  # only set in mode="semantic" results
 
 
 class ChatHistoryResponse(BaseModel):
@@ -1435,6 +1449,7 @@ async def get_memory_stats() -> MemoryStatsResponse:
             cache_invalid  = 0,
             embeddings_pct = 0.0,
             corpus_stale   = False,
+            chat_turns_stale = False,
             available      = False,
         )
 
@@ -1449,6 +1464,7 @@ async def get_memory_stats() -> MemoryStatsResponse:
         cache_invalid  = raw["cache_invalid"],
         embeddings_pct = raw["embeddings_pct"],
         corpus_stale   = mm._corpus_stale,
+        chat_turns_stale = mm._chat_turns_stale,
         available      = True,
     )
 
@@ -1484,6 +1500,37 @@ async def reembed_corpus() -> ReembedCorpusResponse:
     return ReembedCorpusResponse(**result)
 
 
+@app.post(
+    "/memory/reembed-chat-turns",
+    response_model = ReembedChatTurnsResponse,
+    summary        = "Manually re-embed chat_turns with the active embedding model",
+)
+async def reembed_chat_turns() -> ReembedChatTurnsResponse:
+    """
+    Explicit, manually-triggered chat_turns re-embed — the chat_turns
+    counterpart to POST /memory/reembed. chat_turns can grow arbitrarily
+    large (the "forever" eviction preset), so unlike episodes a detected
+    embedding-model mismatch never triggers this automatically; call it
+    after switching embedding models to clear MemoryManager's
+    chat_turns_stale flag and restore embedding-based search in
+    GET /chat/history?mode=semantic.
+
+    Idempotent — safe to call whether or not chat_turns is currently
+    flagged stale (a "just refresh it" operation).
+    """
+    mm = _state.memory_manager
+    if mm is None:
+        raise HTTPException(status_code=503, detail="MemoryManager not initialised.")
+    if mm.embed_fn is None:
+        raise HTTPException(
+            status_code = 409,
+            detail      = "No embedding source configured — nothing to re-embed with.",
+        )
+
+    result = await asyncio.to_thread(mm.reembed_chat_turns)
+    return ReembedChatTurnsResponse(**result)
+
+
 @app.get(
     "/memory/episodes",
     response_model = EpisodesResponse,
@@ -1493,6 +1540,7 @@ async def get_memory_episodes(
     status:          str      = "active",
     project_context: str | None = None,
     episode_type:    str | None = None,
+    task_id:         str | None = None,
     limit:           int      = 50,
     offset:          int      = 0,
 ) -> EpisodesResponse:
@@ -1507,6 +1555,8 @@ async def get_memory_episodes(
                       POST /memory/episodes/{id}/approve or .../reject.
     project_context : filter by project context string
     episode_type    : filter by episode type
+    task_id         : filter by originating task_id — the Episode Browsing
+                      UI's per-turn "related memory" overlay uses this.
     limit           : max results (default 50, max 200)
     offset          : pagination offset (default 0)
     """
@@ -1519,6 +1569,7 @@ async def get_memory_episodes(
         status          = status,
         project_context = project_context,
         episode_type    = episode_type,
+        task_id         = task_id,
         limit           = limit,
         offset          = offset,
     )
@@ -1531,6 +1582,7 @@ async def get_memory_episodes(
         status          = status,
         project_context = project_context,
         episode_type    = episode_type,
+        task_id         = task_id,
     )
 
     return EpisodesResponse(
@@ -2050,18 +2102,34 @@ async def get_chat_history(
     limit:           int         = 50,
     offset:          int         = 0,
     conversation_id: str | None = None,
+    mode:            Literal["keyword", "semantic"] = "keyword",
+    min_score:       float       = 0.3,
+    date_from:       float | None = None,
+    date_to:         float | None = None,
+    has_tool_result: bool         = False,
 ) -> ChatHistoryResponse:
     """
     Return a paginated list of chat_turns, newest first.
 
     Query parameters
     ----------------
-    q               : optional full-text search string (matched via chat_turns_fts)
+    q               : optional search string. mode="keyword" matches via
+                      chat_turns_fts; mode="semantic" scores via cosine
+                      similarity over the stored embedding column.
     limit           : max results (default 50, max 200)
     offset          : pagination offset (default 0)
     conversation_id : optional conversation_id filter — when provided, restricts
                       results to one conversation; when omitted, searches/lists
                       across all conversations.
+    mode            : "keyword" (default) or "semantic". Silently falls back to
+                      keyword search when no embed_fn is configured or
+                      chat_turns is flagged stale — see MemoryManager.get_chat_turns().
+    min_score       : mode="semantic" only — minimum cosine score to include
+                      a result (default 0.3).
+    date_from       : optional inclusive lower bound on created_at (unix seconds).
+    date_to         : optional inclusive upper bound on created_at (unix seconds).
+    has_tool_result : when true, restricts to turns carrying a chart, pending_diffs,
+                      or workflow_id in metadata — see MemoryManager.get_chat_turns().
 
     Read-only — no eviction/deletion happens here.
     """
@@ -2070,7 +2138,8 @@ async def get_chat_history(
 
     rows, total = await asyncio.to_thread(
         mm.get_chat_turns, query=q, limit=limit, offset=offset,
-        conversation_id=conversation_id,
+        conversation_id=conversation_id, mode=mode, min_score=min_score,
+        date_from=date_from, date_to=date_to, has_tool_result=has_tool_result,
     )
 
     return ChatHistoryResponse(

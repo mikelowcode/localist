@@ -324,6 +324,19 @@
         </a>
       </li>
 
+      <!-- Episodes -->
+      <li>
+        <a
+          href="/episodes"
+          class="nav-link"
+          class:active={active.startsWith('/episodes')}
+          aria-current={active.startsWith('/episodes') ? 'page' : undefined}
+        >
+          <span class="nav-icon-sq">E</span>
+          <span class="nav-label">Episodes</span>
+        </a>
+      </li>
+
       <!-- Files -->
       <li>
         <button

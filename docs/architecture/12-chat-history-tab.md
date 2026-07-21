@@ -327,13 +327,14 @@ id used for backend `conversation_log` working-memory grouping (§12.2);
 persisted across reloads. The two must not be conflated: one resets on
 every full page reload by design, the other explicitly does not.
 
-**`src/routes/history/+page.svelte` still exists on disk, unlinked from
-nav.** It retains its original retention-preset dropdown and
-cross-conversation FTS search UI (`chatHistorySettings.ts`,
-`chatHistoryList.ts` — both also still present, unchanged). This is
-flagged explicitly as **not yet integrated into the merged Chat tab, an
-open item** (§12.7) — not dead code that has been fully superseded and
-could be deleted outright.
+**`src/routes/history/+page.svelte` — retired 2026-07-21, see §20.** Was
+unlinked from nav since the 2026-07-02 merge above; deleted outright once
+the Episode Browsing UI's `/episodes` route (§20) made it a strict subset
+(same FTS search + list, superseded by that route's semantic search,
+filters, detail pane, and tool-result rendering). `chatHistorySettings.ts`
+is unaffected — its retention-preset control already lived on `/settings`
+independently and still does; only the duplicate copy on `/history` and
+the dedicated `chatHistoryList.ts` list store were removed.
 
 ### 12.6 Live Verification
 
@@ -397,12 +398,15 @@ search for `*.test.ts`. Not introduced as part of this feature; frontend
 verification for this arc relied on `svelte-check`, `vite build`, and the
 live-fire pass in §12.6.
 
-**Open Item 4 — `src/routes/history/+page.svelte` not yet integrated into
-the merged Chat tab.** Unlinked from `Sidebar.svelte`'s nav since the
-2026-07-02 Chat + History merge (§12.5) but still present on disk with its
-original retention-preset dropdown and cross-conversation FTS search UI —
-functionality the merged `/conversation/[id]` route does not yet expose
-anywhere. This is a known gap to fold in, not dead code safe to delete.
+**Open Item 4 — CLOSED 2026-07-21, see §20.** `src/routes/history/
++page.svelte` and its dedicated `chatHistoryList.ts` store were deleted
+outright rather than folded in — the new Episode Browsing UI's
+`/episodes` route (§20) is a strict superset of `/history`'s turn-list +
+FTS-search functionality (plus semantic search, filters, a detail pane,
+and tool-result rendering), and `/history`'s retention-preset dropdown
+duplicated a control that already lives on `/settings`
+(`chatHistorySettings.ts`, unaffected, still used there). No functionality
+was lost.
 
 **Open Item 5 — Mid-stream navigate-away-and-back does not reconstruct
 in-progress streaming state.** If the user leaves a `/conversation/[id]`

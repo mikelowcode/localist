@@ -150,7 +150,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION   = 8          # increment when schema changes require migration
+_SCHEMA_VERSION   = 9          # increment when schema changes require migration
 _EMBEDDING_DIM    = 768        # EmbeddingGemma-300M-4bit output dimension
 _EMBEDDING_FORMAT = ">768f"    # big-endian float32 × 768
 
@@ -159,13 +159,20 @@ _EMBEDDING_FORMAT = ">768f"    # big-endian float32 × 768
 _CONV_LOG_CAP_PER_TASK = 200
 
 # embedding_provenance store keys — see _check_embedding_provenance().
-_PROVENANCE_STORES: tuple[str, ...] = ("corpus", "episodes")
+_PROVENANCE_STORES: tuple[str, ...] = ("corpus", "episodes", "chat_turns")
 
 # Episodes are expected to stay small enough to re-embed synchronously at
 # startup with no bounding/pagination (docs/architecture/
 # 16-runtime-backend-layer.md §16.4). This is a "revisit if it fires live"
 # tripwire, not a hard limit — re-embedding still runs regardless.
 _EPISODES_REEMBED_WARN_ROW_COUNT = 500
+
+# get_chat_turns(mode="semantic") does a full-table cosine scan (chat_turns
+# has no token_set column to cheaply pre-filter with, unlike document_index)
+# — this just logs a warning past this many rows rather than bounding
+# anything, so a "forever"-eviction-preset install with a long history is
+# visible in logs rather than silently slow.
+_CHAT_TURNS_SEMANTIC_SCAN_WARN_ROW_COUNT = 2000
 
 # Closed set of valid chat_history_settings.eviction_preset values.
 _CHAT_HISTORY_EVICTION_PRESETS: frozenset[str] = frozenset({"7d", "30d", "90d", "forever"})
@@ -356,6 +363,14 @@ class MemoryManager:
         # below, never left stale.
         self._corpus_stale = False
 
+        # Same stale-flag posture as _corpus_stale, for the same reason:
+        # chat_turns can grow arbitrarily large under the "forever" eviction
+        # preset, so — unlike episodes — a provenance mismatch is never
+        # auto-corrected at startup. get_chat_turns(mode="semantic") falls
+        # back to keyword/FTS scoring while this is True, until
+        # reembed_chat_turns() (POST /memory/reembed-chat-turns) clears it.
+        self._chat_turns_stale = False
+
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -363,10 +378,12 @@ class MemoryManager:
             self._check_embedding_provenance()
 
         logger.info(
-            "MemoryManager initialised — db=%s  embeddings=%s  corpus_stale=%s",
+            "MemoryManager initialised — db=%s  embeddings=%s  corpus_stale=%s  "
+            "chat_turns_stale=%s",
             self._db_path,
             "enabled" if embed_fn else "disabled (keyword-only)",
             self._corpus_stale,
+            self._chat_turns_stale,
         )
 
     @property
@@ -543,6 +560,7 @@ class MemoryManager:
                             metadata_json       TEXT    NOT NULL DEFAULT '{}',
                             conversation_id     TEXT    NOT NULL DEFAULT 'legacy',
                             conversation_title  TEXT,
+                            embedding           BLOB,
                             created_at          REAL    NOT NULL
                         );
                         CREATE INDEX IF NOT EXISTS idx_chat_turns_created
@@ -749,6 +767,16 @@ class MemoryManager:
                 );
             """)
 
+        if from_version < 9:
+            logger.info("Applying migration v8→v9: adding embedding column to chat_turns.")
+            cols = {row[1] for row in conn.execute(
+                "PRAGMA table_info(chat_turns)"
+            ).fetchall()}
+            if "embedding" not in cols:
+                conn.executescript(
+                    "ALTER TABLE chat_turns ADD COLUMN embedding BLOB;"
+                )
+
         conn.execute(
             "UPDATE schema_version SET version = ?", (_SCHEMA_VERSION,)
         )
@@ -760,10 +788,11 @@ class MemoryManager:
     #
     # Same detect-and-fail-safe pattern as Planner's _TUNED_EMBEDDING_MODEL
     # guard, applied to stored vectors: cosine similarity between a query
-    # embedding and a stored document/episode embedding is only meaningful
-    # if both came from the same model's geometry. embedding_provenance
-    # tracks, per store ('corpus' | 'episodes'), which model actually
-    # produced the vectors currently on disk.
+    # embedding and a stored document/episode/turn embedding is only
+    # meaningful if both came from the same model's geometry.
+    # embedding_provenance tracks, per store ('corpus' | 'episodes' |
+    # 'chat_turns'), which model actually produced the vectors currently on
+    # disk.
     # -----------------------------------------------------------------------
 
     def _check_embedding_provenance(self) -> None:
@@ -780,7 +809,9 @@ class MemoryManager:
             _maybe_seed_corpus_provenance()); 'episodes' seeds on the next
             process restart that finds embedded rows present (or whenever
             episode-embedding provenance tracking is added to the writer
-            path — not yet, so it seeds one boot later than corpus, at worst).
+            path — not yet, so it seeds one boot later than corpus, at worst);
+            'chat_turns' seeds the first time add_chat_turn() writes an
+            embedding.
           - No row, but the store already has embedded rows: the pre-
             existing-database migration case — provenance tracking shipped
             after data was already embedded under whatever model was active
@@ -789,9 +820,11 @@ class MemoryManager:
             existing user on their very next boot.
           - Row present and it matches: no-op.
           - Row present and it disagrees: a genuine mismatch. Handled per-
-            store below — 'corpus' is flagged stale (manual refresh via
-            reembed_corpus() / POST /memory/reembed); 'episodes' is
-            auto-corrected immediately (small, bounded cost).
+            store below — 'corpus' and 'chat_turns' are flagged stale
+            (manual refresh via reembed_corpus()/reembed_chat_turns()); both
+            can grow arbitrarily large, so neither is ever re-embedded
+            automatically. 'episodes' is auto-corrected immediately (small,
+            bounded cost).
         """
         with self._lock:
             conn = self._connect()
@@ -811,7 +844,12 @@ class MemoryManager:
                 conn.commit()
 
                 for store in _PROVENANCE_STORES:
-                    table = "document_index" if store == "corpus" else "episodes"
+                    if store == "corpus":
+                        table = "document_index"
+                    elif store == "chat_turns":
+                        table = "chat_turns"
+                    else:
+                        table = "episodes"
                     row = conn.execute(
                         "SELECT model FROM embedding_provenance WHERE store = ?",
                         (store,),
@@ -852,6 +890,19 @@ class MemoryManager:
                         )
                         self._corpus_stale = True
                         self._invalidate_cache(conn)
+                        conn.commit()
+                    elif store == "chat_turns":
+                        logger.warning(
+                            "MemoryManager: chat_turns embeddings were produced by %r, "
+                            "but the active embedding model is now %r — disabling "
+                            "embedding-based chat history search (falling back to "
+                            "keyword/FTS scoring) until POST /memory/reembed-chat-turns "
+                            "is run. Cosine similarity is not portable across embedding "
+                            "models; see docs/architecture/16-runtime-backend-layer.md "
+                            "§16.4.",
+                            stored_model, self._embedding_model_name,
+                        )
+                        self._chat_turns_stale = True
                         conn.commit()
                     else:
                         self._reembed_episodes_locked(conn, stored_model)
@@ -942,6 +993,23 @@ class MemoryManager:
             (self._embedding_model_name,),
         )
 
+    def _maybe_seed_chat_turns_provenance(self, conn: sqlite3.Connection) -> None:
+        """
+        Seed the 'chat_turns' embedding_provenance row the first time this
+        process actually writes a chat_turns embedding, if no row exists yet.
+
+        Same pattern as _maybe_seed_corpus_provenance() — cheap
+        (INSERT OR IGNORE), safe to call on every embedded write from
+        add_chat_turn(). Must be called with self._lock already held,
+        inside the same transaction as the write.
+        """
+        if self._embedding_model_name is None:
+            return
+        conn.execute(
+            "INSERT OR IGNORE INTO embedding_provenance (store, model) VALUES ('chat_turns', ?)",
+            (self._embedding_model_name,),
+        )
+
     def reembed_corpus(self) -> dict[str, Any]:
         """
         Manually re-embed every document_index row with the currently
@@ -1007,6 +1075,77 @@ class MemoryManager:
         self._corpus_stale = False
         logger.info(
             "reembed_corpus: complete — %d/%d document(s) re-embedded to %r.",
+            reembedded, len(rows), self._embedding_model_name,
+        )
+        return {
+            "reembedded": reembedded,
+            "total":      len(rows),
+            "model":      self._embedding_model_name,
+        }
+
+    def reembed_chat_turns(self) -> dict[str, Any]:
+        """
+        Manually re-embed every chat_turns row with the currently active
+        embed_fn, update the 'chat_turns' embedding_provenance row, and
+        clear self._chat_turns_stale.
+
+        Same rationale as reembed_corpus(): chat history can grow
+        arbitrarily large (the "forever" eviction preset), so unlike
+        episodes this is never triggered automatically on a detected
+        mismatch. Exposed as POST /memory/reembed-chat-turns.
+
+        Idempotent — safe to call whether or not chat_turns is currently
+        flagged stale.
+
+        Raises
+        ------
+        RuntimeError
+            If no embed_fn is configured — there is nothing to re-embed with.
+        """
+        if self._embed_fn is None:
+            raise RuntimeError("reembed_chat_turns: no embed_fn configured — cannot re-embed.")
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute("SELECT id, content FROM chat_turns").fetchall()
+                reembedded = 0
+                for row in rows:
+                    try:
+                        vec = self._embed_fn(row["content"][:500])
+                    except Exception as exc:
+                        logger.warning(
+                            "reembed_chat_turns: embed failed for chat_turns id=%d (%s) — "
+                            "leaving its previous embedding in place.", row["id"], exc,
+                        )
+                        continue
+                    if len(vec) != _EMBEDDING_DIM:
+                        logger.warning(
+                            "reembed_chat_turns: embed returned dim=%d, expected %d for "
+                            "chat_turns id=%d — skipping.",
+                            len(vec), _EMBEDDING_DIM, row["id"],
+                        )
+                        continue
+                    conn.execute(
+                        "UPDATE chat_turns SET embedding = ? WHERE id = ?",
+                        (_pack_embedding(vec), row["id"]),
+                    )
+                    reembedded += 1
+
+                conn.execute(
+                    """
+                    INSERT INTO embedding_provenance (store, model) VALUES ('chat_turns', ?)
+                    ON CONFLICT(store) DO UPDATE SET model = excluded.model
+                    """,
+                    (self._embedding_model_name,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        self._chat_turns_stale = False
+        logger.info(
+            "reembed_chat_turns: complete — %d/%d row(s) re-embedded to %r.",
             reembedded, len(rows), self._embedding_model_name,
         )
         return {
@@ -1275,10 +1414,30 @@ class MemoryManager:
             Optional dict stored as JSON. Defaults to {}.
         conversation_title :
             Optional human-readable title for the conversation.
+
+        Embeds `content` (truncated to 500 chars, same convention as
+        index_document()/reembed_corpus()) when embed_fn is configured —
+        this is what get_chat_turns(mode="semantic") searches over. Embed
+        failures degrade to a NULL embedding for this row rather than
+        blocking the write; the row is still findable via keyword/FTS.
         """
         sources_json  = json.dumps(sources or [])
         metadata_json = json.dumps(metadata or {})
         now           = time.time()
+
+        embedding_blob: bytes | None = None
+        if self._embed_fn is not None and content:
+            try:
+                vec = self._embed_fn(content[:500])
+                if len(vec) == _EMBEDDING_DIM:
+                    embedding_blob = _pack_embedding(vec)
+                else:
+                    logger.warning(
+                        "add_chat_turn: embed returned dim=%d, expected %d — skipping.",
+                        len(vec), _EMBEDDING_DIM,
+                    )
+            except Exception as exc:
+                logger.warning("add_chat_turn: embed failed for task_id=%s — %s", task_id, exc)
 
         with self._lock:
             conn = self._connect()
@@ -1287,12 +1446,16 @@ class MemoryManager:
                     """
                     INSERT INTO chat_turns
                         (task_id, role, content, sources_json, status_message,
-                         metadata_json, conversation_id, conversation_title, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         metadata_json, conversation_id, conversation_title,
+                         embedding, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (task_id, role, content, sources_json, status_message,
-                     metadata_json, conversation_id, conversation_title, now),
+                     metadata_json, conversation_id, conversation_title,
+                     embedding_blob, now),
                 )
+                if embedding_blob is not None:
+                    self._maybe_seed_chat_turns_provenance(conn)
                 conn.commit()
             finally:
                 conn.close()
@@ -1360,6 +1523,11 @@ class MemoryManager:
         limit:           int = 50,
         offset:          int = 0,
         conversation_id: str | None = None,
+        mode:            str = "keyword",
+        min_score:       float = 0.3,
+        date_from:       float | None = None,
+        date_to:         float | None = None,
+        has_tool_result: bool = False,
     ) -> tuple[list[dict[str, Any]], int]:
         """
         Return a page of chat_turns rows plus the total matching count.
@@ -1369,8 +1537,9 @@ class MemoryManager:
         Parameters
         ----------
         query :
-            Optional full-text search string. When None or empty, returns
-            an unfiltered page ordered by created_at DESC. When non-empty,
+            Optional search string. When None or empty, returns an
+            unfiltered page ordered by created_at DESC (mode is irrelevant
+            in this case). When non-empty and mode="keyword" (default),
             searches chat_turns_fts and orders by bm25() ascending (best
             match first — FTS5's bm25() returns more-negative scores for
             better matches, so ascending puts the best match on top). The
@@ -1386,99 +1555,132 @@ class MemoryManager:
             Row offset for pagination.
         conversation_id :
             Optional filter restricting results to a single conversation.
+        mode :
+            "keyword" (default) or "semantic". "semantic" scores every
+            (optionally conversation-scoped) row against `query` via cosine
+            similarity over the stored `embedding` column — see
+            _get_chat_turns_semantic(). Silently falls back to "keyword"
+            when `query` is empty, embed_fn is unavailable, or
+            self._chat_turns_stale is True — same fail-safe posture as
+            query_corpus()/EpisodicMemoryReader.by_similarity().
+        min_score :
+            "semantic" mode only. Rows scoring below this cosine threshold
+            are excluded. Default 0.3, matching the low-end of
+            by_similarity()'s documented guidance for cosine-scale
+            thresholds.
+        date_from / date_to :
+            Optional inclusive `created_at` bounds (unix timestamp,
+            seconds) for the Episode Browsing UI's date-range filter.
+        has_tool_result :
+            When True, restricts to turns whose metadata_json carries a
+            renderable tool artifact — a "chart", "pending_diffs", or
+            "workflow_id" key (see controller_agent.py's
+            _build_conversational_result()/_build_wiki_diff_result(),
+            the only three writers of those keys). A cheap LIKE-based
+            substring check on the stored JSON text, not a real JSON
+            predicate — sqlite's json1 extension is not assumed to be
+            compiled in, and these three key names are distinctive enough
+            in practice not to need it.
 
         Returns
         -------
         tuple[list[dict], int]
             (rows, total_count). total_count reflects the full matching
-            set (unfiltered table count, or FTS match count) — not just
-            the current page. Each row dict has keys: id, task_id, role,
+            set (unfiltered table count, FTS match count, or
+            score-above-threshold count in semantic mode) — not just the
+            current page. Each row dict has keys: id, task_id, role,
             content, sources, status_message, metadata, conversation_id,
-            conversation_title, created_at.
+            conversation_title, created_at, and (semantic mode only) score.
         """
         limit = min(limit, 200)
+
+        if (
+            mode == "semantic"
+            and query
+            and self._embed_fn is not None
+            and not self._chat_turns_stale
+        ):
+            try:
+                return self._get_chat_turns_semantic(
+                    query, limit, offset, conversation_id, min_score,
+                    date_from, date_to, has_tool_result,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "get_chat_turns: semantic search failed (%s) — "
+                    "falling back to keyword search.", exc,
+                )
+
+        # Extra filter clauses shared by both the unfiltered and FTS
+        # branches below — `col` is the column prefix ("" for the plain
+        # table, "c." for the chat_turns_fts JOIN).
+        def _extra_clauses(col: str) -> tuple[list[str], list[Any]]:
+            clauses: list[str] = []
+            params:  list[Any] = []
+            if conversation_id is not None:
+                clauses.append(f"{col}conversation_id = ?")
+                params.append(conversation_id)
+            if date_from is not None:
+                clauses.append(f"{col}created_at >= ?")
+                params.append(date_from)
+            if date_to is not None:
+                clauses.append(f"{col}created_at <= ?")
+                params.append(date_to)
+            if has_tool_result:
+                clauses.append(
+                    f'({col}metadata_json LIKE \'%"chart"%\' OR '
+                    f'{col}metadata_json LIKE \'%"pending_diffs"%\' OR '
+                    f'{col}metadata_json LIKE \'%"workflow_id"%\')'
+                )
+            return clauses, params
+
         conn = self._connect()
         try:
             if not query:
-                if conversation_id is not None:
-                    total = conn.execute(
-                        "SELECT COUNT(*) FROM chat_turns WHERE conversation_id = ?",
-                        (conversation_id,),
-                    ).fetchone()[0]
-                    rows = conn.execute(
-                        """
-                        SELECT id, task_id, role, content, sources_json,
-                               status_message, metadata_json, conversation_id,
-                               conversation_title, created_at
-                        FROM   chat_turns
-                        WHERE  conversation_id = ?
-                        ORDER  BY created_at DESC
-                        LIMIT  ? OFFSET ?
-                        """,
-                        (conversation_id, limit, offset),
-                    ).fetchall()
-                else:
-                    total = conn.execute(
-                        "SELECT COUNT(*) FROM chat_turns"
-                    ).fetchone()[0]
-                    rows = conn.execute(
-                        """
-                        SELECT id, task_id, role, content, sources_json,
-                               status_message, metadata_json, conversation_id,
-                               conversation_title, created_at
-                        FROM   chat_turns
-                        ORDER  BY created_at DESC
-                        LIMIT  ? OFFSET ?
-                        """,
-                        (limit, offset),
-                    ).fetchall()
+                clauses, params = _extra_clauses("")
+                where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+                total = conn.execute(
+                    f"SELECT COUNT(*) FROM chat_turns {where}", params,
+                ).fetchone()[0]
+                rows = conn.execute(
+                    f"""
+                    SELECT id, task_id, role, content, sources_json,
+                           status_message, metadata_json, conversation_id,
+                           conversation_title, created_at
+                    FROM   chat_turns
+                    {where}
+                    ORDER  BY created_at DESC
+                    LIMIT  ? OFFSET ?
+                    """,
+                    [*params, limit, offset],
+                ).fetchall()
             else:
                 fts_query = '"' + query.replace('"', '""') + '"'
+                clauses, params = _extra_clauses("c.")
+                extra_where = "".join(f" AND {c}" for c in clauses)
                 try:
-                    if conversation_id is not None:
-                        total = conn.execute(
-                            """
-                            SELECT COUNT(*)
-                            FROM   chat_turns_fts
-                            JOIN   chat_turns c ON c.id = chat_turns_fts.rowid
-                            WHERE  chat_turns_fts MATCH ? AND c.conversation_id = ?
-                            """,
-                            (fts_query, conversation_id),
-                        ).fetchone()[0]
-                        rows = conn.execute(
-                            """
-                            SELECT c.id, c.task_id, c.role, c.content, c.sources_json,
-                                   c.status_message, c.metadata_json, c.conversation_id,
-                                   c.conversation_title, c.created_at
-                            FROM   chat_turns_fts
-                            JOIN   chat_turns c ON c.id = chat_turns_fts.rowid
-                            WHERE  chat_turns_fts MATCH ? AND c.conversation_id = ?
-                            ORDER  BY bm25(chat_turns_fts) ASC
-                            LIMIT  ? OFFSET ?
-                            """,
-                            (fts_query, conversation_id, limit, offset),
-                        ).fetchall()
-                    else:
-                        total = conn.execute(
-                            """
-                            SELECT COUNT(*) FROM chat_turns_fts
-                            WHERE  chat_turns_fts MATCH ?
-                            """,
-                            (fts_query,),
-                        ).fetchone()[0]
-                        rows = conn.execute(
-                            """
-                            SELECT c.id, c.task_id, c.role, c.content, c.sources_json,
-                                   c.status_message, c.metadata_json, c.conversation_id,
-                                   c.conversation_title, c.created_at
-                            FROM   chat_turns_fts
-                            JOIN   chat_turns c ON c.id = chat_turns_fts.rowid
-                            WHERE  chat_turns_fts MATCH ?
-                            ORDER  BY bm25(chat_turns_fts) ASC
-                            LIMIT  ? OFFSET ?
-                            """,
-                            (fts_query, limit, offset),
-                        ).fetchall()
+                    total = conn.execute(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM   chat_turns_fts
+                        JOIN   chat_turns c ON c.id = chat_turns_fts.rowid
+                        WHERE  chat_turns_fts MATCH ? {extra_where}
+                        """,
+                        [fts_query, *params],
+                    ).fetchone()[0]
+                    rows = conn.execute(
+                        f"""
+                        SELECT c.id, c.task_id, c.role, c.content, c.sources_json,
+                               c.status_message, c.metadata_json, c.conversation_id,
+                               c.conversation_title, c.created_at
+                        FROM   chat_turns_fts
+                        JOIN   chat_turns c ON c.id = chat_turns_fts.rowid
+                        WHERE  chat_turns_fts MATCH ? {extra_where}
+                        ORDER  BY bm25(chat_turns_fts) ASC
+                        LIMIT  ? OFFSET ?
+                        """,
+                        [fts_query, *params, limit, offset],
+                    ).fetchall()
                 except sqlite3.OperationalError as exc:
                     logger.debug(
                         "get_chat_turns: FTS5 query failed for %r — %s", query, exc,
@@ -1501,6 +1703,110 @@ class MemoryManager:
                 "created_at":         row["created_at"],
             }
             for row in rows
+        ]
+        return result, total
+
+    def _get_chat_turns_semantic(
+        self,
+        query:           str,
+        limit:           int,
+        offset:          int,
+        conversation_id: str | None,
+        min_score:       float,
+        date_from:       float | None = None,
+        date_to:         float | None = None,
+        has_tool_result: bool = False,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """
+        mode="semantic" implementation for get_chat_turns().
+
+        Full-table cosine scan, same approach as EpisodicMemoryReader.
+        _score_all_active() — chat_turns has no token_set column to
+        cheaply pre-filter with the way document_index does, so every row
+        with a stored embedding is scored directly and rows below
+        min_score are dropped before pagination. See
+        _CHAT_TURNS_SEMANTIC_SCAN_WARN_ROW_COUNT.
+
+        date_from/date_to/has_tool_result narrow the candidate set via SQL
+        before scoring — same semantics as get_chat_turns()'s own
+        parameters, applied here too so filters compose correctly with
+        semantic search.
+
+        Raises on embed_fn failure — callers (get_chat_turns()) are
+        expected to catch and fall back to keyword search.
+        """
+        query_vec = self._embed_fn(query)
+
+        clauses: list[str] = []
+        params:  list[Any] = []
+        if conversation_id is not None:
+            clauses.append("conversation_id = ?")
+            params.append(conversation_id)
+        if date_from is not None:
+            clauses.append("created_at >= ?")
+            params.append(date_from)
+        if date_to is not None:
+            clauses.append("created_at <= ?")
+            params.append(date_to)
+        if has_tool_result:
+            clauses.append(
+                '(metadata_json LIKE \'%"chart"%\' OR '
+                'metadata_json LIKE \'%"pending_diffs"%\' OR '
+                'metadata_json LIKE \'%"workflow_id"%\')'
+            )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT id, task_id, role, content, sources_json,
+                       status_message, metadata_json, conversation_id,
+                       conversation_title, created_at, embedding
+                FROM   chat_turns
+                {where}
+                """,
+                params,
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if len(rows) > _CHAT_TURNS_SEMANTIC_SCAN_WARN_ROW_COUNT:
+            logger.warning(
+                "get_chat_turns: semantic scan over %d chat_turns rows — "
+                "unindexed full-table scan; consider whether the configured "
+                "eviction preset should be revisited for this install.",
+                len(rows),
+            )
+
+        scored: list[tuple[float, sqlite3.Row]] = []
+        for row in rows:
+            if row["embedding"] is None:
+                continue
+            doc_vec = _unpack_embedding(row["embedding"])
+            score   = _cosine_similarity(query_vec, doc_vec)
+            if score >= min_score:
+                scored.append((score, row))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        total = len(scored)
+        page  = scored[offset : offset + limit]
+
+        result = [
+            {
+                "id":                 row["id"],
+                "task_id":            row["task_id"],
+                "role":               row["role"],
+                "content":            row["content"],
+                "sources":            json.loads(row["sources_json"]),
+                "status_message":     row["status_message"],
+                "metadata":           json.loads(row["metadata_json"]),
+                "conversation_id":    row["conversation_id"],
+                "conversation_title": row["conversation_title"],
+                "created_at":         row["created_at"],
+                "score":              score,
+            }
+            for score, row in page
         ]
         return result, total
 
@@ -2467,6 +2773,7 @@ class MemoryManager:
         status:          str = "active",
         project_context: str | None = None,
         episode_type:    str | None = None,
+        task_id:         str | None = None,
         limit:           int = 100,
         offset:          int = 0,
     ) -> list[dict]:
@@ -2485,6 +2792,13 @@ class MemoryManager:
             Optional filter by project_context column.
         episode_type :
             Optional filter by episode_type column.
+        task_id :
+            Optional filter by task_id column — the Episode Browsing UI's
+            per-turn "related memory" overlay (episode-browsing-ui-plan.md
+            Phase 6) uses this to find episodes stamped with the same
+            task_id as a selected chat_turns row (implicit extraction
+            passes task_id=task.task_id, see controller_agent.py's
+            process_implicit_extraction call).
         limit :
             Max rows to return (capped at 200).
         offset :
@@ -2503,6 +2817,9 @@ class MemoryManager:
         if episode_type is not None:
             conditions.append("episode_type = ?")
             params.append(episode_type)
+        if task_id is not None:
+            conditions.append("task_id = ?")
+            params.append(task_id)
 
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         sql = f"""
@@ -2528,6 +2845,7 @@ class MemoryManager:
         status:          str = "active",
         project_context: str | None = None,
         episode_type:    str | None = None,
+        task_id:         str | None = None,
     ) -> int:
         """
         Return the total count of episodes matching the same filters as
@@ -2547,6 +2865,8 @@ class MemoryManager:
             Optional filter by project_context column.
         episode_type :
             Optional filter by episode_type column.
+        task_id :
+            Optional filter by task_id column — see list_episodes().
         """
         conditions = []
         params: list = []
@@ -2560,6 +2880,9 @@ class MemoryManager:
         if episode_type is not None:
             conditions.append("episode_type = ?")
             params.append(episode_type)
+        if task_id is not None:
+            conditions.append("task_id = ?")
+            params.append(task_id)
 
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         sql = f"SELECT COUNT(*) FROM episodes {where}"

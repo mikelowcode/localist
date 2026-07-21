@@ -395,6 +395,32 @@ class TestMarkDiffApplied:
         assert result is False
         assert self._metadata(mm, "task-3")["pending_diffs"][0]["status"] == "pending"
 
+    def test_multiple_pending_diffs_only_the_matching_page_flips_to_applied(self, mm):
+        """
+        docs/architecture/17-wiki-agent-diff-target.md's multi-diff open
+        item: mark_diff_applied() already matches by page_name within the
+        list (not "the diff" singular), so a turn proposing 2+ diffs
+        should already apply/track them independently — this is the
+        missing direct coverage proving that (episode-browsing-ui-plan.md
+        Phase 3), not a code change.
+        """
+        mm.add_chat_turn(
+            task_id="task-multi", role="assistant", content="Proposed two diffs.",
+            conversation_id="conv-1",
+            metadata={"pending_diffs": [
+                {"page_name": "page-a", "diff": "@@ a @@", "status": "pending"},
+                {"page_name": "page-b", "diff": "@@ b @@", "status": "pending"},
+            ]},
+        )
+
+        result = mm.mark_diff_applied("task-multi", "page-a")
+
+        assert result is True
+        assert self._metadata(mm, "task-multi")["pending_diffs"] == [
+            {"page_name": "page-a", "diff": "@@ a @@", "status": "applied"},
+            {"page_name": "page-b", "diff": "@@ b @@", "status": "pending"},
+        ]
+
     def test_only_matches_assistant_role_not_user(self, mm):
         # A user row incidentally sharing the same task_id must not match —
         # pending_diffs only ever lives on the assistant row.
@@ -542,6 +568,62 @@ class TestGetChatTurns:
         assert total1 == total2 == 5
         assert len(page1) == 2
         assert len(page2) == 1
+
+    def test_date_from_excludes_earlier_rows(self, mm):
+        _insert_chat_turn_raw(mm._db_path, conversation_id="c", conversation_title=None, created_at=10.0, content="old")
+        _insert_chat_turn_raw(mm._db_path, conversation_id="c", conversation_title=None, created_at=30.0, content="new")
+
+        rows, total = mm.get_chat_turns(date_from=20.0)
+
+        assert total == 1
+        assert rows[0]["content"] == "new"
+
+    def test_date_to_excludes_later_rows(self, mm):
+        _insert_chat_turn_raw(mm._db_path, conversation_id="c", conversation_title=None, created_at=10.0, content="old")
+        _insert_chat_turn_raw(mm._db_path, conversation_id="c", conversation_title=None, created_at=30.0, content="new")
+
+        rows, total = mm.get_chat_turns(date_to=20.0)
+
+        assert total == 1
+        assert rows[0]["content"] == "old"
+
+    def test_date_range_is_inclusive_on_both_ends(self, mm):
+        _insert_chat_turn_raw(mm._db_path, conversation_id="c", conversation_title=None, created_at=10.0, content="a")
+        _insert_chat_turn_raw(mm._db_path, conversation_id="c", conversation_title=None, created_at=20.0, content="b")
+        _insert_chat_turn_raw(mm._db_path, conversation_id="c", conversation_title=None, created_at=30.0, content="c")
+
+        rows, total = mm.get_chat_turns(date_from=10.0, date_to=20.0)
+
+        assert total == 2
+        assert {r["content"] for r in rows} == {"a", "b"}
+
+    def test_date_range_combines_with_fts_query(self, mm):
+        mm.add_chat_turn(task_id="t", role="user", content="pangolin facts", conversation_id="c")
+        _insert_chat_turn_raw(mm._db_path, conversation_id="c", conversation_title=None, created_at=1.0, content="pangolin history")
+
+        rows, total = mm.get_chat_turns(query="pangolin", date_from=time.time() - 5)
+
+        assert total == 1
+        assert rows[0]["content"] == "pangolin facts"
+
+    def test_has_tool_result_filters_to_chart_pending_diffs_or_workflow_only(self, mm):
+        mm.add_chat_turn(task_id="t1", role="assistant", content="a chart", conversation_id="c", metadata={"chart": {"png_path": "x"}})
+        mm.add_chat_turn(task_id="t2", role="assistant", content="a diff", conversation_id="c", metadata={"pending_diffs": [{"page_name": "p", "diff": "d", "status": "pending"}]})
+        mm.add_chat_turn(task_id="t3", role="assistant", content="a workflow", conversation_id="c", metadata={"workflow_id": "wf-1", "workflow_steps": []})
+        mm.add_chat_turn(task_id="t4", role="assistant", content="plain answer", conversation_id="c", metadata={"agent": "conversational_agent"})
+
+        rows, total = mm.get_chat_turns(has_tool_result=True)
+
+        assert total == 3
+        assert {r["content"] for r in rows} == {"a chart", "a diff", "a workflow"}
+
+    def test_has_tool_result_false_returns_all_rows(self, mm):
+        mm.add_chat_turn(task_id="t1", role="assistant", content="a chart", conversation_id="c", metadata={"chart": {}})
+        mm.add_chat_turn(task_id="t2", role="assistant", content="plain answer", conversation_id="c", metadata={})
+
+        rows, total = mm.get_chat_turns(has_tool_result=False)
+
+        assert total == 2
 
     @pytest.mark.parametrize("special_query", [
         "what's up",

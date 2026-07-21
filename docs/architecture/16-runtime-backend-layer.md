@@ -309,7 +309,20 @@ platform-gating change (+7 new tests).
   **Fixed on the MemoryManager side too (2026-07-16).** A new `embedding_provenance` table
   (`store TEXT PRIMARY KEY` — `'corpus'` | `'episodes'` — `model TEXT NOT NULL`, schema v8) records
   which embedding model actually produced the vectors currently stored in `document_index` and
-  `episodes`. `MemoryManager.__init__` gains `embedding_model_name`, threaded from `main.py`'s
+  `episodes`.
+
+  **Extended to `'chat_turns'` (2026-07-21), Episode Browsing UI Phase 1.** Schema v9 adds an
+  `embedding BLOB` column to `chat_turns`; `add_chat_turn()` embeds `content` (truncated to 500
+  chars, same convention as `index_document()`/`reembed_corpus()`) whenever `embed_fn` is
+  configured. `'chat_turns'` follows the same never-automatic path as `'corpus'` below — chat
+  history can grow arbitrarily large under the `"forever"` eviction preset — with its own
+  `self._chat_turns_stale` flag and `MemoryManager.reembed_chat_turns()` (exposed as
+  `POST /memory/reembed-chat-turns`). `MemoryManager.get_chat_turns(mode="semantic")` does a
+  full-table cosine scan (no `token_set`-style pre-filter column exists on `chat_turns` the way it
+  does on `document_index`) and checks `not self._chat_turns_stale` before taking the embedding
+  path — same fail-safe-to-keyword/FTS posture as the other two stores.
+
+  `MemoryManager.__init__` gains `embedding_model_name`, threaded from `main.py`'s
   `_state.active_embedding_model_name` (the same value `ControllerAgent`/`Planner` now receive), and
   runs `_check_embedding_provenance()` once at construction time. Per store, per the recorded row:
 

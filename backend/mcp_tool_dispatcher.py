@@ -79,6 +79,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
@@ -686,6 +687,15 @@ class MCPToolDispatcher:
         logging/fallback logic (Step 3b: corpus fallback when every
         web_search result failed) keeps working unmodified.
 
+        Every ToolResult returned carries the same freshly-generated
+        `workflow_id` (see ToolResult.workflow_id) — this method is already
+        a single bounded call representing one research "workflow", so the
+        id is generated once here and stamped on every constituent result
+        rather than needing a correlation key threaded in from outside.
+        Read by controller_agent.py to build metadata["workflow_steps"] for
+        the Episode Browsing UI's step-chain view
+        (episode-browsing-ui-plan.md, Phase 2).
+
         Two distinct "didn't work" outcomes are handled differently:
           - A search/fetch call itself fails (provider/connectivity error):
             the failing ToolResult already has tool_name="web_search"/
@@ -711,6 +721,7 @@ class MCPToolDispatcher:
         tried_queries: list[str] = []
         tried_urls:    set[str]  = set()
         connectivity_failed = False
+        workflow_id = str(uuid.uuid4())
 
         query = self._derive_initial_query(instruction, context)
 
@@ -719,6 +730,7 @@ class MCPToolDispatcher:
             search_result = await self._execute_web_search_query(
                 session, connect_error, query
             )
+            search_result.workflow_id = workflow_id
             results.append(search_result)
 
             if not search_result.success:
@@ -741,6 +753,7 @@ class MCPToolDispatcher:
                     session, connect_error, instruction,
                     {**context, "fetch_url": candidate_url},
                 )
+                fetch_result.workflow_id = workflow_id
                 results.append(fetch_result)
                 if fetch_result.success:
                     gate_pass = await self._evaluate_pricing_gate(instruction, fetch_result.result)
@@ -769,14 +782,15 @@ class MCPToolDispatcher:
         )
         if not connectivity_failed:
             results.append(ToolResult(
-                tool_name  = "research",
-                parameters = f"queries={tried_queries!r}",
-                result     = (
+                tool_name   = "research",
+                parameters  = f"queries={tried_queries!r}",
+                result      = (
                     f"ERROR: research loop exhausted {len(tried_queries)} "
                     f"iteration(s) without finding concrete pricing "
                     f"information (queries tried: {tried_queries})."
                 ),
-                success    = False,
+                success     = False,
+                workflow_id = workflow_id,
             ))
         return results
 

@@ -559,6 +559,35 @@ class TestWikiDiffResultPath:
         assert result.metadata["pending_diffs"][0]["status"] == "applied"
         assert "Applied" in result.answer
 
+    def test_multiple_diffs_in_one_turn_all_reach_metadata(self, mm):
+        """
+        docs/architecture/17-wiki-agent-diff-target.md's open item: the
+        model has only ever proposed one diff per instruction to date, so
+        this path (WikiAgent.output["diffs"] with len > 1) has never been
+        live-exercised. _build_wiki_diff_result's own list comprehension
+        already has no [0]/single-item assumption — this is the missing
+        direct coverage proving that, not a code change (episode-browsing-
+        ui-plan.md Phase 3).
+        """
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        task = Task(task_id="t1", instruction="update page-a and page-b")
+
+        result = ctrl._build_wiki_diff_result(
+            task, self._plan(), "wiki_agent",
+            [self._diff_result(diffs=[
+                {"page_name": "page-a", "diff": "@@ -1,1 +1,1 @@\n-old a\n+new a\n"},
+                {"page_name": "page-b", "diff": "@@ -1,1 +1,1 @@\n-old b\n+new b\n"},
+            ])],
+        )
+
+        assert result is not None
+        assert result.metadata["pending_diffs"] == [
+            {"page_name": "page-a", "diff": "@@ -1,1 +1,1 @@\n-old a\n+new a\n", "status": "pending"},
+            {"page_name": "page-b", "diff": "@@ -1,1 +1,1 @@\n-old b\n+new b\n", "status": "pending"},
+        ]
+        assert "page-a" in result.answer
+        assert "page-b" in result.answer
+
     def test_empty_diffs_returns_none(self, mm):
         """Regression guard: a pure ingest (new pages only, no diffs) must
         still fall through to the generic synthesizer, unaffected."""
@@ -1092,6 +1121,119 @@ class TestChartArtifactMetadata:
         result = ctrl.handle_task({"instruction": "What is 2+2?"})
 
         assert "chart" not in result["metadata"]
+
+
+# ---------------------------------------------------------------------------
+# workflow_id/workflow_steps -> ControllerResult.metadata (_execute_plan
+# Step 3, episode-browsing-ui-plan.md Phase 2)
+# ---------------------------------------------------------------------------
+
+class TestWorkflowStepsMetadata:
+    """
+    Every ToolResult a research-loop run produces shares one workflow_id
+    (mcp_tool_dispatcher._run_research_loop) — _execute_plan pulls that id
+    and the ordered step list out into ControllerResult.metadata, same
+    "wholesale-MCPToolDispatcher-mock, pull the dict out of metadata"
+    pattern as TestChartArtifactMetadata above.
+    """
+
+    def _make_research_plan(self) -> RoutingPlan:
+        return RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = False,
+            priority       = 3,
+            compound       = True,
+            tools_to_call  = ["research"],
+        )
+
+    def test_research_loop_populates_workflow_metadata(self, mm):
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent("The Basic plan is $10/month.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = self._make_research_plan()
+
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.return_value = [
+            _ToolResult(
+                tool_name   = "web_search",
+                parameters  = "query='basic plan cost'",
+                result      = "See https://vendor.example/pricing for plan details.",
+                success     = True,
+                workflow_id = "wf-1",
+            ),
+            _ToolResult(
+                tool_name   = "url_fetch",
+                parameters  = "url='https://vendor.example/pricing'",
+                result      = "The Basic plan is $10 per month.",
+                success     = True,
+                workflow_id = "wf-1",
+            ),
+        ]
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch("controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            result = ctrl.handle_task(
+                {"instruction": "what does the basic plan cost"}
+            )
+
+        assert result["metadata"]["workflow_id"] == "wf-1"
+        assert result["metadata"]["workflow_steps"] == [
+            {
+                "tool_name":  "web_search",
+                "parameters": "query='basic plan cost'",
+                "success":    True,
+                "result":     "See https://vendor.example/pricing for plan details.",
+            },
+            {
+                "tool_name":  "url_fetch",
+                "parameters": "url='https://vendor.example/pricing'",
+                "success":    True,
+                "result":     "The Basic plan is $10 per month.",
+            },
+        ]
+
+    def test_non_research_turn_omits_workflow_keys_entirely(self, mm):
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent("Test answer.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        result = ctrl.handle_task({"instruction": "What is 2+2?"})
+
+        assert "workflow_id" not in result["metadata"]
+        assert "workflow_steps" not in result["metadata"]
+
+    def test_plain_web_search_without_workflow_id_omits_workflow_keys(self, mm):
+        """A non-research web_search tool call has workflow_id=None on its
+        ToolResult — must not be mistaken for a research-loop workflow."""
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent("Zebras are striped.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = False,
+            priority       = 3,
+            compound       = True,
+            tools_to_call  = ["web_search"],
+        )
+
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.return_value = [
+            _ToolResult(
+                tool_name  = "web_search",
+                parameters = "query='zebras'",
+                result     = "Zebras are striped equines.",
+                success    = True,
+            ),
+        ]
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch("controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            result = ctrl.handle_task({"instruction": "tell me about zebras"})
+
+        assert "workflow_id" not in result["metadata"]
+        assert "workflow_steps" not in result["metadata"]
 
 
 # ---------------------------------------------------------------------------

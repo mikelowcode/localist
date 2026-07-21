@@ -1,13 +1,13 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { get } from 'svelte/store';
-  import { tasksStore, submitTask, markDiffApplied, type PendingDiff } from '$lib/stores/tasks';
+  import { tasksStore, submitTask, markDiffApplied } from '$lib/stores/tasks';
   import { chatHistoryStore, type Turn } from '$lib/stores/chatHistory';
   import { currentConversationId, isFirstTurnOfConversation } from '$lib/stores/conversation';
-  import { applyDiff } from '$lib/stores/wiki';
   import { loadWikiFiles, wikiFiles, wikiLoading, wikiError } from '$lib/stores/files';
   import MarkdownRenderer from '$lib/components/MarkdownRenderer.svelte';
   import ChartRenderer from '$lib/components/ChartRenderer.svelte';
+  import DiffBlock from '$lib/components/DiffBlock.svelte';
 
   let instruction = '';
   let messagesEl: HTMLElement;
@@ -288,54 +288,24 @@
   }
 
   // ── Review-then-apply wiki diffs ──────────────────────────────
-  // Discard is deliberately client-only/ephemeral (no backend call, no
-  // persistence) — keyed by "taskId:pageName" in local component state so
-  // it doesn't fight the reactive metadata-sync block above, which only
-  // ever copies activeTask.metadata (server-known state) onto chat turns.
-  interface DiffUiState {
-    applying: boolean;
-    error: string | null;
-    discarded: boolean;
-  }
-  let diffState: Record<string, DiffUiState> = {};
-
-  function diffKey(taskId: string, pageName: string): string {
-    return `${taskId}:${pageName}`;
-  }
-
-  function diffLineClass(line: string): string {
-    if (line.startsWith('+')) return 'diff-line-add';
-    if (line.startsWith('-')) return 'diff-line-del';
-    if (line.startsWith('@@')) return 'diff-line-hunk';
-    return 'diff-line-ctx';
-  }
-
-  async function handleApplyDiff(turn: Turn, diff: PendingDiff) {
-    if (!turn.task_id) return;
-    const key = diffKey(turn.task_id, diff.page_name);
-    diffState = { ...diffState, [key]: { applying: true, error: null, discarded: false } };
-
-    const result = await applyDiff(turn.task_id, diff.page_name, diff.diff);
-
-    if (!result.success) {
-      diffState = {
-        ...diffState,
-        [key]: { applying: false, error: result.error ?? 'Apply failed.', discarded: false }
-      };
-      return;
-    }
-
+  // Rendering, Apply/Discard, and per-diff UI state now live in
+  // DiffBlock.svelte (extracted so the Episode Browsing UI's detail pane
+  // can reuse the same logic — see that component's docstring). This
+  // handler is ChatPanel's own post-apply sync: it fires after DiffBlock's
+  // internal applyDiff() call succeeds, and updates the two chat-side
+  // stores DiffBlock doesn't know about.
+  function handleDiffApplied(taskId: string, pageName: string) {
     // Source of truth for rendering (works even if the task isn't tracked
     // in tasksStore any more — e.g. a reloaded historical conversation).
     chatHistoryStore.update((turns) =>
       turns.map((t) => {
-        if (t.task_id !== turn.task_id || !t.metadata?.pending_diffs) return t;
+        if (t.task_id !== taskId || !t.metadata?.pending_diffs) return t;
         return {
           ...t,
           metadata: {
             ...t.metadata,
             pending_diffs: t.metadata.pending_diffs.map((d) =>
-              d.page_name === diff.page_name ? { ...d, status: 'applied' as const } : d
+              d.page_name === pageName ? { ...d, status: 'applied' as const } : d
             )
           }
         };
@@ -343,15 +313,7 @@
     );
     // Also patch tasksStore's copy so a later reactive re-sync (see the
     // activeTask block above) doesn't stomp this back to "pending".
-    markDiffApplied(turn.task_id, diff.page_name);
-
-    diffState = { ...diffState, [key]: { applying: false, error: null, discarded: false } };
-  }
-
-  function handleDiscardDiff(turn: Turn, diff: PendingDiff) {
-    if (!turn.task_id) return;
-    const key = diffKey(turn.task_id, diff.page_name);
-    diffState = { ...diffState, [key]: { applying: false, error: null, discarded: true } };
+    markDiffApplied(taskId, pageName);
   }
 
   onMount(() => {
@@ -437,51 +399,12 @@
                 <ChartRenderer config={turn.metadata.chart.chart_config} />
               {/if}
 
-              {#if turn.status === 'complete' && turn.metadata?.pending_diffs}
-                {#each turn.metadata.pending_diffs as diff (diff.page_name)}
-                  {@const key = diffKey(turn.task_id ?? '', diff.page_name)}
-                  {@const state = diffState[key]}
-                  {#if !state?.discarded}
-                    <div class="diff-block">
-                      <div class="diff-block-header">
-                        <span class="diff-page-name">📄 {diff.page_name}.md</span>
-                        {#if diff.status === 'applied'}
-                          <span class="diff-badge diff-badge-applied">✓ Applied</span>
-                        {:else if state?.applying}
-                          <span class="diff-badge diff-badge-pending">Applying…</span>
-                        {:else}
-                          <span class="diff-badge diff-badge-pending">Pending review</span>
-                        {/if}
-                      </div>
-                      <div class="diff-body">
-                        {#each diff.diff.split('\n') as line}
-                          <div class="diff-line {diffLineClass(line)}">{line || ' '}</div>
-                        {/each}
-                      </div>
-                      {#if state?.error}
-                        <p class="diff-error">{state.error}</p>
-                      {/if}
-                      {#if diff.status !== 'applied'}
-                        <div class="diff-actions">
-                          <button
-                            class="diff-btn diff-btn-apply"
-                            on:click={() => handleApplyDiff(turn, diff)}
-                            disabled={state?.applying}
-                          >
-                            {state?.applying ? 'Applying…' : 'Apply'}
-                          </button>
-                          <button
-                            class="diff-btn diff-btn-discard"
-                            on:click={() => handleDiscardDiff(turn, diff)}
-                            disabled={state?.applying}
-                          >
-                            Discard
-                          </button>
-                        </div>
-                      {/if}
-                    </div>
-                  {/if}
-                {/each}
+              {#if turn.status === 'complete' && turn.metadata?.pending_diffs && turn.task_id}
+                <DiffBlock
+                  taskId={turn.task_id}
+                  diffs={turn.metadata.pending_diffs}
+                  onApplied={(pageName) => handleDiffApplied(turn.task_id ?? '', pageName)}
+                />
               {/if}
 
               {#if turn.status === 'failed'}
@@ -801,101 +724,7 @@
     cursor: default;
   }
 
-  /* ── Wiki diff review block ───────────────── */
-  .diff-block {
-    margin-top: var(--sp-3);
-    padding-top: var(--sp-3);
-    border-top: 1px solid var(--border-soft);
-  }
-
-  .diff-block-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--sp-2);
-    margin-bottom: var(--sp-2);
-  }
-
-  .diff-page-name {
-    font-size: var(--text-xs);
-    font-family: var(--font-mono);
-    color: var(--text-secondary);
-    font-weight: 600;
-  }
-
-  .diff-badge {
-    font-size: 10px;
-    font-family: var(--font-mono);
-    padding: 2px 7px;
-    border-radius: 999px;
-    letter-spacing: 0.03em;
-    font-weight: 500;
-    border: 1px solid transparent;
-    flex-shrink: 0;
-  }
-
-  .diff-badge-pending { background: var(--bg-active); color: var(--text-tertiary); border-color: var(--border); }
-  .diff-badge-applied { background: #1a2a1a;          color: #7ecf7e;             border-color: #2d4a2d; }
-
-  .diff-body {
-    max-height: 320px;
-    overflow-y: auto;
-    background: var(--bg-raised);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: var(--sp-2) 0;
-    font-family: var(--font-mono);
-    font-size: 12px;
-    line-height: 1.5;
-  }
-
-  .diff-line {
-    padding: 0 var(--sp-3);
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-
-  .diff-line-add  { background: rgba(126, 207, 126, 0.12); color: #7ecf7e; }
-  .diff-line-del  { background: rgba(207, 126, 126, 0.12); color: #cf7e7e; }
-  .diff-line-hunk { color: var(--text-tertiary); }
-  .diff-line-ctx  { color: var(--text-secondary); }
-
-  .diff-error {
-    font-size: var(--text-xs);
-    color: var(--error);
-    font-family: var(--font-mono);
-    margin-top: var(--sp-2);
-  }
-
-  .diff-actions {
-    display: flex;
-    gap: var(--sp-2);
-    margin-top: var(--sp-2);
-  }
-
-  .diff-btn {
-    font-size: var(--text-xs);
-    font-weight: 500;
-    padding: var(--sp-1) var(--sp-3);
-    border-radius: var(--radius);
-    border: 1px solid var(--border);
-    transition: background var(--dur-fast) var(--ease), opacity var(--dur-fast) var(--ease);
-  }
-
-  .diff-btn:disabled { opacity: 0.5; }
-
-  .diff-btn-apply {
-    background: var(--accent);
-    color: #fff;
-    border-color: var(--accent);
-  }
-  .diff-btn-apply:hover:not(:disabled) { background: #6fa3ff; }
-
-  .diff-btn-discard {
-    background: var(--bg-raised);
-    color: var(--text-secondary);
-  }
-  .diff-btn-discard:hover:not(:disabled) { background: var(--bg-active); }
+  /* Wiki diff review block styles now live in DiffBlock.svelte. */
 
   /* ── Input bar ────────────────────────────── */
   .input-bar {

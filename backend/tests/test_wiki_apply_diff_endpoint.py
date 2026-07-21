@@ -84,6 +84,43 @@ class TestApplyDiffEndpoint:
         turns, _ = main._state.memory_manager.get_chat_turns()
         assert turns[0]["metadata"]["pending_diffs"][0]["status"] == "applied"
 
+    def test_applying_one_of_two_pending_diffs_leaves_the_other_untouched(self, client):
+        """
+        docs/architecture/17-wiki-agent-diff-target.md's multi-diff open
+        item, exercised end to end through the real endpoint: a turn
+        proposing diffs for two separate pages, applying one must write
+        only that page and mark only that page_name's entry "applied" —
+        the other stays "pending" and on disk unmodified. episode-
+        browsing-ui-plan.md Phase 3.
+        """
+        test_client, wiki_dir = client
+        page_a = wiki_dir / "page-a.md"
+        page_b = wiki_dir / "page-b.md"
+        page_a.write_text(_PAGE_CONTENT, encoding="utf-8")
+        page_b.write_text(_PAGE_CONTENT, encoding="utf-8")
+
+        main._state.memory_manager.add_chat_turn(
+            task_id="task-multi", role="assistant", content="Proposed two diffs.",
+            conversation_id="conv-1",
+            metadata={"pending_diffs": [
+                {"page_name": "page-a", "diff": _DIFF_TEXT, "status": "pending"},
+                {"page_name": "page-b", "diff": _DIFF_TEXT, "status": "pending"},
+            ]},
+        )
+
+        resp = test_client.post(
+            "/wiki/apply-diff",
+            json={"task_id": "task-multi", "page_name": "page-a", "diff": _DIFF_TEXT},
+        )
+
+        assert resp.status_code == 200
+        assert "New summary." in page_a.read_text(encoding="utf-8")
+        assert "New summary." not in page_b.read_text(encoding="utf-8")
+
+        turns, _ = main._state.memory_manager.get_chat_turns()
+        diffs = {d["page_name"]: d["status"] for d in turns[0]["metadata"]["pending_diffs"]}
+        assert diffs == {"page-a": "applied", "page-b": "pending"}
+
     def test_missing_page_returns_404(self, client):
         test_client, _ = client
         resp = test_client.post(

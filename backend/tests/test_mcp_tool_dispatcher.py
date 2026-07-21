@@ -770,6 +770,123 @@ class TestResearchLoop:
         assert not any(r.tool_name == "research" for r in results)
 
     # ------------------------------------------------------------------
+    # workflow_id (episode-browsing-ui-plan.md Phase 2) — every ToolResult
+    # produced by one _run_research_loop() call shares a single correlation
+    # key, read by controller_agent.py to build metadata["workflow_steps"].
+    # ------------------------------------------------------------------
+
+    def test_all_results_in_one_loop_share_the_same_workflow_id(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        gate_calls: list[str] = []
+
+        def infer_side_effect(**kw):
+            if kw["system"] == _RESEARCH_GATE_SYSTEM_PROMPT:
+                gate_calls.append(kw["prompt"])
+                return "yes" if len(gate_calls) == 2 else "no"
+            raise AssertionError("reformulate must not be called once the gate passes")
+
+        dispatcher._runtime.infer.side_effect = infer_side_effect
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return json.dumps({
+                    "query": arguments["query"],
+                    "result_text": "See https://vendor.example/pricing for plan details.",
+                    "result_count": 1,
+                }), False
+            if name == "fetch_url":
+                return json.dumps({
+                    "url": "https://vendor.example/pricing", "title": "Pricing", "author": "",
+                    "date_published": "", "cleaned_text": "The Basic plan is $10 per month.",
+                    "word_count": 6, "fetch_duration_ms": 2.0,
+                }), False
+            raise AssertionError(f"unexpected tool name {name!r}")
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["research"],
+                instruction   = "what does the vendor plan cost",
+                context       = {},
+            )
+
+        assert len(results) == 2
+        assert results[0].workflow_id is not None
+        assert results[0].workflow_id == results[1].workflow_id
+
+    def test_iteration_cap_synthetic_failure_carries_same_workflow_id(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        def infer_side_effect(**kw):
+            if kw["system"] == _RESEARCH_GATE_SYSTEM_PROMPT:
+                return "no"
+            return "reformulated query"
+
+        dispatcher._runtime.infer.side_effect = infer_side_effect
+
+        async def fake_call(session, name, arguments):
+            assert name == "web_search"
+            return json.dumps({
+                "query": arguments["query"], "result_text": "no price here", "result_count": 1,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["research"],
+                instruction   = "what does it cost",
+                context       = {},
+            )
+
+        assert results[-1].tool_name == "research" and results[-1].success is False
+        workflow_ids = {r.workflow_id for r in results}
+        assert len(workflow_ids) == 1
+        assert None not in workflow_ids
+
+    def test_two_separate_dispatches_get_different_workflow_ids(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        def infer_side_effect(**kw):
+            return "yes"
+
+        dispatcher._runtime.infer.side_effect = infer_side_effect
+
+        async def fake_call(session, name, arguments):
+            return json.dumps({
+                "query": arguments["query"], "result_text": "$10/month.", "result_count": 1,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results_a = dispatcher.dispatch(
+                tools_to_call=["research"], instruction="cost of plan a", context={},
+            )
+            results_b = dispatcher.dispatch(
+                tools_to_call=["research"], instruction="cost of plan b", context={},
+            )
+
+        assert results_a[0].workflow_id != results_b[0].workflow_id
+
+    def test_web_search_tool_call_never_carries_a_workflow_id(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """workflow_id is a research-loop-only correlation key — a plain
+        "web_search" tool call (not routed through the loop) must not have
+        one, so controller_agent.py's workflow_id extraction never
+        mistakes an ordinary search for a workflow."""
+        async def fake_call(session, name, arguments):
+            return json.dumps({
+                "query": arguments["query"], "result_text": "some text", "result_count": 1,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"],
+                instruction   = "tell me about zebras",
+                context       = {},
+            )
+
+        assert results[0].workflow_id is None
+
+    # ------------------------------------------------------------------
     # Loop termination: iteration cap and repeat-guard
     # ------------------------------------------------------------------
 
