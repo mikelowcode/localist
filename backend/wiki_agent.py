@@ -120,7 +120,7 @@ from pydantic import BaseModel, Field
 from build_graph import build_graph
 from prompt_builder import PromptBuilder
 import wiki_maintenance_log
-from wiki_doc import parse_wiki_doc
+from wiki_doc import META_WIKI_FILENAMES, parse_wiki_doc
 
 from controller_agent import (
     AgentResult,
@@ -355,6 +355,11 @@ _EXAMPLE = """
     <content>
 ---
 type: RESEARCH_NOTE
+title: Example Research Note
+description: One-sentence summary of what this page documents.
+resource: example-raw-file.txt
+tags: [example-tag-one, example-tag-two]
+timestamp: YYYY-MM-DD
 status: draft
 source: example-raw-file.txt
 ---
@@ -432,13 +437,18 @@ Filename: {raw_filename}
 1. Create exactly one RESEARCH_NOTE for the raw file. It MUST include all five
    sections in order: Summary · Details · Related Pages · Revision History,
    each as an H2 heading, plus front-matter at the top.
-2. Details MUST contain three H3 subsections: Extracted Concepts · Mapped Pages
+2. Front matter MUST also include: title (human-readable page title),
+   description (one sentence summarizing the page), resource (the raw
+   filename or URL this page was derived from), tags (2-5 kebab-case topic
+   tags), and timestamp ({today}) — all real, specific values, never the
+   literal placeholder text shown in the example below.
+3. Details MUST contain three H3 subsections: Extracted Concepts · Mapped Pages
    · Proposed New Pages. Use the string "null" when a subsection is empty.
-3. Optionally propose new CONCEPT or SYSTEM pages only if clearly justified.
-4. For existing wiki pages, propose minimal unified diffs only where necessary.
-5. Page names MUST be kebab-case (lowercase letters, digits, hyphens only).
-6. Use {today} as the date in all Revision History entries.
-7. Every [[...]] link target in "### Mapped Pages" and "## Related Pages"
+4. Optionally propose new CONCEPT or SYSTEM pages only if clearly justified.
+5. For existing wiki pages, propose minimal unified diffs only where necessary.
+6. Page names MUST be kebab-case (lowercase letters, digits, hyphens only).
+7. Use {today} as the date in all Revision History entries.
+8. Every [[...]] link target in "### Mapped Pages" and "## Related Pages"
    MUST exactly match an existing page name from EXISTING WIKI PAGES above,
    or a page_name you are proposing in this same response — not a
    paraphrase, not a page title, not a longer or shorter description of
@@ -492,13 +502,18 @@ The file "{raw_filename}" has been provided directly for processing.
 1. Create exactly one RESEARCH_NOTE for the raw file. It MUST include all five
    sections in order: Summary · Details · Related Pages · Revision History,
    each as an H2 heading, plus front-matter at the top.
-2. Details MUST contain three H3 subsections: Extracted Concepts · Mapped Pages
+2. Front matter MUST also include: title (human-readable page title),
+   description (one sentence summarizing the page), resource (the raw
+   filename or URL this page was derived from), tags (2-5 kebab-case topic
+   tags), and timestamp ({today}) — all real, specific values, never the
+   literal placeholder text shown in the example below.
+3. Details MUST contain three H3 subsections: Extracted Concepts · Mapped Pages
    · Proposed New Pages. Use the string "null" when a subsection is empty.
-3. Optionally propose new CONCEPT or SYSTEM pages only if clearly justified.
-4. For existing wiki pages, propose minimal unified diffs only where necessary.
-5. Page names MUST be kebab-case (lowercase letters, digits, hyphens only).
-6. Use {today} as the date in all Revision History entries.
-7. Every [[...]] link target in "### Mapped Pages" and "## Related Pages"
+4. Optionally propose new CONCEPT or SYSTEM pages only if clearly justified.
+5. For existing wiki pages, propose minimal unified diffs only where necessary.
+6. Page names MUST be kebab-case (lowercase letters, digits, hyphens only).
+7. Use {today} as the date in all Revision History entries.
+8. Every [[...]] link target in "### Mapped Pages" and "## Related Pages"
    MUST exactly match an existing page name from EXISTING WIKI PAGES above,
    or a page_name you are proposing in this same response — not a
    paraphrase, not a page title, not a longer or shorter description of
@@ -519,6 +534,7 @@ def build_diff_prompt(
     page_name:    str,
     page_content: str,
     instruction:  str,
+    tool_context: str | None = None,
 ) -> str:
     """
     Prompt for the diff-only path (WikiAgent._run_diff_only()).
@@ -529,6 +545,12 @@ def build_diff_prompt(
     text instruction (not a raw file) describes the desired change. Only
     apply_diff is a legal action here; create_page is explicitly disallowed
     in both this prompt body and DIFF_SYSTEM_PROMPT.
+
+    tool_context, when provided (a Priority 1c compound plan dispatched a
+    tool alongside the pinned-page diff target — see
+    Planner._priority1c_pinned_diff()), is spliced in as a "# FETCHED
+    CONTEXT" section between the target page and the task instructions.
+    Omitted entirely when None, reproducing prior output exactly.
     """
     template_block = "".join(
         f"### TEMPLATE: {key}\n\n{content}\n"
@@ -540,6 +562,8 @@ def build_diff_prompt(
     if len(schema_lines) > _MAX_SCHEMA_LINES:
         schema_snippet += "\n... [schema truncated for context budget]"
 
+    tool_section = f"\n# FETCHED CONTEXT\n\n{tool_context}\n" if tool_context else ""
+
     prompt = f"""\
 # SCHEMA (rules you must follow)
 {schema_snippet}
@@ -550,7 +574,7 @@ def build_diff_prompt(
 # TARGET WIKI PAGE: {page_name}
 
 {page_content}
-
+{tool_section}
 # YOUR TASK
 The user wants the TARGET WIKI PAGE above updated. Their instruction:
 
@@ -1271,6 +1295,7 @@ class WikiAgent:
         auto_apply    = bool(ctx.get("auto_apply",  False))
         max_tokens    = int(ctx.get("max_tokens",   2048))
         temperature   = float(ctx.get("temperature", 0.2))
+        tool_context  = ctx.get("tool_context")
 
         missing = [
             label for label, p in [
@@ -1308,6 +1333,7 @@ class WikiAgent:
             page_name    = diff_target,
             page_content = wiki_pages[diff_target],
             instruction  = subtask.instruction,
+            tool_context = tool_context,
         )
         logger.debug(
             "[%s] diff_prompt_chars=%d  target=%s",
@@ -1401,6 +1427,15 @@ class WikiAgent:
             )
             self._reindex_and_rebuild_graph(wiki_dir, written)
 
+            if written:
+                created_names = {p.page_name for p in actions.new_pages}
+                log_entries = [
+                    ("Creation" if name in created_names else "Update", name)
+                    for name in written
+                ]
+                self._append_logs_md(log_entries, wiki_dir)
+                self._regenerate_index_md(self._load_wiki_pages(wiki_dir), wiki_dir)
+
         # -- Build and return AgentResult --------------------------------------
 
         output: dict[str, Any] = {
@@ -1480,6 +1515,72 @@ class WikiAgent:
         except Exception as exc:
             logger.warning("[%s] Graph rebuild failed after write (non-fatal): %s", self.name, exc)
 
+    @staticmethod
+    def _regenerate_index_md(wiki_pages: dict[str, str], wiki_dir: Path) -> None:
+        """
+        Regenerate wiki_dir/index.md from the current on-disk page set
+        (OKF's per-directory summary file), grouped by front-matter `type`.
+
+        Deterministic — never model-authored — so it can never drift from
+        what's actually on disk or hallucinate a link. A page missing
+        `type` is grouped under "UNSPECIFIED"; missing `title`/
+        `description` fall back to the page's stem / no description line,
+        so a page that hasn't been through the OKF backfill never breaks
+        generation. wiki_pages is expected to already exclude
+        META_WIKI_FILENAMES (see _load_wiki_pages()).
+        """
+        groups: dict[str, list[tuple[str, str, str | None]]] = {}
+        for stem, content in sorted(wiki_pages.items()):
+            frontmatter = parse_wiki_doc(content).frontmatter
+            page_type   = str(frontmatter.get("type") or "UNSPECIFIED")
+            title       = str(frontmatter.get("title") or stem)
+            description = frontmatter.get("description")
+            groups.setdefault(page_type, []).append((stem, title, description))
+
+        lines = ["# Wiki Index", ""]
+        for page_type in sorted(groups):
+            lines.append(f"## {page_type}")
+            lines.append("")
+            for stem, title, description in groups[page_type]:
+                if description:
+                    lines.append(f"- [[{stem}]] — {title}: {description}")
+                else:
+                    lines.append(f"- [[{stem}]] — {title}")
+            lines.append("")
+
+        write_text_file(wiki_dir / "index.md", "\n".join(lines).rstrip() + "\n")
+
+    @staticmethod
+    def _append_logs_md(entries: list[tuple[str, str]], wiki_dir: Path) -> None:
+        """
+        Append a dated changelog section to wiki_dir/logs.md (OKF's
+        changelog file) — one bullet per (kind, page_name) entry, kind one
+        of "Creation"/"Update", linking [[page_name]]. Deterministic —
+        computed from what _apply_changes()/apply_pending_diff() actually
+        wrote, never model-authored. Creates the file with a header on
+        first write; every call after that appends a new dated section
+        rather than trying to merge into an existing same-day section, to
+        keep this a pure, simple append with no re-parsing of logs.md's
+        own structure.
+
+        No-op if entries is empty (nothing was actually written).
+        """
+        if not entries:
+            return
+
+        today = date.today().isoformat()
+        lines = [f"## {today}", ""]
+        for kind, page_name in entries:
+            lines.append(f"- {kind}: [[{page_name}]]")
+        block = "\n".join(lines) + "\n"
+
+        logs_path = wiki_dir / "logs.md"
+        if not logs_path.exists():
+            write_text_file(logs_path, "# Wiki Changelog\n\n" + block)
+        else:
+            with open(logs_path, "a", encoding="utf-8") as fh:
+                fh.write("\n" + block)
+
     # -----------------------------------------------------------------------
     # Review-then-apply UI — apply a single previously-proposed diff
     # -----------------------------------------------------------------------
@@ -1540,6 +1641,8 @@ class WikiAgent:
         logger.info("[%s] apply_pending_diff: wrote '%s'.", self.name, page_name)
 
         self._reindex_and_rebuild_graph(wiki_dir, [page_name])
+        self._append_logs_md([("Update", page_name)], wiki_dir)
+        self._regenerate_index_md(self._load_wiki_pages(wiki_dir), wiki_dir)
 
         return AgentResult(
             subtask_id = subtask_id,
@@ -1586,13 +1689,19 @@ class WikiAgent:
 
     @staticmethod
     def _load_wiki_pages(wiki_dir: Path) -> dict[str, str]:
-        """Load all .md files from the wiki directory (stem → content)."""
+        """Load all .md files from the wiki directory (stem → content).
+
+        Excludes META_WIKI_FILENAMES (index.md, logs.md, MEMORY.md) — these
+        are structural/generated files, never content pages the model
+        should see as "EXISTING WIKI PAGES" or resolve a diff_target
+        against.
+        """
         if not wiki_dir.exists():
             return {}
         return {
             p.stem: read_text_file(p)
             for p in sorted(wiki_dir.iterdir())
-            if p.is_file() and p.suffix == ".md"
+            if p.is_file() and p.suffix == ".md" and p.name not in META_WIKI_FILENAMES
         }
 
     def _load_wiki_pages_from_index(self, wiki_dir: Path) -> dict[str, str]:
@@ -1608,12 +1717,15 @@ class WikiAgent:
 
         docs = self._memory_manager.get_all_documents(doc_type="wiki")
 
-        # Filter to pages that live under this wiki_dir
+        # Filter to pages that live under this wiki_dir, excluding
+        # META_WIKI_FILENAMES (index.md, logs.md, MEMORY.md) — same
+        # exclusion _load_wiki_pages() applies to the filesystem-walk path.
         wiki_dir_str = str(wiki_dir.resolve())
         filtered = {
             d.name: d.content
             for d in docs
             if str(d.path).startswith(wiki_dir_str)
+            and Path(d.path).name not in META_WIKI_FILENAMES
         }
 
         if not filtered and wiki_dir.exists():

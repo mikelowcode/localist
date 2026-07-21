@@ -469,3 +469,25 @@ The previously-missing page.
         assert len(rows2) == 1                  # one edge row, not two
         assert rows2[0]["target_resolved"] == 1
         assert rows2[0]["target_node_id"] is not None
+
+
+# ---------------------------------------------------------------------------
+# META_WIKI_FILENAMES exclusion (OKF alignment) — index.md/logs.md/MEMORY.md
+# must never become graph nodes or resolve_graph_target() candidate stems.
+# ---------------------------------------------------------------------------
+
+class TestBuildGraphExcludesMetaFiles:
+
+    def test_meta_filenames_excluded_from_graph_nodes(self, tmp_path):
+        mm = _fresh_mm(tmp_path)
+        wiki_dir = _make_wiki(tmp_path, {
+            "localist-build-order.md": _BUILD_ORDER,
+            "index.md":                "# Wiki Index\n\n## RESEARCH_NOTE\n\n- [[localist-build-order]]\n",
+            "logs.md":                 "# Wiki Changelog\n\n## 2026-07-21\n\n- Creation: [[localist-build-order]]\n",
+            "MEMORY.md":               "# Memory\n\n- some episodic fact\n",
+        })
+
+        summary = build_graph(wiki_dir, mm)
+
+        assert summary["nodes"] == 1  # only localist-build-order
+        assert mm.list_graph_node_stems() == ["localist-build-order"]

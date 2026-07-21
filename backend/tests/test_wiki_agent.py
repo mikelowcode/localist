@@ -80,6 +80,19 @@ class _FakeRuntime:
         return [0.0] * 768
 
 
+class _CapturingFakeRuntime(_FakeRuntime):
+    """Same contract as _FakeRuntime, but records the prompt kwarg passed to
+    infer() so tests can assert on the assembled diff prompt's contents."""
+
+    def __init__(self, response: str) -> None:
+        super().__init__(response)
+        self.captured_prompt: str | None = None
+
+    def infer(self, *args, **kwargs) -> str:
+        self.captured_prompt = kwargs.get("prompt")
+        return super().infer(*args, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -290,11 +303,13 @@ def test_build_user_prompt_contains_rule7():
 
 
 # ---------------------------------------------------------------------------
-# Test — Rule 7 present in build_slim_prompt() output, identical wording
+# Test — link-target rule (rule 8, since the OKF front-matter rule became
+# rule 2) present in build_slim_prompt() output, identical wording
 # ---------------------------------------------------------------------------
 
-def test_build_slim_prompt_contains_rule7_identical_to_user_prompt():
-    """build_slim_prompt() must contain Rule 7, byte-identical to build_user_prompt()."""
+def test_build_slim_prompt_contains_link_rule_identical_to_user_prompt():
+    """build_slim_prompt() must contain the link-target rule, byte-identical
+    to build_user_prompt()."""
     user_out = build_user_prompt(**_PROMPT_STUBS, raw_content="Some raw content.")
     slim_out = build_slim_prompt(**_PROMPT_STUBS)
 
@@ -302,35 +317,41 @@ def test_build_slim_prompt_contains_rule7_identical_to_user_prompt():
     assert "MUST exactly match an existing page name" in slim_out
     assert "propose it as a new page" in slim_out
 
-    # Extract just the Rule-7 text from each and confirm they match exactly.
+    # Extract just the link-rule text from each and confirm they match exactly.
     import re
-    def _extract_rule7(text: str) -> str:
-        m = re.search(r"7\. Every \[\[\.\.\..*?instead of linking to a guessed name\.", text, re.DOTALL)
-        assert m, f"Rule 7 not found in prompt output"
+    def _extract_link_rule(text: str) -> str:
+        m = re.search(r"8\. Every \[\[\.\.\..*?instead of linking to a guessed name\.", text, re.DOTALL)
+        assert m, "Link-target rule (8.) not found in prompt output"
         return m.group(0)
 
-    assert _extract_rule7(user_out) == _extract_rule7(slim_out), (
-        "Rule 7 wording differs between build_user_prompt() and build_slim_prompt()"
+    assert _extract_link_rule(user_out) == _extract_link_rule(slim_out), (
+        "Link-target rule wording differs between build_user_prompt() and build_slim_prompt()"
     )
 
 
 # ---------------------------------------------------------------------------
-# Test — Rules 1–6 text unchanged in both prompt functions
+# Test — Rules 1–7 text unchanged in both prompt functions (rule 2 is the
+# OKF front-matter fields rule added alongside index.md/logs.md support)
 # ---------------------------------------------------------------------------
 
 _RULE_SUBSTRINGS = [
     "1. Create exactly one RESEARCH_NOTE",
-    "2. Details MUST contain three H3 subsections",
-    "3. Optionally propose new CONCEPT or SYSTEM pages",
-    "4. For existing wiki pages, propose minimal unified diffs",
-    "5. Page names MUST be kebab-case",
-    "6. Use ",
+    "2. Front matter MUST also include: title",
+    "description",
+    "resource",
+    "tags",
+    "timestamp",
+    "3. Details MUST contain three H3 subsections",
+    "4. Optionally propose new CONCEPT or SYSTEM pages",
+    "5. For existing wiki pages, propose minimal unified diffs",
+    "6. Page names MUST be kebab-case",
+    "7. Use ",
     "as the date in all Revision History entries",
 ]
 
 
-def test_prompt_rules_1_through_6_unchanged():
-    """Rules 1–6 must be present and unchanged in both build_user_prompt() and build_slim_prompt()."""
+def test_prompt_rules_1_through_7_unchanged():
+    """Rules 1–7 must be present and unchanged in both build_user_prompt() and build_slim_prompt()."""
     user_out = build_user_prompt(**_PROMPT_STUBS, raw_content="Some raw content.")
     slim_out = build_slim_prompt(**_PROMPT_STUBS)
     for expected in _RULE_SUBSTRINGS:
@@ -571,6 +592,37 @@ def test_diff_prompt_omits_raw_file_section():
     assert "NOT propose a create_page action" in out
 
 
+def test_diff_prompt_with_tool_context_adds_fetched_context_section():
+    """Priority 1c compound plans (diff_target + a dispatched tool) pass
+    tool_context through — it must appear as a distinct section between
+    the target page and the task instructions."""
+    out = build_diff_prompt(
+        schema_text  = "# Schema\n",
+        templates    = {},
+        page_name    = "existing-page",
+        page_content = _PAGE_CONTENT,
+        instruction  = "Update it to reflect the changelog.",
+        tool_context = "Title: Changelog\nSource: https://example.com\n\nAdded X.",
+    )
+    assert "# FETCHED CONTEXT" in out
+    assert "Added X." in out
+    # Ordering: target page content, then fetched context, then the task.
+    assert out.index("Old summary.") < out.index("# FETCHED CONTEXT") < out.index("# YOUR TASK")
+
+
+def test_diff_prompt_without_tool_context_is_unchanged():
+    """tool_context omitted (default None) reproduces prior output exactly
+    — no '# FETCHED CONTEXT' section at all. Regression guard."""
+    out = build_diff_prompt(
+        schema_text  = "# Schema\n",
+        templates    = {},
+        page_name    = "existing-page",
+        page_content = _PAGE_CONTENT,
+        instruction  = "Update it to reflect the new backend.",
+    )
+    assert "# FETCHED CONTEXT" not in out
+
+
 def test_run_dispatches_to_diff_only_path_without_calling_resolve_raw_path(tmp_path: Path):
     """diff_target present, raw_path absent → _run_diff_only() runs;
     _resolve_raw_path() (the ingest-only path guard) must never be called."""
@@ -598,6 +650,34 @@ def test_run_dispatches_to_diff_only_path_without_calling_resolve_raw_path(tmp_p
     assert result.output["diff_target"]  == "existing-page"
     assert len(result.output["diffs"])   == 1
     assert result.output["new_pages"]    == []
+
+
+def test_run_diff_only_threads_tool_context_into_prompt(tmp_path: Path):
+    """context["tool_context"] (set by ControllerAgent when Priority 1c's
+    compound plan dispatched a tool alongside the pinned diff target) must
+    reach the model's actual prompt."""
+    paths = _diff_only_env(tmp_path, _PAGE_CONTENT)
+    rt = _CapturingFakeRuntime(_DIFF_ONLY_XML)
+    agent = WikiAgent(runtime=rt, project_root=tmp_path)
+
+    subtask = MagicMock()
+    subtask.subtask_id  = "diff-test-tool-context"
+    subtask.instruction = "Update existing-page to reflect the changelog."
+    subtask.context = {
+        "diff_target":   "existing-page",
+        "wiki_dir":      str(paths["wiki_dir"]),
+        "schema_path":   str(paths["schema_path"]),
+        "templates_dir": str(paths["templates_dir"]),
+        "auto_apply":    False,
+        "tool_context":  "Title: Changelog\nSource: https://example.com\n\nAdded X.",
+    }
+
+    result = agent.run(subtask)
+
+    assert result.status == TaskStatus.COMPLETE
+    assert rt.captured_prompt is not None
+    assert "# FETCHED CONTEXT" in rt.captured_prompt
+    assert "Added X." in rt.captured_prompt
 
 
 def test_diff_only_run_applies_diff_to_disk_when_auto_apply(tmp_path: Path):
@@ -1244,3 +1324,139 @@ def test_sweep_expired_snapshots_respects_env_var_ttl_override(tmp_path: Path, m
     assert [p.name for p in pruned] == ["page-a.v1.20260101T000000.md"]
     assert not old.exists()
     assert recent.exists()
+
+
+# ---------------------------------------------------------------------------
+# OKF alignment (§18) — META_WIKI_FILENAMES exclusion, index.md/logs.md
+# generation, and end-to-end wiring into _finalize()
+# ---------------------------------------------------------------------------
+
+_REAL_PAGE = """\
+---
+type: RESEARCH_NOTE
+title: Real Page
+description: A real content page.
+---
+
+## Summary
+
+Content.
+"""
+
+
+def test_load_wiki_pages_excludes_meta_filenames(tmp_path: Path):
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+    (wiki_dir / "real-page.md").write_text(_REAL_PAGE, encoding="utf-8")
+    (wiki_dir / "index.md").write_text("# Wiki Index\n", encoding="utf-8")
+    (wiki_dir / "logs.md").write_text("# Wiki Changelog\n", encoding="utf-8")
+    (wiki_dir / "MEMORY.md").write_text("# Memory\n", encoding="utf-8")
+
+    pages = WikiAgent._load_wiki_pages(wiki_dir)
+
+    assert list(pages.keys()) == ["real-page"]
+
+
+class TestRegenerateIndexMd:
+
+    def test_groups_by_type_and_includes_title_description(self, tmp_path: Path):
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+        pages = {
+            "concept-a": "---\ntype: CONCEPT\ntitle: Concept A\ndescription: About A.\n---\n\nbody",
+            "note-b":    "---\ntype: RESEARCH_NOTE\ntitle: Note B\n---\n\nbody",
+        }
+
+        WikiAgent._regenerate_index_md(pages, wiki_dir)
+
+        out = (wiki_dir / "index.md").read_text(encoding="utf-8")
+        assert "## CONCEPT" in out
+        assert "## RESEARCH_NOTE" in out
+        assert "[[concept-a]] — Concept A: About A." in out
+        assert "[[note-b]] — Note B" in out
+        assert out.index("## CONCEPT") < out.index("## RESEARCH_NOTE")  # alphabetical grouping
+
+    def test_missing_frontmatter_falls_back_to_stem_no_crash(self, tmp_path: Path):
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+        pages = {"no-frontmatter-page": "Just a plain body, no front matter at all.\n"}
+
+        WikiAgent._regenerate_index_md(pages, wiki_dir)
+
+        out = (wiki_dir / "index.md").read_text(encoding="utf-8")
+        assert "## UNSPECIFIED" in out
+        assert "[[no-frontmatter-page]] — no-frontmatter-page" in out
+
+    def test_regeneration_overwrites_previous_index(self, tmp_path: Path):
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+        WikiAgent._regenerate_index_md({"page-a": _REAL_PAGE}, wiki_dir)
+        WikiAgent._regenerate_index_md({"page-b": _REAL_PAGE}, wiki_dir)
+
+        out = (wiki_dir / "index.md").read_text(encoding="utf-8")
+        assert "page-a" not in out
+        assert "page-b" in out
+
+
+class TestAppendLogsMd:
+
+    def test_creates_file_with_header_on_first_write(self, tmp_path: Path):
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+
+        WikiAgent._append_logs_md([("Creation", "new-page")], wiki_dir)
+
+        out = (wiki_dir / "logs.md").read_text(encoding="utf-8")
+        assert out.startswith("# Wiki Changelog")
+        assert "- Creation: [[new-page]]" in out
+
+    def test_second_call_appends_not_overwrites(self, tmp_path: Path):
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+
+        WikiAgent._append_logs_md([("Creation", "page-one")], wiki_dir)
+        WikiAgent._append_logs_md([("Update", "page-two")], wiki_dir)
+
+        out = (wiki_dir / "logs.md").read_text(encoding="utf-8")
+        assert "- Creation: [[page-one]]" in out
+        assert "- Update: [[page-two]]" in out
+
+    def test_empty_entries_is_a_no_op(self, tmp_path: Path):
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+
+        WikiAgent._append_logs_md([], wiki_dir)
+
+        assert not (wiki_dir / "logs.md").exists()
+
+
+def test_end_to_end_diff_only_run_regenerates_index_and_logs(tmp_path: Path):
+    """auto_apply=True on the diff-only path must regenerate index.md and
+    append logs.md, in addition to the existing disk-write/reindex/graph
+    behavior already covered by test_diff_only_run_applies_diff_to_disk_when_auto_apply."""
+    paths = _diff_only_env(tmp_path, _PAGE_CONTENT)
+    (paths["wiki_dir"] / "existing-page.md").write_text(
+        "---\ntype: RESEARCH_NOTE\ntitle: Existing Page\n---\n\n" + _PAGE_CONTENT,
+        encoding="utf-8",
+    )
+    rt = _FakeRuntime(_DIFF_ONLY_XML)
+    agent = WikiAgent(runtime=rt, project_root=tmp_path)
+
+    subtask = MagicMock()
+    subtask.subtask_id  = "diff-test-okf"
+    subtask.instruction = "Update existing-page to reflect the new backend."
+    subtask.context = {
+        "diff_target":   "existing-page",
+        "wiki_dir":      str(paths["wiki_dir"]),
+        "schema_path":   str(paths["schema_path"]),
+        "templates_dir": str(paths["templates_dir"]),
+        "auto_apply":    True,
+    }
+
+    result = agent.run(subtask)
+
+    assert result.status == TaskStatus.COMPLETE
+    index_out = (paths["wiki_dir"] / "index.md").read_text(encoding="utf-8")
+    assert "[[existing-page]]" in index_out
+    logs_out = (paths["wiki_dir"] / "logs.md").read_text(encoding="utf-8")
+    assert "- Update: [[existing-page]]" in logs_out

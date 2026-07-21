@@ -5,6 +5,7 @@
   import { chatHistoryStore, type Turn } from '$lib/stores/chatHistory';
   import { currentConversationId, isFirstTurnOfConversation } from '$lib/stores/conversation';
   import { applyDiff } from '$lib/stores/wiki';
+  import { loadWikiFiles, wikiFiles, wikiLoading, wikiError } from '$lib/stores/files';
   import MarkdownRenderer from '$lib/components/MarkdownRenderer.svelte';
   import ChartRenderer from '$lib/components/ChartRenderer.svelte';
 
@@ -17,10 +18,42 @@
   interface AttachedFile {
     filename: string;
     tokenEstimate: number;
+    source?: 'upload' | 'wiki_pin';
   }
   let attachedFiles: AttachedFile[] = [];
   let fileInputEl: HTMLInputElement;
   let attachError: string | null = null;
+
+  // Wiki page pin picker — lists $wikiFiles (already loaded for the Sidebar).
+  let showWikiPicker = false;
+
+  async function toggleWikiPicker() {
+    showWikiPicker = !showWikiPicker;
+    if (showWikiPicker) await loadWikiFiles();
+  }
+
+  async function pinWikiPage(stem: string) {
+    attachError = null;
+    try {
+      const res = await fetch('/api/chat/pin-wiki-page', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stem }),
+      });
+      const body = await res.json();
+      if (!res.ok) {
+        attachError = body.detail ?? `Pin failed (HTTP ${res.status}).`;
+        return;
+      }
+      attachedFiles = [
+        ...attachedFiles,
+        { filename: body.filename, tokenEstimate: body.token_estimate, source: body.source },
+      ];
+      showWikiPicker = false;
+    } catch (err) {
+      attachError = 'Could not reach the server. Is the backend running?';
+    }
+  }
 
   const ALLOWED_EXTENSIONS = new Set([
     '.md', '.txt', '.py', '.ts', '.js', '.svelte', '.json',
@@ -485,6 +518,45 @@
           <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
         </svg>
       </button>
+      <div class="pin-btn-wrap">
+        <button
+          class="attach-btn pin-btn"
+          on:click={toggleWikiPicker}
+          disabled={submitting}
+          aria-label="Pin a wiki page"
+          title="Pin a wiki page"
+          type="button"
+        >
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
+          </svg>
+        </button>
+        {#if showWikiPicker}
+          <div
+            class="wiki-picker-backdrop"
+            role="button"
+            tabindex="-1"
+            aria-label="Close wiki page picker"
+            on:click={() => (showWikiPicker = false)}
+            on:keydown={(e) => e.key === 'Escape' && (showWikiPicker = false)}
+          ></div>
+          <div class="wiki-picker">
+            {#if $wikiLoading}
+              <p class="wiki-picker-status">Loading…</p>
+            {:else if $wikiError}
+              <p class="wiki-picker-status wiki-picker-error">{$wikiError}</p>
+            {:else if $wikiFiles.length === 0}
+              <p class="wiki-picker-status">No wiki pages found.</p>
+            {:else}
+              {#each $wikiFiles as page (page.name)}
+                <button class="wiki-picker-item" type="button" on:click={() => pinWikiPage(page.name)}>
+                  {page.name}
+                </button>
+              {/each}
+            {/if}
+          </div>
+        {/if}
+      </div>
       <textarea
         bind:this={inputEl}
         bind:value={instruction}
@@ -512,9 +584,15 @@
       <div class="attached-files">
         {#each attachedFiles as f (f.filename)}
           <span class="file-pill">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-            </svg>
+            {#if f.source === 'wiki_pin'}
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
+              </svg>
+            {:else}
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+              </svg>
+            {/if}
             <span class="file-pill-name" title={f.filename}>{f.filename}</span>
             <span class="file-pill-tokens">~{f.tokenEstimate.toLocaleString()}t</span>
             <button
@@ -935,6 +1013,51 @@
   }
   .attach-btn:hover:not(:disabled) { color: var(--text-secondary); }
   .attach-btn:disabled { opacity: 0.4; }
+
+  .pin-btn-wrap { position: relative; flex-shrink: 0; }
+
+  .wiki-picker-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+  }
+
+  .wiki-picker {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    z-index: 21;
+    min-width: 220px;
+    max-width: 320px;
+    max-height: 240px;
+    overflow-y: auto;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-md, 0 4px 12px rgba(0, 0, 0, 0.25));
+    padding: var(--sp-1) 0;
+  }
+
+  .wiki-picker-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: var(--sp-1) var(--sp-2);
+    font-size: 12px;
+    font-family: var(--font-mono);
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .wiki-picker-item:hover { background: var(--bg-active); color: var(--text-primary); }
+
+  .wiki-picker-status {
+    padding: var(--sp-1) var(--sp-2);
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .wiki-picker-error { color: var(--error); }
 
   .attached-files {
     display: flex;

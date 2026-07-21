@@ -44,7 +44,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from memory_manager import MemoryManager
-from wiki_doc import load_wiki_doc
+from wiki_doc import META_WIKI_FILENAMES, load_wiki_doc
 
 _WIKI_DIR = _BACKEND_DIR / "wiki"
 
@@ -60,7 +60,9 @@ def build_graph(wiki_dir: Path, mm: MemoryManager) -> dict[str, int]:
 
     Parameters
     ----------
-    wiki_dir : directory to walk (non-recursive, .md files only)
+    wiki_dir : directory to walk (non-recursive, .md files only, excluding
+               META_WIKI_FILENAMES — index.md/logs.md/MEMORY.md never
+               become graph nodes or resolve_graph_target() candidates)
     mm       : MemoryManager connected to the target database
 
     Returns
@@ -69,7 +71,7 @@ def build_graph(wiki_dir: Path, mm: MemoryManager) -> dict[str, int]:
     """
     wiki_files = sorted(
         p for p in wiki_dir.iterdir()
-        if p.is_file() and p.suffix.lower() == ".md"
+        if p.is_file() and p.suffix.lower() == ".md" and p.name not in META_WIKI_FILENAMES
     )
 
     # ---- Pass 1: upsert all graph_nodes ------------------------------------

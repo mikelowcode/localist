@@ -150,7 +150,8 @@ from runtime_factory import available_backends, create_runtime
 import session_files
 import wiki_maintenance_log
 from warmup import run_cache_warmup as _run_cache_warmup
-from wiki_agent import WikiAgent, sweep_expired_snapshots
+from wiki_agent import WikiAgent, read_text_file, sweep_expired_snapshots
+from wiki_doc import META_WIKI_FILENAMES
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -583,7 +584,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # This ensures the index is always current even after pages were written
     # while the server was down.
     if wiki_dir.exists():
-        n_wiki = memory_manager.index_directory(wiki_dir, doc_type="wiki", embed=bool(embed_fn))
+        n_wiki = memory_manager.index_directory(
+            wiki_dir, doc_type="wiki", embed=bool(embed_fn), exclude=META_WIKI_FILENAMES,
+        )
         logger.info("MemoryManager: indexed %d wiki pages from %s.", n_wiki, wiki_dir)
     else:
         logger.warning("MemoryManager: wiki_dir does not exist yet (%s) — skipping seed.", wiki_dir)
@@ -946,6 +949,11 @@ class ApplyDiffResponse(BaseModel):
     """Response body for POST /wiki/apply-diff (success only — failures raise HTTPException)."""
     success:   bool = True
     page_name: str
+
+
+class PinWikiPageRequest(BaseModel):
+    """Payload accepted by POST /chat/pin-wiki-page."""
+    stem: str = Field(..., min_length=1)
 
 
 # ---------------------------------------------------------------------------
@@ -1636,7 +1644,13 @@ async def get_files_raw() -> FilesResponse:
     summary        = "List wiki pages",
 )
 async def get_files_wiki() -> FilesResponse:
-    """Return metadata for every .md file in the wiki/ directory."""
+    """
+    Return metadata for every .md content page in the wiki/ directory.
+
+    Excludes META_WIKI_FILENAMES (index.md, logs.md, MEMORY.md) — these are
+    structural/generated files, never a page a user would pin as a diff
+    target.
+    """
     if _state.wiki_dir is None:
         raise HTTPException(status_code=503, detail="wiki_dir not configured.")
     wiki_dir = _state.wiki_dir
@@ -1645,7 +1659,7 @@ async def get_files_wiki() -> FilesResponse:
     files = [
         _file_entry(p, "wiki")
         for p in sorted(wiki_dir.iterdir())
-        if p.is_file() and p.suffix == ".md"
+        if p.is_file() and p.suffix == ".md" and p.name not in META_WIKI_FILENAMES
     ]
     return FilesResponse(files=files)
 
@@ -1945,6 +1959,44 @@ async def detach_chat_file(filename: str):
     if not removed:
         raise HTTPException(status_code=404, detail=f"'{filename}' not found in session files.")
     return {"removed": True}
+
+
+@app.post("/chat/pin-wiki-page")
+async def pin_wiki_page(body: PinWikiPageRequest):
+    """
+    Pin an existing wiki page into the ephemeral session file cache by stem.
+
+    Reads the page straight off disk (wiki_dir/{stem}.md) rather than via
+    the graph index, since the graph is only rebuilt on an explicit trigger
+    and can lag behind real files. Returns 200 + {filename, token_estimate,
+    source} on success. Returns 404 if no such page exists on disk.
+    Returns 400 + {detail} on rejection (size or budget), same as
+    POST /chat/files.
+    """
+    if _state.wiki_dir is None:
+        raise HTTPException(status_code=503, detail="wiki_dir not configured.")
+
+    filename = f"{body.stem}.md"
+    if filename in META_WIKI_FILENAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{filename}' is a structural wiki file, not a pinnable page.",
+        )
+
+    page_path = _state.wiki_dir / filename
+    if not page_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Wiki page '{body.stem}' not found.")
+
+    content = await asyncio.to_thread(read_text_file, page_path)
+    error = session_files.add_file(filename, content, source="wiki_pin")
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+
+    return {
+        "filename":       filename,
+        "token_estimate": len(content) // 4,
+        "source":         "wiki_pin",
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -1588,6 +1588,51 @@ class TestReconcileWiki:
         }
         assert not self.log_path.exists()
 
+    def test_meta_wiki_filenames_never_indexed(self, mm, wiki_dir):
+        """index.md/logs.md/MEMORY.md must never become document_index rows
+        via reconcile_wiki() — OKF alignment (§18)."""
+        (wiki_dir / "real-page.md").write_text("real content", encoding="utf-8")
+        (wiki_dir / "index.md").write_text("# Wiki Index\n", encoding="utf-8")
+        (wiki_dir / "logs.md").write_text("# Wiki Changelog\n", encoding="utf-8")
+        (wiki_dir / "MEMORY.md").write_text("# Memory\n", encoding="utf-8")
+
+        summary = mm.reconcile_wiki(wiki_dir)
+
+        assert summary["reindexed"] == 1
+        docs = mm.get_all_documents(doc_type="wiki")
+        assert [d.name for d in docs] == ["real-page"]
+
+
+class TestIndexDirectoryExclude:
+
+    @pytest.fixture()
+    def directory(self, tmp_path):
+        d = tmp_path / "raw"
+        d.mkdir()
+        return d
+
+    def test_exclude_skips_named_files(self, mm, directory):
+        (directory / "keep.md").write_text("keep me", encoding="utf-8")
+        (directory / "skip.md").write_text("skip me", encoding="utf-8")
+
+        count = mm.index_directory(
+            directory, doc_type="raw", exclude=frozenset({"skip.md"}),
+        )
+
+        assert count == 1
+        docs = mm.get_all_documents(doc_type="raw")
+        assert [d.name for d in docs] == ["keep"]
+
+    def test_default_exclude_is_empty_no_behavior_change(self, mm, directory):
+        """Regression guard: callers that never pass exclude (e.g. the
+        existing raw_dir call sites) must be completely unaffected."""
+        (directory / "a.md").write_text("a", encoding="utf-8")
+        (directory / "b.md").write_text("b", encoding="utf-8")
+
+        count = mm.index_directory(directory, doc_type="raw")
+
+        assert count == 2
+
 
 class TestWikiMaintenanceLog:
 

@@ -619,6 +619,100 @@ class TestWikiDiffResultPath:
 
 
 # ---------------------------------------------------------------------------
+# Priority 1c compound plan — tool_context wiring for wiki_agent diff-only
+# path (Planner._priority1c_pinned_diff())
+# ---------------------------------------------------------------------------
+
+class TestPinnedDiffToolContextWiring:
+    """
+    A RoutingPlan carrying both diff_target and a non-empty tools_to_call
+    (Priority 1c's compound case) must have the dispatched tool's result
+    text wired into SubTask.context["tool_context"] alongside
+    context["diff_target"] — WikiAgent's diff-only path builds its own
+    prompt and never reads _prebuilt_prompt/_prebuilt_system, so this is
+    the only way fetched content reaches it. Bypasses real Planner routing
+    (patch.object on ctrl._planner) and patches MCPToolDispatcher wholesale,
+    matching TestDeferredFileOpDispatch's convention.
+    """
+
+    @staticmethod
+    def _compound_plan() -> RoutingPlan:
+        return RoutingPlan(
+            agent          = "wiki_agent",
+            fetch_episodic = False,
+            fetch_rag      = False,
+            priority       = 1,
+            diff_target    = "some-page",
+            diff_target_source = "pinned",
+            tools_to_call  = ["url_fetch"],
+            compound       = True,
+            tool_signal_source = "keyword",
+        )
+
+    def test_successful_tool_result_wired_into_tool_context(self, mm):
+        rt   = make_runtime()
+        wiki = make_wiki_agent()
+        received: list[SubTask] = []
+        def capture(subtask):
+            received.append(subtask)
+            return wiki.run.return_value
+        wiki.run.side_effect = capture
+
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.return_value = [
+            _ToolResult(
+                tool_name  = "url_fetch",
+                parameters = "url='https://example.com/changelog'",
+                result     = "Title: Changelog\nSource: https://example.com/changelog\n\nAdded X.",
+                success    = True,
+            )
+        ]
+
+        ctrl = ControllerAgent(runtime=rt, agents=[wiki], memory_manager=mm)
+        with patch.object(ctrl._planner, "route", return_value=self._compound_plan()), \
+             patch("controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            ctrl.handle_task({
+                "instruction": "fetch this url https://example.com/changelog and update page to reflect it",
+            })
+
+        assert received[0].context["diff_target"]  == "some-page"
+        assert received[0].context["tool_context"] == (
+            "Title: Changelog\nSource: https://example.com/changelog\n\nAdded X."
+        )
+
+    def test_no_tool_results_leaves_tool_context_absent(self, mm):
+        rt   = make_runtime()
+        wiki = make_wiki_agent()
+        received: list[SubTask] = []
+        def capture(subtask):
+            received.append(subtask)
+            return wiki.run.return_value
+        wiki.run.side_effect = capture
+
+        # Same compound plan, but the dispatcher fails entirely — no
+        # successful results.
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.return_value = [
+            _ToolResult(
+                tool_name  = "url_fetch",
+                parameters = "url='https://example.com/changelog'",
+                result     = "ERROR: could not reach host",
+                success    = False,
+            )
+        ]
+
+        ctrl = ControllerAgent(runtime=rt, agents=[wiki], memory_manager=mm)
+        with patch.object(ctrl._planner, "route", return_value=self._compound_plan()), \
+             patch("controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            ctrl.handle_task({
+                "instruction": "fetch this url https://example.com/changelog and update page to reflect it",
+            })
+
+        assert received[0].context["diff_target"] == "some-page"
+        assert "tool_context" not in received[0].context
+
+
+# ---------------------------------------------------------------------------
 # Episodic write path (Priority 2)
 # ---------------------------------------------------------------------------
 

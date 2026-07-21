@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+import session_files
 from memory_manager import MemoryManager
 from planner import Planner, RoutingPlan, extract_graph_query, resolve_graph_target
 from controller_agent import (
@@ -812,6 +813,114 @@ class TestPlannerP1bDiff:
         assert plan.diff_target is None
         assert plan.agent       == "conversational_agent"
         assert plan.tools_to_call == []
+
+
+# ---------------------------------------------------------------------------
+# Priority 1c — pinned-wiki-page diff short-circuit
+# ---------------------------------------------------------------------------
+
+class TestPlannerP1cPinnedDiff:
+
+    @pytest.fixture(autouse=True)
+    def _clear_session_files(self):
+        session_files.clear()
+        yield
+        session_files.clear()
+
+    # (a) exactly-one-pin + diff keyword anywhere (not a lead phrase) →
+    # short-circuits, no resolve_graph_target() needed.
+    def test_pinned_page_diff_keyword_anywhere_short_circuits(self, tmp_path):
+        session_files.add_file(
+            "localist-software-stack.md", "# Stack\n", source="wiki_pin",
+        )
+        mm, _ = make_mm_with_nodes(tmp_path)
+        p = Planner(runtime=make_runtime(), memory_manager=mm)
+
+        plan = p.route(
+            "Read my live repo then propose diffs to update the wiki corpus",
+            context={},
+        )
+
+        assert plan.agent              == "wiki_agent"
+        assert plan.diff_target        == "localist-software-stack"
+        assert plan.diff_target_source == "pinned"
+        assert plan.tools_to_call      == []
+        assert plan.compound           is False
+
+    # (b) exactly-one-pin + a Priority 3 tool need (url_fetch) → compound
+    # plan carrying both diff_target and tools_to_call.
+    def test_pinned_page_with_tool_need_routes_compound(self, tmp_path):
+        session_files.add_file(
+            "localist-software-stack.md", "# Stack\n", source="wiki_pin",
+        )
+        mm, _ = make_mm_with_nodes(tmp_path)
+        p = Planner(runtime=make_runtime(), memory_manager=mm)
+
+        plan = p.route(
+            "fetch this url https://example.com/changelog and "
+            "update page to reflect it",
+            context={},
+        )
+
+        assert plan.agent              == "wiki_agent"
+        assert plan.diff_target        == "localist-software-stack"
+        assert plan.diff_target_source == "pinned"
+        assert plan.tools_to_call      == ["url_fetch"]
+        assert plan.compound           is True
+        assert plan.tool_signal_source == "keyword"
+
+    # (c) two or more pins → ambiguous; falls through to normal priority
+    # evaluation exactly as if nothing were pinned.
+    def test_two_pins_falls_through_to_normal_evaluation(self, tmp_path):
+        instruction = "Read my live repo then propose diffs to update the wiki corpus"
+        mm, _ = make_mm_with_nodes(tmp_path)
+
+        session_files.add_file("localist-software-stack.md", "# A\n", source="wiki_pin")
+        session_files.add_file("how-localist-works.md",      "# B\n", source="wiki_pin")
+        p_with_pins = Planner(runtime=make_runtime(), memory_manager=mm)
+        plan_with_pins = p_with_pins.route(instruction, context={})
+
+        session_files.clear()
+        p_without_pins = Planner(runtime=make_runtime(), memory_manager=mm)
+        plan_without_pins = p_without_pins.route(instruction, context={})
+
+        assert plan_with_pins.diff_target_source is None
+        assert plan_with_pins.agent       == plan_without_pins.agent
+        assert plan_with_pins.diff_target == plan_without_pins.diff_target
+
+    # (d) zero pins → Priority 1c's own guard is what causes pass-through
+    # (not accidental non-invocation); the existing TestPlannerP1bDiff
+    # suite above is the full byte-for-byte regression check.
+    def test_zero_pins_priority1c_returns_none(self, tmp_path):
+        mm, _ = make_mm_with_nodes(tmp_path)
+        p = Planner(runtime=make_runtime(), memory_manager=mm)
+
+        result = p._priority1c_pinned_diff(
+            "update page localist-software-stack.md to reflect the new backend",
+            "update page localist-software-stack.md to reflect the new backend",
+        )
+        assert result is None
+
+    # (e) Regression coverage for real-world phrasings that initially fell
+    # through to conversational_agent despite a page being pinned — neither
+    # matched the original five-phrase _DIFF_KEYWORDS set. "apply diffs",
+    # "apply this diff", "propose diffs", "propose a diff" were added.
+    @pytest.mark.parametrize("instruction", [
+        "Apply diffs updating my new tool route logic.",
+        "Propose diffs for the localist-runtime-tooling-update wiki file.",
+    ])
+    def test_real_world_diff_phrasings_short_circuit(self, tmp_path, instruction):
+        session_files.add_file(
+            "localist-runtime-tooling-update.md", "# Tooling\n", source="wiki_pin",
+        )
+        mm, _ = make_mm_with_nodes(tmp_path)
+        p = Planner(runtime=make_runtime(), memory_manager=mm)
+
+        plan = p.route(instruction, context={})
+
+        assert plan.agent              == "wiki_agent"
+        assert plan.diff_target        == "localist-runtime-tooling-update"
+        assert plan.diff_target_source == "pinned"
 
 
 # ---------------------------------------------------------------------------

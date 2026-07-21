@@ -6,11 +6,13 @@ cleared on backend restart. No persistence, no wiki ingestion, no embedding.
 
 Public API
 ----------
-add_file(filename, content) -> None | str
+add_file(filename, content, source="upload") -> None | str
     Add a file to the cache. Returns None on success, or an error string
     if the per-file ceiling is exceeded or the total slot budget would be
     exceeded by adding this file. Callers should surface the error string
-    to the user verbatim — it is user-readable.
+    to the user verbatim — it is user-readable. source="wiki_pin" marks a
+    file as a pinned wiki page rather than an uploaded file; prompt_builder
+    labels it "(from the vault)" in the [SESSION FILES] slot.
 
 remove_file(filename) -> bool
     Remove a named file. Returns True if removed, False if not found.
@@ -32,6 +34,7 @@ MAX_TOTAL_TOKENS   : int   20,000 tokens total across all files
 from __future__ import annotations
 
 from collections import OrderedDict
+from typing import Literal
 
 from prompt_builder import SessionFile
 
@@ -56,7 +59,8 @@ _CHARS_PER_TOKEN: int = 4   # consistent with PromptBuilder._estimate_tokens()
 # ---------------------------------------------------------------------------
 
 # OrderedDict preserves insertion order; filename is the key.
-_cache: OrderedDict[str, str] = OrderedDict()
+# Value is (content, source) — source is "upload" or "wiki_pin".
+_cache: OrderedDict[str, tuple[str, str]] = OrderedDict()
 
 
 def _estimate_tokens(text: str) -> int:
@@ -64,14 +68,18 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _total_tokens() -> int:
-    return sum(_estimate_tokens(content) for content in _cache.values())
+    return sum(_estimate_tokens(content) for content, _source in _cache.values())
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def add_file(filename: str, content: str) -> str | None:
+def add_file(
+    filename: str,
+    content: str,
+    source: Literal["upload", "wiki_pin"] = "upload",
+) -> str | None:
     """
     Add a file to the cache.
 
@@ -85,6 +93,11 @@ def add_file(filename: str, content: str) -> str | None:
 
     If a file with the same filename already exists it is replaced in-place
     (order preserved, total-budget check applied to the new content).
+
+    source distinguishes an uploaded file from a pinned wiki page — carried
+    through to SessionFile so prompt_builder can label it distinctly. It
+    does not change the rejection rules, only the per-file-too-large message
+    (a pinned page's size wasn't the user's choice, so the wording says so).
     """
     import os
     ext = os.path.splitext(filename)[1].lower()
@@ -96,6 +109,12 @@ def add_file(filename: str, content: str) -> str | None:
 
     file_tokens = _estimate_tokens(content)
     if file_tokens > MAX_FILE_TOKENS:
+        if source == "wiki_pin":
+            return (
+                f"The wiki page '{filename}' is too large to pin "
+                f"({file_tokens:,} tokens estimated; limit {MAX_FILE_TOKENS:,}). "
+                f"Try pinning a smaller page."
+            )
         return (
             f"'{filename}' is too large ({file_tokens:,} tokens estimated). "
             f"Maximum per file is {MAX_FILE_TOKENS:,} tokens "
@@ -103,7 +122,7 @@ def add_file(filename: str, content: str) -> str | None:
         )
 
     # Calculate budget excluding any existing entry for this filename
-    existing_tokens = _estimate_tokens(_cache[filename]) if filename in _cache else 0
+    existing_tokens = _estimate_tokens(_cache[filename][0]) if filename in _cache else 0
     projected_total = _total_tokens() - existing_tokens + file_tokens
     if projected_total > MAX_TOTAL_TOKENS:
         return (
@@ -112,7 +131,7 @@ def add_file(filename: str, content: str) -> str | None:
             f"Remove a file first."
         )
 
-    _cache[filename] = content
+    _cache[filename] = (content, source)
     return None
 
 
@@ -126,7 +145,10 @@ def remove_file(filename: str) -> bool:
 
 def get_files() -> list[SessionFile]:
     """Return all cached files in insertion order."""
-    return [SessionFile(filename=k, content=v) for k, v in _cache.items()]
+    return [
+        SessionFile(filename=k, content=content, source=source)
+        for k, (content, source) in _cache.items()
+    ]
 
 
 def clear() -> None:

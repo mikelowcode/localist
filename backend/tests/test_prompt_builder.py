@@ -658,3 +658,37 @@ class TestEmitStructuredWorkingMemory:
 
         surviving_count = sum(1 for i in range(len(turns)) if f"turn-{i}-" in flattened_prompt)
         assert len(working_memory_turns) == surviving_count
+
+
+class TestSlotSessionFilesSource:
+    """SessionFile.source distinguishes an uploaded file from a pinned wiki
+    page — a wiki_pin's opening label gets "(from the vault)" appended so
+    the model can cite it distinctly, per LORA's honor-code citation style."""
+
+    def _pb(self) -> PromptBuilder:
+        return PromptBuilder()
+
+    def test_wiki_pin_label_says_from_the_vault(self):
+        pb = self._pb()
+        result = pb._slot_session_files(
+            [SessionFile("localist-software-stack.md", "content", source="wiki_pin")]
+        )
+        assert "--- localist-software-stack.md (from the vault) ---" in result
+        assert "--- end localist-software-stack.md ---" in result
+
+    def test_default_upload_source_has_no_vault_label(self):
+        pb = self._pb()
+        result = pb._slot_session_files(
+            [SessionFile("notes.md", "content")]
+        )
+        assert "--- notes.md ---" in result
+        assert "from the vault" not in result
+
+    def test_mixed_sources_only_label_the_pin(self):
+        pb = self._pb()
+        result = pb._slot_session_files([
+            SessionFile("notes.md", "a"),
+            SessionFile("lora-persona.md", "b", source="wiki_pin"),
+        ])
+        assert "--- notes.md ---" in result
+        assert "--- lora-persona.md (from the vault) ---" in result

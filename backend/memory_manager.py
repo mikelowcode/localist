@@ -142,6 +142,7 @@ from typing import Any, Callable
 
 import content_safety
 import wiki_maintenance_log
+from wiki_doc import META_WIKI_FILENAMES
 
 logger = logging.getLogger(__name__)
 
@@ -1725,6 +1726,7 @@ class MemoryManager:
         doc_type:  str,
         embed:     bool = True,
         extensions: set[str] = frozenset({".md", ".txt"}),
+        exclude:   frozenset[str] = frozenset(),
     ) -> int:
         """
         Bulk-index all matching files in a directory.
@@ -1744,6 +1746,11 @@ class MemoryManager:
             import of a large directory and run a separate embed pass later.
         extensions :
             File extensions to include.
+        exclude :
+            Filenames (e.g. wiki_doc.META_WIKI_FILENAMES) to skip
+            regardless of extension — structural/generated files that
+            should never become a RAG-eligible document_index row.
+            Defaults to empty, so existing callers (raw_dir) are unaffected.
         """
         directory = Path(directory).resolve()
         if not directory.exists():
@@ -1752,7 +1759,7 @@ class MemoryManager:
 
         count = 0
         for p in sorted(directory.iterdir()):
-            if p.is_file() and p.suffix.lower() in extensions:
+            if p.is_file() and p.suffix.lower() in extensions and p.name not in exclude:
                 try:
                     content = p.read_text(encoding="utf-8")
                 except Exception as exc:
@@ -1809,7 +1816,9 @@ class MemoryManager:
             orphans_removed : int
             orphan_names    : list[str]
         """
-        reindexed = self.index_directory(wiki_dir, doc_type="wiki", embed=True)
+        reindexed = self.index_directory(
+            wiki_dir, doc_type="wiki", embed=True, exclude=META_WIKI_FILENAMES,
+        )
 
         orphan_names: list[str] = []
         for doc in self.get_all_documents(doc_type="wiki"):

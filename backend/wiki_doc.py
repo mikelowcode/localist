@@ -31,6 +31,15 @@ class ParsedWikiDoc:
 
 _LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
+# Structural/generated files that live in wiki_dir alongside real content
+# pages but must never be treated as one: not indexed into the RAG corpus,
+# not a graph node / resolve_graph_target() candidate stem, not shown to
+# the model as "EXISTING WIKI PAGES" context, not offered as a pinnable
+# page in the UI. index.md/logs.md are themselves generated from this
+# exclusion set (see WikiAgent._regenerate_index_md()/_append_logs_md());
+# MEMORY.md is EpisodicMemoryWriter's rendered output (memory_manager.py).
+META_WIKI_FILENAMES: frozenset[str] = frozenset({"index.md", "logs.md", "MEMORY.md"})
+
 
 def parse_wiki_doc(content: str) -> ParsedWikiDoc:
     """Parse already-loaded markdown text. Pure function, no I/O."""

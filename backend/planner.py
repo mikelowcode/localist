@@ -32,6 +32,12 @@ from mcp_tool_dispatcher import (
     _derive_file_op_path,
 )
 
+# Process-global ephemeral session file cache — read-only here, to detect a
+# pinned wiki page for Priority 1c. Same direct-import pattern used by
+# controller_agent.py/conversational_agent.py; session_files is a module-
+# level cache, not a per-request dependency, so no constructor plumbing.
+import session_files as _session_files
+
 if TYPE_CHECKING:
     from memory_manager import MemoryManager
 
@@ -122,6 +128,13 @@ class RoutingPlan:
         (that case routes to conversational_agent for clarification
         instead — see Planner._priority1b_diff()). ControllerAgent wires
         this into the wiki_agent SubTask.context as "diff_target".
+    diff_target_source :
+        None for every existing diff_target-producing path (including
+        Priority 1b's keyword+resolve_graph_target() pipeline — left
+        unset there deliberately, so P1b's construction is unchanged).
+        "pinned" when Priority 1c's short-circuit set diff_target
+        directly from a single wiki-pinned SessionFile, skipping
+        resolve_graph_target() entirely — see Planner._priority1c_pinned_diff().
     """
     agent:          str
     fetch_episodic: bool
@@ -137,6 +150,7 @@ class RoutingPlan:
     file_op_path:     str | None = None
     file_op_action:   str | None = None
     diff_target:      str | None = None
+    diff_target_source: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +176,10 @@ _DIFF_KEYWORDS: frozenset[str] = frozenset({
     "revise page",
     "modify page",
     "apply a diff to",
+    "apply diffs",
+    "apply this diff",
+    "propose diffs",
+    "propose a diff",
 })
 
 # Longest-first ordering for lead-phrase stripping in extract_diff_query(),
@@ -1140,6 +1158,13 @@ class Planner:
         if plan is not None:
             return plan
 
+        # Priority 1c — Pinned-wiki-page diff short-circuit (must run before
+        # P1b: broader keyword match + pin-resolved target takes precedence
+        # over P1b's stricter lead-phrase + stem-resolution path)
+        plan = self._priority1c_pinned_diff(instruction, lowered)
+        if plan is not None:
+            return plan
+
         # Priority 1b — Diff-only wiki update (must run before Priority 2 so
         # both "write to storage" intents — ingest and diff — stay
         # deterministic and ahead of memory commands; only reached when
@@ -1232,6 +1257,69 @@ class Planner:
                 priority       = 1,
             )
         return None
+
+    # -----------------------------------------------------------------------
+    # Priority 1c — Pinned-wiki-page diff short-circuit
+    # -----------------------------------------------------------------------
+
+    def _priority1c_pinned_diff(
+        self,
+        instruction: str,
+        lowered:     str,
+    ) -> RoutingPlan | None:
+        """
+        Priority 1c — pinned-wiki-page diff short-circuit. Fires only when
+        exactly one wiki-pinned SessionFile is currently attached: the pin
+        has already disambiguated the target, so target-name extraction and
+        resolve_graph_target() are skipped entirely. Broader diff-keyword
+        match than P1b (substring anywhere, not a leading phrase) since no
+        remainder needs to be parsed out — see _DIFF_KEYWORDS.
+
+        Also folds in any Priority 3 tool signal (_priority3_tool()) present
+        in the same instruction, so "fetch this URL and update the pinned
+        page to reflect it" dispatches the tool and carries diff_target
+        alongside tools_to_call on one compound RoutingPlan.
+
+        Returns None (falls through to normal priority evaluation,
+        including P1b unchanged) when: zero or 2+ wiki pins are attached, or
+        no _DIFF_KEYWORDS substring is present in the instruction.
+        """
+        pinned = [
+            f for f in _session_files.get_files() if f.source == "wiki_pin"
+        ]
+        if len(pinned) != 1:
+            return None
+
+        if not any(kw in lowered for kw in _DIFF_KEYWORDS):
+            return None
+
+        stem = pinned[0].filename.removesuffix(".md")
+
+        tool_plan = self._priority3_tool(lowered, instruction)
+        tools_to_call      = tool_plan.tools_to_call      if tool_plan else []
+        tool_signal_source = tool_plan.tool_signal_source if tool_plan else None
+        file_op_deferred   = tool_plan.file_op_deferred   if tool_plan else False
+        file_op_path       = tool_plan.file_op_path       if tool_plan else None
+        file_op_action     = tool_plan.file_op_action     if tool_plan else None
+
+        logger.debug(
+            "Planner: Priority 1c matched — diff_target=%r (pinned; tools=%s).",
+            stem, tools_to_call,
+        )
+        return RoutingPlan(
+            agent              = "wiki_agent",
+            fetch_episodic     = False,
+            fetch_rag          = False,
+            priority           = 1,
+            diff_target        = stem,
+            diff_target_source = "pinned",
+            tools_to_call      = tools_to_call,
+            compound           = bool(tools_to_call) or file_op_deferred,
+            tool_signal_source = tool_signal_source,
+            file_op_deferred   = file_op_deferred,
+            file_op_path       = file_op_path,
+            file_op_action     = file_op_action,
+        )
 
     # -----------------------------------------------------------------------
     # Priority 1b — Diff-only wiki update

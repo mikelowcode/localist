@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from wiki_doc import WikiLink, ParsedWikiDoc, parse_wiki_doc, load_wiki_doc
+from wiki_doc import WikiLink, ParsedWikiDoc, META_WIKI_FILENAMES, parse_wiki_doc, load_wiki_doc
 
 
 # ---------------------------------------------------------------------------
@@ -354,3 +354,12 @@ def test_standard_fence_at_line_zero_unaffected_by_fix():
     assert result.frontmatter["title"] == "Localist Build Order"
     assert not result.body.startswith("---")
     assert "title:" not in result.body
+
+
+# ---------------------------------------------------------------------------
+# Test 14 — META_WIKI_FILENAMES (OKF alignment — structural/generated files
+# excluded from indexing, graph nodes, and model-visible wiki context)
+# ---------------------------------------------------------------------------
+
+def test_meta_wiki_filenames_contains_expected_names():
+    assert META_WIKI_FILENAMES == frozenset({"index.md", "logs.md", "MEMORY.md"})

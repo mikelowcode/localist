@@ -29,15 +29,16 @@ New module `backend/session_files.py`. Public API:
 
 | Function | Signature | Behaviour |
 |---|---|---|
-| `add_file` | `(filename, content) -> str \| None` | Returns `None` on success; user-readable error string on rejection. Three rejection conditions checked in order: extension not allowlisted, content exceeds `MAX_FILE_TOKENS` (4,000), adding file would exceed `MAX_TOTAL_TOKENS` (20,000). Same-filename re-upload replaces in-place with budget re-check. |
-| `remove_file` | `(filename) -> bool` | Returns `True` if removed, `False` if not found. |
-| `get_files` | `() -> list[SessionFile]` | Returns all cached files in insertion order. Returns `[]` when cache is empty. |
+| `add_file` | `(filename, content, source="upload") -> str \| None` | Returns `None` on success; user-readable error string on rejection. Three rejection conditions checked in order: extension not allowlisted, content exceeds `MAX_FILE_TOKENS` (4,000), adding file would exceed `MAX_TOTAL_TOKENS` (20,000). Same-filename re-upload replaces in-place with budget re-check. `source="wiki_pin"` (added 2026-07-21, see §11.8) marks a pinned wiki page rather than an uploaded file — same budget rules, but the per-file-too-large message says "too large to pin" instead of "is too large", since the user didn't choose the page's size. |
+| `remove_file` | `(filename) -> bool` | Returns `True` if removed, `False` if not found. Used for both uploads and wiki pins — a pin is cached under `filename = f"{stem}.md"` like any other entry, so no separate unpin path exists. |
+| `get_files` | `() -> list[SessionFile]` | Returns all cached files in insertion order, each carrying its `source`. Returns `[]` when cache is empty. |
 | `clear` | `() -> None` | Removes all cached files. Intended for future "clear chat" affordance. |
 
-**Internal structure:** `OrderedDict[str, str]` (filename → content). Insertion
-order preserved for deterministic prompt assembly. Module-level (process-lifetime).
-No threading locks required — FastAPI's async model serialises access in practice
-for this single-user local deployment.
+**Internal structure:** `OrderedDict[str, tuple[str, str]]` (filename →
+`(content, source)`). Insertion order preserved for deterministic prompt
+assembly. Module-level (process-lifetime). No threading locks required —
+FastAPI's async model serialises access in practice for this single-user
+local deployment.
 
 **Token estimation:** `len(content) // 4` — identical to `PromptBuilder._estimate_tokens()`.
 
@@ -50,7 +51,8 @@ forwarding):
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/chat/files` | Upload a file. Reads bytes, decodes UTF-8 (422 on failure), calls `session_files.add_file()`. Returns `{filename, token_estimate}` on success; 400 + readable `detail` on rejection. |
-| `DELETE` | `/chat/files/{filename}` | Remove a file by name. Returns `{removed: true}` on success; 404 if not found. |
+| `DELETE` | `/chat/files/{filename}` | Remove a file by name. Returns `{removed: true}` on success; 404 if not found. Also used to unpin a wiki page — see §11.8. |
+| `POST` | `/chat/pin-wiki-page` | Added 2026-07-21 (§11.8). Pins an existing wiki page by `{stem}` into the same cache. Returns `{filename, token_estimate, source: "wiki_pin"}` on success; 404 if no `{stem}.md` exists on disk; 400 + readable `detail` on budget rejection; 503 if `wiki_dir` isn't configured. |
 
 **Proxy convention note (2026-06-30):** The initial implementation registered
 these routes as `/api/chat/files` — breaking the existing convention and causing
@@ -151,11 +153,56 @@ automation/profiling tool (no `chromium-cli`, no Playwright) in this environment
 Full diagnostic detail, ranked candidate causes with confidence levels, and the
 two mitigations: see `sessions-log.md` §20 (2026-07-06).
 
-### 11.7 Test Suite
+### 11.8 Wiki Page Pinning (2026-07-21)
 
-Test suite at feature completion: **445 tests, 0 failures.**
-No new test files were added for this feature. The `SessionFile` dataclass and
-`_slot_session_files()` builder are covered by the smoke test run during Prompt 1
-implementation (throwaway script, not committed). A permanent test class for
-`session_files.py` and the new `PromptBuilder` slot is a future addition.
+Extends the attachment picker so a user can pin an existing wiki page — not
+just an uploaded local file — into the session file cache. The motivating
+case: when asking LORA to propose a diff against a specific wiki page, the
+user can pin that exact page first so the model gets the real current file
+content instead of guessing or being asked to paste it in. (This also
+supplies the `source` tag a planned Planner P1b enhancement depends on, to
+short-circuit diff-target resolution when a page is already pinned.)
+
+**No new listing endpoint.** `GET /files/wiki` (already existed for the
+Sidebar's file browser) returns `FileEntry{name, filename, path, size,
+modified, type}` for every `.md` file in `wiki_dir` — sufficient for the
+picker (`name` is the stem). The frontend reuses the existing
+`loadWikiFiles()` / `wikiFiles` store (`localist-ui/src/lib/stores/files.ts`)
+directly rather than adding a parallel fetch path.
+
+**Pin validates against disk, not the graph index.** `POST
+/chat/pin-wiki-page` checks `wiki_dir / f"{stem}.md"` exists directly,
+rather than resolving against `MemoryManager.list_graph_node_stems()` (used
+by Planner P1b/P3c for free-text stem resolution). The graph index is only
+rebuilt on an explicit trigger and can lag behind real files on disk —
+pinning must not fail just because the graph hasn't caught up.
+
+**`SessionFile.source` field** (`prompt_builder.py`): `Literal["upload",
+"wiki_pin"]`, defaulting to `"upload"` so all existing callers are
+unaffected. `_slot_session_files()` renders a `wiki_pin` entry's opening
+label as `--- {filename} (from the vault) ---` instead of the plain
+`--- {filename} ---` used for uploads, so the model can cite a pinned page
+distinctly per LORA's honor-code citation style.
+
+**UI (`ChatPanel.svelte`):** A second small icon button sits beside the
+paper-clip (unchanged) — a bookmark icon that opens a lightweight popover
+listing `$wikiFiles`. Selecting a page calls `POST /chat/pin-wiki-page`
+and pushes the result into the same `attachedFiles` array uploads use; the
+resulting pill swaps its icon (bookmark vs. paperclip) based on `source` but
+is otherwise identical, including reusing `removeAttachedFile()` unchanged
+for unpinning. No tab strip or unified two-source modal — a second trigger
+button was chosen over restructuring the paper-clip's existing
+one-click-to-Finder flow.
+
+### 11.9 Test Suite
+
+Test suite at feature completion: **958 tests, 0 failures**, up from 445 at
+§11.7's writing (unrelated feature work landed in between) plus new coverage
+added for wiki-page pinning: `tests/test_session_files.py` (new — direct
+`add_file()`/`get_files()` coverage for the `source` parameter, both
+defaulted and `wiki_pin`, including the pin-specific oversized-page message),
+`tests/test_chat_pin_wiki_page.py` (new — `POST /chat/pin-wiki-page` success,
+404, 400, 503, and validation cases), and a new `TestSlotSessionFilesSource`
+class in `tests/test_prompt_builder.py` covering the "(from the vault)"
+labeling.
 

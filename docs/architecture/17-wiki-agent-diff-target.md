@@ -260,3 +260,89 @@ the pre-verification content).
 **Test suite:** 578 → 653 passed, 0 failed, across four incremental sessions (snapshot + sweep
 core; success-logging + TTL env override; audit-log parity for prune-on-write). No existing test
 modified or removed at any step.
+
+### 17.10 Priority 1c — Pinned-Wiki-Page Diff Short-Circuit — Added 2026-07-21
+
+Builds on §11.8's wiki-page pinning (a `SessionFile` can carry
+`source == "wiki_pin"`, populated via `POST /chat/pin-wiki-page`). Two gaps
+in Priority 1b (§17.3) motivated this: (1) `extract_diff_query()`'s
+`startswith()` lead-phrase requirement means an instruction like "Read my
+live repo then propose diffs to update the wiki corpus" never matches P1b at
+all, since the diff phrase isn't at the start; (2) even when a lead phrase
+does match, if the extracted remainder doesn't resolve against
+`list_graph_node_stems()`, P1b bounces the user to `conversational_agent` for
+clarification — friction that shouldn't exist when the user has already
+pinned the exact page they mean.
+
+**New tier, `Planner._priority1c_pinned_diff()`**, evaluated between P1
+(ingest) and P1b in `_route_impl()`. Fires only when exactly one
+`wiki_pin`-sourced `SessionFile` is currently attached (checked via a direct
+`import session_files as _session_files` in `planner.py`, mirroring the same
+pattern already used by `controller_agent.py`/`conversational_agent.py` — no
+constructor plumbing needed, since `session_files` is a process-global
+cache, not a per-request dependency) and `_DIFF_KEYWORDS` matches anywhere in
+the instruction (substring `in` check, not the lead-phrase `startswith()`
+P1b uses — no remainder needs to be parsed out, since the pin already
+disambiguates the target). Zero or 2+ pins → returns `None`, falling through
+to P1b unchanged (P1b itself received zero code changes).
+
+On match: `diff_target` is set directly from the pinned file's stem
+(`Path(sf.filename).stem`, since a pin is always cached as `"{stem}.md"`),
+skipping `resolve_graph_target()` entirely. `RoutingPlan` gains
+`diff_target_source: str | None = None` — left `None` by every existing
+path (including P1b), set to `"pinned"` only by this new tier, for
+observability parity with the existing `tool_signal_source` attribution
+field.
+
+**Compound tool dispatch.** P1c also calls `self._priority3_tool(lowered,
+instruction)` directly (reusing P3's full tool-signal detection — url_fetch,
+web_search, file_op, deferred file_op — rather than duplicating any keyword
+logic) and folds whatever it finds into the same `RoutingPlan` alongside
+`diff_target`, so "fetch this URL and update the pinned page to reflect it"
+produces one plan carrying both `diff_target` and `tools_to_call`. This is a
+compound shape no existing priority tier produced for the diff path before
+(`_detect_compound()`, §4.5, only ever pairs ingest with web_search).
+
+**New plumbing to make the tool result actually reach the model.**
+`WikiAgent` builds its diff-only prompt entirely internally and never reads
+`_prebuilt_prompt`/`_prebuilt_system` — the mechanism every other agent uses
+to see tool output. (This gap already existed for the ingest+web_search
+compound path too, pre-dating this change; left unfixed there, out of
+scope.) Fixed only for the diff-only path: `ControllerAgent._execute_plan()`
+now writes a `subtask_context["tool_context"]` key — the joined `.result`
+text of every successful dispatched tool call — right alongside the
+existing `diff_target` wiring, only when non-empty (no empty-string key
+clutter when a tool fails or nothing was dispatched).
+`WikiAgent._run_diff_only()` reads `ctx.get("tool_context")` and passes it to
+`build_diff_prompt()`, which — when present — splices a `# FETCHED CONTEXT`
+section between the target page's content and the task instructions.
+Omitted entirely (byte-for-byte identical output) when `tool_context` is
+`None`.
+
+**Test suite:** 958 → 967 passed, 0 failed. New coverage:
+`test_planner_phase3.py::TestPlannerP1cPinnedDiff` (keyword-anywhere
+short-circuit, tool-need compound routing, 2+ pins falls through unaffected,
+0 pins confirmed via the tier's own guard), `test_controller_phase4.py::
+TestPinnedDiffToolContextWiring` (`tool_context` wired on success, absent
+when no successful tool result exists), and
+`test_wiki_agent.py`'s diff-only section (`build_diff_prompt()`'s
+`# FETCHED CONTEXT` section present/absent, and an end-to-end
+`_run_diff_only()` case confirming the fetched text reaches the actual
+model-facing prompt via a capturing runtime fake).
+
+**Follow-up fix, same day — `_DIFF_KEYWORDS` coverage gap.** First live use
+surfaced that P1c's own guard (exactly one pin + a `_DIFF_KEYWORDS`
+substring) still failed to fire on two real follow-up phrasings — "Apply
+diffs updating my new tool route logic." and "Propose diffs for the
+localist-runtime-tooling-update wiki file." — despite a page being
+unambiguously pinned. Neither matched the original five-phrase set (`"update
+the wiki"`, `"update page"`, `"revise page"`, `"modify page"`, `"apply a
+diff to"`); both requests fell all the way through to Priority 6
+(conversational fallback), confirmed via the debug trail
+(`Priority 3 — gate_fired=False` → `Priority 4 — corpus miss` → `Priority 5
+— no episodic keyword matched` → `Priority 6 — direct answer fallback`).
+Fixed by adding `"apply diffs"`, `"apply this diff"`, `"propose diffs"`,
+`"propose a diff"` to `_DIFF_KEYWORDS` — shared by both P1b and P1c since
+both consume the same frozenset, so P1b's lead-phrase matching gains the
+same coverage. Regression tests added for both exact phrasings.
+**Test suite: 967 → 969 passed, 0 failed.**

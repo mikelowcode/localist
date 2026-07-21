@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +50,7 @@ class RagSource:
 class SessionFile:
     filename: str   # original filename, used as the label in the slot
     content:  str   # full extracted text; truncation enforced at render-time in slot builder
+    source:   Literal["upload", "wiki_pin"] = "upload"
 
 
 @dataclass
@@ -271,6 +272,10 @@ class PromptBuilder:
             {content}
             --- end filename.ext ---
 
+        Files with source == "wiki_pin" get "(from the vault)" appended to
+        the opening label only, so the model can distinguish a pinned wiki
+        page from an ad hoc upload for citation purposes.
+
         Multiple files are separated by a single blank line.
         Truncation appends the standard '… [truncated]' marker via
         _truncate_to_tokens(), consistent with all other slot builders.
@@ -283,7 +288,8 @@ class PromptBuilder:
 
         for f in files:
             truncated = self._truncate_to_tokens(f.content, self._CEIL_SESSION_FILES_EACH)
-            block = f"--- {f.filename} ---\n{truncated}\n--- end {f.filename} ---"
+            label = f"{f.filename} (from the vault)" if f.source == "wiki_pin" else f.filename
+            block = f"--- {label} ---\n{truncated}\n--- end {f.filename} ---"
             block_tokens = self._estimate_tokens(block)
             if total_tokens + block_tokens > self._CEIL_SESSION_FILES_TOTAL:
                 break

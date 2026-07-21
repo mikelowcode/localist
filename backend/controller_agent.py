@@ -1693,6 +1693,17 @@ class ControllerAgent:
             # because the frontend/original request never carries this key
             # — only the Planner's graph-stem resolution produces it.
             subtask_context["diff_target"] = plan.diff_target
+            tool_context = "\n\n".join(
+                r.result for r in dispatched_tool_results if r.success
+            )
+            if tool_context:
+                # Surface dispatched tool output (e.g. a fetched URL's
+                # cleaned text) to WikiAgent's diff-only prompt — unlike
+                # every other agent, WikiAgent builds its own prompt
+                # internally and never reads _prebuilt_prompt/_prebuilt_system,
+                # so tool results need a dedicated context key on this path
+                # (see Planner._priority1c_pinned_diff()).
+                subtask_context["tool_context"] = tool_context
 
         subtask = SubTask(
             subtask_id  = f"{task.task_id}-0",
