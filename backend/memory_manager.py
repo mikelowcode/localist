@@ -150,7 +150,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION   = 9          # increment when schema changes require migration
+_SCHEMA_VERSION   = 10         # increment when schema changes require migration
 _EMBEDDING_DIM    = 768        # EmbeddingGemma-300M-4bit output dimension
 _EMBEDDING_FORMAT = ">768f"    # big-endian float32 × 768
 
@@ -591,6 +591,22 @@ class MemoryManager:
                             id              INTEGER PRIMARY KEY CHECK (id = 1),
                             eviction_preset TEXT
                         );
+
+                        CREATE TABLE IF NOT EXISTS news_preferences (
+                            id              INTEGER PRIMARY KEY CHECK (id = 1),
+                            home_country    TEXT    NOT NULL DEFAULT 'us',
+                            local_query     TEXT,
+                            topics_json     TEXT    NOT NULL DEFAULT '[]',
+                            updated_at      REAL    NOT NULL
+                        );
+
+                        CREATE TABLE IF NOT EXISTS news_brief_cache (
+                            id              INTEGER PRIMARY KEY CHECK (id = 1),
+                            brief_date      TEXT    NOT NULL,
+                            content_json    TEXT    NOT NULL,
+                            conversation_id TEXT,
+                            generated_at    REAL    NOT NULL
+                        );
                     """)
 
                     conn.execute(
@@ -626,6 +642,33 @@ class MemoryManager:
                     )
                     conn.execute("ALTER TABLE chat_turns ADD COLUMN embedding BLOB;")
                     conn.commit()
+
+                # Same self-heal, same rationale, for news_preferences/
+                # news_brief_cache (schema v10, docs/daily-news-brief-plan.md
+                # §4) — hit live during this feature's own build (2026-07-22):
+                # a `--reload` cycle landed mid-edit between the
+                # _SCHEMA_VERSION bump and the matching `_migrate()` block,
+                # stamping schema_version=10 on a real dev DB before the
+                # CREATE TABLEs had actually landed in the file. CREATE TABLE
+                # IF NOT EXISTS is a cheap no-op on a healthy DB.
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS news_preferences (
+                        id              INTEGER PRIMARY KEY CHECK (id = 1),
+                        home_country    TEXT    NOT NULL DEFAULT 'us',
+                        local_query     TEXT,
+                        topics_json     TEXT    NOT NULL DEFAULT '[]',
+                        updated_at      REAL    NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS news_brief_cache (
+                        id              INTEGER PRIMARY KEY CHECK (id = 1),
+                        brief_date      TEXT    NOT NULL,
+                        content_json    TEXT    NOT NULL,
+                        conversation_id TEXT,
+                        generated_at    REAL    NOT NULL
+                    );
+                """)
+                conn.commit()
 
             finally:
                 conn.close()
@@ -801,6 +844,29 @@ class MemoryManager:
                 conn.executescript(
                     "ALTER TABLE chat_turns ADD COLUMN embedding BLOB;"
                 )
+
+        if from_version < 10:
+            logger.info(
+                "Applying migration v9→v10: creating news_preferences and "
+                "news_brief_cache tables."
+            )
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS news_preferences (
+                    id              INTEGER PRIMARY KEY CHECK (id = 1),
+                    home_country    TEXT    NOT NULL DEFAULT 'us',
+                    local_query     TEXT,
+                    topics_json     TEXT    NOT NULL DEFAULT '[]',
+                    updated_at      REAL    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS news_brief_cache (
+                    id              INTEGER PRIMARY KEY CHECK (id = 1),
+                    brief_date      TEXT    NOT NULL,
+                    content_json    TEXT    NOT NULL,
+                    conversation_id TEXT,
+                    generated_at    REAL    NOT NULL
+                );
+            """)
 
         conn.execute(
             "UPDATE schema_version SET version = ?", (_SCHEMA_VERSION,)
@@ -1934,6 +2000,150 @@ class MemoryManager:
                 )
                 conn.commit()
                 logger.info("set_chat_history_eviction_preset: preset=%r.", preset)
+            finally:
+                conn.close()
+
+    # -----------------------------------------------------------------------
+    # Daily News Brief — preferences and same-day cache
+    # (docs/daily-news-brief-plan.md §4/§5/§6)
+    # -----------------------------------------------------------------------
+
+    def get_news_preferences(self) -> dict[str, Any] | None:
+        """
+        Read the current news_preferences row.
+
+        Returns None when no row exists yet (the user has never set
+        preferences) — the caller (main.py's GET /news/preferences)
+        supplies defaults in that case, same posture as
+        get_chat_history_eviction_preset().
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT home_country, local_query, topics_json "
+                "FROM news_preferences WHERE id = 1"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if row is None:
+            return None
+        return {
+            "home_country": row["home_country"],
+            "local_query":  row["local_query"],
+            "topics":       json.loads(row["topics_json"]),
+        }
+
+    def set_news_preferences(
+        self,
+        home_country: str,
+        local_query:  str | None,
+        topics:       list[str],
+    ) -> None:
+        """
+        Insert or update news_preferences (row id=1).
+
+        Parameters
+        ----------
+        topics :
+            Must have exactly 3 entries. Validating each entry against the
+            actual topic pool (docs/daily-news-brief-plan.md §3) is the
+            caller's responsibility — this method only enforces shape;
+            `news_brief.py`'s `NEWS_TOPIC_POOL` is the domain constant that
+            owns which keys are actually valid, checked at the API layer
+            (main.py's `PUT /news/preferences`), not here.
+
+        Raises
+        ------
+        ValueError
+            If `topics` does not have exactly 3 entries.
+        """
+        if len(topics) != 3:
+            raise ValueError(f"topics must have exactly 3 entries, got {len(topics)}")
+
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO news_preferences
+                        (id, home_country, local_query, topics_json, updated_at)
+                    VALUES (1, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        home_country = excluded.home_country,
+                        local_query  = excluded.local_query,
+                        topics_json  = excluded.topics_json,
+                        updated_at   = excluded.updated_at
+                    """,
+                    (home_country, local_query, json.dumps(topics), now),
+                )
+                conn.commit()
+                logger.info(
+                    "set_news_preferences: home_country=%r local_query=%r topics=%r.",
+                    home_country, local_query, topics,
+                )
+            finally:
+                conn.close()
+
+    def get_news_brief_cache(self) -> dict[str, Any] | None:
+        """
+        Read the current news_brief_cache row.
+
+        Returns None when no brief has ever been generated. There is only
+        ever one row — a same-day cache, not a history of past briefs (a
+        new generation overwrites it via set_news_brief_cache()).
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT brief_date, content_json, conversation_id, generated_at "
+                "FROM news_brief_cache WHERE id = 1"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if row is None:
+            return None
+        return {
+            "brief_date":      row["brief_date"],
+            "content":         json.loads(row["content_json"]),
+            "conversation_id": row["conversation_id"],
+            "generated_at":    row["generated_at"],
+        }
+
+    def set_news_brief_cache(
+        self,
+        brief_date:      str,
+        content:         dict[str, Any],
+        conversation_id: str,
+    ) -> None:
+        """
+        Insert or update news_brief_cache (row id=1) after a fresh
+        generation. Always overwrites the whole row — see get_news_brief_cache().
+        """
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO news_brief_cache
+                        (id, brief_date, content_json, conversation_id, generated_at)
+                    VALUES (1, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        brief_date      = excluded.brief_date,
+                        content_json    = excluded.content_json,
+                        conversation_id = excluded.conversation_id,
+                        generated_at    = excluded.generated_at
+                    """,
+                    (brief_date, json.dumps(content), conversation_id, now),
+                )
+                conn.commit()
+                logger.info(
+                    "set_news_brief_cache: brief_date=%r conversation_id=%r.",
+                    brief_date, conversation_id,
+                )
             finally:
                 conn.close()
 

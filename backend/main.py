@@ -146,6 +146,7 @@ from controller_agent import ControllerAgent, TaskStatus, _MEMORY_MD_PATH
 from conversational_agent import ConversationalAgent
 from embedding_engine import EmbeddingEngine
 from memory_manager import MemoryManager, EpisodicMemoryWriter
+import news_brief
 from runtime_factory import available_backends, create_runtime
 import session_files
 import wiki_maintenance_log
@@ -896,6 +897,69 @@ class FileDeleteResponse(BaseModel):
     """Response body for DELETE /files."""
     path:    str
     deleted: bool
+
+
+class NewsPreferencesResponse(BaseModel):
+    """Response body for GET/PUT /news/preferences."""
+    home_country: str
+    local_query:  str | None = None
+    topics:       list[str]      = Field(default_factory=list)
+    topic_pool:   dict[str, str] = Field(default_factory=dict)  # key -> display label
+
+
+class NewsPreferencesRequest(BaseModel):
+    """Payload accepted by PUT /news/preferences."""
+    home_country: str = Field(min_length=2, max_length=2)
+    local_query:  str | None = None
+    topics:       list[str]
+
+
+class NewsBriefSection(BaseModel):
+    """One section (World/National/Local, or one topic) of a Daily News Brief."""
+    key:      str
+    label:    str
+    articles: list[dict[str, Any]] = Field(default_factory=list)
+    error:    str | None = None
+
+
+class NewsBriefPreviewResponse(BaseModel):
+    """
+    Response body for GET /news/brief/preview.
+
+    Read-only — never triggers a NewsAPI call. `available=False` means no
+    brief has been generated yet today (either never generated, or the
+    cached one is from a previous day).
+    """
+    available:  bool
+    brief_date: str | None = None
+    sections:   list[NewsBriefSection] = Field(default_factory=list)
+
+
+class NewsBriefOpenResponse(BaseModel):
+    """
+    Response body for POST /news/brief/open.
+
+    `generated=False` means today's brief already existed and this just
+    returned its existing conversation_id (no new NewsAPI calls, no new
+    chat_turns rows) — the "press the button again" reopen path.
+    """
+    conversation_id: str
+    generated:       bool
+
+
+class NewsBriefOpenRequest(BaseModel):
+    """
+    Payload accepted by POST /news/brief/open.
+
+    session_id : the frontend's per-page-load session id (tasks.ts'
+        SESSION_ID) — the same key ControllerAgent._memory_key() groups
+        working-memory continuity by (conversation_log, NOT chat_turns;
+        see main.py's post_news_brief_open docstring). Optional so the
+        endpoint still degrades gracefully (chat_turns/history still work)
+        if ever called without one, but a follow-up question in the same
+        browser session won't have the brief in working memory in that case.
+    """
+    session_id: str | None = None
 
 
 class ChatHistorySettingsResponse(BaseModel):
@@ -2090,6 +2154,183 @@ async def put_chat_history_settings(
     await asyncio.to_thread(mm.set_chat_history_eviction_preset, request.eviction_preset)
     preset = await asyncio.to_thread(mm.get_chat_history_eviction_preset)
     return ChatHistorySettingsResponse(eviction_preset=preset)
+
+
+# ---------------------------------------------------------------------------
+# Daily News Brief  (docs/daily-news-brief-plan.md)
+# ---------------------------------------------------------------------------
+
+def _today_str() -> str:
+    """Local calendar date, 'YYYY-MM-DD' — same local-time convention the
+    [CURRENT DATETIME] prompt slot uses (prompt_builder.py), not UTC."""
+    return datetime.datetime.now().astimezone().date().isoformat()
+
+
+@app.get(
+    "/news/preferences",
+    response_model = NewsPreferencesResponse,
+    summary        = "Read Daily News Brief preferences",
+)
+async def get_news_preferences() -> NewsPreferencesResponse:
+    """Return current preferences, or defaults if the user has never set any."""
+    mm = _require_memory_manager()
+    prefs = await asyncio.to_thread(mm.get_news_preferences)
+    if prefs is None:
+        prefs = {"home_country": "us", "local_query": None, "topics": []}
+    return NewsPreferencesResponse(
+        home_country = prefs["home_country"],
+        local_query  = prefs["local_query"],
+        topics       = prefs["topics"],
+        topic_pool   = news_brief.NEWS_TOPIC_LABELS,
+    )
+
+
+@app.put(
+    "/news/preferences",
+    response_model = NewsPreferencesResponse,
+    summary        = "Set Daily News Brief preferences",
+)
+async def put_news_preferences(request: NewsPreferencesRequest) -> NewsPreferencesResponse:
+    """
+    Set home_country/local_query/topics. Does not touch an already-cached
+    brief — changes take effect on the next generation (§4/§5).
+    """
+    mm = _require_memory_manager()
+
+    if len(request.topics) != 3:
+        raise HTTPException(
+            status_code=422, detail="topics must have exactly 3 entries."
+        )
+    invalid = [t for t in request.topics if t not in news_brief.NEWS_TOPIC_POOL]
+    if invalid:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown topic key(s): {invalid}. "
+                   f"Valid: {sorted(news_brief.NEWS_TOPIC_POOL)}",
+        )
+
+    await asyncio.to_thread(
+        mm.set_news_preferences,
+        request.home_country.lower(), request.local_query, request.topics,
+    )
+    prefs = await asyncio.to_thread(mm.get_news_preferences)
+    return NewsPreferencesResponse(
+        home_country = prefs["home_country"],
+        local_query  = prefs["local_query"],
+        topics       = prefs["topics"],
+        topic_pool   = news_brief.NEWS_TOPIC_LABELS,
+    )
+
+
+@app.get(
+    "/news/brief/preview",
+    response_model = NewsBriefPreviewResponse,
+    summary        = "Read today's cached Daily News Brief, if any",
+)
+async def get_news_brief_preview() -> NewsBriefPreviewResponse:
+    """
+    Read-only, for the header button's hover popover. Never calls NewsAPI —
+    only ever reads news_brief_cache (docs/daily-news-brief-plan.md §6).
+    """
+    mm = _require_memory_manager()
+    cache = await asyncio.to_thread(mm.get_news_brief_cache)
+    if cache is None or cache["brief_date"] != _today_str():
+        return NewsBriefPreviewResponse(available=False)
+    return NewsBriefPreviewResponse(
+        available  = True,
+        brief_date = cache["brief_date"],
+        sections   = [NewsBriefSection(**s) for s in cache["content"]],
+    )
+
+
+_NEWS_BRIEF_USER_INSTRUCTION = "Give me today's news brief."
+
+
+@app.post(
+    "/news/brief/open",
+    response_model = NewsBriefOpenResponse,
+    summary        = "Open today's Daily News Brief as a chat conversation",
+)
+async def post_news_brief_open(request: NewsBriefOpenRequest) -> NewsBriefOpenResponse:
+    """
+    The header button's click handler.
+
+    Cache already valid for today → return its existing conversation_id,
+    no NewsAPI calls, no new chat_turns (the "press again" reopen path).
+    Otherwise fetches all sections, formats them as one assistant message
+    with zero inference cost, writes a synthetic user turn + the formatted
+    assistant turn into a brand-new conversation, and caches it
+    (docs/daily-news-brief-plan.md §6).
+
+    Either way, also seeds `conversation_log` (via MemoryManager.add(),
+    keyed by request.session_id) with the same exchange — this is the
+    table ControllerAgent._memory_key()/get_context_window() actually read
+    for working-memory continuity (Slot 6), a completely different
+    mechanism from chat_turns (which only backs history display/search,
+    §12/§20). Without this, a follow-up question in the same browser
+    session would have no idea the brief content exists — confirmed live,
+    2026-07-22 (docs/daily-news-brief-plan.md's live-verification step).
+    Always re-seeds on every call (hit or miss) since the current
+    session_id may be a fresh one (e.g. a page reload) that never saw an
+    earlier generation in some prior session.
+    """
+    mm = _require_memory_manager()
+    today = _today_str()
+
+    cache = await asyncio.to_thread(mm.get_news_brief_cache)
+    if cache is not None and cache["brief_date"] == today and cache["conversation_id"]:
+        if request.session_id:
+            markdown = news_brief.format_brief_markdown(cache["content"])
+            await asyncio.to_thread(
+                mm.add, "user", _NEWS_BRIEF_USER_INSTRUCTION, task_id=request.session_id,
+            )
+            await asyncio.to_thread(
+                mm.add, "agent", markdown,
+                metadata={"agent": "news_brief"}, task_id=request.session_id,
+            )
+        return NewsBriefOpenResponse(conversation_id=cache["conversation_id"], generated=False)
+
+    prefs = await asyncio.to_thread(mm.get_news_preferences)
+    if prefs is None:
+        prefs = {"home_country": "us", "local_query": None, "topics": []}
+
+    sections = await news_brief.build_brief(
+        prefs["home_country"], prefs["local_query"], prefs["topics"],
+    )
+
+    conversation_id = str(uuid.uuid4())
+    task_id         = str(uuid.uuid4())
+    markdown        = news_brief.format_brief_markdown(sections)
+    sources         = news_brief.collect_sources(sections)
+
+    await asyncio.to_thread(
+        mm.add_chat_turn,
+        task_id            = task_id,
+        role               = "user",
+        content            = _NEWS_BRIEF_USER_INSTRUCTION,
+        conversation_id    = conversation_id,
+        conversation_title = f"Daily Brief — {today}",
+    )
+    await asyncio.to_thread(
+        mm.add_chat_turn,
+        task_id         = task_id,
+        role            = "assistant",
+        content         = markdown,
+        conversation_id = conversation_id,
+        sources         = sources,
+    )
+    await asyncio.to_thread(mm.set_news_brief_cache, today, sections, conversation_id)
+
+    if request.session_id:
+        await asyncio.to_thread(
+            mm.add, "user", _NEWS_BRIEF_USER_INSTRUCTION, task_id=request.session_id,
+        )
+        await asyncio.to_thread(
+            mm.add, "agent", markdown,
+            metadata={"agent": "news_brief"}, task_id=request.session_id,
+        )
+
+    return NewsBriefOpenResponse(conversation_id=conversation_id, generated=True)
 
 
 @app.get(
