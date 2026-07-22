@@ -194,7 +194,9 @@
                         <span class="source-name">{src.name}</span>
                         <span class="source-meta">
                           <span class="badge badge-muted" style="padding:1px 5px;font-size:10px">{src.type}</span>
-                          <span class="source-score">{(src.relevance_score * 100).toFixed(0)}%</span>
+                          {#if src.relevance_score !== undefined}
+                            <span class="source-score">{(src.relevance_score * 100).toFixed(0)}%</span>
+                          {/if}
                         </span>
                       </div>
                     </li>

@@ -1,6 +1,7 @@
 # Daily News Brief — Header Button → Chat Conversation
 
-**Status:** Built and live-verified, 2026-07-22 (see §11)
+**Status:** Built and live-verified, 2026-07-22 (see §11); frontend redesigned same day
+after live use (see §12)
 **Author:** scoped with Michael, 2026-07-22
 **Depends on:** §14.9 (`news_search` / NewsAPI integration, already built —
 `docs/architecture/14-localist-mcp-tool-layer.md`), `MemoryManager.add_chat_turn()`
@@ -165,6 +166,12 @@ above is needed at this scale (same conclusion §14.9 reached for `news_search`)
 
 ## 8. Frontend
 
+> **Superseded 2026-07-22 — see §12.** The header-button + hover-popover design below was
+> built and briefly live, but live use showed the popover too small and its content
+> truncated for real headlines. It was replaced by a persistent, collapsible right-side
+> "Previews" tab; the header button was removed outright. This section is kept for
+> history — §12 is the current design.
+
 - **Header button** (top bar, next to the `● Ollama` badge): newspaper icon + label.
   States: *idle* (hover → preview popover if `GET /news/brief/preview` returns
   content) → *loading* (spinner; shown only on a real cache-miss generation, i.e. the
@@ -256,3 +263,43 @@ surgery needed).
   `POST /news/brief/open`, the identical follow-up question correctly recalled the
   specific article, its source, and a technical detail from its body — confirmed via a
   real `/task` call sharing the same `session_id` the brief was opened with.
+
+## 12. Frontend redesign: header popover → right-side "Previews" tab (2026-07-22)
+
+Full component/store-level detail lives in `docs/architecture/07-localist-ui.md` §7.14; this
+section records why, since §8 above is now superseded history.
+
+**Why.** A screenshot from the user showed the popover rendering real content, but at
+280px×220px with truncated lines — not usable for actually reading a headline. Rather
+than just resize the popover, the request was to relocate the preview into a proper
+collapsible right-side tab ("Previews") with reserved block slots for future daily-update
+sources (GitHub, Hacker News) — scoped as layout only, no live wiring for those two yet.
+
+**What changed:**
+- `PreviewsPanel.svelte` (new) + `previewsPanel.ts` (new store) — a persistent third
+  `#app-shell` grid column, collapsed by default to a 40px vertical tab, expanding to
+  320px on click. No drag-resize (unlike the left sidebar) since nothing asked for one.
+- The News block inside it shows up to 3 full article links per section, not one
+  truncated line — live-verified by the user in Safari (article links correctly open in
+  a new tab).
+- Two reserved placeholder blocks, **GitHub** and **Hacker News** ("Coming soon", no live
+  data) — intentionally scoped now, deferred integration later.
+- The header button was removed from `StatusBar.svelte` entirely, including its
+  hover-popover state machine and progressive-reveal timer (§6/§8's cosmetic-reveal
+  animation is now dead code, removed with it — the panel just renders the live store
+  value directly, no animation). The only remaining trigger is a plain-text underlined
+  link inside the panel reading "Daily News Brief Refresh," wired to the same
+  `openNewsBrief()` → navigate-to-conversation flow.
+
+**Two Settings bugs found and fixed along the way** (full root-cause detail at
+`docs/architecture/07-localist-ui.md` §7.14, not duplicated here): a native browser
+address-autofill dropdown appearing on the "Local area" field (fixed with
+`autocomplete="off"`), and a genuine Svelte reactivity bug where a store-derived
+`$: { ... }` block sharing scope with `bind:value` targets caused every keystroke to be
+silently reverted — fixed by replacing the continuous reactive mirror with a one-time
+`onMount` sync, since the preferences form was always meant to be freely editable until
+an explicit Save.
+
+Verified via `svelte-check`/`vite build` (0 errors across all revisions) plus the user's
+own live click-through in Safari — no automated browser tooling is available in this
+environment.

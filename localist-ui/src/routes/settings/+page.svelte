@@ -24,6 +24,13 @@
     reembedError,
     reembedCorpus
   } from '$lib/stores/reembedCorpus';
+  import {
+    newsPreferences,
+    newsPreferencesLoading,
+    newsPreferencesError,
+    loadNewsPreferences,
+    setNewsPreferences
+  } from '$lib/stores/newsPreferences';
 
   const EVICTION_PRESETS: { value: EvictionPreset; label: string }[] = [
     { value: '7d',      label: '7 days' },
@@ -35,6 +42,11 @@
   onMount(() => {
     loadChatHistorySettings();
     loadMemoryStats();
+    void loadNewsPreferences().then(() => {
+      homeCountryInput = $newsPreferences.home_country;
+      localQueryInput  = $newsPreferences.local_query ?? '';
+      selectedTopics   = $newsPreferences.topics;
+    });
   });
 
   // Corpus staleness — fetched once on mount and again after a re-embed
@@ -155,6 +167,38 @@
   function toggleEpisodicApproval() {
     episodicApproval = !episodicApproval;
     if (browser) localStorage.setItem('lora-episodic-approval', episodicApproval ? '1' : '0');
+  }
+
+  // Daily News Brief preferences (docs/daily-news-brief-plan.md §5) — local
+  // form state mirrors the store, synced whenever it reloads, saved
+  // explicitly via the Save button below (not on every keystroke/toggle,
+  // since exactly-3-topics is only checkable once the user is done picking).
+  let homeCountryInput = 'us';
+  let localQueryInput  = '';
+  let selectedTopics: string[] = [];
+  let newsSaveResult: string | null = null;
+
+  function toggleTopic(key: string) {
+    newsSaveResult = null;
+    if (selectedTopics.includes(key)) {
+      selectedTopics = selectedTopics.filter((t) => t !== key);
+    } else if (selectedTopics.length < 3) {
+      selectedTopics = [...selectedTopics, key];
+    }
+  }
+
+  async function handleSaveNewsPreferences() {
+    newsSaveResult = null;
+    if (selectedTopics.length !== 3) {
+      newsPreferencesError.set('Select exactly 3 special-interest topics.');
+      return;
+    }
+    const ok = await setNewsPreferences(
+      homeCountryInput.trim().toLowerCase(),
+      localQueryInput.trim() || null,
+      selectedTopics
+    );
+    if (ok) newsSaveResult = 'Saved. Takes effect on the next brief generation.';
   }
 </script>
 
@@ -400,6 +444,65 @@
       {/if}
     </section>
 
+    <!-- Daily News Brief -->
+    <section class="settings-card">
+      <div class="card-title">Daily News Brief</div>
+      <p class="card-desc">
+        World and National are fixed; Local is keyword-matched against a place
+        you set (NewsAPI has no true local-news coverage). Pick exactly 3
+        special-interest topics.
+      </p>
+
+      <label class="news-field-label" for="news-home-country">Home country (2-letter code)</label>
+      <input
+        id="news-home-country"
+        class="news-text-input"
+        type="text"
+        maxlength="2"
+        bind:value={homeCountryInput}
+        placeholder="us"
+      />
+
+      <label class="news-field-label" for="news-local-query">Local area (e.g. a city name)</label>
+      <input
+        id="news-local-query"
+        class="news-text-input"
+        type="text"
+        autocomplete="off"
+        bind:value={localQueryInput}
+        placeholder="Seattle"
+      />
+
+      <div class="news-field-label">
+        Special-interest topics ({selectedTopics.length}/3 selected)
+      </div>
+      <div class="news-topic-grid">
+        {#each Object.entries($newsPreferences.topic_pool) as [key, label]}
+          <button
+            type="button"
+            class="news-topic-chip"
+            class:active={selectedTopics.includes(key)}
+            disabled={!selectedTopics.includes(key) && selectedTopics.length >= 3}
+            on:click={() => toggleTopic(key)}
+          >{label}</button>
+        {/each}
+      </div>
+
+      <button
+        type="button"
+        class="seg-btn news-save-btn"
+        disabled={$newsPreferencesLoading}
+        on:click={handleSaveNewsPreferences}
+      >Save</button>
+
+      {#if newsSaveResult}
+        <p class="card-hint">{newsSaveResult}</p>
+      {/if}
+      {#if $newsPreferencesError}
+        <p class="card-hint" style="color:var(--error)">{$newsPreferencesError}</p>
+      {/if}
+    </section>
+
     <!-- Version -->
     <section class="settings-card row">
       <div class="card-title">Version</div>
@@ -568,5 +671,51 @@
     flex-wrap: wrap;
     gap: var(--sp-1);
     justify-content: flex-end;
+  }
+
+  .news-field-label {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: var(--sp-3);
+  }
+
+  .news-text-input {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-size: var(--text-sm);
+    padding: var(--sp-2) var(--sp-3);
+    margin-top: var(--sp-1);
+  }
+
+  .news-topic-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    margin-top: var(--sp-2);
+  }
+
+  .news-topic-chip {
+    padding: var(--sp-1) var(--sp-3);
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border);
+    background: var(--bg-raised);
+    color: var(--text-secondary);
+    font-size: 12px;
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+  }
+  .news-topic-chip:hover:not(:disabled) { background: var(--bg-hover); }
+  .news-topic-chip.active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+  .news-topic-chip:disabled:not(.active) { cursor: not-allowed; opacity: 0.5; }
+
+  .news-save-btn {
+    margin-top: var(--sp-3);
+    align-self: flex-start;
   }
 </style>

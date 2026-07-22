@@ -5,8 +5,11 @@ export type TaskStatus = 'idle' | 'planning' | 'streaming' | 'complete' | 'faile
 export interface Source {
   name: string;
   path: string;
-  type: 'wiki' | 'raw';
-  relevance_score: number;
+  // 'session' and 'web' were already emitted by the backend
+  // (controller_agent.py's session:// sources, and news_brief.py's article
+  // URLs) without a matching type here — added, not new backend behavior.
+  type: 'wiki' | 'raw' | 'session' | 'web';
+  relevance_score?: number;
 }
 
 export interface PendingDiff {
@@ -79,7 +82,11 @@ const BASE = '/api';
 // a session. Regenerated on full page reload (by design) rather than
 // persisted, so a fresh page load starts a fresh conversation from the
 // backend's perspective.
-const SESSION_ID = crypto.randomUUID();
+// Exported so other features that write directly into conversation_log
+// outside the normal /task flow (e.g. newsBrief.ts's POST /news/brief/open)
+// can seed working memory under the same key a subsequent /task call in
+// this session will read from.
+export const SESSION_ID = crypto.randomUUID();
 
 // ── Create a new task entry ──────────────────────────────────
 function createTask(task_id: string, instruction: string): Task {

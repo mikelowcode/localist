@@ -386,9 +386,19 @@
                     {/if}
                     {#if turn.sources && turn.sources.length > 0}
                       {#each turn.sources as src}
-                        <span class="badge badge-muted source-badge" title={src.path}>
-                          {src.type === 'wiki' ? '📄' : '📁'} {src.name}
-                        </span>
+                        {#if src.type === 'web'}
+                          <a
+                            class="badge badge-muted source-badge source-badge-link"
+                            href={src.path}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title={src.path}
+                          >🌐 {src.name}</a>
+                        {:else}
+                          <span class="badge badge-muted source-badge" title={src.path}>
+                            {src.type === 'wiki' ? '📄' : '📁'} {src.name}
+                          </span>
+                        {/if}
                       {/each}
                     {/if}
                   </div>
@@ -722,6 +732,15 @@
   .source-badge {
     font-size: 11px;
     cursor: default;
+  }
+
+  .source-badge-link {
+    text-decoration: none;
+    color: inherit;
+    cursor: pointer;
+  }
+  .source-badge-link:hover {
+    background: var(--bg-hover);
   }
 
   /* Wiki diff review block styles now live in DiffBlock.svelte. */

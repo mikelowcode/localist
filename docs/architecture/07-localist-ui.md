@@ -558,3 +558,59 @@ field (§4.4a's `ChartArtifact`), inherited by the existing provenance-sync plum
 pass-through code changes; the component reads this app's own CSS custom properties for series
 colors rather than a separate palette, so charts track the live theme like every other surface; and
 it's wired into `ChatPanel.svelte` right after the provenance-bar block (§7.3).
+
+### 7.14 Daily News Brief UI: Header Button Retired in Favor of a Right-Side "Previews" Tab (2026-07-22)
+
+Full feature design (data model, preferences endpoints, brief-generation/caching endpoints, rate-limit
+budget, and the working-memory/`conversation_log` seeding fix) lives at `docs/daily-news-brief-plan.md`
+(§6, §11) — not duplicated here. This section covers only the UI surface, which went through two
+live-bug-driven revisions the same day it first shipped.
+
+**Settings — two real bugs found via live use, not code review:**
+- The "Local area" text input (`settings/+page.svelte`) had no `autocomplete` attribute, so Chrome/
+  Safari's address-autofill heuristics (triggered by the nearby "Home country" field + a "city"-shaped
+  label/placeholder) offered the user's real saved addresses in a native dropdown. Fixed with
+  `autocomplete="off"`.
+- A second, more serious bug survived that first fix: typing in the field was effectively disabled
+  entirely, not just the autofill-selection case. Root-caused by compiling a minimal repro of the
+  page's actual pattern with the real Svelte 4 compiler and reading the generated output directly
+  (not guessed from behavior alone): a `$: { homeCountryInput = $newsPreferences.home_country; ... }`
+  reactive block mixed a store-subscription read with variables that were also `bind:value` targets.
+  Svelte's compiled `input` event handler for a two-way-bound variable invalidates *both* that
+  variable and any store subscription read in the same reactive block — so every keystroke
+  re-triggered the block, which immediately snapped the field back to the stale store value on the
+  next tick. This is a general Svelte pitfall (mixing store-derived reactive assignment with
+  `bind:value` in one block), not specific to this field. Fixed by deleting the reactive block
+  entirely and replacing it with a one-time imperative sync inside `onMount`'s
+  `loadNewsPreferences().then(...)` — local form state is meant to be freely editable until an
+  explicit Save, so a continuous reactive mirror was never the right tool here.
+
+**UI redesign — hover popover replaced by a persistent right-side tab.** The original build put a
+📰 header button in `StatusBar.svelte` next to the runtime-backend chip, with a hover popover showing
+a cosmetic progressive-reveal preview. Live use (a screenshot from the user) showed the popover was too
+small and truncated real headlines. Rather than resize a popover, the preview content was relocated
+into a new persistent, collapsible right-side panel:
+- `$lib/stores/previewsPanel.ts` — a `previewsPanelCollapsed` writable, localStorage-persisted
+  (`lora-previews-panel-collapsed`), defaulting to collapsed. Deliberately simpler than `sidebar.ts`
+  (§7.10): two fixed widths (`--previews-w-collapsed: 40px` / `--previews-w: 320px` in `app.css`), no
+  drag-resize, since nothing asked for one.
+- `#app-shell`'s CSS grid gained a third column (`app.css`, `+layout.svelte`) sized the same way the
+  sidebar's column already is — the existing `grid-template-columns` transition on `#app-shell` applies
+  to this column for free, so expand/collapse animates consistently with the sidebar.
+- `PreviewsPanel.svelte` (new) — collapsed state renders a slim always-visible vertical tab
+  (`writing-mode: vertical-rl`) that expands on click; expanded state renders a header plus a
+  scrollable stack of "blob blocks." The Daily News Brief block shows up to 3 full article
+  title+source links per section (World/National/Local/topics), not the popover's one-truncated-line
+  summary — confirmed live by the user clicking an article link and having it open correctly in a new
+  Safari tab. Two further blocks, **GitHub** and **Hacker News**, are reserved layout only (`Coming
+  soon` badge, no live data) per explicit instruction to scope the multi-block layout now and wire
+  real daily-update APIs into it later.
+- The 📰 header button was removed from `StatusBar.svelte` entirely (its hover-popover CSS and
+  progressive-reveal timer went with it) — the only remaining trigger is a single underlined text
+  link inside the panel's News block, reading "Daily News Brief Refresh," calling the same
+  `openNewsBrief()`/navigate-to-conversation flow the old button used.
+
+Verified via `svelte-check`/`vite build` only (0 errors/warnings both times across all three
+revisions) — same no-frontend-test-framework posture as §20.9. No automated browser click-through was
+possible in this environment (no `chromium-cli`/Playwright/Puppeteer installed); the user performed the
+real interactive verification themselves (Safari, real article links).

@@ -48,6 +48,8 @@
   /* Layout */
   --sidebar-w:    236px;
   --topbar-h:     44px;
+  --previews-w:           320px;
+  --previews-w-collapsed: 40px;
   --radius:       8px;
   --radius-sm:    4px;
   --radius-lg:    12px;
@@ -136,7 +138,7 @@ body {
 #app-shell {
   display: grid;
   transition: grid-template-columns var(--dur-sidebar) var(--ease);
-  grid-template-columns: var(--sidebar-w) 1fr;
+  grid-template-columns: var(--sidebar-w) 1fr var(--previews-w-collapsed);
   grid-template-rows: var(--topbar-h) 1fr;
   height: 100vh;
   width: 100vw;
