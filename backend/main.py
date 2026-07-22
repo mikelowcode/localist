@@ -936,15 +936,8 @@ class NewsBriefPreviewResponse(BaseModel):
 
 
 class NewsBriefOpenResponse(BaseModel):
-    """
-    Response body for POST /news/brief/open.
-
-    `generated=False` means today's brief already existed and this just
-    returned its existing conversation_id (no new NewsAPI calls, no new
-    chat_turns rows) — the "press the button again" reopen path.
-    """
+    """Response body for POST /news/brief/open — always a fresh generation."""
     conversation_id: str
-    generated:       bool
 
 
 class NewsBriefOpenRequest(BaseModel):
@@ -2253,42 +2246,30 @@ _NEWS_BRIEF_USER_INSTRUCTION = "Give me today's news brief."
 )
 async def post_news_brief_open(request: NewsBriefOpenRequest) -> NewsBriefOpenResponse:
     """
-    The header button's click handler.
+    The Previews panel's "Daily News Brief Refresh" link handler.
 
-    Cache already valid for today → return its existing conversation_id,
-    no NewsAPI calls, no new chat_turns (the "press again" reopen path).
-    Otherwise fetches all sections, formats them as one assistant message
-    with zero inference cost, writes a synthetic user turn + the formatted
-    assistant turn into a brand-new conversation, and caches it
-    (docs/daily-news-brief-plan.md §6).
+    Always fetches a fresh brief and opens it in a brand-new conversation —
+    deliberately not idempotent within a day. An earlier revision reopened
+    the same cached same-day conversation instead (a rate-limit-conscious
+    design from the original plan), but that meant pressing a link literally
+    labeled "Refresh" from a different/new chat silently navigated the user
+    into an old conversation showing stale articles instead of doing what
+    the label says — confirmed live, 2026-07-22. news_brief_cache is still
+    written on every call (so GET /news/brief/preview keeps reflecting the
+    latest generated content), just no longer read here to short-circuit
+    generation.
 
-    Either way, also seeds `conversation_log` (via MemoryManager.add(),
-    keyed by request.session_id) with the same exchange — this is the
-    table ControllerAgent._memory_key()/get_context_window() actually read
-    for working-memory continuity (Slot 6), a completely different
-    mechanism from chat_turns (which only backs history display/search,
-    §12/§20). Without this, a follow-up question in the same browser
-    session would have no idea the brief content exists — confirmed live,
-    2026-07-22 (docs/daily-news-brief-plan.md's live-verification step).
-    Always re-seeds on every call (hit or miss) since the current
-    session_id may be a fresh one (e.g. a page reload) that never saw an
-    earlier generation in some prior session.
+    Also seeds `conversation_log` (via MemoryManager.add(), keyed by
+    request.session_id) with the same exchange — this is the table
+    ControllerAgent._memory_key()/get_context_window() actually read for
+    working-memory continuity (Slot 6), a completely different mechanism
+    from chat_turns (which only backs history display/search, §12/§20).
+    Without this, a follow-up question in the same browser session would
+    have no idea the brief content exists — confirmed live, 2026-07-22
+    (docs/daily-news-brief-plan.md's live-verification step).
     """
     mm = _require_memory_manager()
     today = _today_str()
-
-    cache = await asyncio.to_thread(mm.get_news_brief_cache)
-    if cache is not None and cache["brief_date"] == today and cache["conversation_id"]:
-        if request.session_id:
-            markdown = news_brief.format_brief_markdown(cache["content"])
-            await asyncio.to_thread(
-                mm.add, "user", _NEWS_BRIEF_USER_INSTRUCTION, task_id=request.session_id,
-            )
-            await asyncio.to_thread(
-                mm.add, "agent", markdown,
-                metadata={"agent": "news_brief"}, task_id=request.session_id,
-            )
-        return NewsBriefOpenResponse(conversation_id=cache["conversation_id"], generated=False)
 
     prefs = await asyncio.to_thread(mm.get_news_preferences)
     if prefs is None:
@@ -2330,7 +2311,7 @@ async def post_news_brief_open(request: NewsBriefOpenRequest) -> NewsBriefOpenRe
             metadata={"agent": "news_brief"}, task_id=request.session_id,
         )
 
-    return NewsBriefOpenResponse(conversation_id=conversation_id, generated=True)
+    return NewsBriefOpenResponse(conversation_id=conversation_id)
 
 
 @app.get(

@@ -1,18 +1,23 @@
 /**
- * newsBrief.ts — Daily News Brief header-button store
+ * newsBrief.ts — Daily News Brief Live Feed panel store
  *
- * Two deliberately separate calls (docs/daily-news-brief-plan.md §6):
+ * Two deliberately separate calls (docs/daily-news-brief-plan.md §6/§12):
  *   GET  /api/news/brief/preview — read-only, never calls NewsAPI. Feeds
- *                                  the header button's hover popover.
- *   POST /api/news/brief/open    — the click handler. Reopens today's
- *                                  conversation if it already exists,
- *                                  otherwise generates it (fetch + format,
- *                                  zero inference cost) and returns a new
- *                                  conversation_id either way.
+ *                                  the Live Feed panel's News block.
+ *   POST /api/news/brief/open    — the "Daily News Brief Refresh" link's
+ *                                  click handler. Always fetches a fresh
+ *                                  brief and returns a brand-new
+ *                                  conversation_id — deliberately not
+ *                                  idempotent within a day, since an
+ *                                  earlier same-day-reopen design meant
+ *                                  pressing a link literally labeled
+ *                                  "Refresh" could silently navigate into
+ *                                  an old conversation showing stale
+ *                                  articles instead (confirmed live,
+ *                                  2026-07-22).
  *
- * fetchPreview() is safe to call on hover/idle — it has no side effects.
- * openBrief() is the only function that can trigger NewsAPI calls or write
- * chat_turns, and only does so on a genuine cache miss.
+ * fetchPreview() is safe to call on expand/idle — it has no side effects.
+ * openBrief() is the only function that triggers real NewsAPI calls.
  */
 
 import { writable, type Writable } from 'svelte/store';
@@ -80,7 +85,7 @@ export async function openNewsBrief(): Promise<string | null> {
       const detail = await res.json().catch(() => null);
       throw new Error(detail?.detail ?? `HTTP ${res.status}`);
     }
-    const data: { conversation_id: string; generated: boolean } = await res.json();
+    const data: { conversation_id: string } = await res.json();
     return data.conversation_id;
   } catch (err) {
     newsBriefError.set(err instanceof Error ? err.message : String(err));

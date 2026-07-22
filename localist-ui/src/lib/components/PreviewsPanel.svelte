@@ -29,20 +29,20 @@
     type="button"
     class="previews-tab-collapsed"
     on:click={togglePreviewsPanel}
-    aria-label="Expand Previews panel"
-    title="Previews"
+    aria-label="Expand Live Feed panel"
+    title="Live Feed"
   >
-    <span class="previews-tab-label">Previews</span>
+    <span class="previews-tab-label">Live Feed</span>
   </button>
 {:else}
   <div class="previews-panel">
     <div class="previews-panel-header">
-      <span class="previews-panel-title">Previews</span>
+      <span class="previews-panel-title">Live Feed</span>
       <button
         type="button"
         class="previews-collapse-btn"
         on:click={togglePreviewsPanel}
-        aria-label="Collapse Previews panel"
+        aria-label="Collapse Live Feed panel"
         title="Collapse"
       >›</button>
     </div>

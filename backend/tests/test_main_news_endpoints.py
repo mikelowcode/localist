@@ -142,7 +142,7 @@ class TestBriefPreview:
 
 
 class TestBriefOpen:
-    def test_cache_miss_generates_and_writes_two_chat_turns(self, client):
+    def test_generates_and_writes_two_chat_turns(self, client):
         test_client, mm = client
         mm.set_news_preferences("us", None, ["finance", "technology", "sports"])
 
@@ -153,7 +153,6 @@ class TestBriefOpen:
 
         assert resp.status_code == 200
         body = resp.json()
-        assert body["generated"] is True
         conversation_id = body["conversation_id"]
         mock_build.assert_awaited_once_with("us", None, ["finance", "technology", "sports"])
 
@@ -172,7 +171,16 @@ class TestBriefOpen:
         assert cache["conversation_id"] == conversation_id
         assert cache["brief_date"] == main._today_str()
 
-    def test_repeat_call_same_day_reopens_without_regenerating(self, client):
+    def test_repeat_call_same_day_always_regenerates_a_new_conversation(self, client):
+        """
+        A previous revision reopened the same cached conversation on a
+        same-day repeat call. That meant pressing a link literally labeled
+        "Daily News Brief Refresh" from a different/new chat silently
+        navigated into an old conversation showing stale articles instead
+        of doing what the label says — confirmed live, 2026-07-22. Every
+        call must now hit NewsAPI again and open a brand-new conversation,
+        leaving any earlier conversation's chat_turns untouched.
+        """
         test_client, mm = client
         mm.set_news_preferences("us", None, ["finance", "technology", "sports"])
 
@@ -182,18 +190,24 @@ class TestBriefOpen:
             first = test_client.post("/news/brief/open", json={})
         first_id = first.json()["conversation_id"]
 
-        with patch.object(main.news_brief, "build_brief", new=AsyncMock()) as mock_build:
+        with patch.object(
+            main.news_brief, "build_brief", new=AsyncMock(return_value=_FAKE_SECTIONS)
+        ) as mock_build:
             second = test_client.post("/news/brief/open", json={})
+        second_id = second.json()["conversation_id"]
 
-        assert second.json()["generated"] is False
-        assert second.json()["conversation_id"] == first_id
-        mock_build.assert_not_called()
+        assert second_id != first_id
+        mock_build.assert_awaited_once()
 
-        # No duplicate chat_turns were written on the reopen.
+        # The first conversation's chat_turns are untouched, not duplicated.
         rows, total = mm.get_chat_turns(conversation_id=first_id, limit=10)
         assert total == 2
 
-    def test_stale_cache_regenerates_with_a_new_conversation(self, client):
+        # The cache now points at the newest conversation, not the first.
+        cache = mm.get_news_brief_cache()
+        assert cache["conversation_id"] == second_id
+
+    def test_stale_cache_also_regenerates_with_a_new_conversation(self, client):
         test_client, mm = client
         mm.set_news_brief_cache("2000-01-01", _FAKE_SECTIONS, "conv-old")
 
@@ -203,7 +217,6 @@ class TestBriefOpen:
             resp = test_client.post("/news/brief/open", json={})
 
         body = resp.json()
-        assert body["generated"] is True
         assert body["conversation_id"] != "conv-old"
         mock_build.assert_awaited_once()
 
@@ -245,10 +258,11 @@ class TestBriefOpenWorkingMemorySeed:
 
         assert mm.get_context_window(task_id="global") == []
 
-    def test_reopen_path_also_seeds_a_fresh_session_id(self, client):
-        """A page reload between two presses gets a new SESSION_ID — the
-        reopen (cache-hit) path must still seed that new session's working
-        memory, not just the original generation's session."""
+    def test_second_press_also_seeds_a_fresh_session_id(self, client):
+        """A page reload between two presses gets a new SESSION_ID — a
+        second press (which now always regenerates, see TestBriefOpen)
+        must still seed that new session's working memory, not just the
+        original generation's session."""
         test_client, mm = client
         mm.set_news_preferences("us", None, ["finance", "technology", "sports"])
 
@@ -257,11 +271,12 @@ class TestBriefOpenWorkingMemorySeed:
         ):
             test_client.post("/news/brief/open", json={"session_id": "sess-morning"})
 
-        with patch.object(main.news_brief, "build_brief", new=AsyncMock()) as mock_build:
-            resp = test_client.post("/news/brief/open", json={"session_id": "sess-after-reload"})
+        with patch.object(
+            main.news_brief, "build_brief", new=AsyncMock(return_value=_FAKE_SECTIONS)
+        ) as mock_build:
+            test_client.post("/news/brief/open", json={"session_id": "sess-after-reload"})
 
-        assert resp.json()["generated"] is False
-        mock_build.assert_not_called()
+        mock_build.assert_awaited_once()
 
         entries = mm.get_context_window(task_id="sess-after-reload")
         assert [e["role"] for e in entries] == ["user", "agent"]

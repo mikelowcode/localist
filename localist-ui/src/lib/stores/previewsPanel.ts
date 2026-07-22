@@ -1,5 +1,5 @@
 /**
- * previewsPanel.ts — right-side "Previews" tab collapse state
+ * previewsPanel.ts — right-side "Live Feed" tab collapse state
  *
  * Shared between PreviewsPanel.svelte (renders the tab, owns the toggle
  * button) and +layout.svelte (applies collapsed/expanded width to the
