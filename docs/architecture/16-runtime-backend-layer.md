@@ -358,6 +358,32 @@ platform-gating change (+7 new tests).
   comparison at construction time, disabling (not silently degrading) on a mismatch — applied to
   stored vectors instead of threshold constants, split into an automatic path where the fix is cheap
   and a manual path where it isn't.
+
+  **`chat_turns.embedding` schema-drift bug found live, and a broader self-heal added (2026-07-22).**
+  A running instance hit `sqlite3.OperationalError: table chat_turns has no column named embedding`
+  from `add_chat_turn()`'s `INSERT` — its `schema_version` row already reported `9` (current), but the
+  `chat_turns` table was physically missing the `embedding` column migration v8→v9 is supposed to add.
+  `_init_db()`'s `row["version"] < _SCHEMA_VERSION` gate (§16.4 above) never re-triggers `_migrate()`
+  once a DB reports the current version, so the `ALTER TABLE` never ran — the exact class of drift the
+  `_check_embedding_provenance()` self-heal above already exists to catch, just on a different
+  table/column than the one it was written for (the `embedding_provenance` table's own
+  `CREATE TABLE IF NOT EXISTS`). Root cause on the affected DB: an `embedding_provenance` row for
+  `'chat_turns'` already existed (seeded from an earlier state before the column was lost), so the
+  `if row is None:` branch containing the vulnerable `embedding IS NOT NULL` query was never reached
+  either — the provenance check itself couldn't have surfaced this at construction time on this
+  particular DB. **Impact was low but real:** `add_chat_turn()`'s `INSERT` names all columns in one
+  statement, so the missing column failed the entire insert, not just the embedding — every chat turn
+  (both roles) silently stopped persisting to `chat_turns` since the drift happened, caught only by
+  `main.py`'s best-effort `_persist_chat_turn()` try/except (never affecting the live response, but
+  invisible to conversation history / the Episode Browsing UI's `chat_turns` search, §20). **Fix:** an
+  unconditional self-heal added directly in `_init_db()` (not gated by `embedding_model_name`, since
+  `add_chat_turn()`'s `INSERT` always names this column regardless of whether an embed source is
+  configured) — a `PRAGMA table_info(chat_turns)` check + `ALTER TABLE ... ADD COLUMN embedding BLOB`
+  if missing, cheap no-op on a healthy DB, runs on every construction. Live-verified, not just
+  unit-tested: uvicorn's `--reload` picked up the code change on the user's actual running backend,
+  the self-heal fired for real (`logs/backend.log`: `"chat_turns missing 'embedding' column despite
+  schema_version=9 — self-healing via ALTER TABLE"`), and a follow-up `PRAGMA table_info` confirmed the
+  column present with no restart required.
 - Apple-Silicon skip branch remains verified only via mocked `platform` calls; real non-Darwin
   hardware verification is still outstanding, pending access to such a machine.
 - oMLX's `embedding_model` wiring gap noted above (tier 1 never engages for that backend) — a

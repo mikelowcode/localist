@@ -602,6 +602,31 @@ class MemoryManager:
                 elif row["version"] < _SCHEMA_VERSION:
                     self._migrate(conn, from_version=row["version"])
 
+                # Self-heal: a DB can report schema_version == _SCHEMA_VERSION
+                # while still missing a column an earlier migration was
+                # supposed to add, if that migration bumped the version
+                # without the ALTER actually landing on this DB file — the
+                # `row["version"] < _SCHEMA_VERSION` gate above never
+                # re-triggers _migrate() once that's happened. Same class of
+                # drift already handled for the embedding_provenance table in
+                # _check_embedding_provenance(); observed in the wild for
+                # chat_turns.embedding specifically (2026-07-22). Runs
+                # unconditionally (not gated by embedding_model_name) since
+                # add_chat_turn()'s INSERT always names this column
+                # regardless of whether an embed_fn is configured — a
+                # keyword-only setup hits the same missing-column error
+                # otherwise. PRAGMA table_info + ADD COLUMN IF missing is a
+                # cheap no-op on a healthy DB.
+                cols = {c[1] for c in conn.execute("PRAGMA table_info(chat_turns)").fetchall()}
+                if "embedding" not in cols:
+                    logger.warning(
+                        "MemoryManager: chat_turns missing 'embedding' column "
+                        "despite schema_version=%d — self-healing via ALTER TABLE.",
+                        _SCHEMA_VERSION,
+                    )
+                    conn.execute("ALTER TABLE chat_turns ADD COLUMN embedding BLOB;")
+                    conn.commit()
+
             finally:
                 conn.close()
 
