@@ -413,6 +413,133 @@ class TestWebSearch:
         assert "unreachable" in results[0].result
 
 
+class TestNewsSearch:
+    """
+    news_search (news-query-routing plan, 2026-07-22): NewsAPI (tier 1)
+    first, falling through to the existing Brave-backed web_search tool
+    (tier 2, via _execute_web_search_query) on a miss — empty/errored
+    NewsAPI result, or localist-mcp itself unreachable. Both tiers'
+    ToolResults are returned when a fallback fires (not just the winner),
+    the fallback one retagged tool_name="news_search:brave_fallback" for
+    provenance. The end-to-end proof that a double-miss still triggers
+    controller_agent.py's Step 3b corpus fallback lives in
+    test_tool_dispatcher_phase6.py.
+    """
+
+    def test_tier1_success_returns_single_result(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            assert name == "news_search"
+            return json.dumps({
+                "query": arguments["query"],
+                "result_text": "• Headline\n  body\n  [Source] 2026-07-22\n  https://x",
+                "result_count": 1,
+                "is_miss": False,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["news_search"],
+                instruction   = "what's the latest news on APC?",
+                context       = {},
+            )
+
+        assert len(results) == 1
+        assert results[0].tool_name == "news_search"
+        assert results[0].success is True
+
+    def test_tier1_miss_falls_back_to_brave_web_search(self, dispatcher: MCPToolDispatcher):
+        seen_calls: list[tuple[str, str]] = []
+
+        async def fake_call(session, name, arguments):
+            seen_calls.append((name, arguments["query"]))
+            if name == "news_search":
+                return json.dumps({
+                    "query": arguments["query"], "result_text": "", "result_count": 0,
+                    "is_miss": True,
+                }), False
+            assert name == "web_search"
+            return json.dumps({
+                "query": arguments["query"], "result_text": "• Brave result", "result_count": 1,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["news_search"],
+                instruction   = "what's the latest news on APC?",
+                context       = {},
+            )
+
+        assert len(results) == 2
+        assert results[0].tool_name == "news_search"
+        assert results[0].success is False
+        assert results[1].tool_name == "news_search:brave_fallback"
+        assert results[1].success is True
+        assert results[1].result == "• Brave result"
+        # Same derived query reused for both tiers, not a generic re-derivation.
+        assert seen_calls[0][1] == seen_calls[1][1]
+
+    def test_tier1_and_tier2_both_fail(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            if name == "news_search":
+                return json.dumps({
+                    "query": arguments["query"], "result_text": "", "result_count": 0,
+                    "is_miss": True,
+                }), False
+            return (
+                "Error executing tool web_search: ERROR: BRAVE_API_KEY not configured"
+            ), True
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["news_search"],
+                instruction   = "what's the latest news on APC?",
+                context       = {},
+            )
+
+        assert len(results) == 2
+        assert all(not r.success for r in results)
+        assert results[1].tool_name == "news_search:brave_fallback"
+
+    def test_missing_newsapi_key_triggers_fallback(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            if name == "news_search":
+                return (
+                    "Error executing tool news_search: "
+                    "ERROR: NEWSAPI_API_KEY not configured"
+                ), True
+            return json.dumps({
+                "query": arguments["query"], "result_text": "• Brave result", "result_count": 1,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["news_search"],
+                instruction   = "what's the latest news on APC?",
+                context       = {},
+            )
+
+        assert len(results) == 2
+        assert results[0].result == "ERROR: NEWSAPI_API_KEY not configured"
+        assert results[1].success is True
+
+    def test_connection_failure_returns_graceful_error(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            raise ConnectionRefusedError("Connection refused")
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["news_search"],
+                instruction   = "what's the latest news on APC?",
+                context       = {},
+            )
+
+        # Both tiers hit the same unreachable-localist-mcp path.
+        assert len(results) == 2
+        assert all(not r.success for r in results)
+        assert "unreachable" in results[0].result
+        assert "unreachable" in results[1].result
+
+
 class TestChart:
     """
     Coverage for MCPToolDispatcher._run_chart and its extraction pipeline

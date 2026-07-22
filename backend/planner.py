@@ -91,7 +91,7 @@ class RoutingPlan:
         to recover the display name.
     tool_signal_source :
         Provenance of tools_to_call, for per-turn auditability: "keyword"
-        when a deterministic P3/P3b/compound match populated it,
+        when a deterministic P3/P3-news/P3b/compound match populated it,
         "classifier_fallback" when the feature-flagged P6-fallthrough
         tool-need classifier populated it (active mode only),
         "slash_command" when a leading "/chart"/"/research" token (Priority
@@ -203,7 +203,14 @@ _MEMORY_KEYWORDS: frozenset[str] = frozenset({
 
 # Priority 3 — web search trigger keywords
 # Multi-word phrases carry no false-positive risk with _any_whole_word().
-# Single words ("today", "recent", "news") are protected by \b anchors.
+# Single words ("today", "recent") are protected by \b anchors.
+#
+# 2026-07-22: "news" moved out of this set into _NEWS_KEYWORDS (below) now
+# that news_search exists — same pruning rationale as "today" on
+# 2026-07-06 (see the "Correction" note in LOCALIST-Architecture.md §4):
+# leaving it in both sets would just have P3-news and P3 racing on the same
+# word, and P3-news needs to win (it runs first in route()), so "news"
+# lives in exactly one set now.
 _WEB_SEARCH_KEYWORDS: frozenset[str] = frozenset({
     "latest",
     "current price",
@@ -211,10 +218,26 @@ _WEB_SEARCH_KEYWORDS: frozenset[str] = frozenset({
     "current ceo",
     "current status",
     "current rate",
-    "news",
     "recent",
     "web search",
     "do a search",
+})
+
+# Priority 3-news — news_search trigger keywords (checked before P3 so a
+# news match wins over the generic web_search-only P3 branch). Deterministic
+# keyword set only for now; a semantic "news_request" secondary signal is
+# scoped as a fast-follow (news-query-routing plan §3.2/§6) once a real
+# threshold has been tuned via a score_news_request_templates.py diagnostic
+# pass — do not add it here on a guessed number.
+_NEWS_KEYWORDS: frozenset[str] = frozenset({
+    "news",
+    "headline",
+    "headlines",
+    "breaking",
+    "latest news",
+    "latest headlines",
+    "what's happening with",
+    "top stories",
 })
 
 # Priority 3 — explicit-date web search signal, independent of both
@@ -645,7 +668,7 @@ _NEGATIVE_FILTER_TIEBREAK_SYSTEM_PROMPT: str = (
 # ---------------------------------------------------------------------------
 # P6-fallthrough tool-need classifier  (feature-flagged, shadow-first)
 #
-# Fires only when P1, P2, P3/3b/3c, and P4 have all found no match for the
+# Fires only when P1, P2, P3-news, P3/3b/3c, and P4 have all found no match for the
 # turn — i.e. routing is about to fall through past Priority 5 toward
 # Priority 6. Two hard gates run before any model call (see
 # Planner._classify_tool_fallback); the flag below is a third, coarser gate
@@ -901,6 +924,7 @@ class Planner:
 
     # Class-level aliases so callers can access via instance (e.g. p._WEB_SEARCH_KEYWORDS)
     _WEB_SEARCH_KEYWORDS:    frozenset[str]    = _WEB_SEARCH_KEYWORDS
+    _NEWS_KEYWORDS:          frozenset[str]    = _NEWS_KEYWORDS
     _FILE_OP_KEYWORDS:       frozenset[str]    = _FILE_OP_KEYWORDS
     _CHART_KEYWORDS:         frozenset[str]    = _CHART_KEYWORDS
     _GATE1_ENV_VAR:          str               = _GATE1_ENV_VAR
@@ -1185,6 +1209,15 @@ class Planner:
         if plan is not None:
             return plan
 
+        # Priority 3-news — News query (runs before P3 so a news match wins
+        # over a web_search-only P3 match on the same turn; defers to P3's
+        # file_op/url_fetch signals via the same inline-guard pattern P3c
+        # uses). Must NOT run before P3c or P1/P2 — same ordering rule P3c
+        # already documents relative to P3.
+        plan = self._priority3_news(instruction, lowered)
+        if plan is not None:
+            return plan
+
         # Priority 3 — Tool signal
         plan = self._priority3_tool(lowered, instruction)
         if plan is not None:
@@ -1215,7 +1248,7 @@ class Planner:
             return plan
 
         # P6-fallthrough tool-need classifier — feature-flagged, shadow-first.
-        # Only reached when P1, P2, P3/3b/3c, P4, and P5 have all found no
+        # Only reached when P1, P2, P3-news, P3/3b/3c, P4, and P5 have all found no
         # match. Off by default: _maybe_tool_fallback_classifier() returns
         # None immediately without calling _classify_tool_fallback() at all.
         plan = self._maybe_tool_fallback_classifier(instruction, context)
@@ -1904,6 +1937,64 @@ class Planner:
         )
 
     # -----------------------------------------------------------------------
+    # Priority 3-news — News query
+    # -----------------------------------------------------------------------
+
+    def _priority3_news(self, instruction: str, lowered: str) -> RoutingPlan | None:
+        """
+        Priority 3-news — News query ("news", "headlines", "breaking",
+        "top stories", etc.). Wins over a web_search-only P3 match (hence
+        its placement before P3 in route()) but loses to P3c graph-query
+        and to P1/P2 (handled by route()'s call order, not here).
+
+        Deterministic keyword match only for now — see _NEWS_KEYWORDS'
+        module-level comment for why the semantic "news_request" secondary
+        signal is deferred rather than guessed here.
+
+        Returns None (deferring to normal priority evaluation) if:
+          - file_op or url_fetch keywords/a raw URL are present (inline
+            guard, same pattern P3c uses — an explicit "fetch this
+            article" or "read the file" instruction should never get
+            hijacked into a news search), OR
+          - no _NEWS_KEYWORDS match is present.
+
+        On match, returns a RoutingPlan routing to news_search only —
+        Brave/web_search is never separately scheduled here; the
+        NewsAPI-miss fallback lives entirely inside MCPToolDispatcher
+        (_run_news_search), same as web_search/research/chart are the only
+        tool names Planner itself needs to know about.
+        """
+        # 1. Inline file_op/url_fetch guard — duplicates _priority3_tool()'s
+        #    file_op/url_fetch detection, same deliberate duplication P3c
+        #    already uses (see P3c's docstring for why there's no
+        #    standalone pre-check for those two signals). Keep in sync with
+        #    both P3c's and P3's copies if any of the three changes.
+        if (
+            self._any_whole_word(_FILE_OP_KEYWORDS, lowered)
+            or any(p.search(instruction) for p in _FILE_OP_PATH_PATTERNS)
+            or self._any_whole_word(_FETCH_KEYWORDS, lowered)
+            or re.search(r"https?://", lowered)
+        ):
+            return None
+
+        # 2. News keyword match.
+        news_kw = self._any_whole_word(_NEWS_KEYWORDS, lowered)
+        if not news_kw:
+            return None
+
+        logger.debug("Planner: Priority 3-news — news_search signal detected (%r).", news_kw)
+
+        return RoutingPlan(
+            agent              = "conversational_agent",
+            fetch_episodic     = False,
+            fetch_rag          = False,
+            tools_to_call      = ["news_search"],
+            compound           = True,
+            priority           = 3,
+            tool_signal_source = "keyword",
+        )
+
+    # -----------------------------------------------------------------------
     # Priority 3b — Factual query + corpus miss
     # -----------------------------------------------------------------------
 
@@ -2113,7 +2204,7 @@ class Planner:
     ) -> str | None:
         """
         Bounded single-inference-call classifier: "is a tool needed for this
-        instruction, and which one?" Called only when P1, P2, P3/3b/3c, and
+        instruction, and which one?" Called only when P1, P2, P3-news, P3/3b/3c, and
         P4 have all found no match for this turn (i.e. routing is about to
         fall through past Priority 5 toward Priority 6) AND the
         LOCALIST_TOOL_FALLBACK_CLASSIFIER flag is "shadow" or "active" (see

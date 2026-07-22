@@ -1336,9 +1336,21 @@ class ControllerAgent:
         # case, caught by the second clause. Decision (2026-07-16): "no
         # pricing found" deserves the same corpus-grounding attempt as
         # "search API down" rather than leaving the answer ungrounded.
+        #
+        # news_search (mcp_tool_dispatcher._run_news_search, 2026-07-22)
+        # feeds this too: a tier-1 NewsAPI miss surfaces as tool_name=
+        # "news_search" success=False, and — if the tier-2 Brave fallback
+        # is then invoked — that result is retagged tool_name="news_search:
+        # brave_fallback" for provenance rather than left as "web_search".
+        # Without the third clause below that rename would silently escape
+        # this check, the same gap "research" hit and fixed the same way.
+        # startswith() (not ==) so it catches both the tier-1 "news_search"
+        # entry and the retagged "news_search:brave_fallback" one.
         rag_sources: list[RagSource] = []
         _web_search_failed = any(
-            (r.tool_name == "web_search" and not r.success) or r.tool_name == "research"
+            (r.tool_name == "web_search" and not r.success)
+            or r.tool_name == "research"
+            or (r.tool_name.startswith("news_search") and not r.success)
             for r in dispatched_tool_results
         )
         if _web_search_failed and self._memory_manager is not None:

@@ -10,14 +10,17 @@ logging. It exposes tools over **MCP's SSE transport** (`GET /sse`,
 `POST /messages/`, both mounted from `FastMCP.sse_app()`) plus a plain
 `GET /health` returning `{"status": "ok"}`.
 
-This is where `file_op`, `url_fetch`, and `web_search` actually execute.
+This is where `file_op`, `url_fetch`, `web_search`, `generate_chart`
+(§14.8), and `news_search` (§14.9) actually execute.
 `MCPToolDispatcher` (`backend/mcp_tool_dispatcher.py`) is the client —
 `controller_agent.py`'s `_execute_plan()` constructs one per dispatch call
 (the same single seam `ToolDispatcher` used to occupy) and calls it over
 an MCP `ClientSession` per tool invocation. `MCPToolDispatcher` also owns
-a fourth tool name, `"research"` — a client-side bounded loop over the
-`web_search`/`fetch_url` MCP tools above, not a fifth tool implemented on
-`localist-mcp` itself; see §18.
+a tool name with no MCP-server-side counterpart, `"research"` — a
+client-side bounded loop over the `web_search`/`fetch_url` MCP tools
+above, not a tool implemented on `localist-mcp` itself; see §18. Similarly,
+`news_search`'s Brave fallback tier (§14.9) is a client-side reuse of the
+existing `web_search` tool, not a second MCP-server-side provider.
 
 Built across four phases (all 2026-07-03): Phase 1 migrated `file_op` and
 stood up the service; Phase 2 added `fetch_url`, retiring the standalone
@@ -36,6 +39,7 @@ brought this document back in sync.
 | `fetch_url` | `mcp_server/url_fetch.py` | `(url: str, timeout: float = 10.0) -> dict` | `{url, title, author, date_published, cleaned_text, word_count, fetch_duration_ms}` |
 | `web_search` | `mcp_server/web_search.py` | `(query: str) -> dict` | `{query, result_text, result_count}` — `result_text` is the formatted bullet block, or `"No results found."` |
 | `generate_chart` | `mcp_server/chart.py` | `(chart_type: str, labels: list[str], datasets: list[dict], title: str = "") -> dict` | `{summary, png_path, chart_config}` — see §14.8 |
+| `news_search` | `mcp_server/news_search.py` | `(query: str) -> dict` | `{query, result_text, result_count, is_miss}` — see §14.9 |
 
 **`file_op` sandboxing:** every path is resolved against a sandbox root
 and rejected if the resolved absolute path escapes it — same check
@@ -216,6 +220,12 @@ BRAVE_API_KEY                Required for web_search when
                               SEARCH_PROVIDER=brave. Same load_dotenv()
                               path as LANGSEARCH_API_KEY.
 
+NEWSAPI_API_KEY              Required for news_search (§14.9). Free
+                              Developer tier only (100 req/day, dev/test
+                              use only per NewsAPI's terms) — acceptable
+                              since Localist runs single-user on
+                              localhost and never leaves it.
+
 LOCALIST_LOG_LEVEL           localist-mcp's root log level. Default: INFO.
 ```
 
@@ -267,6 +277,12 @@ LOCALIST_LOG_LEVEL           localist-mcp's root log level. Default: INFO.
   the full incident.
 - Live verification for each phase is recorded in `sessions-log.md` under
   2026-07-03.
+- `news_search` (§14.9, 2026-07-22) — `TestNewsSearch`
+  (`test_mcp_tool_dispatcher.py`), `TestPlannerP3News`
+  (`test_planner_phase3.py`), and
+  `test_news_search_double_miss_triggers_corpus_fallback`
+  (`test_tool_dispatcher_phase6.py`), plus live verification against real
+  NewsAPI/Brave traffic — see §14.9 and `sessions-log.md` under 2026-07-22.
 
 ### 14.7 Open Items
 
@@ -830,4 +846,134 @@ this gap had previously produced, which is also what surfaced Open Item
   retry logic are backend-agnostic, but the accepted-failure-rate number
   in this doc should not be assumed to transfer to a different active
   runtime backend without a fresh diagnostic run.
+
+### 14.9 `news_search` Tool — NewsAPI → Brave `web_search` Fallback (2026-07-22)
+
+A sixth MCP tool, `news_search` (`mcp_server/news_search.py`), scoped
+because `news`/`latest`/`recent` news-shaped queries were routing to
+`web_search` — a general-purpose search API (Brave, currently active via
+`SEARCH_PROVIDER=brave`, or LangSearch) with no concept of publish dates,
+sources, or article freshness the way a purpose-built news index has. The
+fix gives news queries a dedicated tier-1 provider (NewsAPI.org) with a
+fallback to the existing `web_search` tool, unchanged, so a NewsAPI miss
+doesn't silently produce "I don't know":
+
+```
+news_search (NewsAPI) → web_search (Brave/LangSearch, existing — unchanged)
+```
+
+**Why the free NewsAPI Developer tier is acceptable here.** Localist runs
+entirely on the user's own Mac (`localhost`), never in a hosted/production
+deployment. NewsAPI's Developer (free) plan terms — 100 requests/day,
+articles carry a 24-hour publish delay, only the last month is queryable,
+explicitly restricted to development/testing — are a natural fit rather
+than a limitation to design around at this single-user, local scale.
+`NEWSAPI_API_KEY` is documented in `.env.example` with the dev-tier
+caveat (§14.4).
+
+**`mcp_server/news_search.py` — the MCP tool itself.** `news_search(query:
+str) -> dict`, structurally mirroring `web_search.py`: reads
+`NEWSAPI_API_KEY` lazily (same not-inherited-`load_dotenv()` reasoning as
+every other key in this file), calls `GET
+https://newsapi.org/v2/everything` with `language=en`,
+`sortBy=publishedAt` (freshness over relevancy ranking — the point of a
+news-specific tool), `pageSize=5` (slightly wider than `web_search`'s
+top-3 convention), auth via the `X-Api-Key` header rather than the
+`?apiKey=` query param (keeps the key out of any request logging that
+captures URLs). Raises `ValueError("ERROR: NEWSAPI_API_KEY not
+configured")` on a missing key, or `ValueError("ERROR: news_search failed
+— ...")` on a genuine transport/HTTP error — same fail-loud,
+no-inference-fallback contract as every other tool here.
+
+**The "miss" signal is distinct from a transport failure.** NewsAPI never
+returns a literal `null` for a miss — a real zero-result response comes
+back `"status": "ok"`, `"totalResults": 0`, `"articles": []`; an
+auth/rate-limit failure comes back `"status": "error"` with an HTTP error
+status code that `httpx` still parses as JSON (no `raise_for_status()`
+call in this tool, deliberately, so an error body's JSON is read rather
+than raising early). Both are folded into a single `is_miss: bool` field
+in the tool's returned dict — the precise "fall through to Brave" trigger
+condition. A genuine network/connection error (localist-mcp unreachable,
+DNS failure, malformed non-JSON response) is a different case entirely,
+raising `ValueError` the normal way, indistinguishable downstream from any
+other tool-call failure.
+
+**`MCPToolDispatcher._run_news_search()` — the fallback chain.** Derives
+one query via the existing `_derive_initial_query()` (the same
+resolution order `_run_web_search`/`_run_research_loop` already use —
+explicit `context["web_search_queries"][0]`, else filler-stripped from the
+instruction) — single query only, unlike `web_search`'s up-to-3-query
+loop. Calls `news_search` first; if that `ToolResult.success` is `False`
+(either `is_miss=True` or a raised error, both normalized to
+`success=False` by `_execute_news_search_query()`), falls through to the
+**existing** `_execute_web_search_query()` helper `_run_web_search()`
+already uses, passing the *same* derived query — a miss on "latest news on
+X" still asks Brave about "X", not a generic re-derivation. No new
+search-provider integration exists or is needed for this fallback tier: it
+is a direct reuse of the already-Brave-backed `web_search` tool and its
+existing MCP call path. Always returns the tier-1 `ToolResult`; only calls
+tier 2 (and appends its result) when tier 1 didn't succeed — same "return
+every ToolResult produced, not just the winner" convention
+`_run_research_loop()` established (§18).
+
+**Provenance tagging.** The tier-2 result, when it fires, is retagged
+`tool_name="news_search:brave_fallback"` (via `dataclasses.replace()`)
+rather than left as `"web_search"` — so a transcript or log makes it
+visible when NewsAPI is answering every query via Brave instead (a signal
+its key/quota needs attention), not just server-side logs. This rename
+required extending `controller_agent.py`'s Step 3b corpus-fallback check
+— documented at §4.6.1's 2026-07-22 update, not duplicated here, since
+that check lives in `controller_agent.py`, not this file.
+
+**Planner routing** — `_NEWS_KEYWORDS`, `_priority3_news()`, and the new
+Priority 3-news step are documented at §4.2 (2026-07-22 update), not
+duplicated here; this section covers only the MCP tool and dispatcher
+sides.
+
+**Test coverage.** `TestNewsSearch` (`test_mcp_tool_dispatcher.py`) —
+tier-1 success (single result), tier-1 miss falling back to a successful
+Brave result (asserting the same derived query is reused for both tiers),
+both tiers failing, a missing-`NEWSAPI_API_KEY` error triggering the
+fallback the same as a miss, and connection-failure graceful degradation
+across both tiers. `TestPlannerP3News` (`test_planner_phase3.py`, 11
+tests) — basic keyword match, the other `_NEWS_KEYWORDS` phrasings, wins
+over a `web_search`-only Priority 3 match, `"news"` confirmed absent from
+`_WEB_SEARCH_KEYWORDS`, file_op/url_fetch guards defer to Priority 3,
+Priority 3c (graph-query) still wins over Priority 3-news, Priority 1
+(ingest) still wins, and a no-match fallthrough case.
+`test_news_search_double_miss_triggers_corpus_fallback`
+(`test_tool_dispatcher_phase6.py`) proves, with real embeddings rather
+than a mocked score, that a full tier-1+tier-2 miss still reaches Step
+3b's corpus grounding — the exact case the Step 3b check extension above
+exists for. Full suite: 1042 → 1059 passed, 0 failed.
+
+**Live verification (2026-07-22).** Booted the real `localist-mcp` server
+(not mocks) and confirmed, over a genuine MCP round trip: (1) with no
+`NEWSAPI_API_KEY` configured, `news_search` fails cleanly
+(`"ERROR: NEWSAPI_API_KEY not configured"`, `isError=True`) exactly as the
+mocked tests assumed; (2) with a real key added, a real query
+(`"Apple Vision Pro"`) returned 5 dated articles from `2026-07-21`,
+confirming the 24-hour dev-tier publish delay doesn't produce a false
+zero-result miss; (3) a deliberately nonsensical query
+(`"zzqqxxvv flibbertigibbet blornak news update 12345"`) forced a genuine
+NewsAPI zero-result miss, and `MCPToolDispatcher.dispatch()` — the real
+class, real fallback chain, pointed at the live server — correctly fell
+through to a real, successful Brave result tagged
+`tool_name="news_search:brave_fallback"`.
+
+**Open Items.**
+
+- **Semantic `news_request` gate not built.** Scoped (mirroring
+  `lookup_request`/`explicit_search_action`, §10) but deliberately deferred
+  — no threshold has been tuned against real utterances via a
+  `score_news_request_templates.py` diagnostic pass (the same methodology
+  §10's gates were tuned with), and guessing one was explicitly rejected.
+  Fast-follow once that data exists.
+- **`top-headlines` endpoint not supported.** Only `/v2/everything` is
+  wired up, covering the "news about X" query shape this was scoped for.
+  Category/country-scoped browsing (NewsAPI's `/v2/top-headlines`) would
+  be a separate follow-up if that use case becomes real.
+- **No caching layer for the 100 req/day cap.** Unlikely to be hit at
+  single-user, local scale; if it becomes a problem the fix is a simple
+  per-query in-memory TTL cache inside the MCP tool, not a Planner change.
 

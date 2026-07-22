@@ -734,6 +734,96 @@ class TestPlannerP3c:
 
 
 # ---------------------------------------------------------------------------
+# Priority 3-news — news_search tool routing (news-query-routing plan)
+# ---------------------------------------------------------------------------
+
+class TestPlannerP3News:
+
+    # 1. Basic news keyword match routes to news_search only.
+    def test_news_keyword_routes_to_news_search(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("what's the latest news on APC?", context={})
+        assert plan.tools_to_call == ["news_search"]
+        assert plan.compound is True
+        assert plan.priority == 3
+        assert plan.tool_signal_source == "keyword"
+        assert plan.fetch_rag is False
+        assert plan.fetch_episodic is False
+
+    # 2. "headlines"/"breaking"/"top stories" all match _NEWS_KEYWORDS too.
+    @pytest.mark.parametrize("instruction", [
+        "any headlines about APC?",
+        "is there breaking news about APC?",
+        "what are the top stories today?",
+    ])
+    def test_other_news_keywords_route_to_news_search(self, instruction):
+        p = Planner(runtime=make_runtime())
+        plan = p.route(instruction, context={})
+        assert plan.tools_to_call == ["news_search"]
+
+    # 3. news_search wins over a web_search-only P3 match on the same turn —
+    #    "recent" is a _WEB_SEARCH_KEYWORDS entry; P3-news runs first in
+    #    route() so it must win, not merge with web_search.
+    def test_news_beats_web_search_p3(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("any recent news on APC?", context={})
+        assert plan.tools_to_call == ["news_search"]
+        assert "web_search" not in plan.tools_to_call
+
+    # 4. "news" no longer fires plain web_search on its own (moved out of
+    #    _WEB_SEARCH_KEYWORDS into _NEWS_KEYWORDS — see planner.py's
+    #    2026-07-22 comment above _WEB_SEARCH_KEYWORDS).
+    def test_news_word_not_in_web_search_keywords(self):
+        from planner import _WEB_SEARCH_KEYWORDS, _NEWS_KEYWORDS
+        assert "news" not in _WEB_SEARCH_KEYWORDS
+        assert "news" in _NEWS_KEYWORDS
+
+    # 5. file_op guard: a literal _FILE_OP_KEYWORDS hit ("read the file")
+    #    alongside "news" defers P3-news to P3, which resolves it as file_op.
+    def test_file_op_guard_defers_to_p3(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("read the file for news updates", context={})
+        assert plan.tools_to_call == ["file_op"]
+        assert "news_search" not in plan.tools_to_call
+
+    # 6. url_fetch guard: a raw URL alongside "news" defers P3-news to P3.
+    def test_url_guard_defers_to_p3(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("summarize the news at https://example.com/article", context={})
+        assert "url_fetch" in plan.tools_to_call
+        assert "news_search" not in plan.tools_to_call
+
+    # 7. Ordering regression: P3c (graph-query) beats P3-news, same as it
+    #    already beats plain P3 web_search — P3-news must not run before P3c.
+    def test_p3c_beats_news_search(self, tmp_path):
+        mm, node_ids = make_mm_with_nodes(tmp_path)
+        p = Planner(runtime=make_runtime(), memory_manager=mm)
+        plan = p.route("what links to lora-persona, any recent news?", context={})
+        assert plan.graph_query is not None
+        direction, node_id, resolved_stem = plan.graph_query
+        assert direction     == "incoming"
+        assert resolved_stem == "lora-persona"
+        assert node_id       == node_ids["lora-persona"]
+        assert "news_search" not in plan.tools_to_call
+
+    # 8. P1 beats P3-news: ingest keyword routes to wiki_agent regardless of
+    #    a news keyword also being present.
+    def test_p1_beats_p3_news(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("ingest this file, it's about recent news", context={})
+        assert plan.agent == "wiki_agent"
+        assert "news_search" not in plan.tools_to_call
+
+    # 9. No news keyword at all → P3-news defers, falls through normally
+    #    (P6 direct answer, since nothing else in this instruction matches).
+    def test_no_news_keyword_falls_through(self):
+        p = Planner(runtime=make_runtime(infer_return="no"))
+        plan = p.route("how do I bake bread?", context={})
+        assert plan.tools_to_call == []
+        assert plan.agent == "conversational_agent"
+
+
+# ---------------------------------------------------------------------------
 # Priority 1b — diff-only wiki update (standalone diff instructions scope doc)
 # ---------------------------------------------------------------------------
 
@@ -1235,10 +1325,18 @@ class TestPriority3SemanticGating:
     """
 
     def test_literal_keyword_still_fires_with_embed_fn(self):
-        """Literal _WEB_SEARCH_KEYWORDS match still produces web_search."""
+        """Literal _WEB_SEARCH_KEYWORDS match still produces web_search.
+
+        2026-07-22: instruction changed from "...latest news on APC?" to
+        "...latest price on APC?" — "news" moved out of _WEB_SEARCH_KEYWORDS
+        into _NEWS_KEYWORDS (news_search now wins for it via P3-news, which
+        runs before P3 — see test_priority3_news.py), so the old wording no
+        longer isolates the literal-web_search-keyword invariant this test
+        is about. "latest"/"current price" remain untouched P3 keywords.
+        """
         fixed_vec = _unit_vector(8)
         p = Planner(runtime=make_runtime(), embed_fn=MagicMock(return_value=fixed_vec))
-        plan = p.route("what is the latest news on APC?", context={})
+        plan = p.route("what is the latest price on APC?", context={})
         assert "web_search" in plan.tools_to_call
         assert plan.compound is True
 

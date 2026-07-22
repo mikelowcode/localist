@@ -47,14 +47,25 @@ All lower priorities are skipped.
 
 ---
 
+**PRIORITY 3-NEWS — NEWS QUERY** *(added 2026-07-22)*
+
+| | |
+|---|---|
+| **Condition** | `_NEWS_KEYWORDS` present in the instruction (`"news"`, `"headline"`, `"headlines"`, `"breaking"`, `"latest news"`, `"latest headlines"`, `"what's happening with"`, `"top stories"`), via `_any_whole_word()`. Same inline file_op/url_fetch/raw-URL guard Priority 3c uses (see below) — an explicit "fetch this article" or "read the file" instruction defers to Priority 3 instead of being hijacked into a news search. |
+| **Action** | Route to `ConversationalAgent` with `tools_to_call = ["news_search"]`, `compound = True`, `priority = 3`, `tool_signal_source = "keyword"`. |
+| **Rationale** | `news`/`headlines`/`breaking` etc. describe a fundamentally different retrieval need than generic web search — a purpose-built news index with publish dates and source attribution, not Brave's general-purpose ranking. Runs before Priority 3 so a news match wins outright rather than merging with a `web_search`-only Priority 3 match on the same turn (e.g. "recent" + "news" in the same instruction routes to `news_search` only, not `["web_search", "news_search"]`). Still loses to Priority 3c (graph-query, §8) and everything above it — same ordering rule §8 already documents for Priority 3c relative to Priority 3. |
+| **Notes** | `"news"` moved out of `_WEB_SEARCH_KEYWORDS` into `_NEWS_KEYWORDS` as part of this change — see the 2026-07-22 update below. The `news_search` MCP tool itself (NewsAPI, falling back to the existing Brave-backed `web_search` tool on a miss) is documented at §14.9; nothing beyond the tool name reaches the Planner — the fallback chain lives entirely inside `MCPToolDispatcher`. A semantic `news_request` secondary signal (mirroring `lookup_request`/`explicit_search_action`, §10) is scoped but deliberately not built yet — no threshold has been tuned against real utterances, and guessing one was explicitly rejected during scoping. |
+
+---
+
 **PRIORITY 3 — TOOL SIGNAL**
 
 | | |
 |---|---|
-| **Condition** | Web search keywords (`"latest"`, `"current price"`, `"current version"`, `"current ceo"`, `"current status"`, `"current rate"`, `"news"`, `"recent"`); OR file operation keywords (`"read the file"`, `"read file"`, `"open the file"`, `"create a file"`); OR URL fetch keywords (`"fetch this"`, `"fetch the url"`, `"read this link"`, `"read this url"`, `"open this link"`, `"summarize this url"`, `"summarize this link"`, `"extract this"`); OR any `http://` or `https://` URL present in the instruction. |
+| **Condition** | Web search keywords (`"latest"`, `"current price"`, `"current version"`, `"current ceo"`, `"current status"`, `"current rate"`, `"recent"`); OR file operation keywords (`"read the file"`, `"read file"`, `"open the file"`, `"create a file"`); OR URL fetch keywords (`"fetch this"`, `"fetch the url"`, `"read this link"`, `"read this url"`, `"open this link"`, `"summarize this url"`, `"summarize this link"`, `"extract this"`); OR any `http://` or `https://` URL present in the instruction. |
 | **Action** | Dispatch appropriate tool(s). Populate `RoutingPlan.tools_to_call`. Tool results populate Slot 5 before ConversationalAgent runs. |
 | **Rationale** | Tool results are the freshest possible evidence and must be gathered before any RAG retrieval. |
-| **Notes** | All single-word keywords use `_any_whole_word()` with `\b` regex anchors to prevent substring false positives. Multi-word phrases (`"current version"`, `"read the file"`) carry no false-positive risk. The URL regex (`https?://`) automatically triggers `url_fetch` when any link is dropped into the instruction. |
+| **Notes** | All single-word keywords use `_any_whole_word()` with `\b` regex anchors to prevent substring false positives. Multi-word phrases (`"current version"`, `"read the file"`) carry no false-positive risk. The URL regex (`https?://`) automatically triggers `url_fetch` when any link is dropped into the instruction. `"news"` removed 2026-07-22 (see update below) — now exclusively a Priority 3-news signal. |
 
 ---
 
@@ -85,6 +96,8 @@ gate missed.
 *Correction 2026-07-06 — bare `"today"`/`"write"`/`"save"` pruned from the keyword lists above.* Live traffic showed the deterministic keyword branch firing independently of, and before, the semantic gate's judgment: an utterance like "Did you know I added a new file read / write / append tool to my Localist app today?" correctly scored non-search by the semantic gate (`lookup_request=0.532 < 0.65`, `gate_fired=False`) but still triggered both `web_search` (on bare `"today"`) and `file_op` (on bare `"write"`) via the keyword branch, which runs unconditionally regardless of the semantic result. Fix: removed `"today"` from `_WEB_SEARCH_KEYWORDS` and `"write"`/`"save"` from `_FILE_OP_KEYWORDS` — all three were too common in ordinary conversational sentences to serve as reliable single-word tool signals. No replacement phrases were added; instructions that used to hit these bare words now fall through to P3b/P4/P5/§15.1's P6 classifier, which is the intended effect, not a gap to be immediately recaptured. Two tests keyed to the removed words (`test_file_op_guard_defers_to_p3`, `test_p3c_beats_web_search_p3` in `test_planner_phase3.py`) were rewritten to use surviving keywords (`"create a file"`, `"recent"`) — same P3c-ordering behavior under test, just a different trigger word; full suite restored to the 572 passed / 2 failed baseline (the 2 being the pre-existing, unrelated failures tracked in §14.6).
 
 *Update 2026-07-20 — chart keyword signal added, third member of the P3 keyword OR.* A new `_CHART_KEYWORDS` frozenset (`"chart this"`, `"make a chart"`, `"make a bar/line/pie chart"`, `"plot this/these"`, `"graph this/these"`, `"visualize this/these"`), checked via `_any_whole_word()` alongside `ws_kw`, appends `"chart"` to `tools_to_call` — full design, the diagnostic corpus behind the keyword choices, the extraction pipeline this feeds, and the accepted-failure behavior when extraction fails are documented at §14.8, not duplicated here. Compounds with `web_search`/`file_op` the same way those two already do.
+
+*Update 2026-07-22 — `"news"` moved out of `_WEB_SEARCH_KEYWORDS`, new Priority 3-news added above.* Same pruning rationale as the 2026-07-06 correction below: leaving `"news"` in both `_WEB_SEARCH_KEYWORDS` and the new `_NEWS_KEYWORDS` would just have Priority 3-news and Priority 3 racing on the same word, and Priority 3-news needs to win (it runs first), so `"news"` now lives in exactly one set. Two pre-existing tests keyed to `"...latest news..."` instructions (`test_literal_keyword_still_fires_with_embed_fn` in `test_planner_phase3.py`, `test_route_populates_gate1_state_for_next_turn` in `test_planner_tool_fallback_classifier.py`) were rewritten to use `"...latest price..."` — same literal-`web_search`-keyword invariant under test, just a trigger word `news_search` doesn't now intercept. Full suite: 1042 → 1059 passed. Full design and live verification at §14.9.
 
 ---
 
@@ -461,6 +474,27 @@ the exact condition it was designed for.
 Open Item 5 in §10.4 (SUCCESS with irrelevant results) is a distinct,
 still-open failure mode — see that section; it is not addressed by this
 update.
+
+#### 4.6.1 Update — `news_search` Extends the Fallback Check (2026-07-22)
+
+The new `news_search` tool (§14.9) reuses this exact Step 3b mechanism —
+NewsAPI is a tier ahead of `web_search`, not a parallel fallback path — but
+its Brave-fallback `ToolResult` is retagged `tool_name="news_search:
+brave_fallback"` for provenance (so a transcript makes it visible when
+NewsAPI's key/quota needs attention, rather than looking identical to a
+plain `web_search` call). That rename would have silently escaped Step 3b's
+exact `tool_name == "web_search"` check — the identical gap the `research`
+tool already hit and fixed with its own `or r.tool_name == "research"`
+clause (documented above). Fixed the same way: the check gained a third
+clause, `or (r.tool_name.startswith("news_search") and not r.success)`,
+catching both the tier-1 `"news_search"` miss entry and, on a double miss,
+the retagged tier-2 entry too. Live-verified against real NewsAPI/Brave
+traffic (not just mocks): a genuine NewsAPI query returned real dated
+articles; a forced nonsense-query miss correctly fell through to a real,
+successful Brave result tagged `news_search:brave_fallback`; a dedicated
+test (`test_news_search_double_miss_triggers_corpus_fallback` in
+`test_tool_dispatcher_phase6.py`) proves a full double-miss still reaches
+Step 3b's corpus grounding using real embeddings, not a mocked score.
 
 #### 4.6.2 Empty-completion guard + forced-tool retry (added 2026-07-17)
 

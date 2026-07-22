@@ -523,6 +523,73 @@ class TestControllerToolIntegration:
         assert "Zylophonic" in prompt
         assert rt.infer.call_count == 2
 
+    def test_news_search_double_miss_triggers_corpus_fallback(self, mm, tmp_path):
+        """
+        Proves controller_agent.py's Step 3b corpus fallback still fires
+        end-to-end when the news_search chain is fully exhausted: tier-1
+        NewsAPI misses, tier-2 Brave fallback also fails.
+
+        This is exactly the case the Step 3b `r.tool_name.startswith(
+        "news_search")` clause (added alongside mcp_tool_dispatcher.
+        _run_news_search, news-query-routing plan, 2026-07-22) exists for —
+        without it, the Brave-fallback ToolResult's renamed tool_name
+        ("news_search:brave_fallback") would silently escape Step 3b's
+        exact `tool_name == "web_search"` check, the same gap "research"
+        hit and was fixed for the same way (see the comment above
+        _web_search_failed in controller_agent.py).
+
+        Mocks the MCP transport seam directly (same idiom as
+        test_tool_results_slot_present_in_prompt above) rather than
+        spinning up a real localist-mcp subprocess — this is a pure
+        controller_agent.py/mcp_tool_dispatcher.py wiring proof, not a
+        real-network one (that's what live verification is for).
+        """
+        doc_path    = tmp_path / "zylophonic-news.md"
+        doc_content = "Zylophonic quarterly earnings breaking news update"
+        doc_path.write_text(doc_content, encoding="utf-8")
+        mm.index_document(doc_path, "raw", content=doc_content, embed=False)
+
+        rt = MagicMock(spec=["infer", "embed"])
+        rt.embed.return_value = [0.0] * 768
+        rt.infer.side_effect = [
+            "no",   # pre-dispatch episodic check
+            "NONE", # implicit extraction
+        ]
+
+        async def fake_open_session(stack):
+            return object()
+
+        async def fake_call_mcp_tool(session, name, arguments):
+            if name == "news_search":
+                return json.dumps({
+                    "query": arguments["query"], "result_text": "", "result_count": 0,
+                    "is_miss": True,
+                }), False
+            assert name == "web_search"
+            return (
+                "Error executing tool web_search: ERROR: BRAVE_API_KEY not configured"
+            ), True
+
+        conv = make_conv_agent("Here is what I found.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        with patch(
+            "mcp_tool_dispatcher.MCPToolDispatcher._open_session",
+            side_effect=fake_open_session,
+        ), patch(
+            "mcp_tool_dispatcher.MCPToolDispatcher._call_mcp_tool",
+            side_effect=fake_call_mcp_tool,
+        ):
+            ctrl.handle_task({
+                "instruction": "any breaking news on Zylophonic quarterly earnings?",
+                "context":     {"project_context": "LORA"},
+            })
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[CONTEXT]" in prompt
+        assert "Zylophonic" in prompt
+        assert rt.infer.call_count == 2
+
 
 # ---------------------------------------------------------------------------
 # MCP follow-up (2026-07-03) — session reuse, live over real SSE

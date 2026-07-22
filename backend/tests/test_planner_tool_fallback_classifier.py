@@ -117,8 +117,10 @@ class TestGate1PriorTurnToolsFired:
         rt = make_runtime(infer_return="web_search")
         p = Planner(runtime=rt, memory_manager=make_memory_manager())
 
-        # Turn 1 — P3 keyword match fires web_search.
-        p.route("What is the latest news?", context={})
+        # Turn 1 — P3 keyword match fires web_search. (Not "...latest
+        # news?" — "news" now routes to news_search via P3-news, which
+        # runs before P3; see test_priority3_news.py.)
+        p.route("What is the latest price?", context={})
         assert p._last_turn_tools_fired == ["web_search"]
 
         # Turn 2 — fallthrough instruction; the classifier method is invoked

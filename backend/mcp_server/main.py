@@ -7,10 +7,12 @@ Exposes file_op capabilities as three MCP tools — read_file, write_file,
 append_file — plus fetch_url (Phase 2: ports the retired standalone Fetcher
 microservice's /extract path in-process), web_search (Phase 3: ports the
 LangSearch integration in-process, no runtime.infer() hallucination
-fallback), and generate_chart (renders a bar/line/pie chart from structured
-data server-side via matplotlib) — over SSE transport, using the official
-`mcp` Python SDK's FastMCP. See backend/mcp_tool_dispatcher.py for the
-dispatch seam.
+fallback), news_search (NewsAPI.org /v2/everything — first-tier provider
+for news-shaped queries; MCPToolDispatcher falls back to web_search on a
+miss, see news-query-routing plan §4), and generate_chart (renders a
+bar/line/pie chart from structured data server-side via matplotlib) — over
+SSE transport, using the official `mcp` Python SDK's FastMCP. See
+backend/mcp_tool_dispatcher.py for the dispatch seam.
 
 Endpoints
 ---------
@@ -36,6 +38,11 @@ Configuration
   BRAVE_API_KEY                Required for web_search when
                                SEARCH_PROVIDER=brave — see
                                mcp_server/web_search.py.
+  NEWSAPI_API_KEY               Required for news_search — see
+                               mcp_server/news_search.py. Free Developer
+                               tier only (100 req/day, dev/test use only);
+                               a paid tier is required if this code is
+                               ever deployed off a single local machine.
 
 Start
 -----
@@ -58,7 +65,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from mcp.server.fastmcp import FastMCP
 
-from mcp_server import chart as _chart, file_ops, url_fetch as _url_fetch, web_search as _web_search
+from mcp_server import (
+    chart as _chart,
+    file_ops,
+    news_search as _news_search,
+    url_fetch as _url_fetch,
+    web_search as _web_search,
+)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -106,6 +119,12 @@ async def web_search(query: str) -> dict:
 
 
 @mcp.tool()
+async def news_search(query: str) -> dict:
+    """Run one news search query via NewsAPI.org (/v2/everything, sorted by publish date)."""
+    return await _news_search.news_search(query)
+
+
+@mcp.tool()
 def generate_chart(chart_type: str, labels: list[str], datasets: list[dict], title: str = "") -> dict:
     """Render a bar/line/pie chart from structured data and save it as a PNG. Returns summary, png_path, and chart_config."""
     return _chart.generate_chart(chart_type, labels, datasets, title)
@@ -125,7 +144,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title       = "Localist MCP Server",
-    description = "MCP tool server for Localist — file_op tools (read_file/write_file/append_file), fetch_url, web_search, and generate_chart.",
+    description = "MCP tool server for Localist — file_op tools (read_file/write_file/append_file), fetch_url, web_search, news_search, and generate_chart.",
     version     = "1.0.0",
     lifespan    = lifespan,
 )

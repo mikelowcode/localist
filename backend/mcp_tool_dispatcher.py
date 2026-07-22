@@ -4,14 +4,31 @@ LORA — MCP Tool Dispatcher
 Was originally a drop-in replacement for the now-deleted ToolDispatcher
 (tool_dispatcher.py) at the controller_agent.py dispatch seam; as of Phase
 4 (cleanup, 2026-07-03) that legacy class is gone entirely — "file_op",
-"url_fetch", "web_search", "research", and "chart" are the only tool names
-Planner ever routes to tools_to_call (see planner.py's P3/P3b), and all are
-served over the localist-mcp service (mcp_server/, port 8003) via the MCP
-SSE transport (research is a client-side loop over the same web_search/
-url_fetch MCP tools, not a distinct MCP tool of its own). Any other tool
-name is unrecognized and produces an inline error ToolResult — the one
-remaining piece of what used to be ToolDispatcher's "else" branch, ported
-inline rather than kept as an excuse to hold onto a whole extra class.
+"url_fetch", "web_search", "research", "chart", and "news_search" are the
+only tool names Planner ever routes to tools_to_call (see planner.py's
+P3/P3-news/P3b), and all are served over the localist-mcp service
+(mcp_server/, port 8003) via the MCP SSE transport (research is a
+client-side loop over the same web_search/url_fetch MCP tools, not a
+distinct MCP tool of its own). Any other tool name is unrecognized and
+produces an inline error ToolResult — the one remaining piece of what used
+to be ToolDispatcher's "else" branch, ported inline rather than kept as an
+excuse to hold onto a whole extra class.
+
+news_search (news-query-routing plan, 2026-07-22): tries the NewsAPI-backed
+news_search MCP tool first; on a miss (NewsAPI empty/errored result — see
+mcp_server/news_search.py's is_miss) or on localist-mcp being unreachable,
+falls through to the same _execute_web_search_query() helper web_search
+already uses, reusing the original derived query rather than re-deriving a
+generic one. Both the failed tier-1 attempt and the fallback attempt are
+returned (not just the winner) so Slot 5 and controller_agent.py's Step 3b
+corpus fallback see the full picture — same "return every ToolResult
+produced, not just the winning one" convention _run_research_loop already
+established. The fallback ToolResult is retagged tool_name="news_search:
+brave_fallback" for provenance (so a transcript/log makes it visible when
+NewsAPI's key/quota needs attention); Step 3b's web_search-failure check
+was extended with an `r.tool_name.startswith("news_search")` clause to
+keep matching it after the rename, mirroring the `or r.tool_name ==
+"research"` clause already added there for the same reason.
 
 url_fetch (Phase 2): extracts the first http(s):// URL from the
 instruction (or context["fetch_url"] if already resolved upstream), calls
@@ -81,6 +98,7 @@ import os
 import re
 import uuid
 from contextlib import AsyncExitStack
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -348,6 +366,10 @@ class MCPToolDispatcher:
                 elif tool_name == "web_search":
                     results.extend(
                         await self._run_web_search(session, connect_error, instruction, ctx)
+                    )
+                elif tool_name == "news_search":
+                    results.extend(
+                        await self._run_news_search(session, connect_error, instruction, ctx)
                     )
                 elif tool_name == "research":
                     results.extend(
@@ -658,6 +680,114 @@ class MCPToolDispatcher:
 
         return ToolResult(
             tool_name  = "web_search",
+            parameters = params_str,
+            result     = data.get("result_text", ""),
+            success    = True,
+        )
+
+    # -----------------------------------------------------------------------
+    # news_search — NewsAPI first, falling back to web_search (Brave) on a miss
+    # -----------------------------------------------------------------------
+
+    async def _run_news_search(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        instruction:   str,
+        context:       dict[str, Any],
+    ) -> list[ToolResult]:
+        """
+        Execute news_search: NewsAPI (tier 1) first, falling through to the
+        existing Brave-backed web_search tool (tier 2) on a miss — see
+        news-query-routing plan §4.1/§4.2. Single query only (unlike
+        web_search's up-to-_MAX_WEB_QUERIES loop) — reuses
+        _derive_initial_query so both tiers see the same derived text; a
+        miss on "latest news on X" still asks the fallback tier about "X",
+        not a generic re-derivation.
+
+        Always returns the tier-1 ToolResult. Only calls tier 2 (and
+        appends its result) when tier 1 didn't succeed — mirrors
+        _run_research_loop's "return every ToolResult produced, not just
+        the winning one" convention so Slot 5 and controller_agent.py's
+        Step 3b corpus fallback see the full picture.
+        """
+        query = self._derive_initial_query(instruction, context)
+        news_result = await self._execute_news_search_query(session, connect_error, query)
+
+        if news_result.success:
+            return [news_result]
+
+        logger.info(
+            "MCPToolDispatcher: news_search miss/failure for query=%r — "
+            "falling back to web_search (Brave).",
+            query,
+        )
+        brave_result = await self._execute_web_search_query(session, connect_error, query)
+        # Retag for provenance (§4.3) — Step 3b's corpus-fallback check in
+        # controller_agent.py matches on tool_name.startswith("news_search"),
+        # so this stays visible to it even after the rename.
+        brave_result = replace(brave_result, tool_name="news_search:brave_fallback")
+
+        return [news_result, brave_result]
+
+    async def _execute_news_search_query(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        query:         str,
+    ) -> ToolResult:
+        params_str = f"query={query!r}"
+
+        if session is None:
+            return ToolResult(
+                tool_name  = "news_search",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {connect_error}",
+                success    = False,
+            )
+
+        try:
+            text, is_error = await self._call_mcp_tool(session, "news_search", {"query": query})
+        except Exception as exc:
+            logger.warning(
+                "MCPToolDispatcher: localist-mcp unreachable for news_search query=%r: %s",
+                query, exc,
+            )
+            return ToolResult(
+                tool_name  = "news_search",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {exc}",
+                success    = False,
+            )
+
+        if is_error:
+            return ToolResult(
+                tool_name  = "news_search",
+                parameters = params_str,
+                result     = _normalize_mcp_error_text(text),
+                success    = False,
+            )
+
+        try:
+            data = json.loads(text)
+        except Exception as exc:
+            return ToolResult(
+                tool_name  = "news_search",
+                parameters = params_str,
+                result     = f"ERROR: failed to parse news_search response — {exc}",
+                success    = False,
+            )
+
+        if data.get("is_miss", False):
+            return ToolResult(
+                tool_name  = "news_search",
+                parameters = params_str,
+                result     = "",
+                success    = False,
+            )
+
+        return ToolResult(
+            tool_name  = "news_search",
             parameters = params_str,
             result     = data.get("result_text", ""),
             success    = True,
