@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { get } from 'svelte/store';
   import { goto } from '$app/navigation';
   import { previewsPanelCollapsed, togglePreviewsPanel } from '$lib/stores/previewsPanel';
   import {
@@ -7,8 +8,12 @@
     fetchNewsBriefPreview,
     newsBriefOpening,
     newsBriefError,
-    openNewsBrief
+    openNewsBrief,
+    type NewsBriefArticle
   } from '$lib/stores/newsBrief';
+  import { tasksStore, submitTask } from '$lib/stores/tasks';
+  import { chatHistoryStore } from '$lib/stores/chatHistory';
+  import { currentConversationId, isFirstTurnOfConversation } from '$lib/stores/conversation';
 
   // Fetched once on mount regardless of collapsed state, so the preview is
   // already populated the moment the user expands the tab — this replaces
@@ -20,7 +25,56 @@
 
   async function handleOpenBrief(): Promise<void> {
     const conversationId = await openNewsBrief();
-    if (conversationId) await goto(`/conversation/${conversationId}`);
+    if (conversationId) {
+      // /open already refreshed the backend's news_brief_cache by the time it
+      // responds, but this panel's own store is only ever populated once on
+      // mount — without this, the Live Feed list stays stale (showing
+      // whatever was cached at page-load) until a full browser reload.
+      await fetchNewsBriefPreview();
+      await goto(`/conversation/${conversationId}`);
+    }
+  }
+
+  // Sends just one clicked article into the currently open conversation,
+  // mirroring ChatPanel.svelte's handleSubmit (optimistic turns + submitTask)
+  // rather than files.ts's ingestFile pattern, since the user is expected to
+  // watch this stream in live rather than land on it after the fact.
+  async function handleAskAboutArticle(article: NewsBriefArticle): Promise<void> {
+    if ($tasksStore.finalizing) return;
+
+    const instruction = `Tell me more about this news story: "${article.title}"`;
+    const task_id = crypto.randomUUID();
+    const now = Date.now();
+    const conversationId = get(currentConversationId);
+
+    let conversationTitle: string | undefined;
+    if (get(isFirstTurnOfConversation)) {
+      conversationTitle = instruction.length > 60 ? instruction.slice(0, 60) + '…' : instruction;
+      isFirstTurnOfConversation.set(false);
+    }
+
+    chatHistoryStore.update((turns) => [
+      ...turns,
+      { role: 'user', content: instruction, task_id, timestamp: now },
+      {
+        role: 'assistant',
+        content: '',
+        task_id,
+        timestamp: now + 1,
+        status: 'planning',
+        status_message: 'Planning…',
+        sources: []
+      }
+    ]);
+
+    await submitTask(
+      instruction,
+      { web_search_queries: [article.title], news_article_url: article.url },
+      task_id,
+      conversationId,
+      conversationTitle
+    );
+    await goto(`/conversation/${conversationId}`);
   }
 </script>
 
@@ -69,15 +123,24 @@
                   <p class="preview-news-unavailable">no articles found</p>
                 {:else}
                   {#each section.articles.slice(0, 3) as article}
-                    <a
-                      class="preview-news-article"
-                      href={article.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                    >
-                      <span class="preview-news-article-title">{article.title}</span>
-                      <span class="preview-news-article-source">{article.source}</span>
-                    </a>
+                    <div class="preview-news-article-row">
+                      <a
+                        class="preview-news-article"
+                        href={article.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        <span class="preview-news-article-title">{article.title}</span>
+                        <span class="preview-news-article-source">{article.source}</span>
+                      </a>
+                      <button
+                        type="button"
+                        class="preview-news-article-ask"
+                        on:click={() => handleAskAboutArticle(article)}
+                        disabled={$tasksStore.finalizing}
+                        title="Ask about this story in the current chat"
+                      >Ask about this</button>
+                    </div>
                   {/each}
                 {/if}
               </div>
@@ -264,11 +327,16 @@
     font-style: italic;
   }
 
+  .preview-news-article-row {
+    position: relative;
+    padding: var(--sp-1) 0;
+  }
+  .preview-news-article-row:hover .preview-news-article-ask { opacity: 1; }
+
   .preview-news-article {
     display: flex;
     flex-direction: column;
     gap: 2px;
-    padding: var(--sp-1) 0;
     text-decoration: none;
   }
   .preview-news-article:hover .preview-news-article-title { color: var(--text-accent); }
@@ -282,6 +350,30 @@
   .preview-news-article-source {
     font-size: 11px;
     color: var(--text-tertiary);
+  }
+
+  .preview-news-article-ask {
+    position: absolute;
+    top: var(--sp-1);
+    right: 0;
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--text-accent);
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 2px var(--sp-2);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity var(--dur-fast) var(--ease);
+  }
+  .preview-news-article-ask:hover:not(:disabled) {
+    color: var(--accent-2);
+    border-color: var(--accent-2);
+  }
+  .preview-news-article-ask:disabled {
+    color: var(--text-tertiary);
+    cursor: default;
   }
 
   .preview-error {

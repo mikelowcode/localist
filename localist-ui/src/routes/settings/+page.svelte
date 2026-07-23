@@ -187,9 +187,17 @@
     }
   }
 
+  // The backend requires exactly 3 topics on every PUT (main.py enforces
+  // this — it's not a frontend-only convention), and Local area/Home
+  // country are saved in that same request. So an incomplete topic
+  // selection silently blocks a city-only edit too — the Save button below
+  // is disabled on this condition so that's no longer discoverable only
+  // after a failed click.
+  $: topicsIncomplete = selectedTopics.length !== 3;
+
   async function handleSaveNewsPreferences() {
     newsSaveResult = null;
-    if (selectedTopics.length !== 3) {
+    if (topicsIncomplete) {
       newsPreferencesError.set('Select exactly 3 special-interest topics.');
       return;
     }
@@ -198,7 +206,12 @@
       localQueryInput.trim() || null,
       selectedTopics
     );
-    if (ok) newsSaveResult = 'Saved. Takes effect on the next brief generation.';
+    if (ok) {
+      const city = $newsPreferences.local_query;
+      newsSaveResult = city
+        ? `Saved — Local area set to "${city}".`
+        : 'Saved — Local area cleared.';
+    }
   }
 </script>
 
@@ -470,7 +483,7 @@
         type="text"
         autocomplete="off"
         bind:value={localQueryInput}
-        placeholder="Seattle"
+        placeholder="e.g. Seattle"
       />
 
       <div class="news-field-label">
@@ -487,11 +500,19 @@
           >{label}</button>
         {/each}
       </div>
+      {#if topicsIncomplete}
+        <p class="card-hint" style="color:var(--text-tertiary)">
+          Pick exactly 3 topics to enable Save — this also saves your Local
+          area and Home country changes above; they're sent together in one
+          request.
+        </p>
+      {/if}
 
       <button
         type="button"
         class="seg-btn news-save-btn"
-        disabled={$newsPreferencesLoading}
+        disabled={$newsPreferencesLoading || topicsIncomplete}
+        title={topicsIncomplete ? 'Select exactly 3 topics to save' : undefined}
         on:click={handleSaveNewsPreferences}
       >Save</button>
 

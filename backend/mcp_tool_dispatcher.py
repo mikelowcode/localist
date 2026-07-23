@@ -712,7 +712,8 @@ class MCPToolDispatcher:
         Step 3b corpus fallback see the full picture.
         """
         query = self._derive_initial_query(instruction, context)
-        news_result = await self._execute_news_search_query(session, connect_error, query)
+        article_url = context.get("news_article_url") or None
+        news_result = await self._execute_news_search_query(session, connect_error, query, article_url)
 
         if news_result.success:
             return [news_result]
@@ -735,8 +736,9 @@ class MCPToolDispatcher:
         session:       ClientSession | None,
         connect_error: Exception | None,
         query:         str,
+        url:           str | None = None,
     ) -> ToolResult:
-        params_str = f"query={query!r}"
+        params_str = f"query={query!r}" if not url else f"query={query!r}, url={url!r}"
 
         if session is None:
             return ToolResult(
@@ -746,8 +748,12 @@ class MCPToolDispatcher:
                 success    = False,
             )
 
+        tool_args: dict[str, Any] = {"query": query}
+        if url:
+            tool_args["url"] = url
+
         try:
-            text, is_error = await self._call_mcp_tool(session, "news_search", {"query": query})
+            text, is_error = await self._call_mcp_tool(session, "news_search", tool_args)
         except Exception as exc:
             logger.warning(
                 "MCPToolDispatcher: localist-mcp unreachable for news_search query=%r: %s",

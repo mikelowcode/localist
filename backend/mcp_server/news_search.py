@@ -35,9 +35,20 @@ _NEWSAPI_ENDPOINT: str = "https://newsapi.org/v2/everything"
 _NEWSAPI_PAGE_SIZE: int = 5
 
 
-async def news_search(query: str) -> dict:
+async def news_search(query: str, url: str | None = None) -> dict:
     """
     Run one news_search query via NewsAPI's /v2/everything endpoint.
+
+    Parameters
+    ----------
+    query : the search text (usually a headline or topic).
+    url   : optional — when a caller already knows the exact article (e.g.
+            the user clicked a specific story in the Live Feed panel), pass
+            its URL to pin the result to that one article rather than
+            trusting the query text to find it again among near-duplicate
+            coverage. If none of the returned articles match, falls back to
+            the normal unfiltered top-5 behavior — an older clicked article
+            may simply be outside NewsAPI dev-tier's last-month window.
 
     Returns
     -------
@@ -94,16 +105,35 @@ async def news_search(query: str) -> dict:
 
     articles = data.get("articles", [])
 
+    # Pin to the one already-known article when a caller (e.g. the Live Feed
+    # panel's "Ask about this") supplies its URL — otherwise a query built
+    # from a headline can resolve to several near-duplicate stories and the
+    # model would have no way to tell which one the user actually clicked.
+    pinned = False
+    if url:
+        matched = [a for a in articles if (a.get("url") or "").strip() == url]
+        if matched:
+            articles = matched
+            pinned = True
+
     lines: list[str] = []
     for article in articles[:_NEWSAPI_PAGE_SIZE]:
         title        = article.get("title", "").strip()
         description  = (article.get("description") or "").strip()
         source_name  = article.get("source", {}).get("name", "").strip()
         published_at = article.get("publishedAt", "").strip()
-        url          = article.get("url", "").strip()
+        article_url  = article.get("url", "").strip()
         # Truncate body to keep Slot 6 within budget, same convention as web_search.
         description  = description[:300].rsplit(" ", 1)[0] if len(description) > 300 else description
-        lines.append(f"• {title}\n  {description}\n  [{source_name}] {published_at}\n  {url}")
+        line = f"• {title}\n  {description}\n  [{source_name}] {published_at}\n  {article_url}"
+        if pinned:
+            # `content` is NewsAPI's own short body snippet (also truncated on
+            # the dev tier) — surfaced only in the pinned single-article case
+            # so the multi-result formatting other callers rely on is unchanged.
+            content = (article.get("content") or "").strip()
+            if content:
+                line += f"\n  {content}"
+        lines.append(line)
 
     result_text = "\n\n".join(lines)
     logger.info(

@@ -119,9 +119,9 @@ async def web_search(query: str) -> dict:
 
 
 @mcp.tool()
-async def news_search(query: str) -> dict:
-    """Run one news search query via NewsAPI.org (/v2/everything, sorted by publish date)."""
-    return await _news_search.news_search(query)
+async def news_search(query: str, url: str | None = None) -> dict:
+    """Run one news search query via NewsAPI.org (/v2/everything, sorted by publish date). Pass url to pin the result to one already-known article."""
+    return await _news_search.news_search(query, url)
 
 
 @mcp.tool()
