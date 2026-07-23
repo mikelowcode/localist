@@ -614,3 +614,76 @@ Verified via `svelte-check`/`vite build` only (0 errors/warnings both times acro
 revisions) — same no-frontend-test-framework posture as §20.9. No automated browser click-through was
 possible in this environment (no `chromium-cli`/Playwright/Puppeteer installed); the user performed the
 real interactive verification themselves (Safari, real article links).
+
+### 7.15 Live Feed Refresh Not Populating the Panel Live (2026-07-23)
+
+Live use surfaced a gap §7.14's redesign didn't catch: clicking "Daily News Brief Refresh" correctly
+populated a new chat conversation, but the Live Feed panel itself stayed stale until a full browser
+reload.
+
+`PreviewsPanel.svelte`'s `handleOpenBrief()` awaited `openNewsBrief()` (`POST /news/brief/open`) and
+navigated to the new conversation, but never re-touched the `newsBriefPreview` store that actually
+backs the panel's rendered article list — that store is populated exactly once, in `onMount`
+(`fetchNewsBriefPreview()`). Because `PreviewsPanel.svelte` lives in `+layout.svelte`, it persists
+across the `goto()` navigation instead of remounting, so `onMount` never refires on a client-side route
+change; only a full page reload re-ran it. The backend side was already correct — `/news/brief/open`
+(`main.py:2303`) writes the fresh sections into `news_brief_cache` before it responds, so `GET
+/news/brief/preview` was already serving current data. Nothing client-side was asking for it again.
+
+Fixed by having `handleOpenBrief()` call `fetchNewsBriefPreview()` immediately after `openNewsBrief()`
+resolves, before navigating away (`PreviewsPanel.svelte:21-29`) — no backend change needed. Verified via
+`svelte-check` (0 errors).
+
+### 7.16 Send a Single Live Feed Article to Chat for a Detailed Summary (2026-07-23)
+
+An "Ask about this" button next to each Live Feed article sends just that one story into the currently
+open conversation and prompts the model to look up more detail on it specifically, rather than making
+the user retype the headline into chat. Backend `news_search` tool changes (the new `url` pin param)
+are covered at §14.10, not duplicated here; this section covers only the UI/dispatch surface.
+
+Built entirely on existing plumbing rather than new endpoints: Planner's Priority 3-news routing (§4.2)
+is pure keyword match, so an instruction containing "news" already routes to `news_search` — the
+synthetic instruction (`Tell me more about this news story: "<title>"`) is worded to guarantee this,
+load-bearing, not cosmetic. `MCPToolDispatcher._derive_initial_query()` (§14.3) already prefers
+`context["web_search_queries"][0]` over deriving a query from instruction text, giving a ready-made hook
+to force the exact article title as the query rather than trusting the model's phrasing.
+`currentConversationId` always holds a value, so there's always a target conversation — no
+new-conversation branch needed.
+
+`PreviewsPanel.svelte`'s `handleAskAboutArticle()` mirrors `ChatPanel.svelte`'s `handleSubmit()` pattern
+(read `currentConversationId`/`isFirstTurnOfConversation`, push an optimistic user turn + empty
+assistant turn into `chatHistoryStore` under one `task_id`, call `submitTask()`) rather than
+`files.ts`'s `ingestFile()` pattern, which duplicates its own SSE parsing and only backfills chat
+history once a task fully completes — the user is expected to watch this stream in live, not land on it
+after the fact. `ChatPanel`'s existing reactive block already patches any task's assistant turn live
+regardless of which component called `submitTask()`, so nothing in `ChatPanel.svelte` itself needed to
+change. `submitTask()` is called with `context = { web_search_queries: [title], news_article_url: url }`
+— the second key is new, consumed only by §14.10's pinning logic. After submitting, the handler
+navigates to `/conversation/<id>` since there's no root route in this app (only `conversation/[id]`
+mounts `ChatPanel`) — so a user elsewhere (e.g. Settings) still lands somewhere they can watch the reply
+arrive.
+
+The button itself is a small hover-revealed control per article, deliberately separate from the
+existing `<a>` that opens the source URL in a new tab — chosen over converting that link into a
+click-then-popover menu, so the pre-existing single-click-opens-source behavior stays untouched.
+
+Verified via `npm run check` (0 errors). Live NewsAPI click-through not yet performed.
+
+### 7.17 Settings "Local Area" Save Silently Gated by an Incomplete Topics Selection (2026-07-23)
+
+A reported "the city field won't stick, it keeps showing Seattle" turned out to have no bug anywhere in
+the actual persistence pipeline (frontend store → `PUT /news/preferences` → SQLite `news_preferences`
+row → `GET /news/preferences` — confirmed no caching, no mismatch, no hardcoded default). The real cause
+was UX: `main.py`'s `PUT /news/preferences` requires exactly 3 topics on every request (422 otherwise) —
+a genuine backend contract — and `settings/+page.svelte` mirrored that gate but only surfaced it as a
+small error *after* a click. A user who had never completed the one-time topic selection would have
+every city-only save attempt silently fail, leaving the field empty — which then displays its own
+`placeholder="Seattle"` hint, easily mistaken for a stuck real value.
+
+Fixed, keeping the backend contract unchanged (the user chose this over decoupling city saves from the
+topics requirement, which would have needed a backend change): the Save button is now `disabled`
+whenever `selectedTopics.length !== 3`, with a persistent inline hint visible before any click
+explaining the two are saved together in one request; the placeholder changed from `"Seattle"` to `"e.g.
+Seattle"`; and the success message now echoes the actual saved city back
+(`Saved — Local area set to "X".`). Verified via `npm run check` (0 errors); user tested and confirmed
+live.

@@ -977,3 +977,32 @@ through to a real, successful Brave result tagged
   single-user, local scale; if it becomes a problem the fix is a simple
   per-query in-memory TTL cache inside the MCP tool, not a Planner change.
 
+### 14.10 `news_search` URL-Pinning for Single-Article Lookups (2026-07-23)
+
+Added to support the Live Feed panel's "Ask about this" feature (full frontend design at §7.16, not
+duplicated here): clicking a specific article needed the model to get detail on *that* article, not a
+fresh query that might resolve to a different, near-duplicate story.
+
+`news_search(query: str, url: str | None = None)` — the new `url` param is optional and additive; every
+existing call site (Daily News Brief, generic chat news questions) passes nothing and sees byte-for-byte
+unchanged behavior. When `url` is supplied, the NewsAPI `/v2/everything` results are filtered down to
+the one article whose `url` matches exactly; if none match, falls back to the prior unfiltered top-5
+behavior (an older clicked article may simply have aged out of NewsAPI dev-tier's last-month query
+window — an existing limitation, not a new one). Only in that pinned, single-article branch does the
+formatted result also include NewsAPI's `content` field, which every caller previously discarded — the
+actual "more detail" NewsAPI can offer beyond what the Live Feed panel already shows (title + source
+only, though `description`/`published_at`/`url` were already being fetched, just unrendered there).
+Left the unfiltered multi-result formatting exactly as-is so other callers are unaffected.
+
+`mcp_server/main.py`'s `@mcp.tool()` wrapper passes `url` through unchanged.
+`MCPToolDispatcher._run_news_search()`/`_execute_news_search_query()` read a new
+`context["news_article_url"]` key and thread it into the MCP call payload alongside the existing
+`_derive_initial_query()`-resolved query text — `None` when absent.
+
+Verified: full pytest run across `test_mcp_tool_dispatcher.py`, `test_planner_phase3.py`,
+`test_tool_dispatcher_phase6.py`, `test_planner_tool_fallback_classifier.py` — 265 passed, 0
+regressions. A standalone script exercised the new logic directly against a mocked NewsAPI response:
+pinned-with-match filters to one article and includes `content`; pinned-with-no-match falls back to the
+unfiltered top-5 with no `content`; unpinned calls are identical to pre-change output. Live NewsAPI
+verification not yet performed.
+
