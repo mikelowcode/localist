@@ -375,11 +375,15 @@ class TestEpisodicMemoryReader:
         results = reader.by_similarity("the", top_n=2)
         assert len(results) <= 2
 
-    def test_by_similarity_min_score_filters(self, writer, reader):
+    def test_by_similarity_min_score_ignored_for_bm25_scored_episodes(self, writer, reader):
+        # No embed_fn on writer/reader — every episode here is BM25-scored,
+        # so by_similarity() skips min_score entirely for them (trusting
+        # BM25's relative ranking instead — raw BM25 scores are unbounded,
+        # so no fixed min_score value is a meaningful "unreachable" floor
+        # the way 1.0 was for the old bounded Jaccard scoring).
         self._seed(writer)
-        # min_score=1.0 is unreachable by keyword scoring — must return empty
-        results = reader.by_similarity("sqlite", min_score=1.0)
-        assert results == []
+        results = reader.by_similarity("sqlite", min_score=999.0)
+        assert len(results) > 0
 
     def test_by_similarity_excludes_inactive(self, writer, reader):
         self._seed(writer)
@@ -387,6 +391,50 @@ class TestEpisodicMemoryReader:
         results = reader.by_similarity("sqlite memory backend")
         subjects = [r.subject for r in results]
         assert "memory backend" not in subjects
+
+    def test_by_similarity_exclude_task_id_drops_matching_rows(self, writer, reader):
+        self._seed(writer)
+        writer.insert(
+            "decision", "memory backend v2", "SQLite committed, again.",
+            "explicit", confidence=1.0, task_id="task-1",
+        )
+        results = reader.by_similarity("sqlite memory backend", exclude_task_id="task-1")
+        subjects = [r.subject for r in results]
+        assert "memory backend v2" not in subjects
+        # the original (no task_id) row is unaffected
+        assert "memory backend" in subjects
+
+    def test_by_similarity_bm25_rare_term_outranks_common_repetition(self, writer, reader):
+        # Keyword-fallback path (no embed_fn on writer/reader) now scores via
+        # BM25 instead of Jaccard — a rare, distinctive matching term should
+        # outrank a subject padded with a common word repeated many times.
+        writer.insert(
+            "project_fact", "common padding",
+            ("common " * 20).strip(), "model_extracted", confidence=0.9,
+        )
+        writer.insert(
+            "project_fact", "rare match",
+            "rare fact about localist framework", "model_extracted", confidence=0.9,
+        )
+        for i in range(4):
+            writer.insert(
+                "project_fact", f"filler {i}",
+                "common stuff nearby", "model_extracted", confidence=0.9,
+            )
+
+        results = reader.by_similarity("rare common", top_n=6)
+        subjects = [r.subject for r in results]
+        assert subjects.index("rare match") < subjects.index("common padding")
+
+    def test_by_similarity_exclude_task_id_none_keeps_all(self, writer, reader):
+        self._seed(writer)
+        writer.insert(
+            "decision", "memory backend v2", "SQLite committed, again.",
+            "explicit", confidence=1.0, task_id="task-1",
+        )
+        results = reader.by_similarity("sqlite memory backend", exclude_task_id=None)
+        subjects = [r.subject for r in results]
+        assert "memory backend v2" in subjects
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +512,21 @@ class TestEpisodicEmbeddingScoring:
         results = reader.by_similarity("Did I say anything about oMLX V0.5.0?", min_score=0.3)
         assert len(results) >= 1
         assert results[0].subject == "oMLX version"
+
+    def test_by_similarity_min_score_still_filters_cosine_scored_episodes(self, db_path):
+        # Unlike the BM25 fallback (which skips min_score entirely — see
+        # TestEpisodicMemoryReader.test_by_similarity_min_score_ignored_for_bm25_scored_episodes),
+        # a genuinely cosine-scored episode is still subject to min_score:
+        # cosine is bounded to [0, 1] and the threshold is meaningful there.
+        writer = EpisodicMemoryWriter(db_path=db_path, embed_fn=_fake_embed)
+        writer.insert(
+            "project_fact", "oMLX version", "The user intends to download oMLX V 0.5.0.",
+            "model_extracted", confidence=0.9,
+        )
+        reader = EpisodicMemoryReader(db_path=db_path, embed_fn=_fake_embed)
+        # Query shares no vocabulary with the stored episode -> cosine 0.0.
+        results = reader.by_similarity("zzz not in vocab at all", min_score=0.1)
+        assert results == []
 
     def test_by_similarity_finds_project_fact_type(self, db_path):
         # Regression guard: by_recency() scopes to _PRIME_TYPES and would
@@ -1686,6 +1749,101 @@ class TestWorkingStateStore:
         assert version_after == _SCHEMA_VERSION
         assert "working_state" in tables_after
         assert "turn_summaries_json" not in cols_after
+
+
+# ---------------------------------------------------------------------------
+# query_corpus() — BM25 keyword prefilter (stage 1)
+# ---------------------------------------------------------------------------
+
+class TestQueryCorpusBM25:
+    """
+    query_corpus()'s stage-1 keyword prefilter now scores via bm25.py
+    instead of the old Jaccard _keyword_score(). The `mm` fixture has no
+    embed_fn, so query_corpus() never enters the embedding re-rank stage —
+    these tests exercise the BM25 stage in isolation, as the final result.
+    """
+
+    def test_returns_indexed_document(self, mm, tmp_path):
+        mm.index_document(
+            path=tmp_path / "doc.md", doc_type="wiki",
+            content="SQLite memory backend committed.", embed=False,
+        )
+        results = mm.query_corpus("sqlite memory backend", use_embeddings=False)
+        assert len(results) == 1
+        assert results[0].name == "doc"
+
+    def test_rare_term_document_outranks_common_term_repetition(self, mm, tmp_path):
+        # Regression guard for the actual point of the BM25 upgrade: plain
+        # Jaccard overlap would rank purely on shared-token-set size, not
+        # term rarity — this asserts real IDF weighting reaches query_corpus.
+        mm.index_document(
+            path=tmp_path / "common.md", doc_type="wiki",
+            content=("common " * 20).strip(), embed=False,
+        )
+        mm.index_document(
+            path=tmp_path / "rare.md", doc_type="wiki",
+            content="rare fact about localist framework", embed=False,
+        )
+        for i in range(4):
+            mm.index_document(
+                path=tmp_path / f"filler{i}.md", doc_type="wiki",
+                content="common stuff nearby", embed=False,
+            )
+
+        results = mm.query_corpus("rare common", max_results=6, use_embeddings=False)
+        names = [r.name for r in results]
+        assert names.index("rare") < names.index("common")
+
+    def test_top_k_selection_still_respects_max_results(self, mm, tmp_path):
+        for i in range(5):
+            mm.index_document(
+                path=tmp_path / f"doc{i}.md", doc_type="wiki",
+                content=f"sqlite memory backend number {i}", embed=False,
+            )
+        results = mm.query_corpus("sqlite memory backend", max_results=2, use_embeddings=False)
+        assert len(results) == 2
+
+    def test_non_matching_document_still_returned_when_pool_is_small(self, mm, tmp_path):
+        # query_corpus() has no min_score floor (unlike EpisodicMemoryReader.
+        # by_similarity()) — a zero-scoring document still fills out
+        # max_results when the corpus is smaller than max_results.
+        mm.index_document(
+            path=tmp_path / "unrelated.md", doc_type="wiki",
+            content="completely unrelated text", embed=False,
+        )
+        results = mm.query_corpus("sqlite memory backend", use_embeddings=False)
+        assert len(results) == 1
+        assert results[0].relevance_score == 0.0
+
+    def test_scored_by_embedding_false_when_no_embed_fn(self, mm, tmp_path):
+        # No embed_fn on this MemoryManager -> every result was scored via
+        # BM25, not cosine. Downstream callers (controller_agent.py's
+        # RAG-source filters) rely on this flag to know a fixed absolute
+        # threshold doesn't mean anything for this result.
+        mm.index_document(
+            path=tmp_path / "doc.md", doc_type="wiki",
+            content="sqlite memory backend", embed=False,
+        )
+        results = mm.query_corpus("sqlite memory backend", use_embeddings=True)
+        assert len(results) == 1
+        assert results[0].scored_by_embedding is False
+
+    def test_scored_by_embedding_true_when_cosine_used(self, tmp_path):
+        # A constant-vector embed_fn (matching EmbeddingGemma's real 768
+        # dims, unlike the 16-dim bag-of-words _fake_embed used elsewhere
+        # in this file — index_document() silently skips storing an
+        # embedding whose dim doesn't match _EMBEDDING_DIM) is enough here:
+        # this test only needs cosine to be the scoring path actually
+        # used, not a semantically meaningful score.
+        embed_fn = lambda text: [0.1] * 768  # noqa: E731
+        mm = MemoryManager(db_path=tmp_path / "embedded.db", embed_fn=embed_fn)
+        mm.index_document(
+            path=tmp_path / "doc.md", doc_type="wiki",
+            content="The user prefers Brave Search over LangSearch.", embed=True,
+        )
+        results = mm.query_corpus("brave search preference", use_embeddings=True)
+        assert len(results) == 1
+        assert results[0].scored_by_embedding is True
 
 
 # ---------------------------------------------------------------------------

@@ -1,12 +1,16 @@
 <script lang="ts">
   // Read-only "related memory" overlay for the Episode Browsing UI's
   // detail pane (episode-browsing-ui-plan.md Phase 6) — active episodes
-  // (preferences/decisions/etc.) stamped with the same task_id as the
-  // selected chat_turns row, via GET /memory/episodes?task_id=...
-  // (backend addition: MemoryManager.list_episodes()/count_episodes()
-  // task_id filter). Purely an annotation surface: no approve/reject here
-  // (that stays EpisodesPanel.svelte's job on the existing /memory route)
-  // — episodes surfaced here are always status=active already.
+  // semantically related to the selected chat_turns row's own content, via
+  // GET /memory/episodes/related (backend: EpisodicMemoryReader.by_similarity(),
+  // Mode 3 §2.6 — real cosine similarity where an embedding exists,
+  // keyword/Jaccard fallback otherwise). Replaces an earlier task_id
+  // exact-match query that read as "no related memory" for the common
+  // case, since episodes are sparse by design (§2.1) and most turns
+  // produce zero episodes of their own. Purely an annotation surface: no
+  // approve/reject here (that stays EpisodesPanel.svelte's job on the
+  // existing /memory route) — episodes surfaced here are always
+  // status=active already.
   //
   // The caller wraps this component in a {#key selected.task_id} block
   // (see EpisodeDetailPane.svelte) so a new instance — and a fresh
@@ -16,6 +20,7 @@
   import { TYPE_LABELS, TYPE_COLORS } from '$lib/stores/episodes';
 
   export let taskId: string;
+  export let content: string;
 
   interface RelatedEpisode {
     id: number;
@@ -30,11 +35,11 @@
   let error: string | null = null;
 
   onMount(async () => {
-    if (!taskId) return;
+    if (!content) return;
     loading = true;
     try {
       const res = await fetch(
-        `/api/memory/episodes?${new URLSearchParams({ task_id: taskId, status: 'active', limit: '10' })}`
+        `/api/memory/episodes/related?${new URLSearchParams({ content, task_id: taskId, limit: '10' })}`
       );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: { episodes: RelatedEpisode[] } = await res.json();

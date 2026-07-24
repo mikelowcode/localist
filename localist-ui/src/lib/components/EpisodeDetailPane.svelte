@@ -95,7 +95,7 @@
     <div class="detail-section">
       <h3 class="detail-section-title">Related memory</h3>
       {#key selected.task_id}
-        <EpisodeAnnotations taskId={selected.task_id} />
+        <EpisodeAnnotations taskId={selected.task_id} content={selected.content} />
       {/key}
     </div>
   {:else}

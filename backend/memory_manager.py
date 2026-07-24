@@ -140,6 +140,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+import bm25
 import content_safety
 import wiki_maintenance_log
 from wiki_doc import META_WIKI_FILENAMES
@@ -219,14 +220,6 @@ def _tokenize(text: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", text.lower()))
 
 
-def _keyword_score(query_tokens: set[str], token_set_str: str) -> float:
-    """Jaccard-like overlap between query tokens and a pre-computed token set."""
-    doc_tokens = set(token_set_str.split()) if token_set_str else set()
-    if not doc_tokens:
-        return 0.0
-    return len(query_tokens & doc_tokens) / len(query_tokens | doc_tokens)
-
-
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Cosine similarity between two equal-length float vectors."""
     if len(a) != len(b) or not a:
@@ -264,21 +257,32 @@ class DocumentResult:
     Synthesizer's _collect_sources() helper.
     """
 
-    __slots__ = ("name", "path", "doc_type", "content", "relevance_score")
+    __slots__ = ("name", "path", "doc_type", "content", "relevance_score", "scored_by_embedding")
 
     def __init__(
         self,
-        name:            str,
-        path:            Path,
-        doc_type:        str,
-        content:         str,
-        relevance_score: float = 0.0,
+        name:                str,
+        path:                Path,
+        doc_type:            str,
+        content:             str,
+        relevance_score:     float = 0.0,
+        scored_by_embedding: bool  = True,
     ) -> None:
-        self.name            = name
-        self.path            = path
-        self.doc_type        = doc_type
-        self.content         = content
-        self.relevance_score = relevance_score
+        self.name                = name
+        self.path                = path
+        self.doc_type            = doc_type
+        self.content             = content
+        self.relevance_score     = relevance_score
+        # False when relevance_score came from BM25 (bm25.py) rather than
+        # embedding cosine similarity — raw BM25 is unbounded and not on a
+        # scale comparable to cosine, so a caller applying a fixed absolute
+        # relevance floor (e.g. controller_agent.py's `>= 0.55` RAG-source
+        # gate) should skip that floor for these and trust BM25's relative
+        # ranking instead. Defaults True since most DocumentResult
+        # construction sites (get_all_documents(), the retrieval-cache
+        # hydration path before this field existed) never scored via BM25
+        # in the first place.
+        self.scored_by_embedding = scored_by_embedding
 
     def to_source_dict(self) -> dict[str, Any]:
         return {
@@ -2809,7 +2813,7 @@ class MemoryManager:
             params       = (doc_type,) if doc_type else ()
             rows = conn.execute(
                 f"""
-                SELECT name, path, doc_type, content, token_set, embedding
+                SELECT id, name, path, doc_type, content, token_set, embedding
                 FROM   document_index
                 {where_clause}
                 """,
@@ -2822,13 +2826,27 @@ class MemoryManager:
             logger.debug("query_corpus: index is empty — returning [].")
             return []
 
-        query_tokens = _tokenize(query)
-
-        # Score by keyword overlap
-        scored: list[tuple[float, sqlite3.Row]] = []
-        for row in rows:
-            score = _keyword_score(query_tokens, row["token_set"])
-            scored.append((score, row))
+        # Stage 1 — BM25 keyword prefilter. Raw, unbounded score (bm25.py
+        # deliberately doesn't normalize — see its module docstring); fine
+        # for ranking/top-2N selection here since every row is on the same
+        # scale for this call, but not safe to compare against an absolute
+        # cosine-tuned threshold downstream — see scored_by_embedding
+        # below. Scored over `rows`' raw content (not the deduplicated
+        # token_set column, which loses the term frequency BM25 needs —
+        # see bm25.tokenize()), keyed by row id so scores map back onto
+        # the right row even if `name` collides. Computed once and reused
+        # below for any un-embedded doc in the rerank pool, rather than
+        # re-scored in isolation there.
+        bm25_scores = bm25.score_documents(
+            query, [(row["id"], row["content"]) for row in rows],
+        )
+        # (score, row, scored_by_embedding) — the third element tracks
+        # which scoring path produced `score` so callers downstream (e.g.
+        # controller_agent.py's RAG-source filters) know whether a fixed
+        # absolute threshold means anything for this particular result.
+        scored: list[tuple[float, sqlite3.Row, bool]] = [
+            (bm25_scores[row["id"]], row, False) for row in rows
+        ]
         scored.sort(key=lambda x: x[0], reverse=True)
 
         # Embedding re-rank on top-2N candidates. self._corpus_stale is the
@@ -2838,15 +2856,17 @@ class MemoryManager:
             pool = scored[: max_results * 2]
             try:
                 query_vec = self._embed_fn(query)
-                re_scored: list[tuple[float, sqlite3.Row]] = []
-                for _, row in pool:
+                re_scored: list[tuple[float, sqlite3.Row, bool]] = []
+                for _, row, _ in pool:
                     if row["embedding"] is not None:
                         doc_vec = _unpack_embedding(row["embedding"])
                         score   = _cosine_similarity(query_vec, doc_vec)
+                        by_embedding = True
                     else:
-                        # Fall back to keyword score for un-embedded docs.
-                        score = _keyword_score(query_tokens, row["token_set"])
-                    re_scored.append((score, row))
+                        # Same raw BM25 score computed above.
+                        score = bm25_scores[row["id"]]
+                        by_embedding = False
+                    re_scored.append((score, row, by_embedding))
                 re_scored.sort(key=lambda x: x[0], reverse=True)
                 scored = re_scored
             except Exception as exc:
@@ -2859,22 +2879,24 @@ class MemoryManager:
         # Build DocumentResult list
         results = [
             DocumentResult(
-                name            = row["name"],
-                path            = Path(row["path"]),
-                doc_type        = row["doc_type"],
-                content         = row["content"],
-                relevance_score = score,
+                name                = row["name"],
+                path                = Path(row["path"]),
+                doc_type            = row["doc_type"],
+                content             = row["content"],
+                relevance_score     = score,
+                scored_by_embedding = by_embedding,
             )
-            for score, row in top
+            for score, row, by_embedding in top
         ]
 
         # Write to cache (store name+score pairs — content is re-fetched from index)
         cache_payload = [
             {
-                "name":     r.name,
-                "path":     str(r.path),
-                "doc_type": r.doc_type,
-                "score":    r.relevance_score,
+                "name":                r.name,
+                "path":                str(r.path),
+                "doc_type":            r.doc_type,
+                "score":               r.relevance_score,
+                "scored_by_embedding": r.scored_by_embedding,
             }
             for r in results
         ]
@@ -3046,11 +3068,16 @@ class MemoryManager:
             if doc_type and row["doc_type"] != doc_type:
                 continue
             results.append(DocumentResult(
-                name            = row["name"],
-                path            = Path(row["path"]),
-                doc_type        = row["doc_type"],
-                content         = row["content"],
-                relevance_score = entry["score"],
+                name                = row["name"],
+                path                = Path(row["path"]),
+                doc_type            = row["doc_type"],
+                content             = row["content"],
+                relevance_score     = entry["score"],
+                # Default True for cache rows written before this field
+                # existed — the safer fallback, since it re-applies the
+                # (pre-existing) absolute-threshold behavior rather than
+                # silently bypassing it for old entries of unknown origin.
+                scored_by_embedding = entry.get("scored_by_embedding", True),
             ))
         return results
 
@@ -4088,7 +4115,9 @@ class EpisodicMemoryReader:
             finally:
                 conn.close()
 
-    def _score_all_active(self, query: str) -> list[tuple[float, EpisodeRecord]]:
+    def _score_all_active(
+        self, query: str,
+    ) -> list[tuple[float, EpisodeRecord, bool]]:
         """
         Shared scoring core for by_similarity() and best_match().
 
@@ -4101,8 +4130,20 @@ class EpisodicMemoryReader:
         embedded once and compared via true cosine similarity against every
         row that has a stored embedding (see EpisodicMemoryWriter.insert(),
         which populates the `embedding` column when it also holds an
-        embed_fn). Rows without a stored embedding — or the whole query, if
-        no embed_fn is available — fall back to keyword (Jaccard) overlap.
+        embed_fn). Rows without a stored embedding — or every row, if no
+        embed_fn is available — fall back to BM25 keyword scoring (bm25.py),
+        computed once over every active episode fetched this call (mirrors
+        query_corpus()'s stage-1 prefilter — same per-call IDF/avg-length
+        scoping, no persisted corpus stats). BM25 scores are raw and
+        unbounded (bm25.py deliberately doesn't normalize them — see its
+        module docstring), so each result carries a `scored_by_embedding`
+        flag alongside its score: by_similarity() uses it to skip its
+        min_score floor for BM25-scored episodes (trusting BM25's relative
+        ranking instead, the same policy query_corpus() applies — see
+        DocumentResult.scored_by_embedding); best_match() deliberately does
+        NOT skip its floor for BM25 scores, since a false-positive
+        retraction is a correctness risk a false-negative recall miss
+        isn't (see best_match()'s docstring).
 
         Returns every active episode with its score, sorted descending.
         Callers are responsible for any min_score filtering, top_n
@@ -4116,11 +4157,10 @@ class EpisodicMemoryReader:
 
         Returns
         -------
-        list[tuple[float, EpisodeRecord]]
-            All active episodes, sorted by score descending. May be empty.
+        list[tuple[float, EpisodeRecord, bool]]
+            (score, record, scored_by_embedding) for every active episode,
+            sorted by score descending. May be empty.
         """
-        query_tokens = _tokenize(query)
-
         query_vec: list[float] | None = None
         if self._embed_fn is not None:
             try:
@@ -4141,15 +4181,22 @@ class EpisodicMemoryReader:
                     """
                 ).fetchall()
 
-                scored: list[tuple[float, EpisodeRecord]] = []
-                for row in rows:
-                    record = self._row_to_record(row)
+                records = [self._row_to_record(row) for row in rows]
+                bm25_scores = bm25.score_documents(
+                    query,
+                    [(r.id, f"{r.subject} {r.content}") for r in records],
+                )
+
+                scored: list[tuple[float, EpisodeRecord, bool]] = []
+                for row, record in zip(rows, records):
                     score: float | None = None
+                    by_embedding = False
 
                     if query_vec is not None and row["embedding"] is not None:
                         try:
                             doc_vec = _unpack_embedding(row["embedding"])
                             score = _cosine_similarity(query_vec, doc_vec)
+                            by_embedding = True
                         except Exception as exc:
                             logger.debug(
                                 "_score_all_active: cosine failed for episode "
@@ -4159,11 +4206,10 @@ class EpisodicMemoryReader:
                             score = None
 
                     if score is None:
-                        combined_text = f"{record.subject} {record.content}"
-                        token_set_str = " ".join(_tokenize(combined_text))
-                        score = _keyword_score(query_tokens, token_set_str)
+                        score = bm25_scores.get(record.id, 0.0)
+                        by_embedding = False
 
-                    scored.append((score, record))
+                    scored.append((score, record, by_embedding))
 
                 scored.sort(key=lambda x: x[0], reverse=True)
                 return scored
@@ -4192,9 +4238,10 @@ class EpisodicMemoryReader:
 
     def by_similarity(
         self,
-        query:      str,
-        top_n:      int   = 5,
-        min_score:  float = 0.0,
+        query:           str,
+        top_n:           int   = 5,
+        min_score:       float = 0.0,
+        exclude_task_id: str | None = None,
     ) -> list[EpisodeRecord]:
         """
         Mode 3 — Semantic similarity.
@@ -4209,11 +4256,24 @@ class EpisodicMemoryReader:
         top_n :
             Maximum records to return. Default 5.
         min_score :
-            Minimum score threshold. Records below this are excluded.
-            Default 0.0 (no filtering). Cosine and Jaccard scores are not
-            on the same scale — callers mixing embedded and un-embedded
-            corpora should keep this low (e.g. 0.3-0.45) rather than tuned
-            for one scale specifically.
+            Minimum score threshold, applied only to cosine-scored episodes.
+            An episode scored via BM25 keyword fallback (no embedding, or
+            no embed_fn available) skips this floor entirely — BM25 scores
+            are raw and unbounded (see bm25.py's module docstring), not on
+            a fixed scale comparable to cosine similarity, so an absolute
+            threshold tuned for one doesn't mean anything for the other.
+            Trusting BM25's relative ranking instead (same policy
+            query_corpus() applies to RAG sources) means top_n still
+            reflects "most relevant of what's here" in keyword-only mode,
+            rather than everything failing a threshold it was never
+            calibrated against.
+        exclude_task_id :
+            When supplied, episodes whose `task_id` equals this value are
+            dropped before the top_n slice. Used by the Related Memory
+            lookup (backend/main.py's GET /memory/episodes/related) to
+            keep a turn's own episode(s) — trivially related, since they
+            were extracted from the query text itself — out of its own
+            "related" results.
 
         Returns
         -------
@@ -4221,7 +4281,11 @@ class EpisodicMemoryReader:
             Sorted by relevance score descending. May be empty.
         """
         scored  = self._score_all_active(query)
-        filtered = [(score, rec) for score, rec in scored if score >= min_score]
+        filtered = [
+            (score, rec) for score, rec, by_embedding in scored
+            if (not by_embedding or score >= min_score)
+            and (exclude_task_id is None or rec.task_id != exclude_task_id)
+        ]
         records = [rec for _, rec in filtered[:top_n]]
 
         self._touch_records(records)
@@ -4251,6 +4315,19 @@ class EpisodicMemoryReader:
         has no second chance to disambiguate among candidates the way a
         ranked list would allow.
 
+        Unlike by_similarity(), this floor is applied unconditionally —
+        even to a BM25-scored (keyword-fallback) top candidate, despite
+        BM25's raw score not being on a scale actually calibrated against
+        0.55. by_similarity() skips its floor for BM25 scores and trusts
+        ranking instead, which is the right tradeoff for recall (a low-
+        confidence-but-plausible episode surfacing among several candidates
+        is a minor miss at worst); best_match() is used for retraction,
+        where a false positive silently destroys the wrong memory — the
+        floor stays a deliberately blunt "no confident single match" guard
+        here, at the cost of degrading to the exact (subject, episode_type)
+        fallback loop more often in keyword-only mode than by_similarity()'s
+        equivalent case would.
+
         Parameters
         ----------
         query :
@@ -4267,7 +4344,7 @@ class EpisodicMemoryReader:
         if not scored:
             return None
 
-        top_score, top_record = scored[0]
+        top_score, top_record, _ = scored[0]
         if top_score < min_score:
             return None
 

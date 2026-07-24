@@ -126,6 +126,7 @@ import platform
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
@@ -145,7 +146,7 @@ from context_profile import check_local_ram_headroom, profile_for
 from controller_agent import ControllerAgent, TaskStatus, _MEMORY_MD_PATH
 from conversational_agent import ConversationalAgent
 from embedding_engine import EmbeddingEngine
-from memory_manager import MemoryManager, EpisodicMemoryWriter
+from memory_manager import MemoryManager, EpisodicMemoryWriter, EpisodicMemoryReader
 import news_brief
 from runtime_factory import available_backends, create_runtime
 import session_files
@@ -857,6 +858,11 @@ class EpisodesResponse(BaseModel):
     total:    int
     offset:   int
     limit:    int
+
+
+class RelatedEpisodesResponse(BaseModel):
+    """Response body for GET /memory/episodes/related."""
+    episodes: list[EpisodeItem]
 
 
 class EpisodeApprovalResponse(BaseModel):
@@ -1632,6 +1638,53 @@ async def get_memory_episodes(
         total    = total,
         offset   = offset,
         limit    = limit,
+    )
+
+
+@app.get(
+    "/memory/episodes/related",
+    response_model = RelatedEpisodesResponse,
+    summary        = "Find episodes semantically related to a chat turn",
+)
+async def get_related_episodes(
+    content: str,
+    task_id: str | None = None,
+    limit:   int = 5,
+) -> RelatedEpisodesResponse:
+    """
+    Mode 3 (semantic similarity, §2.6) lookup backing the Episode Browsing
+    UI's "Related Memory" panel (EpisodeAnnotations.svelte). Replaces the
+    old task_id exact-match query — episodes are sparse by design (§2.1),
+    so most selected turns have zero same-task_id episodes and the old
+    query read as "no related memory" for the common case.
+
+    `content` is the selected chat turn's own content, scored against every
+    active episode via EpisodicMemoryReader.by_similarity() — real cosine
+    similarity where an embedding exists, keyword/Jaccard fallback
+    otherwise, exactly as Mode 3 already behaves elsewhere. `task_id`, when
+    supplied, excludes episodes written from that exact turn: they were
+    extracted from this very content, so are trivially "related" and were
+    already what the old query surfaced — the case this fixes is
+    everything else.
+
+    min_score=0.45 mirrors the same Mode 3 threshold controller_agent.py
+    uses for episodic recall during a live turn (_execute_plan's Step 5).
+    """
+    mm = _state.memory_manager
+    if mm is None:
+        return RelatedEpisodesResponse(episodes=[])
+
+    reader = EpisodicMemoryReader(db_path=mm._db_path, embed_fn=mm.embed_fn)
+    records = await asyncio.to_thread(
+        reader.by_similarity,
+        content,
+        top_n           = limit,
+        min_score       = 0.45,
+        exclude_task_id = task_id,
+    )
+
+    return RelatedEpisodesResponse(
+        episodes = [EpisodeItem(**asdict(record)) for record in records],
     )
 
 

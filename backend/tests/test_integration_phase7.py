@@ -86,11 +86,12 @@ def make_conv_agent(answer: str = "Test answer."):
 @dataclass
 class MockDoc:
     """Lightweight stand-in for MemoryManager DocumentResult."""
-    path:            str
-    content:         str
-    relevance_score: float
-    doc_type:        str = "wiki"
-    name:            str = "mock"
+    path:                str
+    content:             str
+    relevance_score:     float
+    doc_type:            str  = "wiki"
+    name:                str  = "mock"
+    scored_by_embedding: bool = True
 
 
 # ---------------------------------------------------------------------------

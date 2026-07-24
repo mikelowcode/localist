@@ -1,7 +1,7 @@
 """
 Tests for the episodic memory REST endpoints (main.py):
-GET /memory/episodes, POST /memory/episodes/{id}/approve,
-POST /memory/episodes/{id}/reject.
+GET /memory/episodes, GET /memory/episodes/related,
+POST /memory/episodes/{id}/approve, POST /memory/episodes/{id}/reject.
 
 Follows the same TestClient + real-temp-file-MemoryManager pattern as
 tests/test_main_task_chat_turns.py — the FastAPI lifespan is never
@@ -235,3 +235,112 @@ class TestGetEpisodesTaskIdFilter:
         resp = client.get("/memory/episodes")
 
         assert resp.json()["total"] == 2
+
+
+class TestRelatedEpisodesEndpoint:
+    """
+    GET /memory/episodes/related — semantic-similarity replacement for the
+    old task_id exact-match query backing EpisodeAnnotations.svelte's
+    "Related Memory" panel. No embed_fn is configured on the `client`
+    fixture's MemoryManager, so these exercise the keyword (Jaccard)
+    fallback path — the common case for a fresh local install before
+    embeddings are backfilled.
+    """
+
+    def test_returns_semantically_similar_episode(self, client):
+        writer = EpisodicMemoryWriter(db_path=main._state.memory_manager._db_path)
+        writer.insert(
+            "decision", "memory backend", "SQLite committed as the memory backend.",
+            "explicit", task_id="other-task",
+        )
+
+        resp = client.get(
+            "/memory/episodes/related",
+            params={"content": "sqlite memory backend", "task_id": "this-task"},
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["episodes"]) == 1
+        assert body["episodes"][0]["subject"] == "memory backend"
+
+    def test_excludes_episodes_from_same_task_id(self, client):
+        writer = EpisodicMemoryWriter(db_path=main._state.memory_manager._db_path)
+        writer.insert(
+            "decision", "memory backend", "SQLite memory backend.",
+            "explicit", task_id="this-task",
+        )
+        writer.insert(
+            "decision", "memory backend v2", "SQLite memory backend.",
+            "explicit", task_id="other-task",
+        )
+
+        resp = client.get(
+            "/memory/episodes/related",
+            params={"content": "sqlite memory backend", "task_id": "this-task"},
+        )
+
+        subjects = [ep["subject"] for ep in resp.json()["episodes"]]
+        assert "memory backend" not in subjects
+        assert "memory backend v2" in subjects
+
+    def test_no_task_id_keeps_all_matches(self, client):
+        writer = EpisodicMemoryWriter(db_path=main._state.memory_manager._db_path)
+        writer.insert(
+            "decision", "memory backend", "SQLite committed as the memory backend.",
+            "explicit", task_id="this-task",
+        )
+
+        resp = client.get(
+            "/memory/episodes/related",
+            params={"content": "sqlite memory backend"},
+        )
+
+        subjects = [ep["subject"] for ep in resp.json()["episodes"]]
+        assert "memory backend" in subjects
+
+    def test_unrelated_query_still_returned_without_embeddings(self, client):
+        # The `client` fixture's MemoryManager has no embed_fn, so this
+        # episode is BM25-scored — by_similarity() skips its min_score
+        # floor entirely for BM25-scored episodes (raw BM25 is unbounded,
+        # so no floor is meaningful) and trusts ranking instead, the same
+        # "no floor in keyword-only mode" contract query_corpus() already
+        # has. With only one candidate in the pool, it's still returned
+        # even for a completely unrelated query.
+        writer = EpisodicMemoryWriter(db_path=main._state.memory_manager._db_path)
+        writer.insert("decision", "memory backend", "SQLite committed.", "explicit")
+
+        resp = client.get(
+            "/memory/episodes/related",
+            params={"content": "completely unrelated query about weather"},
+        )
+
+        assert resp.status_code == 200
+        assert len(resp.json()["episodes"]) == 1
+
+    def test_no_memory_manager_returns_empty_list(self, client):
+        prev = main._state.memory_manager
+        main._state.memory_manager = None
+        try:
+            resp = client.get(
+                "/memory/episodes/related", params={"content": "anything"},
+            )
+            assert resp.status_code == 200
+            assert resp.json()["episodes"] == []
+        finally:
+            main._state.memory_manager = prev
+
+    def test_respects_limit(self, client):
+        writer = EpisodicMemoryWriter(db_path=main._state.memory_manager._db_path)
+        for i in range(4):
+            writer.insert(
+                "decision", f"sqlite memory backend {i}", "SQLite committed as the memory backend.",
+                "explicit",
+            )
+
+        resp = client.get(
+            "/memory/episodes/related",
+            params={"content": "sqlite memory backend", "limit": 2},
+        )
+
+        assert len(resp.json()["episodes"]) <= 2

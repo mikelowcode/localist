@@ -1429,7 +1429,7 @@ class ControllerAgent:
                         content = parse_wiki_doc(doc.content).body[:2000],
                     )
                     for doc in _fallback_docs
-                    if doc.relevance_score >= 0.55
+                    if (not doc.scored_by_embedding or doc.relevance_score >= 0.55)
                     and not str(doc.path).endswith("lora-persona.md")
                 ]
                 if rag_sources:
@@ -1462,13 +1462,24 @@ class ControllerAgent:
                     max_results    = 3,
                     use_embeddings = True,
                 )
+                # relevance_score >= 0.55 only applies when the score is a
+                # cosine similarity (doc.scored_by_embedding) — a document
+                # scored via BM25 keyword fallback instead (no embed_fn, a
+                # stale corpus, or this doc simply lacking a stored
+                # embedding) has a raw, unbounded score not on the same
+                # scale, so it's included on rank alone (query_corpus()
+                # already only returns the top max_results candidates).
+                # See DocumentResult.scored_by_embedding and bm25.py's
+                # module docstring for why: a ceiling-normalized BM25 score
+                # was tried and rejected, since it made 0.55 nearly
+                # unreachable for realistic single-mention matches.
                 rag_sources = [
                     RagSource(
                         path    = str(doc.path),
                         content = parse_wiki_doc(doc.content).body[:2000],
                     )
                     for doc in docs
-                    if doc.relevance_score >= 0.55
+                    if (not doc.scored_by_embedding or doc.relevance_score >= 0.55)
                     and not str(doc.path).endswith("lora-persona.md")
                 ]
                 logger.info(
@@ -1486,15 +1497,19 @@ class ControllerAgent:
         # node, surface its 1-hop backlinks/outgoing links alongside the RAG
         # snippet. Deliberately narrow — only the single top doc, only when
         # it's doc_type=="wiki" (raw/ docs were never made graph nodes),
-        # gated by the same 0.55 relevance floor already used for
-        # rag_sources — and silently absent otherwise (no logging noise for
+        # gated by the same relevance floor already used for rag_sources
+        # (0.55 for a cosine-scored top doc, no floor — rank alone — for a
+        # BM25-scored one; see that gate's own comment) — and silently
+        # absent otherwise (no logging noise for
         # the common "top hit isn't a graph node" case). Never runs on a
         # plan.graph_query (P3c) turn: those have fetch_rag forced False by
         # design, so `docs` is always [] there and this block is a no-op.
         graph_neighborhood: GraphNeighborhood | None = None
         if docs and self._memory_manager is not None:
             top_doc = docs[0]
-            if top_doc.doc_type == "wiki" and top_doc.relevance_score >= 0.55:
+            if top_doc.doc_type == "wiki" and (
+                not top_doc.scored_by_embedding or top_doc.relevance_score >= 0.55
+            ):
                 try:
                     node = self._memory_manager.get_graph_node_by_doc_path(top_doc.path)
                     if node is not None:

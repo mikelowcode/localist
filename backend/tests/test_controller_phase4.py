@@ -1937,6 +1937,30 @@ class TestRagSourceFrontmatterStripping:
         assert "low relevance content"             not in prompt
         assert "persona content"                   not in prompt
 
+    def test_bm25_scored_doc_bypasses_0_55_floor(self):
+        """
+        A low BM25 score (scored_by_embedding=False) must still be included —
+        raw BM25 is unbounded, so 0.55 was never a meaningful floor for it;
+        controller_agent.py trusts query_corpus()'s ranking instead for
+        these. A cosine-scored doc (scored_by_embedding=True, the default)
+        at the same low score must still be excluded — the floor stays in
+        force there.
+        """
+        bm25_low_doc = _mock_doc("/wiki/bm25-low.md", "bm25 scored content")
+        bm25_low_doc.relevance_score     = 0.1
+        bm25_low_doc.scored_by_embedding = False
+
+        cosine_low_doc = _mock_doc("/wiki/cosine-low.md", "cosine scored content")
+        cosine_low_doc.relevance_score     = 0.1
+        cosine_low_doc.scored_by_embedding = True
+
+        ctrl, conv = _make_rag_ctrl([bm25_low_doc, cosine_low_doc])
+        ctrl.handle_task({"instruction": "check the wiki for Localist"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "bm25 scored content"    in prompt
+        assert "cosine scored content" not in prompt
+
 
 # ---------------------------------------------------------------------------
 # Graph query fetch — Step 5c wiring

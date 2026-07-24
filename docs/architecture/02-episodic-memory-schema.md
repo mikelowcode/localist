@@ -179,10 +179,13 @@ reachable at all. `EpisodicMemoryReader._score_all_active(query)` is the
 shared scoring core: it embeds `query` once (via the reader's `embed_fn`, if
 supplied) and scores every active episode — real cosine similarity
 (`_cosine_similarity`) against any row with a stored `embedding`, falling
-back to keyword (Jaccard) overlap per-row for un-embedded rows or when no
-`embed_fn` is available at all. `by_similarity(query, top_n, min_score)`
-slices the top N above threshold; `best_match(query, min_score)` (used by
-retraction, §2.5) returns just the single top scorer.
+back to BM25 keyword scoring (`bm25.py`, §2.13) for un-embedded rows or when
+no `embed_fn` is available at all. `by_similarity(query, top_n, min_score,
+exclude_task_id)` slices the top N above threshold, optionally dropping any
+episode whose `task_id` matches `exclude_task_id` first (§2.13 — used by the
+Related Memory lookup so a turn's own episode(s) don't show up in their own
+"related" results); `best_match(query, min_score)` (used by retraction,
+§2.5) returns just the single top scorer.
 
 `controller_agent.py`'s Step 5 calls both Mode 2 and Mode 3 per turn
 (`by_similarity(task.instruction, top_n=5, min_score=0.45)`), merges the
@@ -402,4 +405,91 @@ retracts correctly — regression-tested alongside the fix
 (`test_episodic_phase5.py::TestDetectExplicitSignalBareRememberPattern`,
 `test_planner_phase3.py::TestNegatedForgetPattern`). Full detail:
 `diagnostics/reports/explicit_memory_write_gate_2026-07-23.md`.
+
+### 2.13 Related Memory Query Fix + BM25 Keyword-Fallback Upgrade (2026-07-24)
+
+Two sequential, dependency-ordered changes to Mode 3 and its consumers.
+
+**Related Memory query fix.** The Episode Browsing UI's "Related Memory"
+panel (`EpisodeAnnotations.svelte`, §20.5) previously queried `GET
+/memory/episodes?task_id=<selected turn's task_id>&status=active` — an
+exact `task_id` match. Because episodes are sparse by design (§2.1), most
+turns produce zero episodes of their own, so this almost always returned
+empty: a query-design gap, not a retrieval-quality one — it asked "what
+else came from this exact turn" instead of "what else is semantically
+related to this." Fixed by a new `GET /memory/episodes/related?content=
+<turn content>&task_id=<turn task_id>&limit=5` endpoint (`main.py`) built
+on the existing Mode 3 scoring path unchanged: `EpisodicMemoryReader.
+by_similarity()` scored against the selected turn's own `content`, at the
+same `min_score=0.45` threshold `controller_agent.py`'s own Mode 3 call
+already uses. `by_similarity()` gained an `exclude_task_id` parameter for
+this: episodes sharing the selected turn's `task_id` are dropped before the
+top-N slice — they were extracted from this exact content, so are
+trivially "related" (and were already what the old exact-match query
+surfaced); the case this fixes is everything else. `EpisodeAnnotations.svelte`
+now takes a `content` prop (the selected turn's own text) alongside
+`taskId`, passed through from `EpisodeDetailPane.svelte`.
+
+**BM25 keyword-fallback upgrade.** The Jaccard set-overlap scoring
+previously used wherever no embedding is available — `document_index`'s
+stage-1 prefilter in `MemoryManager.query_corpus()`, and `EpisodicMemoryReader.
+_score_all_active()`'s per-row fallback for un-embedded episodes or when no
+`embed_fn` is configured — is replaced by Okapi BM25, in a new
+dependency-free module, `backend/bm25.py` (`score_documents(query,
+[(key, content), ...])`, standard `IDF · tf-saturation · document-length-
+normalization` formula, `k1=1.5`/`b=0.75` defaults). No third-party library:
+the corpus here is small and fetched fresh every call (no persistent index
+to justify an index-then-retrieve library API — see `bm25.py`'s own
+module docstring for the full reasoning). Unlike `document_index.token_set`
+(a deduplicated set built for Jaccard), BM25 needs term *frequency*, so
+`bm25.py` tokenizes raw `content` fresh at query/score time rather than
+reusing that column; IDF and average-document-length are computed once per
+call over the exact row set being scored (matching `_keyword_score()`'s
+existing per-call scoping, just batched instead of evaluated one row at a
+time, since BM25's corpus-wide terms can't be computed per-row). The
+`query_corpus()` embedding re-rank stage and `EpisodicMemoryReader`'s
+cosine-scoring branch are both unchanged — this is a stage-1/fallback
+scoring swap only. Existing tests asserting specific Jaccard-bounded scores
+(e.g. "1.0 is unreachable") were updated for BM25's unbounded range, not
+regressions. New tests cover BM25's actual differentiation from plain
+overlap — a document with one rare matching term outranking a document
+padded with a common matching term repeated many times — both directly
+(`test_bm25.py`) and through `query_corpus()`/`by_similarity()`.
+
+**Fallout: the 0.55/0.45 absolute relevance floors, and why they're now
+conditional.** `controller_agent.py` gates RAG-source inclusion (2 call
+sites) and the graph-assist neighborhood lookup on `relevance_score >=
+0.55`; `EpisodicMemoryReader.by_similarity()`'s Mode 3 recall merge uses
+`min_score=0.45`. Both were tuned against scores that were always bounded
+to roughly `[0, 1]` — cosine similarity, or the old Jaccard overlap. Raw
+BM25 has no such bound, so once it became the *primary* signal in
+keyword-only mode (not "a fallback of a fallback" — every result in that
+mode is BM25-scored), these absolute thresholds stopped meaning anything
+for it. A ceiling-based normalization (dividing by the score's own
+supremum as term-frequency → infinity, so results would land back in
+`[0, 1)`) was tried first and rejected on concrete evidence: it
+mathematically caps a document that mentions every query term exactly
+once — a perfectly good single-mention match, the common case for a short
+wiki page — at roughly 40% of scale, which pushed several genuinely
+relevant real documents below 0.55 and broke previously-passing tests
+(`test_rag_sources_appear_in_prompt`, the corpus-fallback tests in
+`test_tool_dispatcher_phase6.py`).
+
+Adopted instead: `DocumentResult` (`memory_manager.py`) and
+`EpisodicMemoryReader._score_all_active()` both now carry a
+`scored_by_embedding: bool` alongside each score. Callers applying an
+absolute floor skip it entirely when `scored_by_embedding` is `False`,
+trusting BM25's relative ranking instead (`query_corpus()` already returns
+only the top `max_results` candidates, so "no floor" still means "the best
+of what's here," not "everything unfiltered"). `by_similarity()` follows
+this policy — Mode 3 recall is low-stakes when imperfect. `best_match()`
+(used only by retraction, §2.5) deliberately does **not**: a false-positive
+retraction silently destroys the wrong memory, so its floor stays
+unconditional even against an uncalibrated BM25 score, at the cost of
+degrading more often to the exact `(subject, episode_type)` fallback loop
+in keyword-only mode — a known, accepted tradeoff (embed_fn is configured
+by default in this app; the no-embedding case is already the less-precise
+path by design, see §2.5's retraction note). `query_corpus()`'s retrieval
+cache persists `scored_by_embedding` per cached result so a cache hit
+doesn't silently lose the distinction.
 

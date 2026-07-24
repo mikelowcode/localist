@@ -85,10 +85,17 @@ verified rather than fixed — 3 new end-to-end tests, no production code change
 
 `MemoryManager.list_episodes()`/`count_episodes()` gain a `task_id` filter (same pattern as the
 existing `project_context`/`episode_type` filters), exposed via `GET /memory/episodes?task_id=...`.
-Backs the detail pane's "related memory" section: episodes implicit extraction stamped with the
-same `task_id` as the selected `chat_turns` row (`process_implicit_extraction(..., task_id=
-task.task_id, ...)` in `controller_agent.py` already did this stamping — no change needed there,
-only a way to query by it).
+Originally backed the detail pane's "related memory" section via an exact `task_id` match — episodes
+implicit extraction stamped with the same `task_id` as the selected `chat_turns` row
+(`process_implicit_extraction(..., task_id=task.task_id, ...)` in `controller_agent.py` already did
+this stamping — no change needed there, only a way to query by it). **Superseded 2026-07-24
+(§2.13 of the Episodic Memory Schema doc):** the exact-match query almost always returned empty
+(episodes are sparse by design, §2.1 there), so "related memory" is now a real Mode 3 semantic-
+similarity lookup — `GET /memory/episodes/related?content=...&task_id=...` — scored against the
+selected turn's own content, with `task_id` now used only to *exclude* that turn's own episode(s)
+from its own results rather than to select them. `list_episodes()`/`count_episodes()`'s `task_id`
+filter itself is unchanged and still backs the plain `GET /memory/episodes?task_id=...` filter used
+elsewhere (e.g. any future exact-task_id lookup) — only the overlay's own query changed.
 
 ### 20.6 Frontend
 
@@ -119,11 +126,12 @@ extra filter dimensions), different route.
 - `WorkflowSteps.svelte` — read-only step-chain view for `metadata.workflow_steps` (§20.3); a
   connector-dot-and-line layout, one entry per tool call, failed steps flagged.
 - `EpisodeAnnotations.svelte` — the episodes overlay (§20.5): fetches
-  `GET /memory/episodes?task_id=...&status=active` on mount for the selected turn (wrapped in a
-  `{#key selected.task_id}` block in the caller so a turn-selection change remounts it), renders
-  each episode as a small type-chip + content card. Read-only by design — approve/reject stays
-  `EpisodesPanel.svelte`'s job on the existing `/memory` route; every episode surfaced here is
-  already `status=active`.
+  `GET /memory/episodes/related?content=...&task_id=...` on mount for the selected turn (`content`
+  is the turn's own text, `task_id` excludes that turn's own episode(s) from its own results —
+  §2.13 of the Episodic Memory Schema doc), wrapped in a `{#key selected.task_id}` block in the
+  caller so a turn-selection change remounts it, renders each episode as a small type-chip +
+  content card. Read-only by design — approve/reject stays `EpisodesPanel.svelte`'s job on the
+  existing `/memory` route; every episode surfaced here is already `status=active`.
 - `ChartRenderer.svelte` — reused as-is from `ChatPanel.svelte`, no changes.
 
 ### 20.7 `/history` Retirement (Phase 7)
