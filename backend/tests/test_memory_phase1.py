@@ -430,6 +430,26 @@ class TestEpisodicEmbeddingScoring:
         conn.close()
         assert row[0] is None
 
+    def test_insert_truncates_embed_input_to_500_chars(self, db_path):
+        # memory-graph-inference-plan: insert() must embed content[:500],
+        # matching MemoryManager.index_document()'s truncation convention,
+        # not the full (unbounded) "{subject}. {content}" string.
+        seen: list[str] = []
+
+        def _capturing_embed(text: str) -> list[float]:
+            seen.append(text)
+            return _fake_embed(text)
+
+        writer = EpisodicMemoryWriter(db_path=db_path, embed_fn=_capturing_embed)
+        long_content = "the user prefers detailed explanations with examples " * 20
+        writer.insert(
+            "project_fact", "long content test", long_content,
+            "model_extracted", confidence=0.9,
+        )
+
+        assert len(seen) == 1
+        assert len(seen[0]) == 500
+
     def test_by_similarity_uses_cosine_when_embeddings_present(self, db_path):
         writer = EpisodicMemoryWriter(db_path=db_path, embed_fn=_fake_embed)
         writer.insert(
@@ -729,6 +749,16 @@ class TestWriteApprovalGate:
         row_id = writer.insert("preference", "x", "y.", "explicit")
         assert writer.approve(row_id) == 0
         assert _row(db_path, row_id)["status"] == "active"
+
+    def test_get_episode_subject_returns_subject(self, writer, db_path):
+        row_id = writer.insert(
+            "project_fact", "staged fact", "Some staged fact.",
+            "model_extracted", confidence=0.7, initial_status="pending",
+        )
+        assert writer.get_episode_subject(row_id) == "staged fact"
+
+    def test_get_episode_subject_nonexistent_id_returns_none(self, writer):
+        assert writer.get_episode_subject(999999) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1285,6 +1315,143 @@ class TestGraphReadMethods:
         result = mm.get_outgoing_links(node_id)
 
         assert result == []
+
+
+class TestEpisodeGraphNodes:
+    """
+    Phase B (memory-graph-inference-plan §B2): episode graph nodes.
+    Covers the synthetic doc_path scheme, the .resolve()-bypass fix, the
+    P3c stem-resolution episode filter, and get_backlinks()'s
+    include_episode_sources switch.
+    """
+
+    # --- upsert_graph_node_for_episode / synthetic doc_path scheme ---
+
+    def test_upsert_graph_node_for_episode_uses_synthetic_scheme(self, tmp_path):
+        path = tmp_path / "test.db"
+        mm = MemoryManager(db_path=path)
+
+        node_id = mm.upsert_graph_node_for_episode(42, title="oMLX version preference")
+
+        node = mm.get_graph_node_by_doc_path("episode://42")
+        assert node is not None
+        assert node["id"] == node_id
+        assert node["doc_path"] == "episode://42"
+        assert node["title"] == "oMLX version preference"
+
+    def test_synthetic_doc_path_not_resolved_against_cwd(self, tmp_path, monkeypatch):
+        # The bug this guards: Path("episode://42").resolve() would silently
+        # prepend the process's CWD, making the stored doc_path vary across
+        # launch contexts. Changing CWD between the two calls must not
+        # change what upsert_graph_node_for_episode() stores or what
+        # get_graph_node_by_doc_path() can find.
+        path = tmp_path / "test.db"
+        mm = MemoryManager(db_path=path)
+
+        monkeypatch.chdir(tmp_path)
+        node_id = mm.upsert_graph_node_for_episode(7, title="Some fact")
+
+        other_dir = tmp_path / "elsewhere"
+        other_dir.mkdir()
+        monkeypatch.chdir(other_dir)
+
+        node = mm.get_graph_node_by_doc_path("episode://7")
+        assert node is not None
+        assert node["id"] == node_id
+        assert node["doc_path"] == "episode://7"
+
+    def test_real_filesystem_doc_path_still_resolved(self, tmp_path):
+        # Sanity check that the _normalize_doc_path() fix didn't regress
+        # the existing wiki-node behavior (real paths still get resolve()'d).
+        path = tmp_path / "test.db"
+        mm = MemoryManager(db_path=path)
+        doc = tmp_path / "some-page.md"
+
+        node_id = mm.upsert_graph_node(doc, node_type="wiki", title="Some Page")
+
+        node = mm.get_graph_node_by_doc_path(doc)
+        assert node is not None
+        assert node["id"] == node_id
+        assert node["doc_path"] == str(doc.resolve())
+
+    def test_get_graph_node_by_doc_path_not_found(self, tmp_path):
+        path = tmp_path / "test.db"
+        mm = MemoryManager(db_path=path)
+
+        assert mm.get_graph_node_by_doc_path("episode://999") is None
+
+    # --- episode nodes excluded from P3c name resolution ---
+
+    def test_resolve_node_by_stem_excludes_episode_nodes(self, tmp_path):
+        path = tmp_path / "test.db"
+        mm = MemoryManager(db_path=path)
+        mm.upsert_graph_node_for_episode(1, title="42")  # stem-colliding id
+
+        # Path("episode://1").stem == "1", not "42" — but regardless of
+        # what the stem happens to be, an episode node must never satisfy
+        # a stem lookup at all.
+        assert mm.resolve_node_by_stem("1") is None
+
+    def test_list_graph_node_stems_excludes_episode_nodes(self, tmp_path):
+        path = tmp_path / "test.db"
+        mm = MemoryManager(db_path=path)
+        mm.upsert_graph_node(tmp_path / "real-page.md", node_type="wiki", title="Real Page")
+        mm.upsert_graph_node_for_episode(1, title="Some episode")
+
+        stems = mm.list_graph_node_stems()
+
+        assert "real-page" in stems
+        assert all("episode" not in s for s in stems)
+        assert len(stems) == 1
+
+    # --- get_backlinks include_episode_sources ---
+
+    def test_get_backlinks_include_episode_sources_default_true(self, tmp_path):
+        path = tmp_path / "test.db"
+        mm = MemoryManager(db_path=path)
+
+        wiki_target_id = mm.upsert_graph_node(
+            tmp_path / "target.md", node_type="wiki", title="Target Page",
+        )
+        episode_node_id = mm.upsert_graph_node_for_episode(1, title="A related fact")
+        mm.upsert_graph_edge(
+            source_node_id=episode_node_id, source_doc_path="episode://1",
+            target_path="target", target_node_id=wiki_target_id, target_resolved=True,
+            link_text="episodic_association",
+        )
+
+        backlinks = mm.get_backlinks(wiki_target_id)
+
+        assert len(backlinks) == 1
+        assert backlinks[0].node_title == "A related fact"
+
+    def test_get_backlinks_exclude_episode_sources(self, tmp_path):
+        path = tmp_path / "test.db"
+        mm = MemoryManager(db_path=path)
+
+        wiki_target_id = mm.upsert_graph_node(
+            tmp_path / "target.md", node_type="wiki", title="Target Page",
+        )
+        wiki_source_id = mm.upsert_graph_node(
+            tmp_path / "source.md", node_type="wiki", title="Source Page",
+        )
+        episode_node_id = mm.upsert_graph_node_for_episode(1, title="A related fact")
+        mm.upsert_graph_edge(
+            source_node_id=wiki_source_id, source_doc_path=tmp_path / "source.md",
+            target_path="target", target_node_id=wiki_target_id, target_resolved=True,
+            link_text="Target Page",
+        )
+        mm.upsert_graph_edge(
+            source_node_id=episode_node_id, source_doc_path="episode://1",
+            target_path="target", target_node_id=wiki_target_id, target_resolved=True,
+            link_text="episodic_association",
+        )
+
+        # Matches Planner P3c's call site (controller_agent.py Step 5c).
+        backlinks = mm.get_backlinks(wiki_target_id, include_episode_sources=False)
+
+        assert len(backlinks) == 1
+        assert backlinks[0].node_title == "Source Page"
 
 
 # ---------------------------------------------------------------------------

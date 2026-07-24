@@ -199,7 +199,100 @@ _MEMORY_KEYWORDS: frozenset[str] = frozenset({
     "forget that",
     "mark complete",
     "that's no longer true",
+    # Added 2026-07-23: zero collision risk with existing keywords/
+    # _RETRACTION_SIGNALS (unlike "forget"/"don't forget" — see the
+    # deliberately-scoped-out finding below).
+    "keep in mind",
+    "make a note",
 })
+
+# Priority 2 — bare "remember" write-command pattern (2026-07-23)
+#
+# Live bug: "I want you to remember I'm participating in a Claude Impact Lab
+# on August 6th." — no "that" after "remember" — matched no _MEMORY_KEYWORDS
+# entry, so write_episode never turned on and the fact was never stored (only
+# an ephemeral working_state.focus field captured it). A second, independent
+# gate (episodic_extractor._EXPLICIT_SIGNALS / detect_explicit_signal()) has
+# the identical "remember that"-only gap and needed the same fix — this
+# pattern is defined here and imported there rather than duplicated, so the
+# two gates can't drift.
+#
+# Semantic (embedding cosine-similarity) gating was tried first, mirroring
+# the Priority 5 fix, and rejected on measured evidence, not preference: two
+# independent rounds of template design against the real tuned embedding
+# model both failed to find ANY separating threshold — negative-max exceeded
+# positive-min in both rounds (round 1: "Do you remember my name?" 0.7401 vs.
+# min true positive 0.5919; round 2, avoiding bare "remember" in templates:
+# "I remember when we talked about this before." 0.6842 vs. min positive
+# 0.5901). Unlike P5's problem (personal-event request vs. generic task —
+# semantically distant), this is write-intent vs. recall-intent about the
+# same personal-fact vocabulary — too lexically similar for short-phrase
+# cosine similarity to discriminate. Full methodology and both rounds' data:
+# diagnostics/reports/explicit_memory_write_gate_2026-07-23.md.
+#
+# The deterministic rule that DOES separate cleanly (6/6 true positives,
+# 12/12 true negatives on the same battery, same report): bare word
+# "remember", not preceded by an interrogative ("do/can/could/would/will you
+# remember", "what do you remember"), not trailing a question mark, and not
+# "I remember" (the user reminiscing/stating a fact about their own memory,
+# not directing the assistant to store one — e.g. "I remember when we talked
+# about this before" must not fire).
+_MEMORY_INTERROGATIVE_REMEMBER: re.Pattern[str] = re.compile(
+    r"\b(do|does|did|can|could|would|will|what do)\s+(you\s+)?remember\b",
+    re.IGNORECASE,
+)
+
+# Priority 2 — negated "don't forget" write-command pattern (2026-07-23,
+# closed same day as the bare-"remember" fix above).
+#
+# Found while scoping that fix: _RETRACTION_SIGNALS (episodic_extractor.py)
+# substring-matches "forget that" to trigger a *retraction* (delete). "Don't
+# forget that I have a dentist appointment" — a request to REMEMBER
+# something — contains that exact substring and was hitting the retraction
+# branch first, the opposite of what the user means. Originally flagged and
+# deliberately left unfixed (see diagnostics/reports/
+# explicit_memory_write_gate_2026-07-23.md's "Out of scope" section); closed
+# same day per follow-up request.
+#
+# Fix: a negated-forget instruction is detected and routed to the SAME
+# insert path as "remember" (episode_type="preference", matching "remember
+# that"'s existing mapping) BEFORE _RETRACTION_SIGNALS is ever checked —
+# unlike the bare-"remember" pattern, this one is an unconditional positive
+# match (no interrogative/question-mark exclusion): "don't forget" has no
+# equivalent recall-question collision the way bare "remember" does ("Don't
+# forget to bring your laptop, okay?" is still an imperative regardless of
+# the trailing "?"). Scoped narrowly to "forget" only — _RETRACTION_SIGNALS'
+# other phrases ("ignore that", "disregard that", "scratch that") were not
+# reported as colliding and are far less naturally used with a "don't"
+# negation in this sense, so left untouched rather than guessing at a fix
+# nobody asked for.
+_MEMORY_NEGATED_FORGET: re.Pattern[str] = re.compile(
+    r"\b(don'?t|do not|never)\s+forget\b", re.IGNORECASE,
+)
+
+
+def _has_explicit_remember_signal(lowered: str) -> bool:
+    """
+    True if `lowered` (already-lowercased instruction) contains an explicit
+    memory-write command not caught by the literal phrases in
+    _MEMORY_KEYWORDS / _EXPLICIT_SIGNALS — either:
+      1. A bare "remember" write command (no "that") — see the module-level
+         comment above _MEMORY_INTERROGATIVE_REMEMBER.
+      2. A negated "don't forget" / "do not forget" / "never forget" write
+         command — see the module-level comment above _MEMORY_NEGATED_FORGET.
+    Both are backed by diagnostics/reports/explicit_memory_write_gate_2026-07-23.md.
+    """
+    if _MEMORY_NEGATED_FORGET.search(lowered):
+        return True
+    if "remember" not in lowered:
+        return False
+    if _MEMORY_INTERROGATIVE_REMEMBER.search(lowered):
+        return False
+    if lowered.rstrip().endswith("?"):
+        return False
+    if re.search(r"\bi remember\b", lowered):
+        return False
+    return True
 
 # Priority 3 — web search trigger keywords
 # Multi-word phrases carry no false-positive risk with _any_whole_word().
@@ -586,6 +679,48 @@ _SEMANTIC_GATE_THRESHOLDS: dict[str, float] = {
 
 
 # ---------------------------------------------------------------------------
+# Priority 5 — episodic-relevance semantic gate (2026-07-23)
+#
+# Live failure: "Help me prepare for the upcoming Claude Impact Lab on
+# August 6th." matched none of _EPISODIC_KEYWORDS (see
+# Planner._priority5_episodic()), so fetch_episodic never turned on and a
+# real matching episode in the episodes bank was never retrieved. Added a
+# semantic fallback, structurally mirroring _semantic_search_intent()'s
+# pattern (own template set, precomputed embeddings, tuned threshold) — but
+# deliberately kept as its OWN separate mechanism, not folded into
+# _SEARCH_INTENT_TEMPLATES / _SEMANTIC_GATE_THRESHOLDS above. Those carry
+# _ALL_SEARCH_NEGATIVE_FILTERS / _resolve_negative_filter_conflict, which
+# are search-intent-specific collision handling with nothing to do with
+# episodic relevance — reusing that path risked an unrelated P3 filter
+# match silently suppressing this signal.
+#
+# Template phrases are anchored on an explicit personal/calendar referent
+# ("my upcoming event", "my calendar", "we planned/discussed/decided") — the
+# same "object-specificity fix" already applied to lookup_request/
+# research_intent above, after a first round using bare "help me"/"remind
+# me" verb phrasing collided with generic requests like "Remind me how
+# photosynthesis works." (see the diagnostic report for both rounds).
+#
+# Threshold picked empirically, not guessed:
+# diagnostics/reports/episodic_relevance_semantic_gate_2026-07-23.md — 8/10
+# true positives (including the exact triggering utterance, 0.7742) and
+# 19/20 true negatives on a 30-utterance battery against the live tuned
+# model. Small-N, not a large formal corpus — ship to observe, revisit if
+# live behavior disagrees, same posture already used for
+# explicit_search_action's threshold history above.
+_EPISODIC_RELEVANCE_TEMPLATES: tuple[str, ...] = (
+    "help me prepare for my upcoming event",
+    "what do I have coming up on my calendar",
+    "remind me what we planned for this",
+    "catch me up on what we discussed before",
+    "what is on my schedule this week",
+    "help me get ready for my appointment",
+    "what did we decide about this before",
+)
+_EPISODIC_RELEVANCE_THRESHOLD: float = 0.70
+
+
+# ---------------------------------------------------------------------------
 # Tuned-embedding-model guard
 #
 # Every threshold above (_SEMANTIC_GATE_THRESHOLDS, and _RESEARCH_INTENT_
@@ -965,11 +1100,17 @@ class Planner:
 
         # Session state for Priority 5 caching (§4.3)
         # _episodic_injected: True once episodic bullets have been injected
-        #   this session; causes all further Priority 5 checks to return True
-        #   without an inference call (relevance assumed to persist).
+        #   this session. STALE COMMENT UNTIL 2026-07-23: this used to make
+        #   _priority5_episodic() return True unconditionally on every
+        #   subsequent turn. It no longer does — _priority5_episodic() was
+        #   rewritten to a deterministic keyword check (see that method's
+        #   docstring), and this flag now only decides whether to skip
+        #   logging noise for the (removed) inference call; every turn still
+        #   requires a keyword or semantic-gate match regardless of this
+        #   flag's value.
         # _episodic_cache_pairs: parallel list of (embedding, result)
-        #   pairs used for cosine similarity lookup, since dict keys cannot
-        #   be float lists.
+        #   pairs — vestigial from the pre-keyword-check inference design;
+        #   not read or written anywhere in the current implementation.
         self._episodic_injected: bool = False
         self._episodic_cache_pairs: list[tuple[list[float], bool]] = []
 
@@ -1002,6 +1143,26 @@ class Planner:
                     "semantic search-intent check will be skipped. Error: %s", exc,
                 )
                 self._template_embeddings = []
+
+        # Priority 5 episodic-relevance semantic gate — own precomputed
+        # embeddings, kept separate from _template_embeddings above (see the
+        # module-level comment above _EPISODIC_RELEVANCE_TEMPLATES for why).
+        self._episodic_template_embeddings: list[list[float]] = []
+        if embed_fn is not None:
+            try:
+                self._episodic_template_embeddings = [
+                    embed_fn(phrase) for phrase in _EPISODIC_RELEVANCE_TEMPLATES
+                ]
+                logger.debug(
+                    "Planner: pre-embedded %d episodic-relevance templates.",
+                    len(self._episodic_template_embeddings),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Planner: failed to embed episodic-relevance templates — "
+                    "semantic episodic check will be skipped. Error: %s", exc,
+                )
+                self._episodic_template_embeddings = []
 
     # -----------------------------------------------------------------------
     # Public API
@@ -1440,7 +1601,9 @@ class Planner:
     def _priority2_memory(self, lowered: str) -> RoutingPlan | None:
         """
         Match condition: any memory command keyword present in lowercased
-        instruction.
+        instruction, OR the bare-"remember" write-command pattern (2026-07-23
+        — see _has_explicit_remember_signal() for the full rationale and why
+        semantic gating was tried and rejected here).
 
         Sets write_episode=True. The episode_type hint is left as None here
         — the EpisodicMemoryWriter will infer type from content. After
@@ -1452,9 +1615,12 @@ class Planner:
         matched_kw = next(
             (kw for kw in _MEMORY_KEYWORDS if kw in lowered), None
         )
-        if matched_kw is not None:
+        matched_pattern = matched_kw is None and _has_explicit_remember_signal(lowered)
+
+        if matched_kw is not None or matched_pattern:
             logger.debug(
-                "Planner: Priority 2 matched (keyword=%r).", matched_kw
+                "Planner: Priority 2 matched (keyword=%r pattern=%s).",
+                matched_kw, matched_pattern,
             )
             return RoutingPlan(
                 agent          = "conversational_agent",
@@ -2117,32 +2283,71 @@ class Planner:
     # Priority 5 — Episodic relevance  (§4.2, §4.3)
     # -----------------------------------------------------------------------
 
+    def _episodic_semantic_relevance(self, lowered: str) -> float | None:
+        """
+        Best cosine similarity of `lowered` against _EPISODIC_RELEVANCE_TEMPLATES,
+        or None if unavailable (no embed_fn, no precomputed templates, semantic
+        gating disabled for this embedding model, or an embed_fn failure).
+
+        Structurally parallel to _semantic_search_intent() (own precomputed
+        embeddings, same disabled-model guard) but deliberately simpler and
+        kept separate — a single flat template list and no negative-filter/
+        tie-break machinery, since that machinery is specific to P3's
+        search-intent collisions and has nothing to do with episodic
+        relevance. See the module-level comment above
+        _EPISODIC_RELEVANCE_TEMPLATES for the full rationale and the
+        diagnostic report backing the threshold this feeds.
+        """
+        if (
+            self._embed_fn is None
+            or not self._episodic_template_embeddings
+            or self._semantic_gating_disabled
+        ):
+            return None
+
+        try:
+            query_vec = self._embed_fn(lowered)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Planner: _episodic_semantic_relevance — embed_fn raised: %s", exc,
+            )
+            return None
+
+        return max(
+            _cosine_similarity(query_vec, tmpl_vec)
+            for tmpl_vec in self._episodic_template_embeddings
+        )
+
     def _priority5_episodic(self, instruction: str) -> RoutingPlan | None:
         """
         Priority 5 — Episodic relevance (§4.2, §4.3).
 
-        Replaced inference call with deterministic keyword check for
-        Gemma 4B compatibility. The model requires max_tokens=300 to
-        produce binary classifier output, making inference-based routing
-        too expensive for a per-turn call.
+        Two independent signals, either sufficient:
+          1. Deterministic keyword check (_EPISODIC_KEYWORDS) — replaced an
+             inference call for Gemma 4B compatibility (the model requires
+             max_tokens=300 to produce binary classifier output, making
+             inference-based routing too expensive for a per-turn call).
+          2. Semantic gate (2026-07-23, _episodic_semantic_relevance()) —
+             added after a live failure: "Help me prepare for the upcoming
+             Claude Impact Lab on August 6th." matched no keyword and so
+             never fetched episodic memory even though a matching episode
+             existed. Catches personal/calendar-referencing phrasing the
+             keyword list can't enumerate in advance. Cosine similarity
+             against embeddings, not a model call — same cost profile as
+             the keyword check, no extra inference.
 
-        Returns a RoutingPlan with fetch_episodic=True if the instruction
-        contains episodic relevance signals, or None if not.
+        Returns a RoutingPlan with fetch_episodic=True if either signal
+        fires, or None if neither does.
 
-        Session flag caching is preserved: once episodic bullets have been
-        injected this session, all subsequent turns return fetch_episodic=True
-        without keyword evaluation.
+        `self._episodic_injected` (True once episodic bullets have been
+        injected this session) does NOT short-circuit this method to always
+        return True — see the stale-comment correction at its declaration
+        in __init__. Every turn still requires a keyword or semantic match.
         """
-        # Cache check: session-level flag.
-        # When set, we skip the (previously: inference) call and go straight
-        # to keyword evaluation — but we do NOT return True unconditionally.
-        # A turn with no episodic keyword still returns None so P6 or P4 can
-        # handle it correctly.
-        _skip_inference = self._episodic_injected
-        if _skip_inference:
+        if self._episodic_injected:
             logger.debug(
-                "Planner: Priority 5 — episodic_injected=True; "
-                "skipping inference, proceeding to keyword check."
+                "Planner: Priority 5 — episodic_injected=True (session flag; "
+                "does not skip evaluation — see __init__ comment)."
             )
 
         # Deterministic keyword check
@@ -2177,7 +2382,25 @@ class Planner:
                 priority       = 5,
             )
 
-        logger.debug("Planner: Priority 5 — no episodic keyword matched.")
+        semantic_score = self._episodic_semantic_relevance(lowered)
+        if semantic_score is not None and semantic_score >= _EPISODIC_RELEVANCE_THRESHOLD:
+            logger.debug(
+                "Planner: Priority 5 — episodic semantic gate fired "
+                "(score=%.3f >= %.2f) → fetch_episodic=True.",
+                semantic_score, _EPISODIC_RELEVANCE_THRESHOLD,
+            )
+            return RoutingPlan(
+                agent          = "conversational_agent",
+                fetch_episodic = True,
+                fetch_rag      = False,
+                priority       = 5,
+            )
+
+        logger.debug(
+            "Planner: Priority 5 — no episodic keyword matched; semantic "
+            "score=%s.",
+            f"{semantic_score:.3f}" if semantic_score is not None else "n/a",
+        )
         return None
 
     # -----------------------------------------------------------------------

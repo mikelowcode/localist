@@ -341,3 +341,65 @@ Hermes Agent's own default of "write freely"). Turning it on trades
 immediacy for review: a `model_extracted` fact sits invisible to every
 retrieval mode in §2.6 until a human resolves it.
 
+### 2.12 Explicit Signal Detection — Bare-"Remember" Pattern (2026-07-23)
+
+Live bug: "I want you to remember I'm participating in a Claude Impact Lab
+on August 6th." never wrote an episode. Root cause: **two independent**
+deterministic gates both required the literal phrase `"remember that"`, and
+this instruction has no "that":
+
+- `planner.py` Priority 2 (`_priority2_memory()` / `_MEMORY_KEYWORDS`) —
+  decides `RoutingPlan.write_episode`; missed, so `controller_agent.py`
+  never even called `process_explicit_signal()`.
+- `episodic_extractor.py`'s `_EXPLICIT_SIGNALS` / `detect_explicit_signal()`
+  — called *inside* `process_explicit_signal()`, independently re-scanning
+  the instruction; would have missed it too even if the first gate had
+  fired.
+
+Both had to be fixed for the write to actually happen. Semantic
+(embedding-cosine) gating was tried first, mirroring the same-day Planner
+Priority 5 fix (§4.3), and **rejected on measured evidence**: two rounds of
+template tuning against the real embedding model both found the negative
+ceiling exceeded the positive floor (e.g. "Do you remember my name?" scored
+higher than genuine write commands) — unlike P5's problem, write-intent vs.
+recall-intent shares too much surface vocabulary ("remember", "I") for
+short-phrase cosine similarity to discriminate. Full data both rounds:
+`diagnostics/reports/explicit_memory_write_gate_2026-07-23.md`.
+
+**Adopted instead** — a deterministic rule, `planner._has_explicit_remember_signal()`:
+bare word "remember", excluded when preceded by an interrogative
+(`do/does/did/can/could/would/will/what do (you)? remember` — recall
+questions), when the instruction ends in `"?"`, or when the phrase `"i
+remember"` appears (the user reminiscing, not directing the assistant).
+6/6 true positives, 12/12 true negatives on the same battery. Defined once
+in `planner.py` and imported into `episodic_extractor.py` so the two
+independent gates can't drift apart. Also added two zero-collision-risk
+literal phrases to both `_MEMORY_KEYWORDS` and `_EXPLICIT_SIGNALS`: `"keep
+in mind"` (→ `preference`), `"make a note"` (→ `project_fact`).
+
+**"Don't forget" retraction collision — found and CLOSED same day
+(2026-07-23), per explicit follow-up request.** `_RETRACTION_SIGNALS` (§2.5)
+contains the substring `"forget that"`, checked *before* `_EXPLICIT_SIGNALS`.
+"Don't forget that I have a dentist appointment" — a request to *remember*
+something — substring-matched `"forget that"` and routed to **retraction
+(delete)**, the opposite of what the user means. A real, pre-existing,
+higher-stakes bug (silent data deletion) found while scoping the
+bare-"remember" fix above and initially left deliberately unaddressed.
+
+Fix: `planner._MEMORY_NEGATED_FORGET`
+(`\b(don'?t|do not|never)\s+forget\b`) is checked in
+`detect_explicit_signal()` *before* the `_RETRACTION_SIGNALS` loop runs,
+short-circuiting a negated-forget instruction to an insert-type signal
+(`episode_type="preference"`) instead. Folded into
+`_has_explicit_remember_signal()` (now covers both the bare-"remember" and
+negated-"forget" cases, still one shared function so Planner P2 and
+`detect_explicit_signal()` can't drift). Deliberately narrow — only
+`"forget"` is handled; `_RETRACTION_SIGNALS`' other phrases (`"ignore
+that"`, `"disregard that"`, `"scratch that"`) were not reported as
+colliding and are far less naturally used with a `"don't"` negation in this
+sense, so left untouched. Genuine (unnegated) `"forget that"` still
+retracts correctly — regression-tested alongside the fix
+(`test_episodic_phase5.py::TestDetectExplicitSignalBareRememberPattern`,
+`test_planner_phase3.py::TestNegatedForgetPattern`). Full detail:
+`diagnostics/reports/explicit_memory_write_gate_2026-07-23.md`.
+

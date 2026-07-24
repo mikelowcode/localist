@@ -1660,6 +1660,11 @@ async def approve_memory_episode(episode_id: int) -> EpisodeApprovalResponse:
     Transition a pending episode to active — the "yes" path of the
     episodic_write_approval gate. Once active, the episode is eligible for
     by_recency()/by_similarity() and appears in MEMORY.md immediately.
+    Also retriggers the Phase B graph hook (memory-graph-inference-plan
+    §8.9), which the implicit-extraction post-response hook deliberately
+    skipped while the episode was pending — see
+    ControllerAgent._write_episode_graph_node()'s docstring for why a
+    pending episode gets no graph node until this point.
 
     Idempotent: approving an id that's already active/retracted, or that
     doesn't exist, returns updated=False rather than an error.
@@ -1672,6 +1677,18 @@ async def approve_memory_episode(episode_id: int) -> EpisodeApprovalResponse:
         db_path=getattr(mm, "_db_path", None), memory_md_path=_MEMORY_MD_PATH,
     )
     count = await asyncio.to_thread(writer.approve, episode_id)
+    if count > 0:
+        subject = await asyncio.to_thread(writer.get_episode_subject, episode_id)
+        controller = _state.controller
+        if controller is not None and subject is not None:
+            # Reaches into ControllerAgent's private hook — same precedent
+            # as GET /agents reading controller._agents directly elsewhere
+            # in this file. Best-effort and self-contained: the hook
+            # catches and logs its own exceptions, so a broken graph write
+            # can never fail this endpoint or leave the approval half-done.
+            await asyncio.to_thread(
+                controller._write_episode_graph_node, episode_id, subject,
+            )
     return EpisodeApprovalResponse(
         episode_id = episode_id,
         status     = "active",

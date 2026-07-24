@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from memory_manager import EpisodicMemoryWriter, EpisodicMemoryReader, WorkingStateStore, WorkingStateRecord, VALID_EPISODE_TYPES
+from planner import _has_explicit_remember_signal, _MEMORY_NEGATED_FORGET
 from prompt_builder import PromptBuilder
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,12 @@ _EXPLICIT_SIGNALS: dict[str, str] = {
     "should be called":      "naming_convention",
     "not called":            "naming_convention",
     "the correct name is":   "naming_convention",
+    # Added 2026-07-23, mirrors planner._MEMORY_KEYWORDS — zero collision
+    # risk with _RETRACTION_SIGNALS (unlike "forget"/"don't forget", see
+    # planner._has_explicit_remember_signal()'s docstring for the related,
+    # deliberately-out-of-scope retraction bug this fix does not touch).
+    "keep in mind":          "preference",
+    "make a note":           "project_fact",
 }
 
 # Retraction phrases — matched before _EXPLICIT_SIGNALS.
@@ -226,6 +233,7 @@ class ExtractionResult:
     task_id:         str | None = None
     conversation_id: str | None = None
     project_context: str        = "general"
+    episode_id:      int | None = None  # row id from EpisodicMemoryWriter.insert()
 
 
 # ---------------------------------------------------------------------------
@@ -236,11 +244,28 @@ def detect_explicit_signal(instruction: str) -> ExtractionSignal | None:
     """
     Scan the instruction for explicit memory command phrases.
 
-    Retraction phrases are checked first. If a retraction phrase is found,
-    an ExtractionSignal with is_retraction=True is returned — the caller
-    must call EpisodicMemoryWriter.retract() rather than insert().
+    A negated "don't forget" / "do not forget" / "never forget" instruction
+    (planner._MEMORY_NEGATED_FORGET — 2026-07-23) is checked FIRST, before
+    retraction phrases, and short-circuits straight to an insert-type
+    ExtractionSignal. Without this, "Don't forget that I have a dentist
+    appointment" — a request to REMEMBER something — would substring-match
+    _RETRACTION_SIGNALS' "forget that" and incorrectly trigger a *retraction*
+    (delete): a real, pre-existing bug found while scoping the bare-
+    "remember" fix below, originally left deliberately unaddressed (see
+    diagnostics/reports/explicit_memory_write_gate_2026-07-23.md's "Out of
+    scope" section), closed same day per follow-up request.
 
-    Then explicit insert phrases are checked. The first match wins.
+    Retraction phrases are then checked. If a retraction phrase is found, an
+    ExtractionSignal with is_retraction=True is returned — the caller must
+    call EpisodicMemoryWriter.retract() rather than insert().
+
+    Then explicit insert phrases are checked. The first match wins. If none
+    match, the bare-"remember" write-command pattern (2026-07-23,
+    planner._has_explicit_remember_signal() — shared with Planner Priority 2
+    so the two independent gates can't drift; see that function's docstring
+    for the full rationale, including why semantic gating was tried and
+    rejected for this specific case) is checked as a fallback, typed
+    "preference" to match "remember that"'s existing mapping above.
 
     Returns None if no signal is detected.
 
@@ -251,6 +276,20 @@ def detect_explicit_signal(instruction: str) -> ExtractionSignal | None:
         lowercases internally).
     """
     lowered = instruction.lower()
+
+    # Negated "don't forget" check — MUST run before the retraction loop
+    # below, since "forget that" is a substring of "don't forget that" and
+    # would otherwise be caught by it first. See docstring above.
+    if _MEMORY_NEGATED_FORGET.search(lowered):
+        logger.debug(
+            "detect_explicit_signal: negated-forget pattern matched → "
+            "preference (insert, not retraction)."
+        )
+        return ExtractionSignal(
+            episode_type   = "preference",
+            is_retraction  = False,
+            trigger_phrase = "dont_forget:pattern",
+        )
 
     # Retraction check first (§2.5 retraction rule)
     for phrase in _RETRACTION_SIGNALS:
@@ -279,6 +318,17 @@ def detect_explicit_signal(instruction: str) -> ExtractionSignal | None:
                 is_retraction  = False,
                 trigger_phrase = phrase,
             )
+
+    # Bare-"remember" pattern fallback — see docstring above.
+    if _has_explicit_remember_signal(lowered):
+        logger.debug(
+            "detect_explicit_signal: bare-remember pattern matched → preference."
+        )
+        return ExtractionSignal(
+            episode_type   = "preference",
+            is_retraction  = False,
+            trigger_phrase = "remember:pattern",
+        )
 
     return None
 
@@ -717,6 +767,7 @@ def process_explicit_signal(
         confidence      = 1.0,
         task_id         = task_id,
         project_context = project_context,
+        episode_id      = row_id,
     )
 
 
@@ -843,6 +894,7 @@ def process_implicit_extraction(
         confidence      = confidence,
         task_id         = task_id,
         project_context = project_context,
+        episode_id      = row_id,
     )
 
 

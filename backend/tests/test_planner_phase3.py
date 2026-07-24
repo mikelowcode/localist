@@ -22,7 +22,7 @@ import pytest
 
 import session_files
 from memory_manager import MemoryManager
-from planner import Planner, RoutingPlan, extract_graph_query, resolve_graph_target
+from planner import Planner, RoutingPlan, extract_graph_query, resolve_graph_target, _has_explicit_remember_signal
 from controller_agent import (
     ControllerAgent, Task, TaskStatus, SubTask, AgentResult
 )
@@ -111,6 +111,16 @@ class TestPlannerPriorities:
         plan = p.route("forget that preference", context={})
         assert plan.write_episode is True
 
+    def test_p2_keep_in_mind_keyword(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("keep in mind I'm allergic to peanuts", context={})
+        assert plan.write_episode is True
+
+    def test_p2_make_a_note_keyword(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("make a note that my flight is on the 10th", context={})
+        assert plan.write_episode is True
+
     def test_p3_web_search_keyword(self):
         p = Planner(runtime=make_runtime())
         plan = p.route("What are the latest oMLX changes?", context={})
@@ -181,6 +191,115 @@ class TestPlannerPriorities:
         assert plan.tools_to_call == []
         assert plan.write_episode  is False
         assert plan.compound       is False
+
+
+# ---------------------------------------------------------------------------
+# Priority 2 — bare-"remember" write-command pattern (2026-07-23)
+# ---------------------------------------------------------------------------
+# Live bug: "I want you to remember I'm participating in a Claude Impact Lab
+# on August 6th." matched no _MEMORY_KEYWORDS entry (only literal "remember
+# that" was covered). Semantic gating was tried first (mirroring the same-day
+# Priority 5 fix) and rejected on measured evidence — two rounds of template
+# tuning against the real embedding model both found negative-max > positive-
+# min (recall questions like "Do you remember my name?" scored higher than
+# genuine write commands). See diagnostics/reports/
+# explicit_memory_write_gate_2026-07-23.md for both rounds' data and the
+# adopted deterministic rule tested here.
+
+class TestExplicitRememberPattern:
+    """Unit tests for Planner._has_explicit_remember_signal() directly, plus
+    its wiring into _priority2_memory()/route()."""
+
+    def test_live_bug_repro_fires(self):
+        assert _has_explicit_remember_signal(
+            "i want you to remember i'm participating in a claude impact "
+            "lab on august 6th."
+        ) is True
+
+    def test_bare_remember_without_that_fires(self):
+        assert _has_explicit_remember_signal("please remember i prefer dark mode.") is True
+
+    def test_do_you_remember_question_does_not_fire(self):
+        assert _has_explicit_remember_signal(
+            "do you remember what i told you about the migration?"
+        ) is False
+
+    def test_what_do_you_remember_question_does_not_fire(self):
+        assert _has_explicit_remember_signal(
+            "what do you remember about my project?"
+        ) is False
+
+    def test_will_you_remember_question_does_not_fire(self):
+        assert _has_explicit_remember_signal("will you remember to feed the cat?") is False
+
+    def test_i_remember_reminiscing_does_not_fire(self):
+        assert _has_explicit_remember_signal(
+            "i remember when we talked about this before."
+        ) is False
+
+    def test_trailing_question_mark_does_not_fire(self):
+        assert _has_explicit_remember_signal(
+            "should i remember to bring my laptop tomorrow?"
+        ) is False
+
+    def test_no_remember_word_does_not_fire(self):
+        assert _has_explicit_remember_signal("what is the capital of france?") is False
+
+    def test_route_writes_episode_for_live_bug_instruction(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route(
+            "I want you to remember I'm participating in a Claude Impact "
+            "Lab on August 6th.",
+            context={},
+        )
+        assert plan.write_episode is True
+        assert plan.priority == 2
+
+    def test_route_does_not_write_episode_for_recall_question(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("Do you remember what I told you about the migration?", context={})
+        assert plan.write_episode is False
+
+
+class TestNegatedForgetPattern:
+    """
+    Closed 2026-07-23, same day as TestExplicitRememberPattern, follow-up
+    request: "don't forget that X" collided with _RETRACTION_SIGNALS'
+    "forget that" substring in episodic_extractor.detect_explicit_signal()
+    (incorrectly triggering delete instead of remember). This class covers
+    _has_explicit_remember_signal()'s negated-forget branch and
+    _priority2_memory()'s routing; the retraction-vs-insert fix itself lives
+    in episodic_extractor.py (see test_episodic_phase5.py).
+    """
+
+    def test_dont_forget_that_fires(self):
+        assert _has_explicit_remember_signal(
+            "don't forget that i have a dentist appointment."
+        ) is True
+
+    def test_dont_forget_without_that_fires(self):
+        assert _has_explicit_remember_signal(
+            "don't forget i have a dentist appointment next tuesday."
+        ) is True
+
+    def test_do_not_forget_variant_fires(self):
+        assert _has_explicit_remember_signal("do not forget i have a meeting at 3pm.") is True
+
+    def test_never_forget_variant_fires(self):
+        assert _has_explicit_remember_signal("never forget that i prefer dark mode.") is True
+
+    def test_bare_forget_without_negation_does_not_fire(self):
+        # "forget that" alone (no "don't"/"do not"/"never") is NOT this
+        # pattern's concern — it's the existing, correct retraction signal,
+        # untouched by this fix.
+        assert _has_explicit_remember_signal("forget that preference about formatting.") is False
+
+    def test_route_writes_episode_for_dont_forget(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route(
+            "Don't forget I have a dentist appointment next Tuesday.", context={},
+        )
+        assert plan.write_episode is True
 
 
 # ---------------------------------------------------------------------------
@@ -1140,6 +1259,112 @@ class TestSemanticSearchIntent:
 
         result = p._semantic_search_intent("look it up")
         assert result is None
+
+
+class TestEpisodicSemanticRelevance:
+    """
+    Unit + integration tests for Planner._episodic_semantic_relevance() and
+    its wiring into _priority5_episodic() (2026-07-23 addition — see
+    diagnostics/reports/episodic_relevance_semantic_gate_2026-07-23.md).
+
+    Deliberately parallels TestSemanticSearchIntent's fixed_vec/orthogonal_vec
+    pattern rather than inventing a new one, since this gate was built to
+    mirror _semantic_search_intent()'s mechanism.
+    """
+
+    def test_returns_none_when_embed_fn_is_none(self):
+        p = Planner(runtime=make_runtime())
+        assert p._embed_fn is None
+        assert p._episodic_template_embeddings == []
+        assert p._episodic_semantic_relevance("help me prepare for this") is None
+
+    def test_returns_high_score_for_matching_vector(self):
+        fixed_vec = _unit_vector(8)
+        embed_fn = MagicMock(return_value=fixed_vec)
+        p = Planner(runtime=make_runtime(), embed_fn=embed_fn)
+
+        score = p._episodic_semantic_relevance("anything at all")
+        assert score is not None
+        assert abs(score - 1.0) < 1e-6  # cosine(v, v) == 1.0
+
+    def test_returns_low_score_for_orthogonal_vector(self):
+        fixed_vec = _unit_vector(4)                     # templates embedded with this
+        orthogonal_vec = [0.5, 0.5, -0.5, -0.5]          # cosine(fixed, orthogonal) == 0
+
+        embed_fn = MagicMock(return_value=fixed_vec)
+        p = Planner(runtime=make_runtime(), embed_fn=embed_fn)
+        embed_fn.return_value = orthogonal_vec
+
+        score = p._episodic_semantic_relevance("totally unrelated text")
+        assert score is not None
+        assert abs(score) < 1e-6
+
+    def test_returns_none_gracefully_when_embed_fn_raises(self):
+        embed_fn = MagicMock(side_effect=RuntimeError("model unavailable"))
+        p = Planner(runtime=make_runtime(), embed_fn=embed_fn)
+        # __init__ swallows the error too, so _episodic_template_embeddings
+        # stays empty — either way this must return None, never raise.
+        assert p._episodic_semantic_relevance("help me prepare for this") is None
+
+    def test_disabled_when_semantic_gating_disabled(self):
+        # Same _semantic_gating_disabled flag _semantic_search_intent() uses
+        # (mismatched embedding model) — must disable this gate too, since
+        # the "cosine thresholds aren't portable across models" rationale
+        # applies to this threshold exactly as much as P3's.
+        fixed_vec = _unit_vector(8)
+        embed_fn = MagicMock(return_value=fixed_vec)
+        p = Planner(
+            runtime=make_runtime(), embed_fn=embed_fn,
+            embedding_model_name="nomic-embed-text",
+        )
+        assert p._semantic_gating_disabled is True
+        assert p._episodic_semantic_relevance("help me prepare for this") is None
+
+    def test_priority5_fires_via_semantic_gate_with_no_keyword_match(self):
+        # "Help me prepare for the upcoming Claude Impact Lab on August 6th."
+        # (the live failure this gate was added for) contains no
+        # _EPISODIC_KEYWORDS match — only the semantic path can catch it.
+        fixed_vec = _unit_vector(8)
+        embed_fn = MagicMock(return_value=fixed_vec)  # cosine 1.0 with every template
+        p = Planner(runtime=make_runtime(), embed_fn=embed_fn)
+
+        instruction = "Help me prepare for the upcoming Claude Impact Lab on August 6th."
+        assert not any(
+            kw in instruction.lower()
+            for kw in [
+                "preference", "remember", "decision", "correction", "workflow",
+                "last time", "previously", "before", "my project", "my setup",
+                "my environment", "my name", "who am i",
+            ]
+        )
+
+        plan = p._priority5_episodic(instruction)
+        assert plan is not None
+        assert plan.fetch_episodic is True
+        assert plan.fetch_rag is False
+
+    def test_priority5_returns_none_when_neither_keyword_nor_semantic_fires(self):
+        fixed_vec = _unit_vector(4)
+        orthogonal_vec = [0.5, 0.5, -0.5, -0.5]
+
+        embed_fn = MagicMock(return_value=fixed_vec)
+        p = Planner(runtime=make_runtime(), embed_fn=embed_fn)
+        embed_fn.return_value = orthogonal_vec
+
+        plan = p._priority5_episodic("What is 2+2?")
+        assert plan is None
+
+    def test_priority5_keyword_path_unaffected_by_embed_fn_presence(self):
+        # Regression guard: adding the semantic gate must not change the
+        # pre-existing keyword-match behavior for an instruction that hits
+        # both signals.
+        fixed_vec = _unit_vector(8)
+        embed_fn = MagicMock(return_value=fixed_vec)
+        p = Planner(runtime=make_runtime(), embed_fn=embed_fn)
+
+        plan = p._priority5_episodic("What are my formatting preferences?")
+        assert plan is not None
+        assert plan.fetch_episodic is True
 
 
 class TestTunedEmbeddingModelGuard:

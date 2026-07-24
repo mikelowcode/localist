@@ -1028,3 +1028,116 @@ raise), both isolated via `tmp_path`/`monkeypatch`.
 separate, unscoped open question — not resolved by this item, not filed as its own numbered
 item yet, referenced here only as a pointer for whoever picks it up next.
 
+### 8.9 Inference-Time Retrieval + Episodic Graph Nodes (2026-07-23)
+
+Scoped in `memory-graph-inference-plan.md` (two pieces: Phase A additive/RAG-assist,
+Phase B episode graph nodes), implemented same day. Full test suite (1098 tests)
+green after the change.
+
+**Corrections found against the scoping doc while implementing (worth recording since
+the doc's assumptions were stale in three places):**
+- `_SCHEMA_VERSION` was already **10** at implementation time (not 3/5 as the doc
+  guessed) — moot in the end, see below.
+- Episode embedding was **already wired end-to-end** (`EpisodicMemoryWriter.insert()`
+  embeds `f"{subject}. {content}"`, both explicit/implicit call sites in
+  `episodic_extractor.py` already pass a real `embed_fn`, and `backfill_episode_embeddings.py`
+  already exists) — the doc's "Phase B prerequisite" was not a gap. Only fixed a minor
+  truncation inconsistency: `insert()` now slices to `[:500]` chars before embedding, matching
+  `index_document()`'s convention (previously embedded the full string).
+- `resolve_node_by_stem()` / `list_graph_node_stems()` scan every `graph_nodes` row
+  unconditionally with no `node_type` filter — undocumented in the scoping doc, and a real
+  correctness gap once episode nodes exist (would leak synthetic `episode://<id>` doc_paths
+  into Planner P3c's stem-resolution candidate pool). Fixed as part of this work, not treated
+  as separate follow-up.
+- `upsert_graph_node()` / `upsert_graph_edge()` / `clear_graph_for_doc()` all called
+  `str(Path(doc_path).resolve())` unconditionally — `.resolve()` on a synthetic
+  `"episode://<id>"` string resolves it as a relative filesystem path against the process's
+  CWD, producing a value that would silently vary across launch contexts
+  (`start_localist.sh` vs. pytest vs. a shell in a different directory). New module-level
+  `_normalize_doc_path()` in `memory_manager.py` special-cases any doc_path containing
+  `"://"` and stores it verbatim instead of resolving it.
+
+**Schema: no migration needed.** `graph_nodes.node_type` has been a free-text nullable
+`TEXT` column since the v2→v3 migration (§8.3) and was already populated from wiki
+frontmatter's `type:` field (values like `research-note`) — not a closed set. Adding
+`node_type = "episode"` required zero DDL changes. `_SCHEMA_VERSION` stays at whatever it
+already was (10, at time of writing) — the doc's predicted v3→v4/v5→v6 migration line item
+did not apply once the live schema was actually checked.
+
+**Phase A — `prompt_builder.py`:**
+- New `GraphNeighborhood` dataclass (distinct from `GraphQueryResult` — P3c's structural
+  result is "always render, even zero edges"; this one is opportunistic and cleanly omits on
+  zero edges, matching every other slot's clean-omission rule).
+- New `[RELATED CONTEXT: <page>]` slot (`_slot_graph_neighborhood()`), rendered right after
+  Slot 4 `[CONTEXT]`. Truncation is a **flat 500-char slice** (`_CEIL_GRAPH_NEIGHBORHOOD_CHARS`),
+  not a token ceiling like every other slot — deliberately matches
+  `memory_manager.index_document()`'s `content[:500]` embedding-truncation convention per the
+  scoping doc's decision, rather than inventing a new token budget for an already-solved
+  category of problem (bounding an auxiliary signal).
+- `build()` gained a `graph_neighborhood` parameter, threaded through both the primary build
+  call and the empty-response-retry rebuild path in `controller_agent.py` (previously the
+  retry path would have silently dropped the neighborhood on a forced-retry turn).
+
+**Phase A — `controller_agent.py`:** new Step 4b in `_execute_plan()`, between RAG fetch
+(Step 4) and episodic retrieval (Step 5). Triggers only when the single top-ranked
+`query_corpus()` result is `doc_type == "wiki"` and clears the same 0.55 relevance floor
+already used for `rag_sources`; looks the doc up via new `MemoryManager.get_graph_node_by_doc_path()`
+(exact-match, distinct from the name-resolution-oriented `resolve_node_by_stem()`); pulls up
+to 5 backlinks and up to 5 *resolved* outgoing links (unresolved outgoing links point at
+non-existent pages and would just spend the 500-char budget on unreachable targets). Silent,
+best-effort degrade on any failure — matches the existing "log warning, continue" posture used
+everywhere else in `_execute_plan()`. Never fires on a P3c turn (those force `fetch_rag=False`,
+so `docs` is always empty).
+
+**Phase B — episode graph nodes (B2, full node model):**
+- `MemoryManager.upsert_graph_node_for_episode(episode_id, title)` — synthetic doc_path scheme
+  `episode://<id>` (the episode row's own autoincrement id, not `subject` — `subject` alone
+  isn't unique enough and reusing it would collide multiple distinct episode rows onto one
+  `graph_nodes.doc_path` via the `UNIQUE` constraint, which would have actively broken B2's
+  own stated upside of episode nodes eventually carrying their own distinct outgoing edges).
+- `get_backlinks()` gained an `include_episode_sources: bool = True` parameter. Default
+  (`True`) is what Phase A's neighborhood lookup wants — episode-sourced "episodic
+  association" backlinks surfacing as "N conversations referenced this concept" is the whole
+  point of B2. Planner P3c's call site (`controller_agent.py` Step 5c) now passes
+  `include_episode_sources=False` explicitly, preserving its pre-existing "pure structural wiki
+  query" contract unchanged — mixing inferred episodic associations into an explicit "what
+  links to X" answer was flagged in the scoping doc as a deliberate future decision, not a
+  silent default, so it stays off unless a later change turns it on.
+  `resolve_node_by_stem()`/`list_graph_node_stems()` (both used by P3c and by the new episode
+  edge-resolution hook below) now filter out `node_type = 'episode'` rows unconditionally —
+  their doc_path stems are synthetic ids, never meaningful P3c resolution targets.
+- `ControllerAgent._write_episode_graph_node(episode_id, subject)` — new post-response hook:
+  upserts the episode's graph node, then resolves an episode→wiki edge using
+  `resolve_graph_target()` (the same three-tier stem/token-overlap pipeline P3c uses,
+  `planner.py`) against `list_graph_node_stems()`. Embedding-based resolution was explicitly
+  deferred (scoping doc open item 3) since `graph_nodes` carries no embedding column for wiki
+  nodes yet, and stem/token-overlap is accepted as the standing approach — not a placeholder
+  pending a scheduled follow-up. Wired into both existing post-response call sites in
+  `_execute_plan()`: the explicit-signal path (always linked — explicit episodes are never
+  write-approval-gated) and the implicit-extraction path (linked only when
+  `not self._episodic_write_approval`, since a "pending" episode isn't live memory yet and
+  shouldn't get graph representation before a human approves it).
+- `ExtractionResult` (`episodic_extractor.py`) gained an `episode_id: int | None` field,
+  populated from `EpisodicMemoryWriter.insert()`'s return value in both
+  `process_explicit_signal()` and `process_implicit_extraction()` — needed so the graph hook
+  above knows which row to link without a second lookup.
+
+**Approval-path gap — CLOSED 2026-07-23.** `POST /memory/episodes/{id}/approve` (`main.py`) now
+retriggers the graph hook after a successful approval: `EpisodicMemoryWriter.approve()`'s
+return contract is unchanged (still a bare count, so nothing else calling it needed touching),
+but the endpoint follows a successful approve with `writer.get_episode_subject(episode_id)`
+(new, tiny read method — approve() itself doesn't need `subject` for its own job) and then calls
+`ControllerAgent._write_episode_graph_node(episode_id, subject)` directly off
+`_state.controller` — the same "reach into a private method/attribute from main.py" precedent
+already established by `GET /agents` reading `controller._agents`. Guarded on both `count > 0`
+(skip on an already-active/retracted/nonexistent id — no spurious graph writes) and
+`controller is not None` (this endpoint's only hard dependency remains `_state.memory_manager`,
+matching its pre-existing contract; a missing controller degrades to "approved, no graph node"
+rather than a 503). `_write_episode_graph_node()` already catches and logs its own exceptions,
+so this call site needed no additional error handling.
+
+**Deferred, per the scoping doc's own recommendation:** `chat_turns` graph representation
+(out of scope, not revisited); wiki-node embeddings (`graph_nodes` still has no embedding
+column — stem/token-overlap accepted as the interim episode↔wiki resolution strategy; revisit
+only if that quality proves insufficient in practice, not scheduled by default).
+

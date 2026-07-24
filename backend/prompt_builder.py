@@ -90,6 +90,23 @@ class GraphQueryResult:
 
 
 @dataclass
+class GraphNeighborhood:
+    """
+    1-hop graph neighborhood for the Phase A RAG-assist slot — distinct
+    from GraphQueryResult (Planner P3c's explicit structural-query result).
+
+    Opportunistic, not a query result: silently omitted when both lists are
+    empty, unlike GraphQueryResult's "always render, even with zero edges"
+    contract (that contract exists because a P3c query is a direct answer
+    to an explicit question; this is supplementary context nobody asked
+    for, so silence on "nothing to add" is correct here, not a regression).
+    """
+    page_name: str
+    backlinks: list[GraphLinkEntry]
+    outgoing:  list[GraphLinkEntry]
+
+
+@dataclass
 class WorkingMemoryState:
     current_project:  str | None = None
     active_artifacts: list[str]  = field(default_factory=list)
@@ -121,6 +138,12 @@ class PromptBuilder:
                                   Slot 3, after Slot DT
       Slot 3  [EPISODIC MEMORY] — durable facts; conditional; 150-token ceiling
       Slot 4  [CONTEXT]         — RAG snippets; conditional; 800-token ceiling
+      Slot 4b [RELATED CONTEXT] — Phase A RAG-assist graph neighborhood (1-hop
+                                  backlinks/outgoing of the top RAG hit, when
+                                  it's a wiki graph node); conditional, clean
+                                  omission on zero edges (unlike Slot 5b); flat
+                                  500-char ceiling, not token-based — see
+                                  _slot_graph_neighborhood()
       Slot 5  [TOOL RESULTS]    — tool output; conditional; 500-token ceiling
       Slot 5a [TOOL FAILED]     — failed tool calls; conditional; own
                                   150-token ceiling, kept separate from Slot 5
@@ -188,6 +211,15 @@ class PromptBuilder:
     _CEIL_TOOL:     int = 500   # slot 5
     _CEIL_TOOL_FAILURE: int = 150   # slot 5a; own budget — see _slot5a_tool_failures
     _CEIL_GRAPH:    int = 300   # slot 5b
+    # Phase A [RELATED CONTEXT] slot — a flat 500-*char* slice, not a token
+    # ceiling like every other slot above. Deliberately matches
+    # MemoryManager.index_document()'s embedding-truncation convention
+    # (content[:500]) rather than introducing a new token budget: this is
+    # the same category of problem (bounding an auxiliary/supplementary
+    # signal) already empirically tuned once, and re-deriving a token
+    # ceiling here would just re-litigate a settled question. See
+    # _slot_graph_neighborhood().
+    _CEIL_GRAPH_NEIGHBORHOOD_CHARS: int = 500
     _CEIL_WORKING_STATE: int = 100   # slot 6a
     _CEIL_WORKING:       int = 300   # slot 6
     _CEIL_SESSION_FILES_EACH:  int = 4000   # per-file ceiling, tokens
@@ -577,6 +609,46 @@ class PromptBuilder:
         rendered = f"[GRAPH RESULT]\n{content}"
         return self._truncate_to_tokens(rendered, self._CEIL_GRAPH)
 
+    def _slot_graph_neighborhood(
+        self, neighborhood: GraphNeighborhood | None,
+    ) -> str:
+        """
+        Return the Phase A [RELATED CONTEXT] slot, or "" to omit.
+
+        Unlike _slot_graph() (Slot 5b), this slot follows the ordinary
+        clean-omission rule: omitted when neighborhood is None *or* when
+        both backlinks and outgoing are empty — a RAG turn whose top hit
+        happens to be an unconnected wiki page should look exactly like a
+        RAG turn with no graph data at all, not announce "zero edges" the
+        way an explicit P3c query must.
+
+        Truncation is a flat _CEIL_GRAPH_NEIGHBORHOOD_CHARS-char slice with
+        no word-boundary trimming and no "…[truncated]" suffix — a
+        deliberate deviation from _truncate_to_tokens()'s convention, to
+        match memory_manager.index_document()'s embedding-truncation
+        convention instead (see the constant's definition for the
+        rationale). Label is distinct from Slot 5b's "[GRAPH RESULT]" so
+        the model never confuses an opportunistic hint with a direct
+        answer to a structural question it asked.
+        """
+        if neighborhood is None:
+            return ""
+        if not neighborhood.backlinks and not neighborhood.outgoing:
+            return ""
+
+        page = neighborhood.page_name
+        sections: list[str] = []
+        if neighborhood.backlinks:
+            body = "\n".join(f"- {e.name}" for e in neighborhood.backlinks)
+            sections.append(f"Referenced by:\n{body}")
+        if neighborhood.outgoing:
+            body = "\n".join(f"- {e.name}" for e in neighborhood.outgoing)
+            sections.append(f"Links to:\n{body}")
+        content = "\n\n".join(sections)
+
+        rendered = f"[RELATED CONTEXT: {page}]\n{content}"
+        return rendered[: self._CEIL_GRAPH_NEIGHBORHOOD_CHARS]
+
     def _slot6a_working_state(
         self,
         state: WorkingMemoryState | None,
@@ -745,6 +817,7 @@ class PromptBuilder:
         tool_results:     list[ToolResult]         | None = None,
         tool_failures:    list[ToolResult]         | None = None,
         graph_result:     GraphQueryResult         | None = None,
+        graph_neighborhood: GraphNeighborhood       | None = None,
         working_state:    WorkingMemoryState       | None = None,
         working_memory:   list[Turn]               | None = None,
         working_memory_ceiling: int                | None = None,
@@ -794,6 +867,12 @@ class PromptBuilder:
         graph_result :
             GraphQueryResult for the current turn (Slot 5b). When not None,
             always rendered — even with zero links. Pass None to omit.
+        graph_neighborhood :
+            GraphNeighborhood for the current turn ([RELATED CONTEXT],
+            Phase A RAG-assist — see memory-graph-inference-plan). Rendered
+            right after Slot 4 [CONTEXT]. Unlike graph_result, cleanly
+            omitted whenever there is nothing to add (None, or zero
+            backlinks and outgoing edges). Pass None to omit.
         working_state :
             Structured working state (Slot 6A). Deterministic; not inferred.
             Rendered between tool-results and working-memory slots.
@@ -864,6 +943,7 @@ class PromptBuilder:
             self._slot_session_files(session_files),   # unnumbered — before Slot 3
             self._slot3_combined(episodic_summary, profile_facts),
             self._slot4_rag(rag_snippets),
+            self._slot_graph_neighborhood(graph_neighborhood),
             self._slot5_tools(tool_results),
             self._slot5a_tool_failures(tool_failures),
             self._slot_graph(graph_result),

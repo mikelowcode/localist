@@ -22,6 +22,7 @@ from prompt_builder import (
     ToolResult,
     GraphLinkEntry,
     GraphQueryResult,
+    GraphNeighborhood,
     WorkingMemoryState,
 )
 
@@ -425,6 +426,113 @@ class TestSlotGraph:
         assert "[GRAPH RESULT]" not in user_prompt
         expected_dt_slot = pb._slot_datetime(_FIXED_DT)
         assert user_prompt == expected_dt_slot + "\n\n[INSTRUCTION]\nhello"
+
+
+# ---------------------------------------------------------------------------
+# TestSlotGraphNeighborhood — Phase A [RELATED CONTEXT]
+# (memory-graph-inference-plan) — distinct from GraphQueryResult/[GRAPH
+# RESULT] above: opportunistic, clean-omission on zero edges, flat 500-char
+# truncation instead of the token-ceiling convention.
+# ---------------------------------------------------------------------------
+
+class TestSlotGraphNeighborhood:
+
+    def _pb(self) -> PromptBuilder:
+        return PromptBuilder()
+
+    def test_none_returns_empty(self):
+        pb = self._pb()
+        assert pb._slot_graph_neighborhood(None) == ""
+
+    def test_zero_edges_clean_omission(self):
+        # Unlike GraphQueryResult, this must NOT render "zero edges" text —
+        # it should look identical to no graph data at all.
+        pb = self._pb()
+        gn = GraphNeighborhood(page_name="lonely-page", backlinks=[], outgoing=[])
+        assert pb._slot_graph_neighborhood(gn) == ""
+
+    def test_backlinks_only(self):
+        pb = self._pb()
+        gn = GraphNeighborhood(
+            page_name="localist-software-stack",
+            backlinks=[GraphLinkEntry("how-localist-works", True)],
+            outgoing=[],
+        )
+        expected = (
+            "[RELATED CONTEXT: localist-software-stack]\n"
+            "Referenced by:\n"
+            "- how-localist-works"
+        )
+        assert pb._slot_graph_neighborhood(gn) == expected
+
+    def test_outgoing_only(self):
+        pb = self._pb()
+        gn = GraphNeighborhood(
+            page_name="localist-build-order",
+            backlinks=[],
+            outgoing=[GraphLinkEntry("localist-master-project-outline", True)],
+        )
+        expected = (
+            "[RELATED CONTEXT: localist-build-order]\n"
+            "Links to:\n"
+            "- localist-master-project-outline"
+        )
+        assert pb._slot_graph_neighborhood(gn) == expected
+
+    def test_both_backlinks_and_outgoing(self):
+        pb = self._pb()
+        gn = GraphNeighborhood(
+            page_name="how-localist-works",
+            backlinks=[GraphLinkEntry("localist-software-stack", True)],
+            outgoing=[GraphLinkEntry("localist-master-project-outline", True)],
+        )
+        expected = (
+            "[RELATED CONTEXT: how-localist-works]\n"
+            "Referenced by:\n"
+            "- localist-software-stack\n"
+            "\n"
+            "Links to:\n"
+            "- localist-master-project-outline"
+        )
+        assert pb._slot_graph_neighborhood(gn) == expected
+
+    def test_truncated_at_flat_500_chars_not_tokens(self):
+        # Deliberately a flat char slice (index_document()'s convention),
+        # not _truncate_to_tokens()'s word-boundary + "…[truncated]" scheme
+        # — no ellipsis suffix, cut can land mid-word.
+        pb = self._pb()
+        gn = GraphNeighborhood(
+            page_name="big-page",
+            backlinks=[GraphLinkEntry(f"backlink-{i}", True) for i in range(100)],
+            outgoing=[],
+        )
+        result = pb._slot_graph_neighborhood(gn)
+        assert len(result) == 500
+        assert "… [truncated]" not in result
+
+    def test_build_slot_order_after_context_before_tools(self):
+        pb = self._pb()
+        gn = GraphNeighborhood(
+            page_name="localist-software-stack",
+            backlinks=[GraphLinkEntry("how-localist-works", True)],
+            outgoing=[],
+        )
+        _, user_prompt = pb.build(
+            instruction        = "test",
+            current_datetime   = _FIXED_DT,
+            rag_snippets       = [RagSource(path="wiki/localist-software-stack.md", content="body text")],
+            tool_results       = [ToolResult("search", "q=wiki", "some result")],
+            graph_neighborhood = gn,
+        )
+        context_pos = user_prompt.index("[CONTEXT]")
+        related_pos = user_prompt.index("[RELATED CONTEXT")
+        tools_pos   = user_prompt.index("[TOOL RESULTS]")
+        assert context_pos < related_pos < tools_pos
+
+    def test_build_none_neighborhood_no_stray_output(self):
+        pb = self._pb()
+        _, user_prompt = pb.build(instruction="hello", current_datetime=_FIXED_DT)
+        assert "[RELATED CONTEXT" not in user_prompt
 
 
 # ---------------------------------------------------------------------------

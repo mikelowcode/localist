@@ -193,6 +193,27 @@ def _unpack_embedding(blob: bytes) -> list[float]:
     return list(struct.unpack(f">{n}f", blob))
 
 
+def _normalize_doc_path(doc_path: "Path | str") -> str:
+    """
+    Normalize a graph_nodes doc_path for storage/lookup.
+
+    Real wiki/raw corpus paths are resolved against the filesystem
+    (str(Path(doc_path).resolve())) so doc_path is stable regardless of the
+    caller's relative-path spelling. Synthetic non-filesystem identifiers
+    (e.g. "episode://<id>", introduced for episode graph nodes) must NOT be
+    passed through Path.resolve() — resolve() treats any string as a
+    relative filesystem path and prepends the process's current working
+    directory, so a synthetic id would silently vary across launch
+    contexts (start_localist.sh vs. pytest vs. a shell in a different
+    directory) instead of staying a stable, opaque key. Recognized by a
+    "://" scheme marker and passed through unchanged.
+    """
+    doc_path_str = str(doc_path)
+    if "://" in doc_path_str:
+        return doc_path_str
+    return str(Path(doc_path_str).resolve())
+
+
 def _tokenize(text: str) -> set[str]:
     """Word-level token set for keyword overlap scoring."""
     return set(re.findall(r"[a-z0-9]+", text.lower()))
@@ -2392,8 +2413,12 @@ class MemoryManager:
         On conflict (same doc_path already exists): node_type/title/updated_at
         are overwritten; created_at is preserved from the original insert so
         the first-seen timestamp is stable across rebuilds.
+
+        doc_path is normalized via _normalize_doc_path() — a real filesystem
+        path is resolve()'d as before; a synthetic scheme like "episode://42"
+        (see upsert_graph_node_for_episode()) is stored verbatim.
         """
-        doc_path_str = str(Path(doc_path).resolve())
+        doc_path_str = _normalize_doc_path(doc_path)
         now = time.time()
         with self._lock:
             conn = self._connect()
@@ -2436,8 +2461,11 @@ class MemoryManager:
         On update, target_node_id / target_resolved / link_text are refreshed
         so a previously-unresolved link can resolve on a later rebuild once
         the target page exists.
+
+        source_doc_path is normalized via _normalize_doc_path() — see
+        upsert_graph_node() for the filesystem-vs-synthetic-id rationale.
         """
-        source_doc_path_str = str(Path(source_doc_path).resolve())
+        source_doc_path_str = _normalize_doc_path(source_doc_path)
         with self._lock:
             conn = self._connect()
             try:
@@ -2478,8 +2506,11 @@ class MemoryManager:
         Intended for per-document partial rebuilds (e.g. a future WikiAgent
         post-ingest hook). The full offline rebuild script uses
         clear_graph_edges() instead.
+
+        doc_path is normalized via _normalize_doc_path() — see
+        upsert_graph_node() for the filesystem-vs-synthetic-id rationale.
         """
-        doc_path_str = str(Path(doc_path).resolve())
+        doc_path_str = _normalize_doc_path(doc_path)
         with self._lock:
             conn = self._connect()
             try:
@@ -2514,12 +2545,20 @@ class MemoryManager:
         Does exact-match only — caller is responsible for normalising the stem
         before calling. Returns a dict with keys ``id``, ``doc_path``, ``title``
         if exactly one row matches, else ``None`` (zero or multiple matches).
+
+        Excludes node_type='episode' rows. This is the name-resolution path
+        used by Planner P3c ("what links to X") to turn free-text into a wiki
+        page — episode nodes use the synthetic "episode://<id>" doc_path
+        scheme (see upsert_graph_node_for_episode()), whose Path(...).stem
+        is not a meaningful user-facing name and must never surface as a
+        P3c resolution candidate.
         """
         with self._lock:
             conn = self._connect()
             try:
                 rows = conn.execute(
-                    "SELECT id, doc_path, title FROM graph_nodes"
+                    "SELECT id, doc_path, title FROM graph_nodes "
+                    "WHERE node_type IS NULL OR node_type != 'episode'"
                 ).fetchall()
             finally:
                 conn.close()
@@ -2531,7 +2570,9 @@ class MemoryManager:
         ]
         return matches[0] if len(matches) == 1 else None
 
-    def get_backlinks(self, node_id: int) -> list[GraphEdgeResult]:
+    def get_backlinks(
+        self, node_id: int, include_episode_sources: bool = True,
+    ) -> list[GraphEdgeResult]:
         """
         Return all graph_edges rows where ``target_node_id`` equals ``node_id``.
 
@@ -2542,19 +2583,35 @@ class MemoryManager:
         (structural guarantee: an edge found by ``target_node_id = ?`` is, by
         construction, always resolved).
 
+        include_episode_sources :
+            When True (default), backlinks whose source is an episode node
+            (episode → wiki "episodic association" edges, see
+            upsert_graph_node_for_episode()) are included alongside authored
+            [[wikilink]] backlinks — this is what the Phase A RAG-assist
+            neighborhood wants, so "N conversations referenced this concept"
+            can surface. Pass False to restrict to wiki-authored backlinks
+            only — used by Planner P3c, whose "pure structural query"
+            contract predates episode nodes and must not silently start
+            mixing inferred episodic associations into an explicit
+            "what links to X" answer without a deliberate design decision.
+
         Returns an empty list when no backlinks exist.
         """
+        episode_filter = (
+            "" if include_episode_sources
+            else " AND (n.node_type IS NULL OR n.node_type != 'episode')"
+        )
         with self._lock:
             conn = self._connect()
             try:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT e.link_text, e.target_path,
                            n.title    AS node_title,
                            n.doc_path AS node_doc_path
                     FROM   graph_edges e
                     JOIN   graph_nodes n ON n.id = e.source_node_id
-                    WHERE  e.target_node_id = ?
+                    WHERE  e.target_node_id = ?{episode_filter}
                     """,
                     (node_id,),
                 ).fetchall()
@@ -2613,23 +2670,85 @@ class MemoryManager:
 
     def list_graph_node_stems(self) -> list[str]:
         """
-        Return the stem of every ``doc_path`` currently stored in
+        Return the stem of every wiki ``doc_path`` currently stored in
         ``graph_nodes``.
 
         Used by Planner P3c to feed a candidate-stem list into
-        ``resolve_graph_target()`` without touching the filesystem.
-        Returns an empty list when the graph has not been built yet.
+        ``resolve_graph_target()`` without touching the filesystem — also
+        reused by the Phase B episode→wiki edge-resolution hook (same
+        stem/token-overlap pipeline, applied to episode subject text
+        instead of a P3c instruction). Excludes node_type='episode' rows
+        for the same reason as resolve_node_by_stem(): their doc_path stem
+        is a synthetic id, not a real page name. Returns an empty list when
+        the graph has not been built yet.
         """
         with self._lock:
             conn = self._connect()
             try:
                 rows = conn.execute(
-                    "SELECT doc_path FROM graph_nodes"
+                    "SELECT doc_path FROM graph_nodes "
+                    "WHERE node_type IS NULL OR node_type != 'episode'"
                 ).fetchall()
             finally:
                 conn.close()
 
         return [Path(row["doc_path"]).stem for row in rows]
+
+    def get_graph_node_by_doc_path(self, doc_path: Path | str) -> dict | None:
+        """
+        Look up a single graph_nodes row by exact doc_path.
+
+        Unlike resolve_node_by_stem() (free-text name resolution, tolerant
+        of stem ambiguity, episode-excluded), this is an exact-match lookup
+        for when the caller already holds a real, resolved document path —
+        e.g. Phase A's RAG-assist trigger, which has query_corpus()'s
+        top-ranked result path in hand and just needs to know whether it is
+        also a graph node. doc_path is resolved via _normalize_doc_path()
+        exactly as upsert_graph_node() stores it, so a real filesystem path
+        passed in either raw or already-resolved form matches correctly.
+
+        Returns None if no row matches.
+        """
+        doc_path_str = _normalize_doc_path(doc_path)
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT id, doc_path, title FROM graph_nodes WHERE doc_path = ?",
+                    (doc_path_str,),
+                ).fetchone()
+            finally:
+                conn.close()
+
+        if row is None:
+            return None
+        return {"id": row["id"], "doc_path": row["doc_path"], "title": row["title"]}
+
+    def upsert_graph_node_for_episode(self, episode_id: int, title: str) -> int:
+        """
+        Upsert a graph_nodes row for an episode (Phase B — the B2 "full node
+        model" decision in memory-graph-inference-plan: episodes get real
+        graph_nodes rows, node_type='episode', rather than being bolted on
+        as edge-targets only. This lets an episode node carry its own
+        backlinks/outgoing edges — e.g. a wiki page's neighborhood can cite
+        "N conversations referenced this concept" as a first-class graph
+        citizen, and a future correction-episode could point at the
+        decision episode it supersedes.
+
+        doc_path uses the synthetic "episode://<id>" scheme — episodes have
+        no filesystem path, and the episode's own row id is already a
+        stable, permanent, unique key (unlike `subject`, which can repeat
+        across unrelated episode rows and would collide on graph_nodes'
+        UNIQUE(doc_path) constraint, silently merging distinct episodes
+        into one node).
+
+        Returns the row's id.
+        """
+        return self.upsert_graph_node(
+            doc_path  = f"episode://{episode_id}",
+            node_type = "episode",
+            title     = title,
+        )
 
     # -----------------------------------------------------------------------
     # Corpus retrieval  (ResearchAgent API)
@@ -3380,7 +3499,13 @@ class EpisodicMemoryWriter:
         embedding_blob: bytes | None = None
         if self._embed_fn is not None:
             try:
-                vector = self._embed_fn(f"{subject}. {content}")
+                # Embed the first ~500 chars — consistent with
+                # MemoryManager.index_document()'s embedding-truncation
+                # convention (keeps embedding calls cheap). Generous
+                # headroom here: subject is capped at 80 chars and content
+                # is meant to be "one sentence preferred" per the episodes
+                # schema, so this is not expected to bind in practice.
+                vector = self._embed_fn(f"{subject}. {content}"[:500])
                 embedding_blob = _pack_embedding(vector)
             except Exception as exc:
                 logger.warning(
@@ -3617,6 +3742,30 @@ class EpisodicMemoryWriter:
                 return count
             finally:
                 conn.close()
+
+    def get_episode_subject(self, episode_id: int) -> str | None:
+        """
+        Look up the ``subject`` of a single episode by id.
+
+        Purpose-built for the approve() call site in main.py's
+        POST /memory/episodes/{id}/approve endpoint: approve() itself
+        returns only a count (unchanged, to avoid touching its existing
+        contract), but the caller needs `subject` to feed
+        ControllerAgent._write_episode_graph_node() and retrigger the
+        Phase B graph hook now that the episode is live. Not used by
+        insert()/approve()/reject() themselves. Returns None if no row
+        with that id exists.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT subject FROM episodes WHERE id = ?",
+                    (episode_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+        return row["subject"] if row is not None else None
 
     # -----------------------------------------------------------------------
     # Markdown snapshot

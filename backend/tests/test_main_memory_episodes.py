@@ -58,6 +58,16 @@ def _insert_pending(memory_manager: MemoryManager) -> int:
     return row_id
 
 
+def _graph_node_type(memory_manager: MemoryManager, doc_path: str) -> str | None:
+    conn = sqlite3.connect(str(memory_manager._db_path))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT node_type FROM graph_nodes WHERE doc_path = ?", (doc_path,)
+    ).fetchone()
+    conn.close()
+    return row["node_type"] if row is not None else None
+
+
 class TestApproveEndpoint:
 
     def test_approve_pending_row_returns_updated_true_and_activates(self, client):
@@ -84,6 +94,69 @@ class TestApproveEndpoint:
         assert resp.status_code == 200
         assert resp.json()["updated"] is False
         assert _status(main._state.memory_manager, row_id) == "active"
+
+    def test_approve_without_controller_still_succeeds_no_graph_node(self, client):
+        # main._state.controller is never set by the `client` fixture (no
+        # FastAPI lifespan triggered in this suite) — approve() must
+        # degrade gracefully rather than raise when there's no controller
+        # to retrigger the Phase B graph hook on.
+        assert main._state.controller is None
+        episode_id = _insert_pending(main._state.memory_manager)
+
+        resp = client.post(f"/memory/episodes/{episode_id}/approve")
+
+        assert resp.status_code == 200
+        assert resp.json()["updated"] is True
+        assert _graph_node_type(
+            main._state.memory_manager, f"episode://{episode_id}",
+        ) is None
+
+
+class TestApproveEndpointGraphHook:
+    """
+    Approving a pending episode must retrigger
+    ControllerAgent._write_episode_graph_node() (memory-graph-inference-plan
+    §8.9) — the implicit-extraction hook in _execute_plan() deliberately
+    skips graph representation for a still-pending episode, so approval is
+    the only remaining trigger point.
+    """
+
+    @pytest.fixture()
+    def controller(self, client):
+        from unittest.mock import MagicMock
+
+        from controller_agent import ControllerAgent
+
+        prev_controller = main._state.controller
+        main._state.controller = ControllerAgent(
+            runtime        = MagicMock(),
+            agents         = [],
+            memory_manager = main._state.memory_manager,
+        )
+        yield main._state.controller
+        main._state.controller = prev_controller
+
+    def test_approve_creates_episode_graph_node(self, client, controller):
+        episode_id = _insert_pending(main._state.memory_manager)
+
+        resp = client.post(f"/memory/episodes/{episode_id}/approve")
+
+        assert resp.status_code == 200
+        assert resp.json()["updated"] is True
+        assert _graph_node_type(
+            main._state.memory_manager, f"episode://{episode_id}",
+        ) == "episode"
+
+    def test_approve_nonexistent_id_does_not_call_graph_hook(self, client, controller):
+        # count == 0 (nothing approved) must short-circuit before the hook
+        # ever runs — no graph node for an id that was never approved.
+        resp = client.post("/memory/episodes/999999/approve")
+
+        assert resp.status_code == 200
+        assert resp.json()["updated"] is False
+        assert _graph_node_type(
+            main._state.memory_manager, "episode://999999",
+        ) is None
 
 
 class TestRejectEndpoint:

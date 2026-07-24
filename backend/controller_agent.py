@@ -44,9 +44,9 @@ if TYPE_CHECKING:
     # the dependency graph clean.
     from memory_manager import MemoryManager
 
-from planner import Planner as _RulePlanner, RoutingPlan
+from planner import Planner as _RulePlanner, RoutingPlan, resolve_graph_target
 from pathlib import Path
-from prompt_builder import PromptBuilder, Turn, EpisodeBullet, RagSource, UserProfileFact, GraphQueryResult, GraphLinkEntry, WorkingMemoryState
+from prompt_builder import PromptBuilder, Turn, EpisodeBullet, RagSource, UserProfileFact, GraphQueryResult, GraphNeighborhood, GraphLinkEntry, WorkingMemoryState
 from context_profile import profile_for
 from omlx_runtime_client import OMLXRuntimeClient
 from memory_manager import (
@@ -965,6 +965,64 @@ class ControllerAgent:
             raise RuntimeError("No embed function available on MemoryManager.")
         return fn(text)
 
+    def _write_episode_graph_node(self, episode_id: int | None, subject: str) -> None:
+        """
+        Phase B incremental hook (memory-graph-inference-plan §B2): upsert a
+        graph_nodes row for a newly-written active episode, then resolve an
+        episode → wiki edge against the live wiki-node stems using the same
+        stem/token-overlap pipeline Planner P3c uses for name resolution
+        (resolve_graph_target()). Embedding-based resolution is deferred
+        until wiki nodes carry embeddings too (not yet true — see the plan
+        doc's open item 3); stem/token-overlap is the accepted interim
+        approach, not a placeholder awaiting replacement on a deadline.
+
+        Called from two places: the post-response hooks that write episodes
+        (process_explicit_signal / process_implicit_extraction call sites in
+        _execute_plan) — never on a "pending" (write-approval-gated) episode,
+        since an unreviewed model guess shouldn't get graph representation
+        before a human confirms it, the caller is responsible for that
+        gate — and main.py's POST /memory/episodes/{id}/approve endpoint,
+        which calls this directly (reaching into a private method, same
+        precedent as GET /agents reading controller._agents) right after a
+        pending episode is approved, since that's the moment a
+        previously-skipped episode actually becomes eligible for one.
+
+        Best-effort and silent on failure, matching every other
+        post-response hook in this class — a broken graph write must never
+        surface as a failed turn. No-op if episode_id is None (content-
+        safety-rejected write) or no MemoryManager is configured.
+        """
+        if episode_id is None or self._memory_manager is None:
+            return
+        try:
+            episode_node_id = self._memory_manager.upsert_graph_node_for_episode(
+                episode_id, title=subject,
+            )
+            candidate_stems = self._memory_manager.list_graph_node_stems()
+            resolved_stem = resolve_graph_target(subject, candidate_stems)
+            if resolved_stem is None:
+                return
+            wiki_node = self._memory_manager.resolve_node_by_stem(resolved_stem)
+            if wiki_node is None:
+                return
+            self._memory_manager.upsert_graph_edge(
+                source_node_id  = episode_node_id,
+                source_doc_path = f"episode://{episode_id}",
+                target_path     = resolved_stem,
+                target_node_id  = wiki_node["id"],
+                target_resolved = True,
+                link_text       = "episodic_association",
+            )
+            logger.debug(
+                "_write_episode_graph_node: linked episode id=%d to wiki page %r.",
+                episode_id, resolved_stem,
+            )
+        except Exception as exc:
+            logger.warning(
+                "_write_episode_graph_node: failed for episode id=%s (%s) — "
+                "continuing.", episode_id, exc,
+            )
+
     def _score_profile_facts(
         self,
         instruction_embedding: list[float],
@@ -1195,6 +1253,11 @@ class ControllerAgent:
                         extraction.subject,
                     )
                     self._recency_cache.clear()
+                    # Explicit episodes are never write-approval-gated (user
+                    # already gave direct consent), so always safe to link.
+                    self._write_episode_graph_node(
+                        extraction.episode_id, extraction.subject,
+                    )
                 else:
                     logger.debug(
                         "_execute_plan: process_explicit_signal returned None "
@@ -1391,6 +1454,7 @@ class ControllerAgent:
         # rag_sources is initialized above (Step 3b).  Step 4 populates it
         # on fetch_rag (P4) routes; on P3 routes fetch_rag is False so the
         # fallback-populated list flows through untouched.
+        docs: list = []
         if plan.fetch_rag and self._memory_manager is not None:
             try:
                 docs = self._memory_manager.query_corpus(
@@ -1415,6 +1479,67 @@ class ControllerAgent:
                 logger.warning(
                     "_execute_plan: RAG fetch failed (%s) — continuing without context.", exc
                 )
+
+        # -- Step 4b: Graph-assisted RAG (Phase A, memory-graph-inference-plan) --
+        # Opportunistic supplement to a normal RAG turn: when the single
+        # top-ranked corpus hit is a curated wiki page that's also a graph
+        # node, surface its 1-hop backlinks/outgoing links alongside the RAG
+        # snippet. Deliberately narrow — only the single top doc, only when
+        # it's doc_type=="wiki" (raw/ docs were never made graph nodes),
+        # gated by the same 0.55 relevance floor already used for
+        # rag_sources — and silently absent otherwise (no logging noise for
+        # the common "top hit isn't a graph node" case). Never runs on a
+        # plan.graph_query (P3c) turn: those have fetch_rag forced False by
+        # design, so `docs` is always [] there and this block is a no-op.
+        graph_neighborhood: GraphNeighborhood | None = None
+        if docs and self._memory_manager is not None:
+            top_doc = docs[0]
+            if top_doc.doc_type == "wiki" and top_doc.relevance_score >= 0.55:
+                try:
+                    node = self._memory_manager.get_graph_node_by_doc_path(top_doc.path)
+                    if node is not None:
+                        backlinks = self._memory_manager.get_backlinks(node["id"])
+                        # Unresolved outgoing links point at non-existent
+                        # pages — not retrievable, so they'd just spend the
+                        # 500-char budget on noise the model can't act on.
+                        outgoing = [
+                            e for e in self._memory_manager.get_outgoing_links(node["id"])
+                            if e.target_resolved
+                        ]
+                        if backlinks or outgoing:
+                            graph_neighborhood = GraphNeighborhood(
+                                page_name = node["title"] or Path(node["doc_path"]).stem,
+                                backlinks = [
+                                    GraphLinkEntry(
+                                        name=(
+                                            Path(e.node_doc_path).stem
+                                            if e.node_doc_path is not None
+                                            else e.link_text
+                                        ),
+                                        resolved=e.target_resolved,
+                                    )
+                                    for e in backlinks[:5]
+                                ],
+                                outgoing = [
+                                    GraphLinkEntry(
+                                        name=Path(e.node_doc_path).stem,
+                                        resolved=True,
+                                    )
+                                    for e in outgoing[:5]
+                                ],
+                            )
+                            logger.info(
+                                "_execute_plan: graph-assist neighborhood — "
+                                "page=%s backlinks=%d outgoing=%d",
+                                graph_neighborhood.page_name,
+                                len(graph_neighborhood.backlinks),
+                                len(graph_neighborhood.outgoing),
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "_execute_plan: graph-assist neighborhood lookup failed "
+                        "(%s) — continuing without it.", exc,
+                    )
 
         # -- Step 5: Episodic retrieval --------------------------------------
         episodic_bullets: list[EpisodeBullet] = []
@@ -1527,7 +1652,14 @@ class ControllerAgent:
             direction, node_id, resolved_stem = plan.graph_query
             try:
                 if direction == "incoming":
-                    edges = self._memory_manager.get_backlinks(node_id)
+                    # P3c is a pure structural wiki-graph query (Phase C
+                    # design contract, predates episode nodes) — exclude
+                    # episode-sourced "episodic association" backlinks so
+                    # "what links to X" keeps meaning "what wiki page links
+                    # to X" until that's a deliberate future decision.
+                    edges = self._memory_manager.get_backlinks(
+                        node_id, include_episode_sources=False,
+                    )
                 else:  # "outgoing"
                     edges = self._memory_manager.get_outgoing_links(node_id)
 
@@ -1642,6 +1774,7 @@ class ControllerAgent:
                 if r.result.startswith("ERROR:")
             ] or None,
             graph_result     = graph_result             or None,
+            graph_neighborhood = graph_neighborhood,
             working_state    = working_state,
             working_memory   = working_turns            or None,
             working_memory_ceiling = context_profile.working_memory_tokens,
@@ -1753,7 +1886,7 @@ class ControllerAgent:
             results = self._dispatch_conversational_with_empty_guard(
                 subtask, memory, mem_key, task, plan,
                 episodic_bullets, profile_facts, rag_sources,
-                graph_result, working_state, working_turns,
+                graph_result, graph_neighborhood, working_state, working_turns,
             )
         else:
             results = self._dispatch([subtask], memory, mem_key)
@@ -1865,6 +1998,19 @@ class ControllerAgent:
                             implicit.subject,
                         )
                         self._recency_cache.clear()
+                        # Skip when write-approval-gated: a "pending" episode
+                        # isn't live memory yet (not eligible for
+                        # by_recency()/by_similarity()/MEMORY.md either), so
+                        # it shouldn't get graph representation before a
+                        # human approves it. If/when it is approved, this
+                        # hook fires from POST /memory/episodes/{id}/approve
+                        # instead (main.py calls
+                        # ControllerAgent._write_episode_graph_node()
+                        # directly after a successful approve()).
+                        if not self._episodic_write_approval:
+                            self._write_episode_graph_node(
+                                implicit.episode_id, implicit.subject,
+                            )
             except Exception as exc:
                 logger.warning(
                     "_execute_plan: implicit extraction failed (%s) — "
@@ -2168,6 +2314,7 @@ class ControllerAgent:
         profile_facts:     list[UserProfileFact],
         rag_sources:       list[RagSource],
         graph_result:      GraphQueryResult | None,
+        graph_neighborhood: GraphNeighborhood | None,
         working_state:     WorkingMemoryState | None,
         working_turns:     list[Turn],
     ) -> list[AgentResult]:
@@ -2263,6 +2410,7 @@ class ControllerAgent:
                             if r.result.startswith("ERROR:")
                         ] or None,
                         graph_result     = graph_result   or None,
+                        graph_neighborhood = graph_neighborhood,
                         working_state    = working_state,
                         working_memory   = working_turns  or None,
                         session_files    = _session_files.get_files() or None,

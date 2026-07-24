@@ -147,28 +147,60 @@ gate missed.
 
 ---
 
-### 4.3 Priority 5 — Deterministic Episodic Relevance Check
+### 4.3 Priority 5 — Deterministic Episodic Relevance Check + Semantic Gate
 
-Priority 5 uses a deterministic keyword check. No inference call is made.
+Priority 5 fires on either of two independent signals — a deterministic
+keyword check, or (2026-07-23) a semantic cosine-similarity gate. Neither
+makes an inference call.
 
-**Implementation:** Scan the lowercased instruction for membership in
-`_EPISODIC_KEYWORDS` and `_PERSONAL_REF_KEYWORDS` (defined in `planner.py`).
-Personal reference keywords return `fetch_episodic=True` immediately.
-General episodic keywords also return `fetch_episodic=True` on first match.
+**Signal 1 — keyword check.** Scan the lowercased instruction for membership
+in `_EPISODIC_KEYWORDS` (defined in `planner.py`). Returns
+`fetch_episodic=True` on first match.
 
-**Caching rule:**
-- Once episodic bullets have been injected this session (`_episodic_injected = True`),
-  the inference call is skipped on subsequent turns.
-- Keyword evaluation still runs regardless of the flag. A turn with no matching
-  episodic keyword returns `fetch_episodic = False` and falls through to P6.
-- The flag suppresses inference cost only — it does not force `fetch_episodic = True`
-  unconditionally.
+**Signal 2 — semantic gate (added 2026-07-23).** Live bug: "Help me prepare
+for the upcoming Claude Impact Lab on August 6th." matched no keyword, so
+`fetch_episodic` never turned on and a real matching episode in the episodes
+bank was never retrieved. `Planner._episodic_semantic_relevance()` embeds the
+instruction and scores it by cosine similarity against
+`_EPISODIC_RELEVANCE_TEMPLATES` (7 phrases, e.g. "help me prepare for my
+upcoming event", "what did we decide about this before" — anchored on an
+explicit personal/calendar referent after a first round using bare "help
+me"/"remind me" verb phrasing collided with generic requests like "Remind me
+how photosynthesis works."); a score `>= _EPISODIC_RELEVANCE_THRESHOLD`
+(0.70) also returns `fetch_episodic=True`. Threshold picked empirically
+against the live tuned embedding model, not guessed — see
+`diagnostics/reports/episodic_relevance_semantic_gate_2026-07-23.md` (8/10
+true positives, 19/20 true negatives on a 30-utterance battery; small-N, ship
+to observe, revisit if live behavior disagrees, same posture already used for
+`explicit_search_action`'s threshold history in §4.2a).
+
+Structurally mirrors §4.2a's `_semantic_search_intent()` pattern (own
+precomputed template embeddings, same `_TUNED_EMBEDDING_MODEL`/
+`_semantic_gating_disabled` guard) but is kept as an entirely separate
+mechanism — own template list, own threshold, own instance state
+(`_episodic_template_embeddings`) — rather than folded into
+`_SEARCH_INTENT_TEMPLATES`/`_SEMANTIC_GATE_THRESHOLDS`. Those carry P3-
+specific negative-filter/tie-break collision handling for search-intent
+phrasing that has nothing to do with episodic relevance; reusing that path
+risked a P3-specific filter match silently suppressing this unrelated signal.
+
+**Caching rule (`_episodic_injected`):** the comment/docstring describing
+this flag previously claimed that once episodic bullets have been injected
+this session, "all subsequent turns return `fetch_episodic=True` without
+[keyword] evaluation." That was stale — corrected 2026-07-23. The flag has
+never done that since Priority 5 moved off inference to the deterministic
+keyword check; it's now vestigial except as a log-suppression signal. Every
+turn always evaluates both signals above.
 
 **Why inference was removed:** Gemma 4B (`gemma-4-e4b-it-4bit`) requires
 `max_tokens ≥ 300` to produce reliable output on binary classification
 prompts. Below this threshold the model consistently returns a bare newline.
 A 300-token budget for a yes/no routing decision is incompatible with the
-**Sparse** and **Predictable** constraints in §1.
+**Sparse** and **Predictable** constraints in §1. The semantic gate keeps
+this constraint: it's a local cosine-similarity comparison against
+precomputed embeddings, not a model call, so it costs nothing beyond one
+embedding call per turn — the same cost every P3 semantic-gated turn already
+pays.
 
 ### 4.4 RoutingPlan Structure
 

@@ -177,6 +177,118 @@ class TestDetectExplicitSignal:
         assert sig.episode_type == "preference"
 
 
+class TestDetectExplicitSignalBareRememberPattern:
+    """
+    2026-07-23 fix: "remember" without "that" (e.g. "remember I'm doing X")
+    matched no _EXPLICIT_SIGNALS entry — see
+    diagnostics/reports/explicit_memory_write_gate_2026-07-23.md for the
+    rejected semantic-gating attempt and the adopted deterministic rule
+    (planner._has_explicit_remember_signal(), shared with Planner Priority 2
+    so both independent gates agree).
+    """
+
+    def test_live_bug_repro(self):
+        sig = detect_explicit_signal(
+            "I want you to remember I'm participating in a Claude Impact "
+            "Lab on August 6th."
+        )
+        assert sig is not None
+        assert sig.is_retraction is False
+        assert sig.episode_type == "preference"
+        assert sig.trigger_phrase == "remember:pattern"
+
+    def test_bare_remember_without_that(self):
+        sig = detect_explicit_signal("Please remember I prefer dark mode.")
+        assert sig is not None
+        assert sig.episode_type == "preference"
+
+    def test_keep_in_mind_literal_addition(self):
+        sig = detect_explicit_signal("Keep in mind I'm allergic to peanuts.")
+        assert sig is not None
+        assert sig.episode_type == "preference"
+
+    def test_make_a_note_literal_addition(self):
+        sig = detect_explicit_signal("Make a note that my flight is on the 10th.")
+        assert sig is not None
+        assert sig.episode_type == "project_fact"
+
+    def test_do_you_remember_question_does_not_fire(self):
+        assert detect_explicit_signal(
+            "Do you remember what I told you about the migration?"
+        ) is None
+
+    def test_what_do_you_remember_question_does_not_fire(self):
+        assert detect_explicit_signal("What do you remember about my project?") is None
+
+    def test_can_you_recall_question_with_remember_word_does_not_fire(self):
+        # "recall" itself isn't in the pattern; this exercises the "remember"
+        # word not being present at all, distinct from the interrogative case.
+        assert detect_explicit_signal("Can you recall what I said earlier?") is None
+
+    def test_will_you_remember_question_does_not_fire(self):
+        assert detect_explicit_signal("Will you remember to feed the cat?") is None
+
+    def test_i_remember_reminiscing_does_not_fire(self):
+        # The user stating a fact about their own memory, not directing the
+        # assistant to store one.
+        assert detect_explicit_signal(
+            "I remember when we talked about this before."
+        ) is None
+
+    def test_trailing_question_mark_does_not_fire(self):
+        assert detect_explicit_signal(
+            "Should I remember to bring my laptop tomorrow?"
+        ) is None
+
+    def test_unrelated_instruction_still_returns_none(self):
+        assert detect_explicit_signal(
+            "Help me prepare for the upcoming Claude Impact Lab on August 6th."
+        ) is None
+
+    def test_dont_forget_now_fixed_routes_to_insert_not_retraction(self):
+        # CLOSED 2026-07-23 (same day, follow-up request): "don't forget
+        # that X" means "please remember X" but used to substring-match
+        # _RETRACTION_SIGNALS' "forget that" first, incorrectly triggering a
+        # retraction (delete). planner._MEMORY_NEGATED_FORGET now short-
+        # circuits detect_explicit_signal() to an insert-type signal BEFORE
+        # the retraction loop ever runs. Un-negated "forget that" (no
+        # "don't"/"do not"/"never") must still retract — see the sibling
+        # tests above (test_retraction_forget_that etc.), unaffected by this
+        # fix since they don't match the negation pattern.
+        sig = detect_explicit_signal("Don't forget that I have a dentist appointment.")
+        assert sig is not None
+        assert sig.is_retraction is False
+        assert sig.episode_type == "preference"
+
+    def test_dont_forget_without_that_also_fixed(self):
+        # Bonus coverage: "don't forget X" (no "that" at all) previously
+        # matched neither the retraction phrase nor any insert phrase, so it
+        # silently did nothing. Now caught by the same negated-forget
+        # pattern (which doesn't require "that").
+        sig = detect_explicit_signal("Don't forget I have a dentist appointment.")
+        assert sig is not None
+        assert sig.is_retraction is False
+        assert sig.episode_type == "preference"
+
+    def test_never_forget_variant(self):
+        sig = detect_explicit_signal("Never forget that I prefer dark mode.")
+        assert sig is not None
+        assert sig.is_retraction is False
+
+    def test_do_not_forget_variant(self):
+        sig = detect_explicit_signal("Do not forget I have a meeting at 3pm.")
+        assert sig is not None
+        assert sig.is_retraction is False
+
+    def test_unnegated_forget_that_still_retracts(self):
+        # Regression guard: the negated-forget fix must not weaken the
+        # existing, correct retraction behavior for genuine "forget that X"
+        # (no "don't"/"do not"/"never" preceding it).
+        sig = detect_explicit_signal("Forget that preference about formatting.")
+        assert sig is not None
+        assert sig.is_retraction is True
+
+
 # ---------------------------------------------------------------------------
 # 5.3 — Confidence scoring
 # ---------------------------------------------------------------------------
