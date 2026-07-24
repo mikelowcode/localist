@@ -1557,8 +1557,26 @@ class ControllerAgent:
                     )
 
         # -- Step 5: Episodic retrieval --------------------------------------
+        # Episodic Injection rule (04-planner-routing-model.md §4.3a): this
+        # step runs on every conversational-agent turn, regardless of
+        # plan.fetch_episodic — decoupling "should we attempt recall" from
+        # "should we show it." plan.fetch_episodic is still computed by the
+        # Planner and reported in ResponseMetadata for audit/UX, but no
+        # longer gates execution here; the existing confidence>=0.7 /
+        # max-5-bullet formatting contract (format_episodic_summary(), §2.7)
+        # is what decides what actually surfaces in Slot 3a.
+        #
+        # plan.graph_query is not None excludes P3c turns explicitly — P3c
+        # is a deliberate no-interpretation zone (§5b) that must never
+        # co-render Slot 3 alongside its structural [GRAPH RESULT] answer,
+        # and P3c also routes to conversational_agent, so the agent check
+        # alone isn't sufficient to preserve that guarantee.
         episodic_bullets: list[EpisodeBullet] = []
-        if plan.fetch_episodic and db_path is not None:
+        if (
+            plan.agent == "conversational_agent"
+            and plan.graph_query is None
+            and db_path is not None
+        ):
             try:
                 embed_fn = getattr(self._memory_manager, "_embed_fn", None)
                 reader   = EpisodicMemoryReader(db_path=db_path, embed_fn=embed_fn)
@@ -1623,6 +1641,62 @@ class ControllerAgent:
                         seen_ids.add(rec.id)
                         added_from_similarity += 1
 
+                # Mode 4 — graph-neighbor expansion. Narrow by design,
+                # mirroring Step 4b's RAG-assist restraint (only the single
+                # top doc): take the single top-scoring Mode 3 candidate (if
+                # any), find its episode graph node (§8.9 Phase B —
+                # "episode://<id>"), walk its resolved outgoing edge(s) to
+                # the wiki concept(s) it's linked to, then pull that
+                # concept's backlinks — including sibling episode-sourced
+                # ones (include_episode_sources=True) — to surface other
+                # episodes tied to the same concept that wouldn't otherwise
+                # score high enough against *this* instruction to appear via
+                # Mode 3 alone. Silent, best-effort degrade on any failure,
+                # same posture as every other try/except in this function.
+                added_from_graph = 0
+                if similar and self._memory_manager is not None:
+                    top_similar = similar[0]
+                    try:
+                        episode_node = self._memory_manager.get_graph_node_by_doc_path(
+                            f"episode://{top_similar.id}"
+                        )
+                        if episode_node is not None:
+                            sibling_ids: set[int] = set()
+                            for edge in self._memory_manager.get_outgoing_links(
+                                episode_node["id"]
+                            ):
+                                if not edge.target_resolved or edge.node_doc_path is None:
+                                    continue
+                                concept_node = self._memory_manager.get_graph_node_by_doc_path(
+                                    edge.node_doc_path
+                                )
+                                if concept_node is None:
+                                    continue
+                                for backlink in self._memory_manager.get_backlinks(
+                                    concept_node["id"], include_episode_sources=True,
+                                ):
+                                    if (
+                                        backlink.node_doc_path is not None
+                                        and backlink.node_doc_path.startswith("episode://")
+                                    ):
+                                        sibling_id = int(
+                                            backlink.node_doc_path[len("episode://"):]
+                                        )
+                                        if sibling_id not in seen_ids:
+                                            sibling_ids.add(sibling_id)
+
+                            if sibling_ids:
+                                for rec in reader.get_by_ids(list(sibling_ids)):
+                                    if rec.id not in seen_ids:
+                                        records.append(rec)
+                                        seen_ids.add(rec.id)
+                                        added_from_graph += 1
+                    except Exception as exc:
+                        logger.debug(
+                            "_execute_plan: episodic graph-neighbor expansion "
+                            "failed (%s) — continuing without it.", exc,
+                        )
+
                 summary = format_episodic_summary(records)
                 if summary:
                     for record in records:
@@ -1635,8 +1709,10 @@ class ControllerAgent:
                     self._planner.mark_episodic_injected()
                     logger.info(
                         "_execute_plan: episodic retrieval complete — "
-                        "%d recency + %d new-from-semantic → %d bullet(s).",
-                        recency_count, added_from_similarity, len(episodic_bullets),
+                        "%d recency + %d new-from-semantic + %d "
+                        "new-from-graph-neighbor → %d bullet(s).",
+                        recency_count, added_from_similarity, added_from_graph,
+                        len(episodic_bullets),
                     )
             except Exception as exc:
                 logger.warning(

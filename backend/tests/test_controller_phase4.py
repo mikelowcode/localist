@@ -44,6 +44,7 @@ from memory_manager import (
     MemoryManager,
     EpisodicMemoryWriter,
     EpisodicMemoryReader,
+    EpisodeRecord,
     GraphEdgeResult,
 )
 from episodic_extractor import ExtractionResult
@@ -907,10 +908,237 @@ class TestRecencyCache:
             ctrl.handle_task({"instruction": "remember that I prefer step-by-step instructions"})
             ctrl.handle_task({"instruction": "What are my preferences now?"})
 
-        # Turn 1: cache miss (queried, cached). Turn 2: write invalidates
-        # the cache (fetch_episodic=False, so by_recency isn't called this
-        # turn regardless). Turn 3: cache miss again — must re-query.
+        # Turn 1: cache miss (queried, cached). Turn 2: the write invalidates
+        # the cache *before* Step 5 runs, and Step 5 now runs unconditionally
+        # for every conversational-agent turn (Episodic Injection rule,
+        # §4.3a) regardless of fetch_episodic — so it re-queries into an
+        # empty cache and repopulates it. Turn 3: cache hit against what
+        # turn 2 just repopulated — no further query. Net count still 2,
+        # same total as before this rule, just via a different turn-2 path.
         assert by_recency_mock.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Episodic Injection rule (§4.3a of 04-planner-routing-model.md):
+# Step 5 decoupled from plan.fetch_episodic + new Mode 4 graph-neighbor
+# expansion
+# ---------------------------------------------------------------------------
+
+class TestEpisodicInjectionUnconditionalRecall:
+    """
+    Step 5 now runs on every conversational-agent, non-graph-query turn
+    regardless of plan.fetch_episodic — closing the class of gap where a
+    real matching episode exists but the instruction trips no P5
+    keyword/semantic signal at all (a true P6 fallback). Quality control
+    stays entirely on the existing confidence>=0.7 formatting floor
+    (format_episodic_summary(), §2.7) — unchanged.
+    """
+
+    def test_recall_runs_on_true_fallback_turn_with_no_episodic_signal(self, db_path, mm):
+        writer = EpisodicMemoryWriter(db_path=db_path)
+        writer.insert(
+            episode_type    = "project_fact",
+            subject         = "Claude Impact Lab",
+            content         = "User is participating in a Claude Impact Lab on August 6th.",
+            source          = "explicit",
+            confidence      = 1.0,
+            project_context = "general",
+        )
+
+        rt   = make_runtime(infer_return="no")  # "no" → P5 semantic gate does not fire
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        # No episodic/RAG/tool keyword anywhere in this instruction — a true
+        # P6 fallback under the old gate, which never attempted recall here.
+        ctrl.handle_task({"instruction": "What should I pack for a trip to Denver?"})
+
+        routing = conv._received[0].context["_routing"]
+        assert routing["fetch_episodic"] is False, (
+            "P5 keyword/semantic gate correctly did not fire — "
+            "fetch_episodic stays informational, not a gate, per §4.3a"
+        )
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[EPISODIC MEMORY]" in prompt
+        assert "Claude Impact Lab" in prompt
+
+    def test_no_episodes_no_slot_rendered(self, mm):
+        """Empty store — Step 5 runs but produces nothing to inject."""
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        ctrl.handle_task({"instruction": "What should I pack for a trip to Denver?"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[EPISODIC MEMORY]" not in prompt
+
+    def test_p3c_graph_query_turn_still_excluded(self, db_path, mm):
+        """
+        The unconditional-recall change must not regress §5b's P3c
+        mutual-exclusivity guarantee — see also
+        TestGraphQueryFetch.test_p3c_purity_no_rag_or_episodic_slots for the
+        full real-Planner end-to-end version of this check.
+        """
+        writer = EpisodicMemoryWriter(db_path=db_path)
+        writer.insert(
+            episode_type    = "project_fact",
+            subject         = "graph query purity",
+            content         = "PURITY_LEAK: should not appear on a P3c turn.",
+            source          = "explicit",
+            confidence      = 1.0,
+            project_context = "general",
+        )
+
+        rt   = make_runtime(infer_return="yes")
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = False,
+            priority       = 3,
+            graph_query    = ("incoming", 1, "some-page"),
+        )
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch.object(mm, "get_backlinks", return_value=[]):
+            ctrl.handle_task({"instruction": "what links to some-page"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[EPISODIC MEMORY]" not in prompt
+        assert "PURITY_LEAK" not in prompt
+
+
+class TestEpisodicGraphNeighborExpansion:
+    """
+    Mode 4 (controller_agent.py Step 5): when the top Mode 3 candidate has
+    an episode graph node (§8.9 Phase B), its resolved outgoing edge(s) are
+    followed to a wiki concept node, and that concept's backlinks —
+    including sibling episode-sourced ones — are pulled in as additional
+    Slot 3a candidates. Uses a MagicMock memory_manager with EpisodicMemoryReader's
+    query methods patched directly, mirroring TestGraphQueryFetch's style,
+    so the controller's Mode 4 orchestration is tested in isolation from
+    real BM25/graph-write mechanics (covered separately in
+    test_memory_phase1.py and 08-graph-retrieval-layer.md's own tests).
+    """
+
+    @staticmethod
+    def _record(id_, subject="s", content="c", confidence=1.0):
+        return EpisodeRecord(
+            id=id_, episode_type="project_fact", subject=subject, content=content,
+            confidence=confidence, source="model_extracted", task_id=None,
+            conversation_id=None, project_context="general", status="active",
+            created_at=time.time(), last_accessed=None,
+        )
+
+    def _wire_graph(self, mm_mock, sibling_doc_path: str = "episode://2"):
+        mm_mock.get_graph_node_by_doc_path.side_effect = lambda p: (
+            {"id": 10, "doc_path": "episode://1", "title": None} if p == "episode://1"
+            else {"id": 20, "doc_path": "/wiki/omlx.md", "title": "oMLX"} if p == "/wiki/omlx.md"
+            else None
+        )
+        mm_mock.get_outgoing_links.return_value = [
+            GraphEdgeResult(
+                link_text="oMLX", target_path="omlx", target_resolved=True,
+                node_title="oMLX", node_doc_path="/wiki/omlx.md",
+            )
+        ]
+        mm_mock.get_backlinks.return_value = [
+            GraphEdgeResult(
+                link_text=None, target_path=None, target_resolved=True,
+                node_title=None, node_doc_path=sibling_doc_path,
+            ),
+        ]
+
+    def test_sibling_episode_surfaced_via_shared_concept(self, db_path, mm):
+        top_match = self._record(1, subject="oMLX version", content="oMLX 0.4.2 is current.")
+        sibling   = self._record(2, subject="oMLX release notes", content="0.4.2 fixed the paging bug.")
+
+        mm_mock = MagicMock()
+        mm_mock._db_path = db_path
+        self._wire_graph(mm_mock)
+
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm_mock)
+        plan = RoutingPlan(agent="conversational_agent", fetch_episodic=False, fetch_rag=False, priority=6)
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch.object(EpisodicMemoryReader, "by_recency", return_value=[]), \
+             patch.object(EpisodicMemoryReader, "by_similarity", return_value=[top_match]), \
+             patch.object(EpisodicMemoryReader, "get_by_ids", return_value=[sibling]):
+            ctrl.handle_task({"instruction": "tell me about oMLX"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "oMLX 0.4.2 is current." in prompt
+        assert "0.4.2 fixed the paging bug." in prompt
+
+    def test_low_confidence_sibling_not_injected(self, db_path, mm):
+        """Mode 4 only adds *candidates* — the existing 0.7 injection floor
+        (format_episodic_summary(), §2.7) still governs what surfaces."""
+        top_match = self._record(1, subject="oMLX version", content="oMLX 0.4.2 is current.")
+        sibling   = self._record(
+            2, subject="oMLX rumor", content="Unverified: oMLX may add X next.",
+            confidence=0.5,
+        )
+
+        mm_mock = MagicMock()
+        mm_mock._db_path = db_path
+        self._wire_graph(mm_mock)
+
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm_mock)
+        plan = RoutingPlan(agent="conversational_agent", fetch_episodic=False, fetch_rag=False, priority=6)
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch.object(EpisodicMemoryReader, "by_recency", return_value=[]), \
+             patch.object(EpisodicMemoryReader, "by_similarity", return_value=[top_match]), \
+             patch.object(EpisodicMemoryReader, "get_by_ids", return_value=[sibling]):
+            ctrl.handle_task({"instruction": "tell me about oMLX"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "oMLX 0.4.2 is current." in prompt
+        assert "Unverified: oMLX may add X next." not in prompt
+
+    def test_graph_lookup_failure_degrades_gracefully(self, db_path, mm):
+        top_match = self._record(1, subject="oMLX version", content="oMLX 0.4.2 is current.")
+
+        mm_mock = MagicMock()
+        mm_mock._db_path = db_path
+        mm_mock.get_graph_node_by_doc_path.side_effect = RuntimeError("SQLite locked")
+
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm_mock)
+        plan = RoutingPlan(agent="conversational_agent", fetch_episodic=False, fetch_rag=False, priority=6)
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch.object(EpisodicMemoryReader, "by_recency", return_value=[]), \
+             patch.object(EpisodicMemoryReader, "by_similarity", return_value=[top_match]):
+            result = ctrl.handle_task({"instruction": "tell me about oMLX"})
+
+        assert result["status"] == "complete"
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "oMLX 0.4.2 is current." in prompt
+
+    def test_no_similarity_match_skips_graph_lookup_entirely(self, db_path, mm):
+        mm_mock = MagicMock()
+        mm_mock._db_path = db_path
+
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm_mock)
+        plan = RoutingPlan(agent="conversational_agent", fetch_episodic=False, fetch_rag=False, priority=6)
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch.object(EpisodicMemoryReader, "by_recency", return_value=[]), \
+             patch.object(EpisodicMemoryReader, "by_similarity", return_value=[]):
+            ctrl.handle_task({"instruction": "What is 2+2?"})
+
+        mm_mock.get_graph_node_by_doc_path.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

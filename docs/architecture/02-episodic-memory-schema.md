@@ -202,6 +202,25 @@ NULL` and score via keyword fallback until backfilled —
 every active row missing a vector and regenerates `MEMORY.md` (§2.9) from
 current state; safe to re-run.
 
+**Mode 4 — Graph-neighbor expansion (2026-07-24, Episodic Injection rule,
+§4.3a of the Planner Routing Model doc).** Not a query-shaped retrieval mode
+like Modes 1–3 — a graph traversal that runs immediately after Mode 3 in
+`controller_agent.py`'s Step 5, narrow by design (mirrors §8.9 Phase A's
+"only the single top doc" restraint): takes the single top-scoring Mode 3
+candidate (if any), looks up its episode graph node
+(`get_graph_node_by_doc_path("episode://<id>")`, §8.9 Phase B), follows its
+resolved outgoing edge(s) to the wiki concept(s) it's linked to, then pulls
+that concept's backlinks — including sibling episode-sourced ones
+(`get_backlinks(..., include_episode_sources=True)`) — to surface other
+episodes tied to the same concept that wouldn't otherwise score high enough
+against *this* instruction to appear via Mode 3 alone. Sibling ids are
+resolved back to full records via the new `EpisodicMemoryReader.get_by_ids()`
+(exact-id batch lookup, `status='active'` only — not a scoring method).
+Silent, best-effort degrade on any failure. Mode 4 only ever adds
+*candidates* to the merge; the existing confidence>=0.7 / max-5-bullet /
+type-priority injection contract (§2.7) is unchanged and still decides what
+actually surfaces in Slot 3a.
+
 ### 2.7 Summarization Contract
 
 When episodic memory is injected into the prompt, it must conform to this

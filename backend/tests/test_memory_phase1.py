@@ -436,6 +436,47 @@ class TestEpisodicMemoryReader:
         subjects = [r.subject for r in results]
         assert "memory backend v2" in subjects
 
+    # Mode 4 — get_by_ids() (exact-id batch lookup, used by graph-neighbor
+    # expansion in controller_agent.py Step 5; see 04-planner-routing-model.md §4.3a)
+
+    def test_get_by_ids_returns_matching_records(self, writer, reader):
+        self._seed(writer)
+        subject_id = reader.by_subject("vault resolver")[0].id
+        results = reader.get_by_ids([subject_id])
+        assert len(results) == 1
+        assert results[0].subject == "vault resolver"
+
+    def test_get_by_ids_multiple_ids(self, writer, reader):
+        self._seed(writer)
+        ids = [r.id for r in reader.by_recency(project_context="LORA")]
+        results = reader.get_by_ids(ids)
+        assert len(results) == len(ids)
+
+    def test_get_by_ids_empty_list_returns_empty_no_query(self, reader):
+        assert reader.get_by_ids([]) == []
+
+    def test_get_by_ids_excludes_retracted(self, writer, reader):
+        self._seed(writer)
+        target = reader.by_subject("vault resolver")[0]
+        writer.retract("vault resolver", "correction")
+        assert reader.get_by_ids([target.id]) == []
+
+    def test_get_by_ids_missing_id_omitted(self, writer, reader):
+        self._seed(writer)
+        target = reader.by_subject("vault resolver")[0]
+        results = reader.get_by_ids([target.id, 999999])
+        assert len(results) == 1
+        assert results[0].id == target.id
+
+    def test_get_by_ids_updates_last_accessed(self, writer, reader):
+        self._seed(writer)
+        target = reader.by_subject("vault resolver")[0]
+        before = time.time()
+        results = reader.get_by_ids([target.id])
+        after = time.time()
+        assert results[0].last_accessed is not None
+        assert before <= results[0].last_accessed <= after
+
 
 # ---------------------------------------------------------------------------
 # Embedding-backed cosine scoring (writer stores vectors, reader uses them)

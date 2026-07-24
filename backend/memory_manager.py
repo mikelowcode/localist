@@ -4351,6 +4351,54 @@ class EpisodicMemoryReader:
         self._touch_records([top_record])
         return top_score, top_record
 
+    def get_by_ids(self, ids: list[int]) -> list[EpisodeRecord]:
+        """
+        Exact-id batch lookup, restricted to active episodes.
+
+        Used by Mode 4 (graph-neighbor expansion, controller_agent.py Step
+        5) to resolve sibling episode ids discovered via the episode
+        graph-node backlink traversal (see 08-graph-retrieval-layer.md §8.9)
+        back into full EpisodeRecords. Not one of the three query-shaped
+        retrieval modes in §2.6 — a plain id lookup, no scoring involved.
+
+        Parameters
+        ----------
+        ids :
+            Episode primary keys to fetch. Empty input returns [] with no
+            query executed.
+
+        Returns
+        -------
+        list[EpisodeRecord]
+            Only rows with status='active'; order is not guaranteed to
+            match `ids`. Shorter than `ids` if some are missing/inactive.
+        """
+        if not ids:
+            return []
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                placeholders = ",".join("?" * len(ids))
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM episodes
+                    WHERE  id IN ({placeholders})
+                      AND  status = 'active'
+                    """,
+                    ids,
+                ).fetchall()
+
+                records = [self._row_to_record(r) for r in rows]
+                now = self._touch_last_accessed(conn, [r.id for r in records])
+                if now is not None:
+                    for rec in records:
+                        rec.last_accessed = now
+                conn.commit()
+                return records
+            finally:
+                conn.close()
+
 
 # ---------------------------------------------------------------------------
 # WorkingStateStore — Slot 6A Tier 2 persistent storage

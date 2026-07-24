@@ -202,6 +202,51 @@ precomputed embeddings, not a model call, so it costs nothing beyond one
 embedding call per turn — the same cost every P3 semantic-gated turn already
 pays.
 
+### 4.3a Episodic Injection Rule — Recall Decoupled from `fetch_episodic` (2026-07-24)
+
+**Named rule, per §0's Auditable constraint.** Formalizes what
+`controller_agent.py`'s Step 5 does after routing, independent of which
+Planner priority matched. Scoped and built from a live request to name this
+as an explicit, auditable rule rather than leaving it as unlabeled
+controller-side plumbing.
+
+**Trigger.** Step 5 (episodic retrieval) now runs on **every** turn where
+`plan.agent == "conversational_agent"` and `plan.graph_query is None` —
+i.e., every conversational turn except a P3c graph-query turn (§5b's
+mutual-exclusivity guarantee is preserved explicitly, not incidentally: P3c
+also routes to `conversational_agent`, so the agent check alone would not
+have been sufficient). This is unconditional with respect to
+`plan.fetch_episodic` — the P4/P5/P6 outcome that used to gate whether this
+step ran at all.
+
+**Rationale — decoupling "should we look" from "should we show."** Before
+this rule, episodic retrieval only ran when Priority 5's keyword or semantic
+gate (§4.3) fired. A true P6 fallback turn — no episodic keyword, no
+semantic-gate match — got no episodic attempt whatsoever, even when a
+strongly relevant episode existed in the store. §4.3's semantic gate
+narrowed this gap by adding a smarter "should we look" signal, but a
+gate remains a gate: some real matches will always fall under any threshold.
+This rule removes that gate's execution-gating role entirely. Recall now
+always runs (cheap — one embedding call, the same cost class §4.3 already
+accepted for gated turns); `plan.fetch_episodic` stays computed by the
+Planner and reported in `ResponseMetadata` for audit/UX purposes (e.g. the
+"personal reference keyword always fetches" signal), but no longer decides
+whether Step 5 executes. All quality control shifts to the existing,
+unchanged confidence>=0.7 / max-5-bullet / type-priority formatting contract
+(`format_episodic_summary()`, §2.7) — the "should we show" decision.
+
+**The four recall modes, run in sequence inside Step 5:**
+
+1. **Mode 2 — recency** (`by_recency()`, cached per `project_context`, §2.6).
+2. **Mode 3 — semantic similarity** (`by_similarity(task.instruction, top_n=5, min_score=0.45)`, §2.6), merged into the Mode 2 result set by id.
+3. **Mode 4 — graph-neighbor expansion** (new, §2.6): takes the single top-scoring Mode 3 candidate, walks its episode graph node's resolved outgoing edge(s) to a wiki concept, then pulls that concept's episode-sourced backlinks in as further candidates via the new `EpisodicMemoryReader.get_by_ids()`. Silent, best-effort degrade on failure.
+4. **Injection formatting** (unchanged): `format_episodic_summary()` filters the merged candidate set to `confidence >= 0.7`, orders by type priority, caps at 5 bullets / ~150 tokens (Slot 3a).
+
+**Explicitly out of scope.** Retraction is untouched — it remains the
+separate Priority 2 → `EpisodicMemoryReader.best_match(min_score=0.55)`
+mechanism (§2.5), not triggered by or related to this rule. The injection
+confidence floor stays 0.7, not lowered.
+
 ### 4.4 RoutingPlan Structure
 
 ```python
