@@ -24,14 +24,15 @@
   });
 
   async function handleOpenBrief(): Promise<void> {
-    const conversationId = await openNewsBrief();
-    if (conversationId) {
+    const ok = await openNewsBrief();
+    if (ok) {
       // /open already refreshed the backend's news_brief_cache by the time it
       // responds, but this panel's own store is only ever populated once on
       // mount — without this, the Live Feed list stays stale (showing
       // whatever was cached at page-load) until a full browser reload.
+      // Refresh stays on the Live Feed panel — it no longer opens a Chat
+      // Conversation (see newsBrief.ts).
       await fetchNewsBriefPreview();
-      await goto(`/conversation/${conversationId}`);
     }
   }
 

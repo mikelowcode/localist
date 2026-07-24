@@ -687,3 +687,51 @@ explaining the two are saved together in one request; the placeholder changed fr
 Seattle"`; and the success message now echoes the actual saved city back
 (`Saved — Local area set to "X".`). Verified via `npm run check` (0 errors); user tested and confirmed
 live.
+
+### 7.18 "Daily News Brief Refresh" No Longer Opens a Chat Conversation (2026-07-24)
+
+Since §7.16 shipped the per-article "Ask about this" button, dumping the *entire* brief into a new Chat
+Conversation on every "Daily News Brief Refresh" click had become redundant — a user who wants to
+discuss a specific story now clicks that story directly, so auto-populating the chat transcript with
+every headline was, per live feedback, "just noise without context."
+
+`POST /news/brief/open` (`main.py`) previously wrote two `chat_turns` rows (a synthetic user instruction
++ the full brief markdown as the assistant reply, backing the visible Chat Conversation history) and,
+when a `session_id` was supplied, also seeded `conversation_log` (Slot 6 working memory) with the same
+exchange so a same-session follow-up question had brief content in context. Both writes are removed.
+The endpoint now does exactly one thing: regenerate the brief and overwrite `news_brief_cache` (still not
+idempotent within a day, same "Refresh means refresh" rationale as §7.14/§7.15) so `GET
+/news/brief/preview` reflects it. `NewsBriefOpenRequest` (the `session_id` payload) and
+`_NEWS_BRIEF_USER_INSTRUCTION` were deleted as dead code; `NewsBriefOpenResponse` now returns
+`{"success": true}` instead of a `conversation_id`, since no conversation is created.
+
+Frontend: `newsBrief.ts`'s `openNewsBrief()` returns a plain `boolean` instead of a `conversation_id`,
+and posts with no body (the `SESSION_ID` payload is gone). `PreviewsPanel.svelte`'s `handleOpenBrief()`
+still calls `fetchNewsBriefPreview()` after a successful refresh (§7.15's fix, still needed since the
+panel's store only populates once on mount) but no longer calls `goto()` — the click now stays on
+whatever page the user was on, since there is no conversation to navigate to. `handleAskAboutArticle()`
+(§7.16, per-article chat) is unaffected — it never wrote to `chat_turns` directly and still runs through
+the normal `submitTask()` pipeline. Backend regression tests updated in
+`tests/test_main_news_endpoints.py`'s `TestBriefOpen` to assert `chat_turns`/`conversation_log` stay
+empty across a refresh. Verified via `pytest tests/` (1160 passed) and `npm run check` (0 errors).
+
+### 7.19 Collapsed the Duplicative World/National Sections into One "Top Stories" Section (2026-07-24)
+
+`docs/daily-news-brief-plan.md` §2 flagged this live during the feature's original build (2026-07-22)
+and shipped it anyway as a documented "known limitation": NewsAPI's top-headlines endpoint has no
+"world" category, so the World section's `category=general` call (no `country` param) returned the same
+US-outlet results as the National section's `country=home_country` call for a US `home_country` —
+two calls, one set of headlines, shown twice under different labels. Live use in the Live Feed panel
+surfaced this as a real, reported redundancy rather than an acceptable tradeoff.
+
+Fixed in `backend/news_brief.py`'s `build_brief()`: the World and National calls are replaced with one
+call, section key `top_stories` / label "Top Stories", using the same params National always used
+(`{"country": home_country}`) — i.e. the World call was simply dropped, not replaced with something new,
+since National's country-anchored query was already the more meaningful of the two. Cuts a brief with
+all 3 topics selected from 6 NewsAPI calls to 5. `PreviewsPanel.svelte` needed no change — the Live Feed
+panel renders sections generically by `section.label`/`section.key` from the backend response, no
+per-section frontend logic existed to update. `settings/+page.svelte`'s Daily News Brief card description
+updated to describe "Top Stories" instead of "World and National." Backend tests in
+`tests/test_news_brief.py`'s `TestBuildBrief` updated for the single section (was two), plus a new test
+asserting the call is still anchored to `home_country`. Verified via `pytest tests/` (1161 passed) and
+`npm run check` (0 errors).

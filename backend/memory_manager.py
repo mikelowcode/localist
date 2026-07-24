@@ -2137,7 +2137,7 @@ class MemoryManager:
         self,
         brief_date:      str,
         content:         dict[str, Any],
-        conversation_id: str,
+        conversation_id: str | None,
     ) -> None:
         """
         Insert or update news_brief_cache (row id=1) after a fresh

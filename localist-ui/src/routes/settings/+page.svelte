@@ -461,9 +461,9 @@
     <section class="settings-card">
       <div class="card-title">Daily News Brief</div>
       <p class="card-desc">
-        World and National are fixed; Local is keyword-matched against a place
-        you set (NewsAPI has no true local-news coverage). Pick exactly 3
-        special-interest topics.
+        Top Stories (anchored to your home country) is fixed; Local is
+        keyword-matched against a place you set (NewsAPI has no true
+        local-news coverage). Pick exactly 3 special-interest topics.
       </p>
 
       <label class="news-field-label" for="news-home-country">Home country (2-letter code)</label>

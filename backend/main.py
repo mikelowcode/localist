@@ -937,22 +937,7 @@ class NewsBriefPreviewResponse(BaseModel):
 
 class NewsBriefOpenResponse(BaseModel):
     """Response body for POST /news/brief/open — always a fresh generation."""
-    conversation_id: str
-
-
-class NewsBriefOpenRequest(BaseModel):
-    """
-    Payload accepted by POST /news/brief/open.
-
-    session_id : the frontend's per-page-load session id (tasks.ts'
-        SESSION_ID) — the same key ControllerAgent._memory_key() groups
-        working-memory continuity by (conversation_log, NOT chat_turns;
-        see main.py's post_news_brief_open docstring). Optional so the
-        endpoint still degrades gracefully (chat_turns/history still work)
-        if ever called without one, but a follow-up question in the same
-        browser session won't have the brief in working memory in that case.
-    """
-    session_id: str | None = None
+    success: bool = True
 
 
 class ChatHistorySettingsResponse(BaseModel):
@@ -2253,37 +2238,29 @@ async def get_news_brief_preview() -> NewsBriefPreviewResponse:
     )
 
 
-_NEWS_BRIEF_USER_INSTRUCTION = "Give me today's news brief."
-
-
 @app.post(
     "/news/brief/open",
     response_model = NewsBriefOpenResponse,
-    summary        = "Open today's Daily News Brief as a chat conversation",
+    summary        = "Refresh today's Daily News Brief for the Live Feed panel",
 )
-async def post_news_brief_open(request: NewsBriefOpenRequest) -> NewsBriefOpenResponse:
+async def post_news_brief_open() -> NewsBriefOpenResponse:
     """
     The Previews panel's "Daily News Brief Refresh" link handler.
 
-    Always fetches a fresh brief and opens it in a brand-new conversation —
-    deliberately not idempotent within a day. An earlier revision reopened
-    the same cached same-day conversation instead (a rate-limit-conscious
-    design from the original plan), but that meant pressing a link literally
-    labeled "Refresh" from a different/new chat silently navigated the user
-    into an old conversation showing stale articles instead of doing what
-    the label says — confirmed live, 2026-07-22. news_brief_cache is still
-    written on every call (so GET /news/brief/preview keeps reflecting the
-    latest generated content), just no longer read here to short-circuit
-    generation.
+    Always fetches a fresh brief and writes it to news_brief_cache (so
+    GET /news/brief/preview reflects it) — deliberately not idempotent
+    within a day, same rationale as before: pressing a link literally
+    labeled "Refresh" should never silently reuse stale content.
 
-    Also seeds `conversation_log` (via MemoryManager.add(), keyed by
-    request.session_id) with the same exchange — this is the table
-    ControllerAgent._memory_key()/get_context_window() actually read for
-    working-memory continuity (Slot 6), a completely different mechanism
-    from chat_turns (which only backs history display/search, §12/§20).
-    Without this, a follow-up question in the same browser session would
-    have no idea the brief content exists — confirmed live, 2026-07-22
-    (docs/daily-news-brief-plan.md's live-verification step).
+    Does NOT touch chat_turns or conversation_log. An earlier revision
+    also opened the brief as a synthetic chat_turns conversation and
+    seeded conversation_log (Slot 6 working memory) with the full
+    markdown, so the Chat Conversation UI displayed it and a same-session
+    follow-up question had context. Removed 2026-07-24: once the
+    per-article "Ask about this" button (§7.16) shipped, dumping the
+    *entire* unscoped brief into a chat turn on every refresh became
+    redundant noise — a user who wants to discuss a specific story now
+    clicks that story instead.
     """
     mm = _require_memory_manager()
     today = _today_str()
@@ -2295,40 +2272,9 @@ async def post_news_brief_open(request: NewsBriefOpenRequest) -> NewsBriefOpenRe
     sections = await news_brief.build_brief(
         prefs["home_country"], prefs["local_query"], prefs["topics"],
     )
+    await asyncio.to_thread(mm.set_news_brief_cache, today, sections, None)
 
-    conversation_id = str(uuid.uuid4())
-    task_id         = str(uuid.uuid4())
-    markdown        = news_brief.format_brief_markdown(sections)
-    sources         = news_brief.collect_sources(sections)
-
-    await asyncio.to_thread(
-        mm.add_chat_turn,
-        task_id            = task_id,
-        role               = "user",
-        content            = _NEWS_BRIEF_USER_INSTRUCTION,
-        conversation_id    = conversation_id,
-        conversation_title = f"Daily Brief — {today}",
-    )
-    await asyncio.to_thread(
-        mm.add_chat_turn,
-        task_id         = task_id,
-        role            = "assistant",
-        content         = markdown,
-        conversation_id = conversation_id,
-        sources         = sources,
-    )
-    await asyncio.to_thread(mm.set_news_brief_cache, today, sections, conversation_id)
-
-    if request.session_id:
-        await asyncio.to_thread(
-            mm.add, "user", _NEWS_BRIEF_USER_INSTRUCTION, task_id=request.session_id,
-        )
-        await asyncio.to_thread(
-            mm.add, "agent", markdown,
-            metadata={"agent": "news_brief"}, task_id=request.session_id,
-        )
-
-    return NewsBriefOpenResponse(conversation_id=conversation_id)
+    return NewsBriefOpenResponse()
 
 
 @app.get(

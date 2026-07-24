@@ -1,7 +1,16 @@
 # Daily News Brief — Header Button → Chat Conversation
 
+> **Superseded 2026-07-24 — see `docs/architecture/07-localist-ui.md` §7.18.** This
+> document's whole premise — the brief materializes as a `chat_turns` conversation
+> (§5/§6/§9 below) plus a `conversation_log` seed (§6's correction note) — no longer
+> holds. Once §7.16's per-article "Ask about this" button shipped, auto-populating a
+> full Chat Conversation with every headline on each "Daily News Brief Refresh" became
+> redundant, unscoped noise, and both writes were removed from `POST /news/brief/open`.
+> The endpoint now only regenerates and caches the brief for the Live Feed panel (§12).
+> Kept below for historical/design-rationale reference only.
+
 **Status:** Built and live-verified, 2026-07-22 (see §11); frontend redesigned same day
-after live use (see §12)
+after live use (see §12); chat-conversation integration removed 2026-07-24 (see banner above)
 **Author:** scoped with Michael, 2026-07-22
 **Depends on:** §14.9 (`news_search` / NewsAPI integration, already built —
 `docs/architecture/14-localist-mcp-tool-layer.md`), `MemoryManager.add_chat_turn()`
@@ -33,6 +42,13 @@ scheme and the API's actual surface:
 | **World** | No "world" category exists. `category` ∈ `{business, entertainment, general, health, science, sports, technology}` only; `country` is a single code per call, not a scope selector. | `GET /v2/top-headlines?category=general` (no `country`) — closest proxy to "global general news." **Confirmed live, 2026-07-22 (not just unverified): this does not return a cross-country mix.** With no `country` param, NewsAPI returned 5/5 US-outlet results (NY Post, MLB.com, Ars Technica, Yahoo, CBS News) — identical to the National section's `country=us` results for a US `home_country`. World and National are effectively duplicative for a US-based user today; there is no available NewsAPI fix for this (it's the API's actual behavior, not a bug in this integration) — documented as a known limitation rather than silently shipped as if resolved. |
 | **National** | `country` is exactly one 2-letter ISO 3166-1 code per call (e.g. `us`) — no concept above or below country level. | `GET /v2/top-headlines?country={home_country}`. Needs a `home_country` preference, default `"us"`. |
 | **Local** | **No city/region granularity exists in this API at all.** | Approximated via `GET /v2/everything?q={local_query}&sortBy=publishedAt` — a free-text keyword the user sets (e.g. `"Seattle"`), matched against NewsAPI's full source archive. Keyword matching, not real local-outlet curation — labeled as an approximation in the UI, not implied to be genuine local-news coverage. |
+
+> **Resolved 2026-07-24** — the World/National duplication flagged above as a
+> "known limitation" turned out live in the Live Feed panel and was reported as a
+> real redundancy, not an acceptable tradeoff. World and National were collapsed into
+> one section, **Top Stories** (`GET /v2/top-headlines?country={home_country}`, i.e.
+> exactly the old National call — the World call was simply dropped), cutting the
+> brief from 6 NewsAPI calls to 5. See `docs/architecture/07-localist-ui.md` §7.19.
 
 ## 3. Special-interest topic pool
 

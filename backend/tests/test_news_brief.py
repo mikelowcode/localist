@@ -125,14 +125,24 @@ class TestFetchSection:
 
 
 class TestBuildBrief:
-    def test_world_and_national_always_included(self, monkeypatch):
+    def test_top_stories_always_included(self, monkeypatch):
         monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
         ok = {"status": "ok", "totalResults": 1, "articles": [_article()]}
-        with _patched_client([ok, ok]):
+        with _patched_client([ok]):
             sections = asyncio.run(news_brief.build_brief("us", None, []))
 
         keys = [s["key"] for s in sections]
-        assert keys == ["world", "national"]
+        assert keys == ["top_stories"]
+
+    def test_top_stories_anchored_to_home_country(self, monkeypatch):
+        monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
+        ok = {"status": "ok", "totalResults": 1, "articles": [_article()]}
+        with _patched_client([ok]):
+            asyncio.run(news_brief.build_brief("gb", None, []))
+
+        _, params = _FakeAsyncClient.calls[0]
+        assert params["country"] == "gb"
+        assert "category" not in params
 
     def test_local_omitted_when_no_query(self, monkeypatch):
         monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
@@ -146,11 +156,11 @@ class TestBuildBrief:
     def test_local_included_when_query_set(self, monkeypatch):
         monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
         ok = {"status": "ok", "totalResults": 1, "articles": [_article()]}
-        with _patched_client([ok, ok, ok]):
+        with _patched_client([ok, ok]):
             sections = asyncio.run(news_brief.build_brief("us", "Seattle", []))
 
         keys = [s["key"] for s in sections]
-        assert keys == ["world", "national", "local"]
+        assert keys == ["top_stories", "local"]
 
     def test_one_topic_failing_does_not_fail_the_others(self, monkeypatch):
         """Per-section failure containment (docs/daily-news-brief-plan.md §6):
@@ -158,8 +168,8 @@ class TestBuildBrief:
         monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
         ok = {"status": "ok", "totalResults": 1, "articles": [_article()]}
         error = {"status": "error", "code": "rateLimited", "message": "rate limited"}
-        # world, national, then 2 topics: finance (ok), technology (error)
-        with _patched_client([ok, ok, ok, error]):
+        # top_stories, then 2 topics: finance (ok), technology (error)
+        with _patched_client([ok, ok, error]):
             sections = asyncio.run(
                 news_brief.build_brief("us", None, ["finance", "technology"])
             )
@@ -173,21 +183,20 @@ class TestBuildBrief:
     def test_unknown_topic_key_skipped(self, monkeypatch):
         monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
         ok = {"status": "ok", "totalResults": 1, "articles": [_article()]}
-        with _patched_client([ok, ok]):
+        with _patched_client([ok]):
             sections = asyncio.run(news_brief.build_brief("us", None, ["not-a-real-topic"]))
 
         keys = [s["key"] for s in sections]
-        assert keys == ["world", "national"]
+        assert keys == ["top_stories"]
 
     def test_labels_attached(self, monkeypatch):
         monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
         ok = {"status": "ok", "totalResults": 1, "articles": [_article()]}
-        with _patched_client([ok, ok, ok]):
+        with _patched_client([ok, ok]):
             sections = asyncio.run(news_brief.build_brief("us", None, ["finance"]))
 
         by_key = {s["key"]: s for s in sections}
-        assert by_key["world"]["label"] == "World"
-        assert by_key["national"]["label"] == "National"
+        assert by_key["top_stories"]["label"] == "Top Stories"
         assert by_key["finance"]["label"] == "Finance"
 
 

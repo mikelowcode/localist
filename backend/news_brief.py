@@ -2,7 +2,7 @@
 Daily News Brief — NewsAPI call builders
 ===========================================
 Fetches and formats the sections behind the Daily News Brief feature
-(docs/daily-news-brief-plan.md): World, National, Local (keyword-
+(docs/daily-news-brief-plan.md): Top Stories, Local (keyword-
 approximated), and the 9-member special-interest topic pool (§3).
 
 Lives in the main backend process, not mcp_server/ — this feature has no
@@ -151,24 +151,28 @@ async def build_brief(
     topics:       list[str],
 ) -> list[dict[str, Any]]:
     """
-    Fetch every section for one brief: World, National, Local (only when
+    Fetch every section for one brief: Top Stories, Local (only when
     local_query is set — no point calling NewsAPI with an empty/meaningless
     query), then the 3 selected topics in the order given.
 
-    Runs sequentially, not concurrently — at most 6 calls, well within a
+    Top Stories used to be two separate calls, "World" (`category=general`,
+    no country) and "National" (`country=home_country`, no category) —
+    NewsAPI's top-headlines endpoint returns near-identical results for
+    those two param shapes in practice, so the brief was showing the same
+    headlines twice under different labels. Collapsed into one call
+    (2026-07-24), still anchored to the user's home country.
+
+    Runs sequentially, not concurrently — at most 5 calls, well within a
     single request's reasonable latency budget, and keeps NewsAPI request
     pacing simple (docs/daily-news-brief-plan.md §7's rate-limit budget).
 
     Returns a list of section dicts: {key, label, articles, error}, in
-    fixed display order (World, National, Local, then topics).
+    fixed display order (Top Stories, Local, then topics).
     """
     sections: list[dict[str, Any]] = []
 
-    world = await fetch_section("world", {"category": "general"})
-    sections.append({**world, "label": "World"})
-
-    national = await fetch_section("national", {"country": home_country})
-    sections.append({**national, "label": "National"})
+    top_stories = await fetch_section("top_stories", {"country": home_country})
+    sections.append({**top_stories, "label": "Top Stories"})
 
     if local_query:
         local = await fetch_section("local", {"q": local_query}, use_everything=True)
