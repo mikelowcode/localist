@@ -144,6 +144,27 @@ Tests are organized by phase (memory substrate, routing, controller dispatch, ex
 
 ## Roadmap
 
-**Done:** Localist CLI launcher, MCP migration (tools off legacy dispatcher/Fetcher), identity continuity, user profile injection, generate-then-save file ops, graph retrieval layer (SQLite schema v6), Ollama runtime backend (incl. Cloud) with real `/api/embed` support and a cross-platform local embedding path, chat-model fail-fast validation, wiki diff updates with review/apply UI (plus a pre-write snapshot safety net with a 30-day-TTL undo path, closing the prior no-rollback gap), episodic memory hardening (real cosine retrieval, write-approval gate, semantic retraction), KaTeX-rendered math in chat output, oMLX-specific multi-turn prompt caching (working memory sent as discrete per-turn messages, sized from the model's real context window), live-switchable runtime backend with per-backend chat-model pinning (no restart required), a diagnostic-first `generate_chart` tool (interactive Chart.js rendering in the UI), a bounded research loop with a relevance-aware answer gate for price/spec-lookup queries, explicit `/chart`/`/research` slash commands that bypass normal tool-detection paths on demand, chat attachments that can pin an existing wiki page (not just upload a local file) with a Planner short-circuit routing a pinned-page diff request straight to `WikiAgent`, OKF (Open Knowledge Framework)-aligned wiki front matter/structure (reconciled `type`/`title`/`description`/`resource`/`tags`/`timestamp` convention, deterministically-generated `index.md`/`logs.md`, and a one-time backfill of the existing corpus), a three-pane Episode Browsing UI (`/episodes`, schema v9) with semantic search over chat history, tool-result-aware filters, and inline chart/diff/research-loop-step rendering — replacing the earlier `/history` tab and closing the multi-diff wiki-turn open item (verified the existing apply pipeline already handled 2+ diffs per turn correctly), a `news_search` tool (NewsAPI.org, falling back to Brave-backed `web_search` on a miss or error) with dedicated Planner routing for news-shaped queries, and the Daily News Brief Live Feed panel (schema v10) — a collapsible right-side tab with a configurable World/National/Local + 3-topic brief that always regenerates fresh from NewsAPI on demand and opens into a brand-new chat conversation whose working memory actually contains the brief (not just its history-display record — a real gap found and fixed via live follow-up-question testing), plus reserved GitHub/Hacker News placeholder blocks for future daily-update sources, the Episode Browsing UI's "Related Memory" panel moved off an exact same-turn match (almost always empty, since episodes are sparse by design) onto a real semantic-similarity lookup against the turn's own content, and a hand-rolled Okapi BM25 keyword scorer (`backend/bm25.py`) replacing Jaccard set-overlap scoring wherever no embedding is available (corpus retrieval and episodic recall) — with a `scored_by_embedding` flag threaded through so downstream absolute-relevance floors (tuned for cosine's bounded scale) are skipped for BM25-scored results rather than silently miscalibrated, except retraction's matcher, which keeps its floor unconditional since a false positive there destroys data.
+**Done**
+- ✅ Localist CLI launcher; MCP migration off legacy dispatcher/Fetcher
+- ✅ Identity continuity + user profile injection
+- ✅ Graph retrieval layer (SQLite schema v6)
+- ✅ Ollama runtime backend (incl. Cloud), real `/api/embed`, cross-platform embeddings
+- ✅ Wiki diff review/apply UI with pre-write snapshots (30-day undo)
+- ✅ Episodic memory hardening — cosine retrieval, write-approval gate, semantic retraction
+- ✅ KaTeX math rendering in chat output
+- ✅ oMLX multi-turn prompt caching, sized from real context window
+- ✅ Live-switchable runtime backend with per-backend chat-model pinning
+- ✅ `generate_chart` tool with interactive Chart.js rendering
+- ✅ Bounded research loop with relevance-aware answer gate
+- ✅ `/chart` and `/research` slash commands
+- ✅ Chat attachments can pin an existing wiki page, not just upload a file
+- ✅ OKF-aligned wiki front matter, generated `index.md`/`logs.md`
+- ✅ Episode Browsing UI (`/episodes`) — semantic chat-history search, tool-result rendering
+- ✅ `news_search` tool (NewsAPI, falls back to Brave `web_search`)
+- ✅ Daily News Brief Live Feed panel, always-fresh regeneration
+- ✅ Related Memory panel now does real semantic similarity, not exact-turn matching
+- ✅ Hand-rolled BM25 keyword scoring (`backend/bm25.py`) replacing Jaccard, for corpus + episodic recall when no embedding is available
 
-**Open:** generalize the bullet/diff-marker collision edge case; macOS `.app` packaging via PyInstaller + Tauri.
+**Open**
+- ⬜ Generalize the bullet/diff-marker collision edge case
+- ⬜ macOS `.app` packaging via PyInstaller + Tauri
