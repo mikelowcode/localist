@@ -38,7 +38,7 @@ import pytest
 
 from mcp.shared.memory import create_connected_server_and_client_session
 
-from mcp_server import chart, file_ops, url_fetch, web_search
+from mcp_server import chart, file_ops, news_search, search_format, url_fetch, web_search
 from mcp_server.main import mcp as mcp_app
 
 
@@ -251,7 +251,7 @@ class TestWebSearchSuccess:
             {
                 "name":        "oMLX Release Notes",
                 "snippet":     "fallback snippet",
-                "summary":     "x" * 350,  # forces truncation
+                "summary":     "x" * 750,  # forces truncation
                 "displayUrl":  "example.com/omlx",
                 "url":         "https://example.com/omlx",
             }
@@ -263,11 +263,13 @@ class TestWebSearchSuccess:
         assert result["query"] == "oMLX release notes"
         assert result["result_count"] == 1
         text = result["result_text"]
-        assert text.startswith("• oMLX Release Notes\n  ")
+        assert text.startswith("• oMLX Release Notes — example.com\n  ")
         assert text.endswith("[example.com/omlx]")
-        # body truncated to <=300 chars on a word boundary, no raw 350-char run
-        body_line = text.splitlines()[1]
-        assert len(body_line.strip()) <= 300
+        # body truncated to <=700 chars on a word boundary, with a trailing
+        # ellipsis marking the cut
+        body_line = text.splitlines()[1].strip()
+        assert len(body_line) <= 701
+        assert body_line.endswith("…")
 
     def test_prefers_summary_over_snippet(self, monkeypatch):
         monkeypatch.setenv("LANGSEARCH_API_KEY", "test-key")
@@ -382,7 +384,7 @@ class TestWebSearchBraveSuccess:
         results = [
             {
                 "title":       "oMLX Release Notes",
-                "description": "x" * 350,  # forces truncation
+                "description": "x" * 750,  # forces truncation
                 "url":         "https://example.com/omlx",
             }
         ]
@@ -393,10 +395,11 @@ class TestWebSearchBraveSuccess:
         assert result["query"] == "oMLX release notes"
         assert result["result_count"] == 1
         text = result["result_text"]
-        assert text.startswith("• oMLX Release Notes\n  ")
+        assert text.startswith("• oMLX Release Notes — example.com\n  ")
         assert text.endswith("[https://example.com/omlx]")
-        body_line = text.splitlines()[1]
-        assert len(body_line.strip()) <= 300
+        body_line = text.splitlines()[1].strip()
+        assert len(body_line) <= 701
+        assert body_line.endswith("…")
 
     def test_empty_results_returns_success_not_error(self, monkeypatch):
         monkeypatch.setenv("SEARCH_PROVIDER", "brave")
@@ -438,6 +441,168 @@ class TestWebSearchBraveErrors:
         with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
             with pytest.raises(ValueError, match="ERROR: web_search failed —"):
                 asyncio.run(web_search.web_search("q"))
+
+
+# ---------------------------------------------------------------------------
+# search_format — direct unit tests
+# ---------------------------------------------------------------------------
+
+class TestDeriveSourceFromUrl:
+    def test_full_url_with_scheme(self):
+        assert search_format.derive_source_from_url("https://www.ign.com/articles/x") == "ign.com"
+
+    def test_bare_domain_no_scheme(self):
+        assert search_format.derive_source_from_url("example.com/omlx") == "example.com"
+
+    def test_strips_leading_www(self):
+        assert search_format.derive_source_from_url("https://www.example.com/page") == "example.com"
+
+    def test_no_www_left_untouched(self):
+        assert search_format.derive_source_from_url("https://example.com") == "example.com"
+
+
+class TestTruncateSummary:
+    def test_short_summary_unchanged_no_ellipsis(self):
+        assert search_format.truncate_summary("short text", 700) == "short text"
+
+    def test_long_summary_cut_with_ellipsis(self):
+        result = search_format.truncate_summary("word " * 200, 50)
+        assert len(result) <= 51
+        assert result.endswith("…")
+
+    def test_exact_boundary_no_ellipsis(self):
+        text = "x" * 700
+        assert search_format.truncate_summary(text, 700) == text
+
+
+class TestFormatResults:
+    def test_empty_list_returns_empty_string(self):
+        assert search_format.format_results([], per_result_budget=700) == ""
+
+    def test_single_result_derives_source_from_url(self):
+        result = search_format.SearchResult(
+            title="Title", summary="Summary text.", url="https://example.com/page",
+        )
+        text = search_format.format_results([result], per_result_budget=700)
+        assert text == "• Title — example.com\n  Summary text.\n  [https://example.com/page]"
+
+    def test_explicit_source_and_published_at_in_header(self):
+        result = search_format.SearchResult(
+            title="Headline", summary="Body.", url="https://ign.com/x",
+            source="IGN", published_at="2026-07-21",
+        )
+        text = search_format.format_results([result], per_result_budget=700)
+        assert text.startswith("• Headline — IGN — 2026-07-21\n")
+
+    def test_extra_field_appended_after_url_line(self):
+        result = search_format.SearchResult(
+            title="Headline", summary="Body.", url="https://ign.com/x",
+            source="IGN", extra="Full article body excerpt.",
+        )
+        text = search_format.format_results([result], per_result_budget=700)
+        assert text.endswith("[https://ign.com/x]\n  Full article body excerpt.")
+
+    def test_multiple_results_joined_with_blank_line(self):
+        results = [
+            search_format.SearchResult(title="A", summary="a", url="https://a.com"),
+            search_format.SearchResult(title="B", summary="b", url="https://b.com"),
+        ]
+        text = search_format.format_results(results, per_result_budget=700)
+        assert "\n\n" in text
+        assert text.count("•") == 2
+
+
+# ---------------------------------------------------------------------------
+# news_search.news_search — direct unit tests
+# ---------------------------------------------------------------------------
+
+def _newsapi_response(articles: list[dict], total_results: int | None = None, status: str = "ok") -> httpx.Response:
+    request = httpx.Request("GET", news_search._NEWSAPI_ENDPOINT)
+    payload = {
+        "status":       status,
+        "totalResults": total_results if total_results is not None else len(articles),
+        "articles":     articles,
+    }
+    return httpx.Response(200, json=payload, request=request)
+
+
+class TestNewsSearchFormat:
+    def test_header_includes_source_and_date(self, monkeypatch):
+        monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
+        articles = [{
+            "title":       "Apple Vision Pro Gets a Major Update",
+            "description": "A short description.",
+            "source":      {"name": "IGN"},
+            "publishedAt": "2026-07-21T13:45:00Z",
+            "url":         "https://ign.com/articles/vision-pro-update",
+        }]
+        response = _newsapi_response(articles)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(news_search.news_search("vision pro"))
+
+        assert result["is_miss"] is False
+        text = result["result_text"]
+        assert text.startswith("• Apple Vision Pro Gets a Major Update — IGN — 2026-07-21\n")
+        assert text.endswith("[https://ign.com/articles/vision-pro-update]")
+
+    def test_summary_truncated_past_600_chars_with_ellipsis(self, monkeypatch):
+        monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
+        articles = [{
+            "title":       "Long Article",
+            "description": "x" * 650,
+            "source":      {"name": "IGN"},
+            "publishedAt": "2026-07-21T13:45:00Z",
+            "url":         "https://ign.com/x",
+        }]
+        response = _newsapi_response(articles)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(news_search.news_search("long"))
+
+        body_line = result["result_text"].splitlines()[1].strip()
+        assert len(body_line) <= 601
+        assert body_line.endswith("…")
+
+    def test_pinned_article_appends_content_line(self, monkeypatch):
+        monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
+        articles = [{
+            "title":       "Pinned Story",
+            "description": "Short description.",
+            "source":      {"name": "IGN"},
+            "publishedAt": "2026-07-21T13:45:00Z",
+            "url":         "https://ign.com/pinned",
+            "content":     "Full excerpt of the pinned article body.",
+        }]
+        response = _newsapi_response(articles)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(news_search.news_search("pinned story", url="https://ign.com/pinned"))
+
+        text = result["result_text"]
+        assert text.endswith("Full excerpt of the pinned article body.")
+
+    def test_non_pinned_multi_result_has_no_content_line(self, monkeypatch):
+        monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
+        articles = [{
+            "title":       "Story One",
+            "description": "Description one.",
+            "source":      {"name": "IGN"},
+            "publishedAt": "2026-07-21T13:45:00Z",
+            "url":         "https://ign.com/one",
+            "content":     "This should not appear — not pinned.",
+        }]
+        response = _newsapi_response(articles)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(news_search.news_search("story one"))
+
+        assert "This should not appear" not in result["result_text"]
+
+    def test_miss_returns_empty_result_text(self, monkeypatch):
+        monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
+        response = _newsapi_response([], total_results=0)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(news_search.news_search("nothing"))
+
+        assert result["is_miss"] is True
+        assert result["result_text"] == ""
 
 
 # ---------------------------------------------------------------------------

@@ -306,7 +306,7 @@ class TestControllerToolIntegration:
 
     def test_tool_slot_ceiling_enforced(self, mm):
         """
-        Slot 6 must not exceed 500 tokens (2000 chars) in the prompt.
+        Slot 6 must not exceed 1500 tokens (6000 chars) in the prompt.
 
         Mocks the MCP transport seam (see test_slot_order_user_before_tool_results
         above) instead of relying on nothing being reachable on
@@ -322,7 +322,7 @@ class TestControllerToolIntegration:
         async def fake_call_mcp_tool(session, name, arguments):
             return json.dumps({
                 "query":        arguments["query"],
-                "result_text":  "• " + "A" * 3000,  # far exceeds 500-token slot ceiling
+                "result_text":  "• " + "A" * 9000,  # far exceeds 1500-token slot ceiling
                 "result_count": 1,
             }), False
 
@@ -351,7 +351,7 @@ class TestControllerToolIntegration:
             if pos != -1:
                 next_slot = min(next_slot, pos)
         tool_section = prompt[start:next_slot]
-        assert len(tool_section) // 4 <= 505  # 500 + small label tolerance
+        assert len(tool_section) // 4 <= 1505  # 1500 + small label tolerance
 
     def test_tool_dispatch_failure_graceful(self, mm):
         """

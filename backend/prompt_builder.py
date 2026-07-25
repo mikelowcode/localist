@@ -208,7 +208,7 @@ class PromptBuilder:
     _CEIL_EPISODIC: int = 150   # slot 3a; episodic bullets
     _CEIL_PROFILE:  int = 100   # slot 3b; user profile facts
     _CEIL_RAG:      int = 800   # slot 4
-    _CEIL_TOOL:     int = 500   # slot 5
+    _CEIL_TOOL:     int = 1500   # slot 5
     _CEIL_TOOL_FAILURE: int = 150   # slot 5a; own budget — see _slot5a_tool_failures
     _CEIL_GRAPH:    int = 300   # slot 5b
     # Phase A [RELATED CONTEXT] slot — a flat 500-*char* slice, not a token
@@ -471,7 +471,7 @@ class PromptBuilder:
             {tool_name}({parameters}):
               {result}
 
-        The 500-token ceiling is enforced. Each result is truncated to fit
+        The 1500-token ceiling is enforced. Each result is truncated to fit
         within the remaining budget before being appended.
         """
         if not tool_results:

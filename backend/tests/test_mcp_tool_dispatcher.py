@@ -56,6 +56,8 @@ import pytest
 from mcp_tool_dispatcher import (
     MCPToolDispatcher,
     _CHART_RETRY_TEMPERATURE,
+    _ENRICH_EXCERPT_CHARS,
+    _ENRICH_MAX_ATTEMPTS,
     _MAX_RESEARCH_ITERATIONS,
     _RESEARCH_CLASSIFIER_TIMEOUT,
     _RESEARCH_GATE_SYSTEM_PROMPT,
@@ -538,6 +540,244 @@ class TestNewsSearch:
         assert all(not r.success for r in results)
         assert "unreachable" in results[0].result
         assert "unreachable" in results[1].result
+
+
+def _fetch_url_ok(url: str, cleaned_text: str = "Full article body text.") -> tuple[str, bool]:
+    return json.dumps({
+        "url": url, "title": "T", "author": "", "date_published": "",
+        "cleaned_text": cleaned_text, "word_count": len(cleaned_text.split()),
+        "fetch_duration_ms": 1.0,
+    }), False
+
+
+class TestSearchEnrichment:
+    """
+    Coverage for _enrich_top_result and its wiring into _run_web_search /
+    _run_news_search — a follow-up fetch_url call on the top search result's
+    URL, added because Brave's `description` field is a short meta
+    description (not an article summary) that no truncation-cap tuning can
+    lengthen. Silent-fail by design: a blocked/slow enrichment fetch just
+    means no bonus depth, not a [TOOL FAILED] entry.
+    """
+
+    def test_web_search_enrichment_appends_url_fetch_result(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return json.dumps({
+                    "query": arguments["query"],
+                    "result_text": "• Title — example.com\n  Short snippet.\n  [https://example.com/a]",
+                    "result_count": 1,
+                }), False
+            assert name == "fetch_url"
+            assert arguments["url"] == "https://example.com/a"
+            return _fetch_url_ok(arguments["url"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"],
+                instruction   = "what's the latest news",
+                context       = {},
+            )
+
+        assert len(results) == 2
+        assert results[0].tool_name == "web_search"
+        assert results[1].tool_name == "url_fetch"
+        assert results[1].success is True
+        assert "Full article body text." in results[1].result
+        assert results[0].workflow_id is not None
+        assert results[0].workflow_id == results[1].workflow_id
+
+    def test_web_search_no_enrichment_when_no_url_in_result(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            assert name == "web_search"
+            return json.dumps({
+                "query": arguments["query"], "result_text": "• Title — example.com\n  No url here.",
+                "result_count": 1,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"], instruction = "ignored", context = {},
+            )
+
+        assert mock_call.call_count == 1
+        assert len(results) == 1
+        assert results[0].workflow_id is None
+
+    def test_web_search_enrichment_fetch_failure_skips_silently(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return json.dumps({
+                    "query": arguments["query"],
+                    "result_text": "• Title — example.com\n  Short snippet.\n  [https://example.com/a]",
+                    "result_count": 1,
+                }), False
+            assert name == "fetch_url"
+            return "Error executing tool fetch_url: ERROR: connection_error", True
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"], instruction = "ignored", context = {},
+            )
+
+        assert len(results) == 1
+        assert results[0].tool_name == "web_search"
+        assert results[0].success is True
+        assert results[0].workflow_id is None
+
+    def test_web_search_enrichment_falls_through_to_next_url_on_failure(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """A bot-blocked/failed top URL (e.g. a 403 from a news portal's
+        anti-scraping defense) shouldn't cost the whole enrichment when a
+        later URL in the same result is perfectly fetchable."""
+        fetch_attempts: list[str] = []
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return json.dumps({
+                    "query": arguments["query"],
+                    "result_text": (
+                        "• Title — example.com\n  Snippet.\n  [https://example.com/blocked]\n\n"
+                        "• Title 2 — example.com\n  Snippet 2.\n  [https://example.com/ok]"
+                    ),
+                    "result_count": 2,
+                }), False
+            assert name == "fetch_url"
+            fetch_attempts.append(arguments["url"])
+            if arguments["url"] == "https://example.com/blocked":
+                return "Error executing tool fetch_url: ERROR: http_client_error — 403", True
+            return _fetch_url_ok(arguments["url"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"], instruction = "ignored", context = {},
+            )
+
+        assert fetch_attempts == ["https://example.com/blocked", "https://example.com/ok"]
+        assert len(results) == 2
+        assert results[1].tool_name == "url_fetch"
+        assert results[1].success is True
+
+    def test_web_search_enrichment_gives_up_after_max_attempts(self, dispatcher: MCPToolDispatcher):
+        """Bounded retry: even with more candidate URLs available, stop
+        after _ENRICH_MAX_ATTEMPTS failed fetches rather than trying every
+        URL in the result."""
+        fetch_attempts: list[str] = []
+        urls = [f"https://example.com/{i}" for i in range(5)]
+        bullets = "\n\n".join(f"• Title {i} — example.com\n  Snippet.\n  [{u}]" for i, u in enumerate(urls))
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return json.dumps({
+                    "query": arguments["query"], "result_text": bullets, "result_count": 5,
+                }), False
+            assert name == "fetch_url"
+            fetch_attempts.append(arguments["url"])
+            return "Error executing tool fetch_url: ERROR: connection_error", True
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"], instruction = "ignored", context = {},
+            )
+
+        assert len(fetch_attempts) == _ENRICH_MAX_ATTEMPTS
+        assert fetch_attempts == urls[:_ENRICH_MAX_ATTEMPTS]
+        assert len(results) == 1
+
+    def test_web_search_enrichment_excerpt_truncated(self, dispatcher: MCPToolDispatcher):
+        long_text = "word " * 1000  # far exceeds _ENRICH_EXCERPT_CHARS
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return json.dumps({
+                    "query": arguments["query"],
+                    "result_text": "• Title — example.com\n  Short snippet.\n  [https://example.com/a]",
+                    "result_count": 1,
+                }), False
+            assert name == "fetch_url"
+            return _fetch_url_ok(arguments["url"], cleaned_text=long_text)
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"], instruction = "ignored", context = {},
+            )
+
+        assert len(results) == 2
+        assert results[1].result.endswith("…")
+        assert len(results[1].result) <= _ENRICH_EXCERPT_CHARS + 1
+
+    def test_web_search_tried_urls_dedup_across_queries(self, dispatcher: MCPToolDispatcher):
+        fetch_calls: list[str] = []
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return json.dumps({
+                    "query": arguments["query"],
+                    "result_text": "• Title — example.com\n  Snippet.\n  [https://example.com/same]",
+                    "result_count": 1,
+                }), False
+            assert name == "fetch_url"
+            fetch_calls.append(arguments["url"])
+            return _fetch_url_ok(arguments["url"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"],
+                instruction   = "ignored",
+                context       = {"web_search_queries": ["query one", "query two"]},
+            )
+
+        assert fetch_calls == ["https://example.com/same"]
+        assert len(results) == 3  # 2 search results + exactly 1 enrichment
+
+    def test_news_search_tier1_success_enrichment_appended(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            if name == "news_search":
+                return json.dumps({
+                    "query": arguments["query"],
+                    "result_text": "• Headline — IGN — 2026-07-21\n  Short.\n  [https://ign.com/a]",
+                    "result_count": 1, "is_miss": False,
+                }), False
+            assert name == "fetch_url"
+            return _fetch_url_ok(arguments["url"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["news_search"], instruction = "latest apple news", context = {},
+            )
+
+        assert len(results) == 2
+        assert results[0].tool_name == "news_search"
+        assert results[1].tool_name == "url_fetch"
+        assert results[0].workflow_id == results[1].workflow_id
+
+    def test_news_search_brave_fallback_tier_enriched_not_tier1(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            if name == "news_search":
+                return json.dumps({
+                    "query": arguments["query"], "result_text": "", "result_count": 0, "is_miss": True,
+                }), False
+            if name == "web_search":
+                return json.dumps({
+                    "query": arguments["query"],
+                    "result_text": "• Title — example.com\n  Snippet.\n  [https://example.com/b]",
+                    "result_count": 1,
+                }), False
+            assert name == "fetch_url"
+            return _fetch_url_ok(arguments["url"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["news_search"], instruction = "latest apple news", context = {},
+            )
+
+        assert len(results) == 3
+        assert results[0].tool_name == "news_search"
+        assert results[0].workflow_id is not None  # stamped even on the failed tier-1 attempt
+        assert results[1].tool_name == "news_search:brave_fallback"
+        assert results[2].tool_name == "url_fetch"
+        assert results[0].workflow_id == results[1].workflow_id == results[2].workflow_id
 
 
 class TestChart:

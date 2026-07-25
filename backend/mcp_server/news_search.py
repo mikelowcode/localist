@@ -29,10 +29,14 @@ import os
 
 import httpx
 
+from mcp_server import search_format
+
 logger = logging.getLogger(__name__)
 
 _NEWSAPI_ENDPOINT: str = "https://newsapi.org/v2/everything"
 _NEWSAPI_PAGE_SIZE: int = 5
+_NEWSAPI_SUMMARY_CHARS: int = 600
+_NEWSAPI_CONTENT_CHARS: int = 500
 
 
 async def news_search(query: str, url: str | None = None) -> dict:
@@ -116,26 +120,35 @@ async def news_search(query: str, url: str | None = None) -> dict:
             articles = matched
             pinned = True
 
-    lines: list[str] = []
+    results: list[search_format.SearchResult] = []
     for article in articles[:_NEWSAPI_PAGE_SIZE]:
         title        = article.get("title", "").strip()
         description  = (article.get("description") or "").strip()
         source_name  = article.get("source", {}).get("name", "").strip()
-        published_at = article.get("publishedAt", "").strip()
+        published_at = article.get("publishedAt", "").strip().split("T", 1)[0]
         article_url  = article.get("url", "").strip()
-        # Truncate body to keep Slot 6 within budget, same convention as web_search.
-        description  = description[:300].rsplit(" ", 1)[0] if len(description) > 300 else description
-        line = f"• {title}\n  {description}\n  [{source_name}] {published_at}\n  {article_url}"
+
+        # `content` is NewsAPI's own short body snippet (also truncated on
+        # the dev tier) — surfaced only in the pinned single-article case
+        # so the multi-result formatting other callers rely on is unchanged.
+        extra = None
         if pinned:
-            # `content` is NewsAPI's own short body snippet (also truncated on
-            # the dev tier) — surfaced only in the pinned single-article case
-            # so the multi-result formatting other callers rely on is unchanged.
             content = (article.get("content") or "").strip()
             if content:
-                line += f"\n  {content}"
-        lines.append(line)
+                extra = search_format.truncate_summary(content, _NEWSAPI_CONTENT_CHARS)
 
-    result_text = "\n\n".join(lines)
+        results.append(search_format.SearchResult(
+            title=title,
+            summary=description,
+            url=article_url,
+            source=source_name or None,
+            published_at=published_at or None,
+            extra=extra,
+        ))
+
+    result_text = search_format.format_results(
+        results, per_result_budget=_NEWSAPI_SUMMARY_CHARS
+    )
     logger.info(
         "news_search: NewsAPI complete for query=%r results=%d result_chars=%d.",
         query, len(articles), len(result_text),

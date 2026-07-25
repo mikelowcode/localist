@@ -94,9 +94,48 @@ Each provider's request/response contract:
   params `{q: query, count: 3}`; parses `web.results[]`, using `title`,
   `description`, `url`.
 
-Both providers format their up-to-3 results identically — `"•
-{title}\n  {body}\n  [{url}]"` joined with `"\n\n"`, body truncated to 300
-chars on a word boundary — and return the same `"No results found."` /
+**Result formatting (updated 2026-07-25 — shared structured formatter).**
+Both `web_search` providers and `news_search` build their `result_text` via
+one shared module, `mcp_server/search_format.py`, rather than each
+hand-rolling its own bullet string. `search_format.format_results()` renders
+a deterministic `Title — Source[ — Date]` header line followed by the
+summary and a bracketed URL line, per result, joined with `"\n\n"`:
+
+```
+• {title} — {source}[ — {published_at}]
+  {summary}
+  [{url}]
+```
+
+`source` is the provider's own publisher name when it has one (NewsAPI's
+`source.name`); LangSearch and Brave have no such field, so
+`search_format.derive_source_from_url()` extracts a domain from the result's
+URL instead (`www.` stripped). Per-result summaries are truncated at a
+word boundary by `search_format.truncate_summary()`, which appends a single
+`"…"` only when it actually cuts something — distinct from
+`PromptBuilder`'s own `"… [truncated]"` marker, which signals a different,
+stronger condition (the *entire* result was cut, not just one summary).
+
+Per-tool summary-length caps (raised from a flat 300 chars for all three,
+which was producing shallow, mid-sentence-truncated results before they even
+reached Slot 5's own budget):
+
+| Tool | Summary cap | Result count |
+|---|---|---|
+| `web_search` (LangSearch) | `_LANGSEARCH_SUMMARY_CHARS = 700` | top 3 |
+| `web_search` (Brave) | `_BRAVE_SUMMARY_CHARS = 700` | top 3 |
+| `news_search` (NewsAPI) | `_NEWSAPI_SUMMARY_CHARS = 600` | top 5 |
+
+These are fixed per-tool constants rather than a dynamic
+total-budget-divided-by-result-count split — a single tool invocation can't
+see sibling tool calls in the same turn (`web_search` may run up to
+`_MAX_WEB_QUERIES = 3` times per turn; `news_search` can produce a tier-1 +
+`brave_fallback` pair). `PromptBuilder._slot5_tools()`'s own 1,500-token
+ceiling (§3, Slot 5) is the only place that sees every `ToolResult` for a
+turn at once, and its existing `"… [truncated]"` second pass remains the
+real backstop regardless of these per-tool caps.
+
+All three tools still return the same `"No results found."` /
 `result_count: 0` shape when the provider returns zero results, so
 `result_text`'s shape at every downstream consumer (`MCPToolDispatcher`,
 Slot 5) is identical regardless of which provider is active.
@@ -136,6 +175,30 @@ Phase 1. Internally:
   if present, else derived from the instruction by stripping known filler
   prefixes (`"what is the "`, `"search for "`, etc.) and taking the first
   120 characters. Calls `web_search` once per resolved query, up to 3.
+  **Enrichment (2026-07-25, `_enrich_top_result()`):** each query's
+  successful result gets one follow-up `fetch_url` call on a URL found in
+  its result text — added because raising `_CEIL_TOOL`/each provider's
+  summary cap (§14.2) fixed artificial truncation but not Brave's
+  inherently short `description` field (a meta-description snippet, not
+  an article summary). Silent-fail by design: unlike
+  `_run_research_loop`'s candidate fetch (whose failure is itself
+  diagnostic for the pricing gate), a blocked/slow/paywalled enrichment
+  fetch here just means no bonus depth — nothing is appended, no
+  `[TOOL FAILED]` entry. Live testing the same day found a top result
+  whose top URL was bot-blocked (HTTP 403 from a news portal's
+  anti-scraping defense), costing the whole enrichment even though other
+  URLs in the same result fetched fine — `_enrich_top_result()` now tries
+  up to `_ENRICH_MAX_ATTEMPTS = 3` candidate URLs, in result order, before
+  giving up. The fetched excerpt is capped at `_ENRICH_EXCERPT_CHARS =
+  2000` chars so one article can't dominate Slot 5's shared budget. `news_search` gets the same treatment on whichever
+  tier actually succeeds (§14.9/§14.10) — never both tiers, since a
+  tier-1 success means the Brave fallback never runs. A `workflow_id` is
+  stamped across the search + enrichment results (same mechanism
+  `_run_research_loop` uses for its step-chain), but only when an
+  enrichment actually happened — a plain, un-enriched search stays a
+  single unwrapped `ToolResult` as before. No feature flag: unlike the
+  research loop, this has no inference cost, just one bounded (10s
+  default timeout) network call.
 - **Any other tool name** — Planner never routes `tools_to_call` to
   anything but the three above (see §4.2's priority tree), so this is an
   unreachable-in-practice defensive path. Produces an inline
@@ -1005,4 +1068,10 @@ regressions. A standalone script exercised the new logic directly against a mock
 pinned-with-match filters to one article and includes `content`; pinned-with-no-match falls back to the
 unfiltered top-5 with no `content`; unpinned calls are identical to pre-change output. Live NewsAPI
 verification not yet performed.
+
+**Update (2026-07-25):** the pinned `content` field now goes through
+`search_format.truncate_summary()` capped at `_NEWSAPI_CONTENT_CHARS = 500`
+before being attached as `SearchResult.extra` — see §14.2's result-formatting
+update. Previously unbounded (subject only to NewsAPI dev-tier's own
+truncation and Slot 5's now-larger 1,500-token ceiling).
 

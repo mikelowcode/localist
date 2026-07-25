@@ -147,6 +147,18 @@ _MAX_WEB_QUERIES: int = 3
 # search provider is a cost and latency risk, not just a correctness one.
 _MAX_RESEARCH_ITERATIONS: int = 3
 
+# Cap on one enrichment fetch_url's contribution to Slot 5's shared token
+# budget (see _enrich_top_result) — a full article's cleaned_text could
+# otherwise dominate the whole [TOOL RESULTS] block on its own.
+_ENRICH_EXCERPT_CHARS: int = 2000
+
+# 2026-07-25: live testing showed a top search result whose top URL was
+# bot-blocked (HTTP 403 from a news portal's anti-scraping defense) meant
+# zero enrichment for that turn, even though the same result had other,
+# perfectly fetchable URLs a few lines below. _enrich_top_result now tries
+# up to this many candidate URLs (in result order) before giving up.
+_ENRICH_MAX_ATTEMPTS: int = 3
+
 # Chart argument extraction — matches diag_shadow_chart_toolcall_v4_full.py's
 # measured pipeline exactly. _CHART_RETRY_TEMPERATURE is a second,
 # independent inference sample on a MALFORMED_ENVELOPE first pass, not a
@@ -598,6 +610,63 @@ class MCPToolDispatcher:
     # web_search — served by localist-mcp
     # -----------------------------------------------------------------------
 
+    async def _enrich_top_result(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        search_result: ToolResult,
+        tried_urls:    set[str],
+    ) -> ToolResult | None:
+        """
+        Best-effort depth boost for one successful web_search/news_search
+        result: follow up with a single fetch_url call on the first URL
+        found in its result text, so the model gets real article text
+        instead of relying solely on the search provider's own short
+        snippet (Brave's `description` in particular is a short meta
+        description, not a summary — no truncation-cap tuning can lengthen
+        it, only a real fetch can).
+
+        Silent-fail by design — unlike _run_research_loop's candidate
+        fetch (whose failure is itself diagnostic information for the
+        pricing gate), a blocked/slow/paywalled fetch here just means no
+        bonus depth this round: the search snippet already grounds the
+        answer, so there's nothing for the model to hedge against. Tries
+        up to _ENRICH_MAX_ATTEMPTS candidate URLs, in result order, before
+        giving up entirely — a single bot-blocked/timed-out URL (news
+        portals routinely 403 non-browser fetches) shouldn't cost the
+        whole enrichment when other, perfectly fetchable URLs are sitting
+        right below it in the same result. Returns None (nothing to
+        append) when there's no URL left to try, the search itself didn't
+        succeed, or every candidate's fetch failed.
+        """
+        if not search_result.success:
+            return None
+
+        for _ in range(_ENRICH_MAX_ATTEMPTS):
+            url = self._extract_first_url(search_result.result, tried_urls)
+            if not url:
+                return None
+            tried_urls.add(url)
+
+            fetch_result = await self._run_url_fetch(
+                session, connect_error, "", {"fetch_url": url}
+            )
+            if not fetch_result.success:
+                logger.info(
+                    "MCPToolDispatcher: enrichment fetch failed for url=%r — "
+                    "trying next candidate, if any (%s).",
+                    url, fetch_result.result,
+                )
+                continue
+
+            if len(fetch_result.result) > _ENRICH_EXCERPT_CHARS:
+                excerpt = fetch_result.result[:_ENRICH_EXCERPT_CHARS].rsplit(" ", 1)[0] + "…"
+                fetch_result = replace(fetch_result, result=excerpt)
+
+            return fetch_result
+
+        return None
+
     async def _run_web_search(
         self,
         session:       ClientSession | None,
@@ -613,6 +682,16 @@ class MCPToolDispatcher:
           1. context["web_search_queries"] — explicit list (max 3 used)
           2. Derive a single query from the instruction by stripping known
              filler phrases and taking the first 120 characters.
+
+        Each query's search result that succeeds and contains a URL gets
+        one follow-up fetch_url enrichment (see _enrich_top_result).
+        tried_urls is shared across every query in this call so two
+        similar queries surfacing the same top hit don't fetch it twice.
+        A workflow_id is stamped across every result in this call, but
+        only when at least one enrichment actually happened — a plain,
+        un-enriched search stays a single unwrapped ToolResult exactly as
+        before, so the Episode Browsing UI's step-chain view only appears
+        when there's a real multi-step chain to show.
         """
         raw_queries: list[str] = context.get("web_search_queries") or []
 
@@ -625,10 +704,20 @@ class MCPToolDispatcher:
             raw_queries = [derived[:120]]
 
         queries = raw_queries[:_MAX_WEB_QUERIES]
-        return [
-            await self._execute_web_search_query(session, connect_error, query)
-            for query in queries
-        ]
+        tried_urls: set[str] = set()
+        results: list[ToolResult] = []
+        for query in queries:
+            search_result = await self._execute_web_search_query(session, connect_error, query)
+            results.append(search_result)
+            enrichment = await self._enrich_top_result(session, connect_error, search_result, tried_urls)
+            if enrichment is not None:
+                results.append(enrichment)
+
+        if len(results) > len(queries):
+            workflow_id = str(uuid.uuid4())
+            results = [replace(r, workflow_id=workflow_id) for r in results]
+
+        return results
 
     async def _execute_web_search_query(
         self,
@@ -710,13 +799,29 @@ class MCPToolDispatcher:
         _run_research_loop's "return every ToolResult produced, not just
         the winning one" convention so Slot 5 and controller_agent.py's
         Step 3b corpus fallback see the full picture.
+
+        Whichever tier actually succeeds gets one follow-up fetch_url
+        enrichment (see _enrich_top_result) — never both, since a tier-1
+        success means tier 2 never runs. This also transparently benefits
+        the §14.10 URL-pinning case (Live Feed "Ask about this"): the
+        pinned article's own URL is already in news_result.result, so
+        enrichment fetches that same article's full text on top of
+        NewsAPI's own short `content` field.
         """
         query = self._derive_initial_query(instruction, context)
         article_url = context.get("news_article_url") or None
         news_result = await self._execute_news_search_query(session, connect_error, query, article_url)
+        tried_urls: set[str] = set()
+        results: list[ToolResult] = [news_result]
 
         if news_result.success:
-            return [news_result]
+            enrichment = await self._enrich_top_result(session, connect_error, news_result, tried_urls)
+            if enrichment is not None:
+                results.append(enrichment)
+            if len(results) > 1:
+                workflow_id = str(uuid.uuid4())
+                results = [replace(r, workflow_id=workflow_id) for r in results]
+            return results
 
         logger.info(
             "MCPToolDispatcher: news_search miss/failure for query=%r — "
@@ -728,8 +833,17 @@ class MCPToolDispatcher:
         # controller_agent.py matches on tool_name.startswith("news_search"),
         # so this stays visible to it even after the rename.
         brave_result = replace(brave_result, tool_name="news_search:brave_fallback")
+        results.append(brave_result)
 
-        return [news_result, brave_result]
+        enrichment = await self._enrich_top_result(session, connect_error, brave_result, tried_urls)
+        if enrichment is not None:
+            results.append(enrichment)
+
+        if len(results) > 2:
+            workflow_id = str(uuid.uuid4())
+            results = [replace(r, workflow_id=workflow_id) for r in results]
+
+        return results
 
     async def _execute_news_search_query(
         self,

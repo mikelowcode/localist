@@ -316,7 +316,7 @@ Source: wiki/WikiAgent Architecture.md
 **Purpose:** Fresh, request-specific evidence from tool calls made during
 this request's routing phase.
 
-**Token ceiling:** 500 tokens (hard limit)
+**Token ceiling:** 1,500 tokens (hard limit)
 
 **Format:**
 ```
@@ -331,7 +331,11 @@ this request's routing phase.
 - The `[TOOL RESULTS]` label is mandatory. Tool name and call parameters
   are mandatory for auditability.
 - `url_fetch` results include title, source URL, word count, and full
-  extracted text. PromptBuilder enforces the 500-token ceiling.
+  extracted text. PromptBuilder enforces the 1,500-token ceiling.
+- `web_search`/`news_search` results arrive pre-formatted as deterministic
+  `Title — Source — Summary` bullets (built by `mcp_server/search_format.py`,
+  shared across both tools) — see §14 for the per-tool summary-length caps
+  that feed into this slot's shared budget.
 
 ---
 
@@ -576,20 +580,26 @@ Turn -1 [assistant]: {most recent prior assistant response}
 | 3a — Episodic memory | `[EPISODIC MEMORY]` | 150 | Conditional | User |
 | 3b — User profile | `[USER PROFILE]` | 100 | Conditional | User |
 | 4 — RAG snippets | `[CONTEXT]` | 800 | Conditional | User |
-| 5 — Tool results | `[TOOL RESULTS]` | 500 | Conditional | User |
+| 5 — Tool results | `[TOOL RESULTS]` | 1,500 | Conditional | User |
 | 5b — Graph result | `[GRAPH RESULT]` | 300 | Conditional | User |
 | 6A — Working state | `[WORKING STATE]` | 100 | Conditional | User |
 | 6 — Working memory | `[WORKING MEMORY]` | 300 | Conditional | User |
 | 7 — Instruction | `[INSTRUCTION]` | Uncapped | Always | User |
-| **Worst-case total** | | **~2,850** | | |
+| **Worst-case total** | | **~3,850** | | |
 
 Slot numbers 2 and the old Slot 2 label `[USER]` are retired. The gap
 between 1b and 3 is intentional: slot numbering reflects cognitive role
 and stability rank, not sequential position in the output string.
 
 Gemma 4B quantized has an effective context window of approximately 8,000
-tokens. The prompt contract consumes under 2,000 tokens in the worst case,
+tokens. The prompt contract consumes under 4,000 tokens in the worst case,
 leaving substantial headroom for model output.
+
+`_CEIL_TOOL` was raised from 500 to 1,500 tokens (2026-07-25) — search-shaped
+tool results (`web_search`, `news_search`) were landing shallow and
+mid-sentence-truncated at the old ceiling on top of each provider's own
+300-char-per-summary cut. See §14's search-result formatting for the
+corresponding per-result summary caps.
 
 ### 3.4 PromptBuilder Interface
 

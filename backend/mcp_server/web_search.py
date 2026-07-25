@@ -34,13 +34,17 @@ import os
 
 import httpx
 
+from mcp_server import search_format
+
 logger = logging.getLogger(__name__)
 
 _LANGSEARCH_ENDPOINT: str = "https://api.langsearch.com/v1/web-search"
 _LANGSEARCH_COUNT: int = 3
+_LANGSEARCH_SUMMARY_CHARS: int = 700
 
 _BRAVE_ENDPOINT: str = "https://api.search.brave.com/res/v1/web/search"
 _BRAVE_COUNT: int = 3
+_BRAVE_SUMMARY_CHARS: int = 700
 
 
 async def _web_search_langsearch(query: str) -> dict:
@@ -84,18 +88,18 @@ async def _web_search_langsearch(query: str) -> dict:
     if not pages:
         return {"query": query, "result_text": "No results found.", "result_count": 0}
 
-    lines: list[str] = []
+    results: list[search_format.SearchResult] = []
     for page in pages[:_LANGSEARCH_COUNT]:
         name    = page.get("name", "").strip()
         snippet = page.get("snippet", "").strip()
         url     = page.get("displayUrl", page.get("url", "")).strip()
         # Prefer summary over snippet when available
         body    = page.get("summary") or snippet
-        # Truncate body to keep Slot 6 within budget
-        body    = body[:300].rsplit(" ", 1)[0] if len(body) > 300 else body
-        lines.append(f"• {name}\n  {body}\n  [{url}]")
+        results.append(search_format.SearchResult(title=name, summary=body, url=url))
 
-    result_text = "\n\n".join(lines)
+    result_text = search_format.format_results(
+        results, per_result_budget=_LANGSEARCH_SUMMARY_CHARS
+    )
     logger.info(
         "web_search: LangSearch complete for query=%r results=%d result_chars=%d.",
         query, len(pages), len(result_text),
@@ -142,16 +146,16 @@ async def _web_search_brave(query: str) -> dict:
     if not results:
         return {"query": query, "result_text": "No results found.", "result_count": 0}
 
-    lines: list[str] = []
+    search_results: list[search_format.SearchResult] = []
     for result in results[:_BRAVE_COUNT]:
         title = result.get("title", "").strip()
         body  = result.get("description", "").strip()
         url   = result.get("url", "").strip()
-        # Truncate body to keep Slot 6 within budget
-        body  = body[:300].rsplit(" ", 1)[0] if len(body) > 300 else body
-        lines.append(f"• {title}\n  {body}\n  [{url}]")
+        search_results.append(search_format.SearchResult(title=title, summary=body, url=url))
 
-    result_text = "\n\n".join(lines)
+    result_text = search_format.format_results(
+        search_results, per_result_budget=_BRAVE_SUMMARY_CHARS
+    )
     logger.info(
         "web_search: Brave complete for query=%r results=%d result_chars=%d.",
         query, len(results), len(result_text),
