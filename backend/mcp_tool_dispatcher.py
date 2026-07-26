@@ -150,7 +150,7 @@ _MAX_RESEARCH_ITERATIONS: int = 3
 # Cap on one enrichment fetch_url's contribution to Slot 5's shared token
 # budget (see _enrich_top_result) — a full article's cleaned_text could
 # otherwise dominate the whole [TOOL RESULTS] block on its own.
-_ENRICH_EXCERPT_CHARS: int = 2000
+_ENRICH_EXCERPT_CHARS: int = 3000
 
 # 2026-07-25: live testing showed a top search result whose top URL was
 # bot-blocked (HTTP 403 from a news portal's anti-scraping defense) meant

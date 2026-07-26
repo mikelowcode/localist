@@ -190,7 +190,10 @@ Phase 1. Internally:
   URLs in the same result fetched fine — `_enrich_top_result()` now tries
   up to `_ENRICH_MAX_ATTEMPTS = 3` candidate URLs, in result order, before
   giving up. The fetched excerpt is capped at `_ENRICH_EXCERPT_CHARS =
-  2000` chars so one article can't dominate Slot 5's shared budget. `news_search` gets the same treatment on whichever
+  3000` chars (raised from 2000 the same day — live testing showed the cap
+  was landing mid-paragraph on real articles, at times before a later
+  paragraph with real added information) so one article can't dominate
+  Slot 5's shared budget. `news_search` gets the same treatment on whichever
   tier actually succeeds (§14.9/§14.10) — never both tiers, since a
   tier-1 success means the Brave fallback never runs. A `workflow_id` is
   stamped across the search + enrichment results (same mechanism
