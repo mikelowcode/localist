@@ -48,17 +48,23 @@ Configuration
                                ever deployed off a single local machine.
   GITHUB_TOKEN                 Optional for github_search / github_read —
                                see mcp_server/github.py. Both are
-                               public-repo GitHub REST reads that work
-                               unauthenticated (60 req/hr) or authenticated
-                               (5000 req/hr); the token is used
-                               opportunistically if present. Also read by
-                               backend/github_watch.py in the main backend
-                               process, where it is required (not optional)
-                               — GET /user/subscriptions needs an
-                               authenticated identity. A fine-grained PAT
-                               with no repository permissions selected is
-                               sufficient for all of this (public data
-                               only).
+                               public-repo GitHub REST reads; the token is
+                               used opportunistically if present. Rate
+                               limits differ by endpoint: github_read
+                               (core REST bucket) gets 60 req/hr
+                               unauthenticated vs 5000 req/hr authenticated;
+                               github_search (Search API's separate,
+                               stricter bucket) gets 10 req/min
+                               unauthenticated vs 30 req/min authenticated.
+                               Also read by backend/github_watch.py in the
+                               main backend process, where it is required
+                               (not optional) — GET /user/subscriptions
+                               needs an authenticated identity. A classic
+                               PAT with no scopes selected is sufficient
+                               for all of this (public data only) — a
+                               fine-grained PAT cannot call
+                               GET /user/subscriptions at all (no
+                               corresponding account permission exists).
 
 Start
 -----

@@ -7,14 +7,21 @@ nothing ever written back to GitHub) and never touch archive/zip endpoints
 or shell out to `git`/`gh` — no download, no CLI capability, by design.
 
 GITHUB_TOKEN is optional here (unlike NEWSAPI_API_KEY/LANGSEARCH_API_KEY,
-which hard-fail when unset) — both endpoints below are public data that
-GitHub's REST API serves unauthenticated at 60 req/hr, or authenticated at
-5000 req/hr. The token is used opportunistically when present rather than
-required, since these tools have no need to act as a specific identity
-(contrast backend/github_watch.py's watch-feed fetch, which does need one
-and hard-fails without a token). Read lazily on every call, same reasoning
-as every other mcp_server tool: this process does not inherit
+which hard-fail when unset) — both endpoints below are public data, and
+the token is used opportunistically when present rather than required,
+since these tools have no need to act as a specific identity (contrast
+backend/github_watch.py's watch-feed fetch, which does need one and
+hard-fails without a token). Read lazily on every call, same reasoning as
+every other mcp_server tool: this process does not inherit
 backend/main.py's own load_dotenv() call.
+
+Rate limits differ by endpoint, confirmed live via response headers —
+don't assume one figure covers both tools:
+  - github_read (Contents API) uses GitHub's general "core" REST bucket:
+    60 req/hr unauthenticated, 5000 req/hr authenticated.
+  - github_search (Search API) uses a separate, much stricter bucket:
+    10 req/min unauthenticated, 30 req/min authenticated — not the core
+    figure above. The token still helps (3x), just far less dramatically.
 """
 
 from __future__ import annotations

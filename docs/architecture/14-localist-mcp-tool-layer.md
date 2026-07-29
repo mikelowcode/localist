@@ -297,12 +297,17 @@ NEWSAPI_API_KEY              Required for news_search (§14.9). Free
 
 GITHUB_TOKEN                 Optional for github_search/github_read
                               (§14.11) — both are public-repo GitHub REST
-                              reads that work unauthenticated (60 req/hr)
-                              or authenticated (5000 req/hr); used
-                              opportunistically when present. Also read
-                              by backend/github_watch.py in the main
-                              backend process (§7.20), where it is
-                              required, not optional.
+                              reads, used opportunistically when present.
+                              Rate limits differ by endpoint (confirmed
+                              live via response headers, §14.11):
+                              github_read uses GitHub's core REST bucket
+                              (60 req/hr unauth / 5000 req/hr auth);
+                              github_search uses the Search API's separate,
+                              much stricter bucket (10 req/min unauth /
+                              30 req/min auth). Also read by
+                              backend/github_watch.py in the main backend
+                              process (§7.20), where it is required, not
+                              optional.
 
 LOCALIST_LOG_LEVEL           localist-mcp's root log level. Default: INFO.
 ```
@@ -1111,12 +1116,19 @@ consequence of scope-creep avoidance after the fact.
 
 **`GITHUB_TOKEN` is optional here** — the one deliberate asymmetry versus every other tool in this file,
 which all hard-fail on a missing key (§4.6.1's no-inference-fallback contract still applies to genuine
-failures; this is about whether a key is *required at all*). Both tools are public GitHub REST reads that
-work unauthenticated (60 req/hr) or authenticated (5000 req/hr) — the token is used opportunistically via
-an `Authorization: Bearer` header when present, omitted otherwise. Contrast `github_watch.py`'s watch feed
-(§7.20), which hard-requires the token: `GET /user/subscriptions` needs an authenticated identity to know
-*whose* watch list to return, and there's no equivalent anonymous call the way there is for public repo
-search/content reads.
+failures; this is about whether a key is *required at all*). Both tools are public GitHub REST reads; the
+token is used opportunistically via an `Authorization: Bearer` header when present, omitted otherwise.
+Contrast `github_watch.py`'s watch feed (§7.20), which hard-requires the token: `GET /user/subscriptions`
+needs an authenticated identity to know *whose* watch list to return, and there's no equivalent anonymous
+call the way there is for public repo search/content reads.
+
+**Rate limits are not uniform across the two tools** — confirmed live via response headers after the user
+added a real token (2026-07-29), not assumed from GitHub's general docs alone. `github_read`'s Contents
+API calls land in GitHub's general "core" REST bucket: `X-RateLimit-Resource: core`, `X-RateLimit-Limit:
+5000` once authenticated (60 unauthenticated). `github_search`'s calls land in a separate, much stricter
+bucket: `X-RateLimit-Resource: search`, `X-RateLimit-Limit: 30` **per minute** once authenticated (10/min
+unauthenticated) — not the core figure. The token still meaningfully helps `github_search` (3x), just far
+less dramatically than the "5000/hr" figure might suggest if read as applying to both tools uniformly.
 
 **`github_search(query: str, kind: str = "repositories") -> dict`.** Calls GitHub's Search API
 (`/search/repositories` or `/search/code`, selected by `kind`), builds `search_format.SearchResult`
