@@ -333,6 +333,22 @@ _NEWS_KEYWORDS: frozenset[str] = frozenset({
     "top stories",
 })
 
+# Priority 3-github — github_search trigger keywords (checked alongside
+# _NEWS_KEYWORDS, before P3, so a github match wins over the generic
+# web_search-only P3 branch — same rationale as _NEWS_KEYWORDS above).
+# Deterministic keyword set only, same as news — no semantic secondary
+# signal here either.
+_GITHUB_KEYWORDS: frozenset[str] = frozenset({
+    "github",
+    "repo",
+    "repository",
+    "repositories",
+    "pull request",
+    "readme",
+    "github issue",
+    "github repo",
+})
+
 # Priority 3 — explicit-date web search signal, independent of both
 # _WEB_SEARCH_KEYWORDS and _SEMANTIC_GATE_THRESHOLDS. A query that names a
 # specific calendar date (month + year, with or without a day) is a
@@ -1060,6 +1076,7 @@ class Planner:
     # Class-level aliases so callers can access via instance (e.g. p._WEB_SEARCH_KEYWORDS)
     _WEB_SEARCH_KEYWORDS:    frozenset[str]    = _WEB_SEARCH_KEYWORDS
     _NEWS_KEYWORDS:          frozenset[str]    = _NEWS_KEYWORDS
+    _GITHUB_KEYWORDS:        frozenset[str]    = _GITHUB_KEYWORDS
     _FILE_OP_KEYWORDS:       frozenset[str]    = _FILE_OP_KEYWORDS
     _CHART_KEYWORDS:         frozenset[str]    = _CHART_KEYWORDS
     _GATE1_ENV_VAR:          str               = _GATE1_ENV_VAR
@@ -1376,6 +1393,14 @@ class Planner:
         # uses). Must NOT run before P3c or P1/P2 — same ordering rule P3c
         # already documents relative to P3.
         plan = self._priority3_news(instruction, lowered)
+        if plan is not None:
+            return plan
+
+        # Priority 3-github — GitHub query (same tier as Priority 3-news;
+        # ordering between the two doesn't matter since they gate on
+        # disjoint keyword sets — both must stay before generic P3 and
+        # after P3c, same as P3-news documents above).
+        plan = self._priority3_github(instruction, lowered)
         if plan is not None:
             return plan
 
@@ -2155,6 +2180,59 @@ class Planner:
             fetch_episodic     = False,
             fetch_rag          = False,
             tools_to_call      = ["news_search"],
+            compound           = True,
+            priority           = 3,
+            tool_signal_source = "keyword",
+        )
+
+    def _priority3_github(self, instruction: str, lowered: str) -> RoutingPlan | None:
+        """
+        Priority 3-github — GitHub query ("github", "repo", "readme",
+        "pull request", etc.). Same tier as Priority 3-news — wins over a
+        web_search-only P3 match, loses to P3c graph-query and to P1/P2
+        (handled by route()'s call order, not here).
+
+        Deterministic keyword match only — see _GITHUB_KEYWORDS'
+        module-level comment.
+
+        Returns None (deferring to normal priority evaluation) if:
+          - file_op or url_fetch keywords/a raw URL are present (inline
+            guard, same pattern P3-news/P3c use — an explicit "fetch this
+            URL" or "read the file" instruction should never get hijacked
+            into a github_search), OR
+          - no _GITHUB_KEYWORDS match is present.
+
+        On match, returns a RoutingPlan routing to github_search only —
+        github_read is never scheduled here; it's reached only when a
+        caller supplies context["github_repo"] directly (same
+        caller-supplied-pin convention as news_search's
+        context["news_article_url"] — see MCPToolDispatcher._run_github_read),
+        not via a keyword gate.
+        """
+        # 1. Inline file_op/url_fetch guard — duplicates _priority3_tool()'s
+        #    file_op/url_fetch detection, same deliberate duplication
+        #    P3c/P3-news already use. Keep in sync with all three copies
+        #    if any of them changes.
+        if (
+            self._any_whole_word(_FILE_OP_KEYWORDS, lowered)
+            or any(p.search(instruction) for p in _FILE_OP_PATH_PATTERNS)
+            or self._any_whole_word(_FETCH_KEYWORDS, lowered)
+            or re.search(r"https?://", lowered)
+        ):
+            return None
+
+        # 2. GitHub keyword match.
+        github_kw = self._any_whole_word(_GITHUB_KEYWORDS, lowered)
+        if not github_kw:
+            return None
+
+        logger.debug("Planner: Priority 3-github — github_search signal detected (%r).", github_kw)
+
+        return RoutingPlan(
+            agent              = "conversational_agent",
+            fetch_episodic     = False,
+            fetch_rag          = False,
+            tools_to_call      = ["github_search"],
             compound           = True,
             priority           = 3,
             tool_signal_source = "keyword",

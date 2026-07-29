@@ -542,6 +542,175 @@ class TestNewsSearch:
         assert "unreachable" in results[1].result
 
 
+class TestGithubSearch:
+    """
+    github_search: single query, no fallback tier (see
+    _run_github_search's docstring) — a miss or tool-level error both just
+    produce one success=False ToolResult, unlike news_search's two-tier
+    fallback chain.
+    """
+
+    def test_success_returns_single_result(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            assert name == "github_search"
+            assert arguments["kind"] == "repositories"
+            return json.dumps({
+                "query": arguments["query"], "result_text": "• o/r — GitHub\n  ...",
+                "result_count": 1, "is_miss": False,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_search"],
+                instruction   = "look up the FastAPI github repo",
+                context       = {},
+            )
+
+        assert len(results) == 1
+        assert results[0].tool_name == "github_search"
+        assert results[0].success is True
+
+    def test_context_kind_overrides_default(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            assert arguments["kind"] == "code"
+            return json.dumps({
+                "query": arguments["query"], "result_text": "x", "result_count": 1, "is_miss": False,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_search"],
+                instruction   = "search github",
+                context       = {"github_search_kind": "code"},
+            )
+        assert results[0].success is True
+
+    def test_miss_returns_success_false(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            return json.dumps({
+                "query": arguments["query"], "result_text": "", "result_count": 0, "is_miss": True,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_search"],
+                instruction   = "look up some obscure github repo",
+                context       = {},
+            )
+        assert len(results) == 1
+        assert results[0].success is False
+
+    def test_tool_level_error_normalized_via_shared_helper(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            return "Error executing tool github_search: ERROR: github_search failed — boom", True
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_search"],
+                instruction   = "search github for something",
+                context       = {},
+            )
+        assert results[0].success is False
+        assert results[0].result == "ERROR: github_search failed — boom"
+
+    def test_connection_failure_returns_graceful_error(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            raise ConnectionRefusedError("Connection refused")
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_search"],
+                instruction   = "search github for something",
+                context       = {},
+            )
+        assert len(results) == 1
+        assert results[0].success is False
+        assert "unreachable" in results[0].result
+
+
+class TestGithubRead:
+    """
+    github_read: only ever reached when a caller supplies
+    context["github_repo"] (an "owner/repo" string) — Planner's keyword
+    gate never routes to it directly (see _priority3_github's docstring).
+    """
+
+    def test_success_passes_owner_repo_and_path(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            assert name == "github_read"
+            assert arguments == {"owner": "anthropics", "repo": "claude-code", "path": "README.md"}
+            return json.dumps({
+                "owner": "anthropics", "repo": "claude-code", "path": "README.md",
+                "kind": "file", "content": "hello", "truncated": False,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_read"],
+                instruction   = "read the readme",
+                context       = {"github_repo": "anthropics/claude-code", "github_path": "README.md"},
+            )
+
+        assert len(results) == 1
+        assert results[0].tool_name == "github_read"
+        assert results[0].success is True
+        assert results[0].result == "hello"
+
+    def test_omitted_path_reads_readme(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            assert arguments == {"owner": "o", "repo": "r"}
+            return json.dumps({
+                "owner": "o", "repo": "r", "path": None, "kind": "file",
+                "content": "readme", "truncated": False,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_read"],
+                instruction   = "read this repo",
+                context       = {"github_repo": "o/r"},
+            )
+        assert results[0].success is True
+
+    def test_missing_github_repo_returns_error_without_calling_mcp(self, dispatcher: MCPToolDispatcher):
+        fake_call = MagicMock()
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_read"],
+                instruction   = "read the readme",
+                context       = {},
+            )
+        assert results[0].success is False
+        assert "github_repo not provided" in results[0].result
+        fake_call.assert_not_called()
+
+    def test_tool_level_error_normalized_via_shared_helper(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            return "Error executing tool github_read: ERROR: github_read — o/r/missing.py not found", True
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_read"],
+                instruction   = "read this file",
+                context       = {"github_repo": "o/r", "github_path": "missing.py"},
+            )
+        assert results[0].success is False
+        assert results[0].result == "ERROR: github_read — o/r/missing.py not found"
+
+    def test_connection_failure_returns_graceful_error(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            raise ConnectionRefusedError("Connection refused")
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_read"],
+                instruction   = "read this repo",
+                context       = {"github_repo": "o/r"},
+            )
+        assert results[0].success is False
+        assert "unreachable" in results[0].result
+
+
 def _fetch_url_ok(url: str, cleaned_text: str = "Full article body text.") -> tuple[str, bool]:
     return json.dumps({
         "url": url, "title": "T", "author": "", "date_published": "",

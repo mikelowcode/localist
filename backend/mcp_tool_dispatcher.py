@@ -4,15 +4,27 @@ LORA — MCP Tool Dispatcher
 Was originally a drop-in replacement for the now-deleted ToolDispatcher
 (tool_dispatcher.py) at the controller_agent.py dispatch seam; as of Phase
 4 (cleanup, 2026-07-03) that legacy class is gone entirely — "file_op",
-"url_fetch", "web_search", "research", "chart", and "news_search" are the
-only tool names Planner ever routes to tools_to_call (see planner.py's
-P3/P3-news/P3b), and all are served over the localist-mcp service
-(mcp_server/, port 8003) via the MCP SSE transport (research is a
-client-side loop over the same web_search/url_fetch MCP tools, not a
-distinct MCP tool of its own). Any other tool name is unrecognized and
-produces an inline error ToolResult — the one remaining piece of what used
-to be ToolDispatcher's "else" branch, ported inline rather than kept as an
-excuse to hold onto a whole extra class.
+"url_fetch", "web_search", "research", "chart", "news_search", and
+"github_search"/"github_read" are the only tool names Planner ever routes
+to tools_to_call (see planner.py's P3/P3-news/P3-github/P3b), and all are
+served over the localist-mcp service (mcp_server/, port 8003) via the MCP
+SSE transport (research is a client-side loop over the same
+web_search/url_fetch MCP tools, not a distinct MCP tool of its own). Any
+other tool name is unrecognized and produces an inline error ToolResult —
+the one remaining piece of what used to be ToolDispatcher's "else" branch,
+ported inline rather than kept as an excuse to hold onto a whole extra
+class.
+
+github_search/github_read: public-repo GitHub REST reads (search and
+file/README/directory content) — the GitHub counterpart to news_search,
+minus a fallback tier (GitHub's Search API has no NewsAPI-style
+miss/error split worth a second provider). github_search is routed by
+Planner's keyword gate (P3-github); github_read is reached only when a
+caller supplies context["github_repo"] directly (same
+caller-supplied-pin convention as news_search's context["news_article_url"]),
+since Planner's keyword gate can only detect that a GitHub-shaped request
+was made, not which repo. See mcp_server/github.py for the tool
+implementations — both are read-only (GET-only), no archive/CLI paths.
 
 news_search (news-query-routing plan, 2026-07-22): tries the NewsAPI-backed
 news_search MCP tool first; on a miss (NewsAPI empty/errored result — see
@@ -285,9 +297,10 @@ def _normalize_mcp_error_text(text: str) -> str:
 
 class MCPToolDispatcher:
     """
-    "file_op", "url_fetch", "web_search", and "chart" are served by the
-    localist-mcp MCP server; any other tool name is unrecognized (Planner
-    never routes tools_to_call to anything else — see planner.py's P3/P3b)
+    "file_op", "url_fetch", "web_search", "chart", and
+    "github_search"/"github_read" are served by the localist-mcp MCP
+    server; any other tool name is unrecognized (Planner never routes
+    tools_to_call to anything else — see planner.py's P3/P3b/P3-github)
     and produces an inline error ToolResult, same shape the legacy
     ToolDispatcher's "else" branch used to produce.
 
@@ -382,6 +395,14 @@ class MCPToolDispatcher:
                 elif tool_name == "news_search":
                     results.extend(
                         await self._run_news_search(session, connect_error, instruction, ctx)
+                    )
+                elif tool_name == "github_search":
+                    results.append(
+                        await self._run_github_search(session, connect_error, instruction, ctx)
+                    )
+                elif tool_name == "github_read":
+                    results.append(
+                        await self._run_github_read(session, connect_error, instruction, ctx)
                     )
                 elif tool_name == "research":
                     results.extend(
@@ -910,6 +931,170 @@ class MCPToolDispatcher:
             tool_name  = "news_search",
             parameters = params_str,
             result     = data.get("result_text", ""),
+            success    = True,
+        )
+
+    # -----------------------------------------------------------------------
+    # github_search / github_read — served by localist-mcp
+    # -----------------------------------------------------------------------
+
+    async def _run_github_search(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        instruction:   str,
+        context:       dict[str, Any],
+    ) -> ToolResult:
+        """
+        Execute one github_search query — public repo/code search via the
+        GitHub Search API. Single query only, no _MAX_WEB_QUERIES-style
+        loop and no NewsAPI-style fallback tier (GitHub's Search API has no
+        "miss vs. error" distinction worth a second provider) — reuses the
+        same query resolution web_search/news_search already use via
+        _derive_initial_query, so a "search github for X" instruction and a
+        plain "look up X" instruction derive the same query text.
+        """
+        query = self._derive_initial_query(instruction, context)
+        kind  = context.get("github_search_kind") or "repositories"
+        params_str = f"query={query!r} kind={kind!r}"
+
+        if session is None:
+            return ToolResult(
+                tool_name  = "github_search",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {connect_error}",
+                success    = False,
+            )
+
+        try:
+            text, is_error = await self._call_mcp_tool(
+                session, "github_search", {"query": query, "kind": kind}
+            )
+        except Exception as exc:
+            logger.warning(
+                "MCPToolDispatcher: localist-mcp unreachable for github_search query=%r: %s",
+                query, exc,
+            )
+            return ToolResult(
+                tool_name  = "github_search",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {exc}",
+                success    = False,
+            )
+
+        if is_error:
+            return ToolResult(
+                tool_name  = "github_search",
+                parameters = params_str,
+                result     = _normalize_mcp_error_text(text),
+                success    = False,
+            )
+
+        try:
+            data = json.loads(text)
+        except Exception as exc:
+            return ToolResult(
+                tool_name  = "github_search",
+                parameters = params_str,
+                result     = f"ERROR: failed to parse github_search response — {exc}",
+                success    = False,
+            )
+
+        if data.get("is_miss", False):
+            return ToolResult(
+                tool_name  = "github_search",
+                parameters = params_str,
+                result     = "",
+                success    = False,
+            )
+
+        return ToolResult(
+            tool_name  = "github_search",
+            parameters = params_str,
+            result     = data.get("result_text", ""),
+            success    = True,
+        )
+
+    async def _run_github_read(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        instruction:   str,
+        context:       dict[str, Any],
+    ) -> ToolResult:
+        """
+        Read a public repo's README/file/directory listing. Unlike
+        github_search (reached via Planner's keyword gate, P3-github),
+        github_read is only ever reached when a caller supplies
+        context["github_repo"] as an "owner/repo" string directly — same
+        caller-supplied-pin convention as news_search's
+        context["news_article_url"] (see _run_news_search) — Planner's
+        keyword gate can detect that a GitHub-shaped request was made, not
+        which repo. context["github_path"] is optional (omitted reads the
+        repo's README).
+        """
+        repo_spec = context.get("github_repo") or ""
+        path      = context.get("github_path") or None
+        params_str = f"repo={repo_spec!r} path={path!r}"
+
+        if "/" not in repo_spec:
+            return ToolResult(
+                tool_name  = "github_read",
+                parameters = params_str,
+                result     = 'ERROR: github_repo not provided in context (expected "owner/repo")',
+                success    = False,
+            )
+
+        owner, _, repo = repo_spec.partition("/")
+
+        if session is None:
+            return ToolResult(
+                tool_name  = "github_read",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {connect_error}",
+                success    = False,
+            )
+
+        arguments: dict[str, Any] = {"owner": owner, "repo": repo}
+        if path:
+            arguments["path"] = path
+
+        try:
+            text, is_error = await self._call_mcp_tool(session, "github_read", arguments)
+        except Exception as exc:
+            logger.warning(
+                "MCPToolDispatcher: localist-mcp unreachable for github_read repo=%r path=%r: %s",
+                repo_spec, path, exc,
+            )
+            return ToolResult(
+                tool_name  = "github_read",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {exc}",
+                success    = False,
+            )
+
+        if is_error:
+            return ToolResult(
+                tool_name  = "github_read",
+                parameters = params_str,
+                result     = _normalize_mcp_error_text(text),
+                success    = False,
+            )
+
+        try:
+            data = json.loads(text)
+        except Exception as exc:
+            return ToolResult(
+                tool_name  = "github_read",
+                parameters = params_str,
+                result     = f"ERROR: failed to parse github_read response — {exc}",
+                success    = False,
+            )
+
+        return ToolResult(
+            tool_name  = "github_read",
+            parameters = params_str,
+            result     = data.get("content", ""),
             success    = True,
         )
 

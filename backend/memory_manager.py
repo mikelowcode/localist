@@ -151,7 +151,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION   = 10         # increment when schema changes require migration
+_SCHEMA_VERSION   = 11         # increment when schema changes require migration
 _EMBEDDING_DIM    = 768        # EmbeddingGemma-300M-4bit output dimension
 _EMBEDDING_FORMAT = ">768f"    # big-endian float32 × 768
 
@@ -632,6 +632,12 @@ class MemoryManager:
                             conversation_id TEXT,
                             generated_at    REAL    NOT NULL
                         );
+
+                        CREATE TABLE IF NOT EXISTS github_watch_cache (
+                            id              INTEGER PRIMARY KEY CHECK (id = 1),
+                            content_json    TEXT    NOT NULL,
+                            generated_at    REAL    NOT NULL
+                        );
                     """)
 
                     conn.execute(
@@ -690,6 +696,17 @@ class MemoryManager:
                         brief_date      TEXT    NOT NULL,
                         content_json    TEXT    NOT NULL,
                         conversation_id TEXT,
+                        generated_at    REAL    NOT NULL
+                    );
+                """)
+                conn.commit()
+
+                # Same self-heal, same rationale, for github_watch_cache
+                # (schema v11, GitHub Watch Feed).
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS github_watch_cache (
+                        id              INTEGER PRIMARY KEY CHECK (id = 1),
+                        content_json    TEXT    NOT NULL,
                         generated_at    REAL    NOT NULL
                     );
                 """)
@@ -889,6 +906,16 @@ class MemoryManager:
                     brief_date      TEXT    NOT NULL,
                     content_json    TEXT    NOT NULL,
                     conversation_id TEXT,
+                    generated_at    REAL    NOT NULL
+                );
+            """)
+
+        if from_version < 11:
+            logger.info("Applying migration v10→v11: creating github_watch_cache table.")
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS github_watch_cache (
+                    id              INTEGER PRIMARY KEY CHECK (id = 1),
+                    content_json    TEXT    NOT NULL,
                     generated_at    REAL    NOT NULL
                 );
             """)
@@ -2169,6 +2196,54 @@ class MemoryManager:
                     "set_news_brief_cache: brief_date=%r conversation_id=%r.",
                     brief_date, conversation_id,
                 )
+            finally:
+                conn.close()
+
+    def get_github_watch_cache(self) -> dict[str, Any] | None:
+        """
+        Read the current github_watch_cache row.
+
+        Returns None when the watch feed has never been generated. There is
+        only ever one row — unlike news_brief_cache there's no brief_date
+        column, since watched-repo releases aren't day-keyed the way a news
+        brief is; a new refresh overwrites it via set_github_watch_cache().
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT content_json, generated_at FROM github_watch_cache WHERE id = 1"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if row is None:
+            return None
+        return {
+            "content":      json.loads(row["content_json"]),
+            "generated_at": row["generated_at"],
+        }
+
+    def set_github_watch_cache(self, content: list[dict[str, Any]]) -> None:
+        """
+        Insert or update github_watch_cache (row id=1) after a fresh
+        refresh. Always overwrites the whole row — see get_github_watch_cache().
+        """
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO github_watch_cache (id, content_json, generated_at)
+                    VALUES (1, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        content_json = excluded.content_json,
+                        generated_at = excluded.generated_at
+                    """,
+                    (json.dumps(content), now),
+                )
+                conn.commit()
+                logger.info("set_github_watch_cache: repos=%d.", len(content))
             finally:
                 conn.close()
 

@@ -11,6 +11,13 @@
     openNewsBrief,
     type NewsBriefArticle
   } from '$lib/stores/newsBrief';
+  import {
+    githubWatchPreview,
+    fetchGithubWatchPreview,
+    githubWatchOpening,
+    githubWatchError,
+    openGithubWatch
+  } from '$lib/stores/githubWatch';
   import { tasksStore, submitTask } from '$lib/stores/tasks';
   import { chatHistoryStore } from '$lib/stores/chatHistory';
   import { currentConversationId, isFirstTurnOfConversation } from '$lib/stores/conversation';
@@ -21,6 +28,7 @@
   // which only had room to show one truncated line per section.
   onMount(() => {
     void fetchNewsBriefPreview();
+    void fetchGithubWatchPreview();
   });
 
   async function handleOpenBrief(): Promise<void> {
@@ -33,6 +41,16 @@
       // Refresh stays on the Live Feed panel — it no longer opens a Chat
       // Conversation (see newsBrief.ts).
       await fetchNewsBriefPreview();
+    }
+  }
+
+  // Same pattern as handleOpenBrief — /refresh already wrote a fresh
+  // github_watch_cache by the time it responds, but this panel's own store
+  // is only ever populated once on mount, so it needs an explicit re-fetch.
+  async function handleOpenGithubWatch(): Promise<void> {
+    const ok = await openGithubWatch();
+    if (ok) {
+      await fetchGithubWatchPreview();
     }
   }
 
@@ -153,15 +171,55 @@
         </div>
       </section>
 
-      <!-- Reserved blocks — layout only, not wired to a live API yet. -->
-      <section class="preview-block preview-block-reserved">
-        <div class="preview-block-header">
-          <span class="preview-block-title">🐙 GitHub</span>
-          <span class="preview-block-badge">Coming soon</span>
+      <!-- GitHub Watch Feed block — live. Same shape as the News block
+           above (single refresh link + preview.repos rendered generically),
+           no "Ask about this" button — this feed never touches chat
+           (github_watch.py has no Planner/MCPToolDispatcher involvement). -->
+      <section class="preview-block">
+        <button
+          type="button"
+          class="preview-block-refresh-link"
+          on:click={handleOpenGithubWatch}
+          disabled={$githubWatchOpening}
+        >{$githubWatchOpening ? 'Refreshing…' : 'GitHub Watch Feed Refresh'}</button>
+        <div class="preview-block-body">
+          {#if $githubWatchPreview.repos.length === 0}
+            <p class="preview-empty">No watch feed generated yet — click the link above to generate.</p>
+          {:else if $githubWatchPreview.repos[0].key === '_error'}
+            <p class="preview-news-unavailable">{$githubWatchPreview.repos[0].error}</p>
+          {:else}
+            {#each $githubWatchPreview.repos as repo (repo.key)}
+              <div class="preview-news-article-row">
+                <a
+                  class="preview-news-article"
+                  href={repo.repo_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <span class="preview-news-article-title">{repo.label}</span>
+                  {#if repo.error}
+                    <span class="preview-news-article-source">unavailable</span>
+                  {:else if repo.latest_release}
+                    <span class="preview-news-article-source">
+                      {repo.latest_release.name || repo.latest_release.tag_name}
+                      {#if repo.latest_release.published_at}
+                        · {repo.latest_release.published_at.slice(0, 10)}
+                      {/if}
+                    </span>
+                  {:else}
+                    <span class="preview-news-article-source">no releases yet</span>
+                  {/if}
+                </a>
+              </div>
+            {/each}
+          {/if}
+          {#if $githubWatchError}
+            <p class="preview-error">{$githubWatchError}</p>
+          {/if}
         </div>
-        <p class="preview-empty">Daily activity from watched repos will appear here.</p>
       </section>
 
+      <!-- Reserved block — layout only, not wired to a live API yet. -->
       <section class="preview-block preview-block-reserved">
         <div class="preview-block-header">
           <span class="preview-block-title">💬 Hacker News</span>

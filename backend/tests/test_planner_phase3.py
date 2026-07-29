@@ -943,6 +943,87 @@ class TestPlannerP3News:
 
 
 # ---------------------------------------------------------------------------
+# Priority 3-github — github_search tool routing
+# ---------------------------------------------------------------------------
+
+class TestPlannerP3Github:
+
+    # 1. Basic github keyword match routes to github_search only.
+    def test_github_keyword_routes_to_github_search(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("what's in the anthropics github repo?", context={})
+        assert plan.tools_to_call == ["github_search"]
+        assert plan.compound is True
+        assert plan.priority == 3
+        assert plan.tool_signal_source == "keyword"
+        assert plan.fetch_rag is False
+        assert plan.fetch_episodic is False
+
+    # 2. "readme"/"pull request"/"repository" all match _GITHUB_KEYWORDS too.
+    @pytest.mark.parametrize("instruction", [
+        "can you read the readme for that project?",
+        "is there an open pull request for this?",
+        "find a python repository for parsing PDFs",
+    ])
+    def test_other_github_keywords_route_to_github_search(self, instruction):
+        p = Planner(runtime=make_runtime())
+        plan = p.route(instruction, context={})
+        assert plan.tools_to_call == ["github_search"]
+
+    # 3. github_search wins over a web_search-only P3 match on the same turn —
+    #    "recent" is a _WEB_SEARCH_KEYWORDS entry; P3-github runs before P3.
+    def test_github_beats_web_search_p3(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("any recent activity on that github repo?", context={})
+        assert plan.tools_to_call == ["github_search"]
+        assert "web_search" not in plan.tools_to_call
+
+    # 4. file_op guard: a literal _FILE_OP_KEYWORDS hit ("read the file")
+    #    alongside "github" defers P3-github to P3, which resolves it as file_op.
+    def test_file_op_guard_defers_to_p3(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("read the file about that github project", context={})
+        assert plan.tools_to_call == ["file_op"]
+        assert "github_search" not in plan.tools_to_call
+
+    # 5. url_fetch guard: a raw URL alongside "github" defers P3-github to P3.
+    def test_url_guard_defers_to_p3(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("summarize this github page: https://example.com/article", context={})
+        assert "url_fetch" in plan.tools_to_call
+        assert "github_search" not in plan.tools_to_call
+
+    # 6. Ordering regression: P3c (graph-query) beats P3-github, same as it
+    #    already beats plain P3 web_search and P3-news.
+    def test_p3c_beats_github_search(self, tmp_path):
+        mm, node_ids = make_mm_with_nodes(tmp_path)
+        p = Planner(runtime=make_runtime(), memory_manager=mm)
+        plan = p.route("what links to lora-persona, any related github repo?", context={})
+        assert plan.graph_query is not None
+        direction, node_id, resolved_stem = plan.graph_query
+        assert direction     == "incoming"
+        assert resolved_stem == "lora-persona"
+        assert node_id       == node_ids["lora-persona"]
+        assert "github_search" not in plan.tools_to_call
+
+    # 7. P1 beats P3-github: ingest keyword routes to wiki_agent regardless of
+    #    a github keyword also being present.
+    def test_p1_beats_p3_github(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("ingest this file, it's about a github repo", context={})
+        assert plan.agent == "wiki_agent"
+        assert "github_search" not in plan.tools_to_call
+
+    # 8. No github keyword at all → P3-github defers, falls through normally
+    #    (P6 direct answer, since nothing else in this instruction matches).
+    def test_no_github_keyword_falls_through(self):
+        p = Planner(runtime=make_runtime(infer_return="no"))
+        plan = p.route("how do I bake bread?", context={})
+        assert plan.tools_to_call == []
+        assert plan.agent == "conversational_agent"
+
+
+# ---------------------------------------------------------------------------
 # Priority 1b — diff-only wiki update (standalone diff instructions scope doc)
 # ---------------------------------------------------------------------------
 

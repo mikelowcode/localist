@@ -9,10 +9,13 @@ microservice's /extract path in-process), web_search (Phase 3: ports the
 LangSearch integration in-process, no runtime.infer() hallucination
 fallback), news_search (NewsAPI.org /v2/everything — first-tier provider
 for news-shaped queries; MCPToolDispatcher falls back to web_search on a
-miss, see news-query-routing plan §4), and generate_chart (renders a
-bar/line/pie chart from structured data server-side via matplotlib) — over
-SSE transport, using the official `mcp` Python SDK's FastMCP. See
-backend/mcp_tool_dispatcher.py for the dispatch seam.
+miss, see news-query-routing plan §4), generate_chart (renders a
+bar/line/pie chart from structured data server-side via matplotlib), and
+github_search/github_read (public-repo GitHub REST reads — search and
+file/README/directory content, read-only, no archive/CLI capability; see
+mcp_server/github.py) — over SSE transport, using the official `mcp`
+Python SDK's FastMCP. See backend/mcp_tool_dispatcher.py for the dispatch
+seam.
 
 Endpoints
 ---------
@@ -43,6 +46,19 @@ Configuration
                                tier only (100 req/day, dev/test use only);
                                a paid tier is required if this code is
                                ever deployed off a single local machine.
+  GITHUB_TOKEN                 Optional for github_search / github_read —
+                               see mcp_server/github.py. Both are
+                               public-repo GitHub REST reads that work
+                               unauthenticated (60 req/hr) or authenticated
+                               (5000 req/hr); the token is used
+                               opportunistically if present. Also read by
+                               backend/github_watch.py in the main backend
+                               process, where it is required (not optional)
+                               — GET /user/subscriptions needs an
+                               authenticated identity. A fine-grained PAT
+                               with no repository permissions selected is
+                               sufficient for all of this (public data
+                               only).
 
 Start
 -----
@@ -68,6 +84,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp_server import (
     chart as _chart,
     file_ops,
+    github as _github,
     news_search as _news_search,
     url_fetch as _url_fetch,
     web_search as _web_search,
@@ -130,6 +147,18 @@ def generate_chart(chart_type: str, labels: list[str], datasets: list[dict], tit
     return _chart.generate_chart(chart_type, labels, datasets, title)
 
 
+@mcp.tool()
+async def github_search(query: str, kind: str = "repositories") -> dict:
+    """Search public GitHub repositories or code (kind='repositories'|'code') via the GitHub Search API."""
+    return await _github.github_search(query, kind)
+
+
+@mcp.tool()
+async def github_read(owner: str, repo: str, path: str | None = None) -> dict:
+    """Read a public repo's README (path omitted), a file's contents, or a directory listing (path set)."""
+    return await _github.github_read(owner, repo, path)
+
+
 # ── App ──────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -144,7 +173,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title       = "Localist MCP Server",
-    description = "MCP tool server for Localist — file_op tools (read_file/write_file/append_file), fetch_url, web_search, news_search, and generate_chart.",
+    description = "MCP tool server for Localist — file_op tools (read_file/write_file/append_file), fetch_url, web_search, news_search, generate_chart, and github_search/github_read.",
     version     = "1.0.0",
     lifespan    = lifespan,
 )

@@ -5,6 +5,9 @@ retired standalone Fetcher microservice's /extract path in-process.
 Phase 3 adds web_search coverage (mcp_server/web_search.py) — ports the
 LangSearch integration in-process, no runtime.infer() fallback. A second
 provider (Brave) was later added behind the SEARCH_PROVIDER env var switch.
+Also covers github.github_search / github.github_read (mcp_server/github.py)
+— public-repo GitHub REST reads, GITHUB_TOKEN optional (used opportunistically,
+never required — see the module docstring).
 
 Covers:
   - file_ops.read_file / write_file / append_file: sandboxing, truncation,
@@ -38,7 +41,7 @@ import pytest
 
 from mcp.shared.memory import create_connected_server_and_client_session
 
-from mcp_server import chart, file_ops, news_search, search_format, url_fetch, web_search
+from mcp_server import chart, file_ops, github, news_search, search_format, url_fetch, web_search
 from mcp_server.main import mcp as mcp_app
 
 
@@ -606,6 +609,138 @@ class TestNewsSearchFormat:
 
 
 # ---------------------------------------------------------------------------
+# github.github_search / github.github_read — direct unit tests
+# ---------------------------------------------------------------------------
+
+def _github_search_response(items: list[dict], status_code: int = 200) -> httpx.Response:
+    request = httpx.Request("GET", f"{github._GITHUB_API_BASE}/search/repositories")
+    return httpx.Response(status_code, json={"items": items}, request=request)
+
+
+def _github_raw_response(text: str, content_type: str = "text/plain; charset=utf-8", status_code: int = 200) -> httpx.Response:
+    request = httpx.Request("GET", f"{github._GITHUB_API_BASE}/repos/o/r/readme")
+    return httpx.Response(
+        status_code, text=text, headers={"content-type": content_type}, request=request,
+    )
+
+
+def _github_dir_response(entries: list[dict], status_code: int = 200) -> httpx.Response:
+    request = httpx.Request("GET", f"{github._GITHUB_API_BASE}/repos/o/r/contents/src")
+    return httpx.Response(status_code, json=entries, request=request)
+
+
+class TestGithubSearchSuccess:
+    def test_repositories_formatted_with_stars_and_url(self):
+        items = [{
+            "full_name":         "anthropics/claude-code",
+            "description":       "Claude Code CLI",
+            "html_url":          "https://github.com/anthropics/claude-code",
+            "stargazers_count":  42,
+        }]
+        response = _github_search_response(items)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(github.github_search("claude code"))
+
+        assert result["is_miss"] is False
+        assert result["result_count"] == 1
+        text = result["result_text"]
+        assert text.startswith("• anthropics/claude-code — GitHub\n")
+        assert "[https://github.com/anthropics/claude-code]" in text
+        assert text.endswith("⭐ 42")
+
+    def test_code_kind_formats_path_and_repo(self):
+        items = [{
+            "path":        "src/main.py",
+            "html_url":    "https://github.com/o/r/blob/main/src/main.py",
+            "repository":  {"full_name": "o/r"},
+        }]
+        response = _github_search_response(items)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(github.github_search("main", kind="code"))
+
+        assert result["result_count"] == 1
+        assert "in o/r" in result["result_text"]
+
+    def test_no_items_is_miss(self):
+        response = _github_search_response([])
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(github.github_search("nothing found query"))
+        assert result["is_miss"] is True
+        assert result["result_text"] == ""
+
+    def test_unknown_kind_raises_without_network_call(self):
+        fake_get = AsyncMock()
+        with patch.object(httpx.AsyncClient, "get", fake_get):
+            with pytest.raises(ValueError, match="ERROR: unknown github_search kind"):
+                asyncio.run(github.github_search("q", kind="issues"))
+        fake_get.assert_not_called()
+
+
+class TestGithubSearchErrors:
+    def test_transport_error_raises_clean_message(self):
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(side_effect=httpx.ConnectError("refused"))):
+            with pytest.raises(ValueError, match="ERROR: github_search failed —"):
+                asyncio.run(github.github_search("q"))
+
+    def test_rate_limited_raises_clean_message(self):
+        response = httpx.Response(
+            403, json={"message": "API rate limit exceeded"},
+            request=httpx.Request("GET", f"{github._GITHUB_API_BASE}/search/repositories"),
+        )
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            with pytest.raises(ValueError, match="ERROR: github_search failed —"):
+                asyncio.run(github.github_search("q"))
+
+
+class TestGithubReadSuccess:
+    def test_readme_returns_raw_text(self):
+        response = _github_raw_response("# Hello\n\nThis is a README.")
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(github.github_read("o", "r"))
+        assert result["kind"] == "file"
+        assert result["content"] == "# Hello\n\nThis is a README."
+        assert result["truncated"] is False
+
+    def test_file_content_truncated_past_budget(self):
+        long_text = "x" * (github._GITHUB_CONTENT_CHARS + 500)
+        response = _github_raw_response(long_text)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(github.github_read("o", "r", path="big.txt"))
+        assert result["truncated"] is True
+        assert len(result["content"]) == github._GITHUB_CONTENT_CHARS + 1  # + ellipsis
+        assert result["content"].endswith("…")
+
+    def test_directory_listing_formats_names_by_type(self):
+        entries = [
+            {"name": "src", "type": "dir"},
+            {"name": "README.md", "type": "file"},
+        ]
+        response = _github_dir_response(entries)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(github.github_read("o", "r", path="."))
+        assert result["kind"] == "directory"
+        assert "📁 src" in result["content"]
+        assert "📄 README.md" in result["content"]
+        assert result["truncated"] is False
+
+
+class TestGithubReadErrors:
+    def test_not_found_raises_clean_message(self):
+        response = httpx.Response(
+            404, json={"message": "Not Found"},
+            request=httpx.Request("GET", f"{github._GITHUB_API_BASE}/repos/o/r/contents/missing.py"),
+        )
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            with pytest.raises(ValueError, match="ERROR: github_read — o/r/missing.py not found"):
+                asyncio.run(github.github_read("o", "r", path="missing.py"))
+
+    def test_transport_error_raises_clean_message(self):
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(side_effect=httpx.ConnectError("refused"))):
+            with pytest.raises(ValueError, match="ERROR: github_read failed —"):
+                asyncio.run(github.github_read("o", "r"))
+
+
+# ---------------------------------------------------------------------------
 # chart.generate_chart — direct unit tests
 # ---------------------------------------------------------------------------
 
@@ -803,3 +938,38 @@ class TestMCPToolsInProcess:
         )
         assert is_error is True
         assert "chart_type invalid or missing" in text
+
+    def test_github_search_tool_success(self):
+        items = [{
+            "full_name": "o/r", "description": "d",
+            "html_url": "https://github.com/o/r", "stargazers_count": 1,
+        }]
+        response = _github_search_response(items)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            text, is_error = asyncio.run(_call_tool("github_search", {"query": "test query"}))
+        assert is_error is False
+        data = json.loads(text)
+        assert data["result_count"] == 1
+
+    def test_github_search_tool_unknown_kind_surfaces_as_is_error(self):
+        text, is_error = asyncio.run(_call_tool("github_search", {"query": "q", "kind": "issues"}))
+        assert is_error is True
+        assert "unknown github_search kind" in text
+
+    def test_github_read_tool_success(self):
+        response = _github_raw_response("readme text")
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            text, is_error = asyncio.run(_call_tool("github_read", {"owner": "o", "repo": "r"}))
+        assert is_error is False
+        data = json.loads(text)
+        assert data["content"] == "readme text"
+
+    def test_github_read_tool_not_found_surfaces_as_is_error(self):
+        response = httpx.Response(
+            404, json={"message": "Not Found"},
+            request=httpx.Request("GET", f"{github._GITHUB_API_BASE}/repos/o/r/readme"),
+        )
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            text, is_error = asyncio.run(_call_tool("github_read", {"owner": "o", "repo": "r"}))
+        assert is_error is True
+        assert "not found" in text

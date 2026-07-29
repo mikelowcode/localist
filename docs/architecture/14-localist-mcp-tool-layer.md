@@ -11,7 +11,8 @@ logging. It exposes tools over **MCP's SSE transport** (`GET /sse`,
 `GET /health` returning `{"status": "ok"}`.
 
 This is where `file_op`, `url_fetch`, `web_search`, `generate_chart`
-(§14.8), and `news_search` (§14.9) actually execute.
+(§14.8), `news_search` (§14.9), and `github_search`/`github_read` (§14.11)
+actually execute.
 `MCPToolDispatcher` (`backend/mcp_tool_dispatcher.py`) is the client —
 `controller_agent.py`'s `_execute_plan()` constructs one per dispatch call
 (the same single seam `ToolDispatcher` used to occupy) and calls it over
@@ -40,6 +41,8 @@ brought this document back in sync.
 | `web_search` | `mcp_server/web_search.py` | `(query: str) -> dict` | `{query, result_text, result_count}` — `result_text` is the formatted bullet block, or `"No results found."` |
 | `generate_chart` | `mcp_server/chart.py` | `(chart_type: str, labels: list[str], datasets: list[dict], title: str = "") -> dict` | `{summary, png_path, chart_config}` — see §14.8 |
 | `news_search` | `mcp_server/news_search.py` | `(query: str) -> dict` | `{query, result_text, result_count, is_miss}` — see §14.9 |
+| `github_search` | `mcp_server/github.py` | `(query: str, kind: str = "repositories") -> dict` | `{query, result_text, result_count, is_miss}` — see §14.11 |
+| `github_read` | `mcp_server/github.py` | `(owner: str, repo: str, path: str \| None = None) -> dict` | `{owner, repo, path, kind, content, truncated}` — see §14.11 |
 
 **`file_op` sandboxing:** every path is resolved against a sandbox root
 and rejected if the resolved absolute path escapes it — same check
@@ -292,6 +295,15 @@ NEWSAPI_API_KEY              Required for news_search (§14.9). Free
                               since Localist runs single-user on
                               localhost and never leaves it.
 
+GITHUB_TOKEN                 Optional for github_search/github_read
+                              (§14.11) — both are public-repo GitHub REST
+                              reads that work unauthenticated (60 req/hr)
+                              or authenticated (5000 req/hr); used
+                              opportunistically when present. Also read
+                              by backend/github_watch.py in the main
+                              backend process (§7.20), where it is
+                              required, not optional.
+
 LOCALIST_LOG_LEVEL           localist-mcp's root log level. Default: INFO.
 ```
 
@@ -349,6 +361,14 @@ LOCALIST_LOG_LEVEL           localist-mcp's root log level. Default: INFO.
   `test_news_search_double_miss_triggers_corpus_fallback`
   (`test_tool_dispatcher_phase6.py`), plus live verification against real
   NewsAPI/Brave traffic — see §14.9 and `sessions-log.md` under 2026-07-22.
+- `github_search`/`github_read` (§14.11, 2026-07-29) —
+  `TestGithubSearchSuccess`/`TestGithubSearchErrors`/`TestGithubReadSuccess`/
+  `TestGithubReadErrors` plus `TestMCPToolsInProcess` additions
+  (`test_mcp_server.py`), `TestGithubSearch`/`TestGithubRead`
+  (`test_mcp_tool_dispatcher.py`), and `TestPlannerP3Github`
+  (`test_planner_phase3.py`), plus live verification against real GitHub
+  REST traffic (unauthenticated and, later, with a real classic PAT) —
+  see §14.11 and `sessions-log.md` under 2026-07-29.
 
 ### 14.7 Open Items
 
@@ -1077,4 +1097,97 @@ verification not yet performed.
 before being attached as `SearchResult.extra` — see §14.2's result-formatting
 update. Previously unbounded (subject only to NewsAPI dev-tier's own
 truncation and Slot 5's now-larger 1,500-token ceiling).
+
+### 14.11 `github_search` / `github_read` Tools — Public-Repo Crawl (2026-07-29)
+
+A seventh and eighth MCP tool (`mcp_server/github.py`), scoped to let Localist read public GitHub repos
+on demand during chat — the GitHub counterpart to `news_search` (§14.9). Built alongside, but entirely
+independent from, the GitHub Watch Feed (`backend/github_watch.py`, §7.20) — that feature lives in the
+main backend process with no chat/Planner/MCP involvement at all, the same "two separate tiers" split
+NewsAPI already established between `news_search` (this file) and `news_brief.py` (§7.14, not documented
+in this file). Both new tools are read-only GET-only REST calls — no write/PATCH/POST to GitHub, no
+archive/zip download, no shelling out to `git`/`gh` — a hard constraint from the outset, not a
+consequence of scope-creep avoidance after the fact.
+
+**`GITHUB_TOKEN` is optional here** — the one deliberate asymmetry versus every other tool in this file,
+which all hard-fail on a missing key (§4.6.1's no-inference-fallback contract still applies to genuine
+failures; this is about whether a key is *required at all*). Both tools are public GitHub REST reads that
+work unauthenticated (60 req/hr) or authenticated (5000 req/hr) — the token is used opportunistically via
+an `Authorization: Bearer` header when present, omitted otherwise. Contrast `github_watch.py`'s watch feed
+(§7.20), which hard-requires the token: `GET /user/subscriptions` needs an authenticated identity to know
+*whose* watch list to return, and there's no equivalent anonymous call the way there is for public repo
+search/content reads.
+
+**`github_search(query: str, kind: str = "repositories") -> dict`.** Calls GitHub's Search API
+(`/search/repositories` or `/search/code`, selected by `kind`), builds `search_format.SearchResult`
+objects per hit (`title=full_name` or file path, `source="GitHub"`, `extra="⭐ {stargazers_count}"` for
+repo results), and formats via the same shared `search_format.format_results()` (§14.2) every other search
+tool uses — same `{query, result_text, result_count, is_miss}` return shape as `news_search`, same
+`[{url}]` bracket-line convention (load-bearing for `MCPToolDispatcher`'s `fetch_url` enrichment chaining,
+though enrichment isn't wired up for this tool). `is_miss=True` on zero results; raises
+`ValueError("ERROR: github_search failed — ...")` on a genuine transport/HTTP error (rate-limited,
+malformed query syntax), or `ValueError("ERROR: unknown github_search kind ...")` for an invalid `kind`.
+
+**`github_read(owner: str, repo: str, path: str | None = None) -> dict`.** One endpoint
+(`/repos/{owner}/{repo}/contents/{path}`, or `/repos/{owner}/{repo}/readme` when `path` is omitted) covers
+three cases via GitHub's Contents API: `path=None` reads the repo's README; `path` pointing at a file
+reads that file's content; `path` pointing at a directory returns a listing instead (GitHub's own contents
+endpoint returns a JSON array for directories regardless of the requested media type, which is what
+distinguishes the three cases server-side — `Content-Type` on the response, not a separate directory
+endpoint). Uses the `application/vnd.github.raw+json` `Accept` header for file/README reads, returning raw
+text directly with no base64 decoding needed — keeps this dependency-free (`httpx` + stdlib only, same as
+every other tool). File/README content is truncated at `_GITHUB_CONTENT_CHARS = 4000` chars with a
+`truncated: bool` flag, mirroring every other tool's summary-truncation convention (§14.2) — never returns
+an entire large file untruncated into the prompt. Never fetches archive/zip endpoints. Returns
+`{owner, repo, path, kind: "file" | "directory", content, truncated}`. Raises
+`ValueError("ERROR: github_read — <owner>/<repo>[/<path>] not found")` on a 404, or
+`ValueError("ERROR: github_read failed — ...")` on any other failure.
+
+**`mcp_server/main.py`** registers both as thin `@mcp.tool()` wrappers next to `news_search`/`web_search`
+(§14.2's table), each a one-line call into `github.py` — no action-enum dispatch pattern introduced at
+this layer, matching the existing one-tool-per-verb convention `read_file`/`write_file`/`append_file`
+already established (an action-enum pattern does exist, but one layer up, client-side — see
+`MCPToolDispatcher`'s `_FILE_OP_TOOL_MAP` below).
+
+**`MCPToolDispatcher._run_github_search()`/`_run_github_read()`.** `_run_github_search()` mirrors
+`_run_web_search()`'s query derivation (`_derive_initial_query()`, §14.3) but — like `news_search` — is
+single-query only, with no fallback tier at all (not even `news_search`'s Brave fallback): GitHub's Search
+API has no NewsAPI-style miss/error split worth a second provider. `_run_github_read()` is only ever
+reached when a caller supplies `context["github_repo"]` as an `"owner/repo"` string (and optionally
+`context["github_path"]`) — the same caller-supplied-pin convention `news_search`'s
+`context["news_article_url"]` (§14.10) established — since Planner's keyword gate can detect that a
+GitHub-shaped request was made, but not which repo. No frontend caller of `github_read` exists yet (no
+§7.16-style "browse this repo" button); it's wired plumbing waiting for one.
+
+**Planner routing** — `_GITHUB_KEYWORDS` (`"github"`, `"repo"`, `"repository"`, `"repositories"`,
+`"pull request"`, `"readme"`, `"github issue"`, `"github repo"`) and a new `_priority3_github()` method,
+same tier and same inline file_op/url_fetch/raw-URL guard as `_priority3_news()` (§4.2's 2026-07-22
+entry) — routes to `tools_to_call=["github_search"]` only, same "Planner only ever names the search tool,
+the dispatcher owns any pin/fallback logic" convention `news_search` established. Documented at §4.2, not
+duplicated here.
+
+**Test coverage.** `TestGithubSearchSuccess`/`TestGithubSearchErrors`/`TestGithubReadSuccess`/
+`TestGithubReadErrors` plus `TestMCPToolsInProcess` additions (`test_mcp_server.py`) — direct unit tests
+against mocked `httpx` responses and in-process MCP session calls, same idioms as every other tool in this
+file. `TestGithubSearch`/`TestGithubRead` (`test_mcp_tool_dispatcher.py`) — dispatcher-level success/miss/
+tool-error/connection-failure paths, `context["github_repo"]`/`context["github_path"]` threading,
+missing-`github_repo` returns an error without ever calling the MCP server. `TestPlannerP3Github`
+(`test_planner_phase3.py`, 8 tests) — mirrors `TestPlannerP3News`'s structure: basic keyword match, other
+`_GITHUB_KEYWORDS` phrasings, wins over a `web_search`-only Priority 3 match, file_op/url_fetch guards
+defer to Priority 3, Priority 3c still wins, Priority 1 still wins, no-match fallthrough. Full suite: 1265
+→ 1284 passed (Track A's memory_manager/endpoint tests, §7.20, land in the same count).
+
+**Live verification (2026-07-29).** Against the real running stack (not mocks): a chat instruction ("look
+up the FastAPI github repo") correctly routed to `github_search` (`metadata.tools_fired ==
+["github_search"]`, `priority == 3`, `tool_signal_source == "keyword"`) and returned real GitHub Search
+API results, confirmed via `localist-mcp`'s `--reload` picking up the new tool registrations with no
+service restart needed. A direct unauthenticated call to both `github_search` and `github_read` (no
+`GITHUB_TOKEN` set at the time) returned real data for `anthropics/claude-code`, confirming the
+optional-token design actually works unauthenticated as intended.
+
+**Open items.** No caching/rate-limiting layer beyond GitHub's own per-token limits — same "unlikely to
+matter at single-user, local scale, simple to add later if it does" posture §14.9 already accepts for
+NewsAPI's cap. No frontend surface yet calls `github_read` — it's reachable today only via a caller that
+sets `context["github_repo"]` directly (e.g. a future MCP client, or a manually-constructed task); no chat
+UI affordance analogous to §7.16's "Ask about this" exists for "read this specific repo" yet.
 

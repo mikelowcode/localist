@@ -146,6 +146,7 @@ from context_profile import check_local_ram_headroom, profile_for
 from controller_agent import ControllerAgent, TaskStatus, _MEMORY_MD_PATH
 from conversational_agent import ConversationalAgent
 from embedding_engine import EmbeddingEngine
+import github_watch
 from memory_manager import MemoryManager, EpisodicMemoryWriter, EpisodicMemoryReader
 import news_brief
 from runtime_factory import available_backends, create_runtime
@@ -943,6 +944,33 @@ class NewsBriefPreviewResponse(BaseModel):
 
 class NewsBriefOpenResponse(BaseModel):
     """Response body for POST /news/brief/open — always a fresh generation."""
+    success: bool = True
+
+
+class GithubWatchRepo(BaseModel):
+    """One watched repo's entry in the GitHub Watch Feed."""
+    key:             str
+    label:           str
+    repo_url:        str
+    latest_release:  dict[str, Any] | None = None
+    error:           str | None = None
+
+
+class GithubWatchPreviewResponse(BaseModel):
+    """
+    Response body for GET /github/watch/preview.
+
+    Read-only — never calls GitHub. `available=False` means the watch feed
+    has never been generated yet (unlike the news brief, there's no
+    same-day staleness check — watched-repo releases aren't day-keyed).
+    """
+    available:    bool
+    generated_at: float | None = None
+    repos:        list[GithubWatchRepo] = Field(default_factory=list)
+
+
+class GithubWatchOpenResponse(BaseModel):
+    """Response body for POST /github/watch/refresh — always a fresh fetch."""
     success: bool = True
 
 
@@ -2328,6 +2356,50 @@ async def post_news_brief_open() -> NewsBriefOpenResponse:
     await asyncio.to_thread(mm.set_news_brief_cache, today, sections, None)
 
     return NewsBriefOpenResponse()
+
+
+@app.get(
+    "/github/watch/preview",
+    response_model = GithubWatchPreviewResponse,
+    summary        = "Read the cached GitHub Watch Feed, if any",
+)
+async def get_github_watch_preview() -> GithubWatchPreviewResponse:
+    """
+    Read-only, for the Previews panel's GitHub section. Never calls
+    GitHub — only ever reads github_watch_cache.
+    """
+    mm = _require_memory_manager()
+    cache = await asyncio.to_thread(mm.get_github_watch_cache)
+    if cache is None:
+        return GithubWatchPreviewResponse(available=False)
+    return GithubWatchPreviewResponse(
+        available    = True,
+        generated_at = cache["generated_at"],
+        repos        = [GithubWatchRepo(**r) for r in cache["content"]],
+    )
+
+
+@app.post(
+    "/github/watch/refresh",
+    response_model = GithubWatchOpenResponse,
+    summary        = "Refresh the GitHub Watch Feed for the Previews panel",
+)
+async def post_github_watch_refresh() -> GithubWatchOpenResponse:
+    """
+    The Previews panel's GitHub section refresh handler.
+
+    Always fetches a fresh feed and writes it to github_watch_cache (so
+    GET /github/watch/preview reflects it) — same "a refresh always hits
+    the network" rationale as POST /news/brief/open. github_watch.build_watch_feed()
+    never raises (a missing GITHUB_TOKEN or a failed repo listing degrades
+    to a single error entry — see its docstring), so there's no try/except
+    needed here, same as news_brief.build_brief().
+    """
+    mm = _require_memory_manager()
+    repos = await github_watch.build_watch_feed()
+    await asyncio.to_thread(mm.set_github_watch_cache, repos)
+
+    return GithubWatchOpenResponse()
 
 
 @app.get(

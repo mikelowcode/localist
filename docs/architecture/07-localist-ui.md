@@ -735,3 +735,45 @@ updated to describe "Top Stories" instead of "World and National." Backend tests
 `tests/test_news_brief.py`'s `TestBuildBrief` updated for the single section (was two), plus a new test
 asserting the call is still anchored to `home_country`. Verified via `pytest tests/` (1161 passed) and
 `npm run check` (0 errors).
+
+### 7.20 GitHub Watch Feed — the Live Feed Panel's "GitHub" Block Goes Live (2026-07-29)
+
+§7.14's reserved "🐙 GitHub — Coming soon" block is wired up: a per-repo feed of the user's own
+GitHub-watched repos' latest releases, the structural twin of the Daily News Brief block right above it
+in the same panel. Full backend design (why classic PATs over fine-grained, `github_watch_cache` schema,
+endpoint contracts) is not duplicated here — see this feature's build session and `sessions-log.md`
+under 2026-07-29; this section covers only the UI surface. The companion on-demand `github_search`/
+`github_read` MCP tools (chat-triggered public-repo crawling, unrelated to this panel) are documented at
+§14.11, not here — this block never touches chat, same as the News Brief block's own §7.18 change.
+
+**Store.** `$lib/stores/githubWatch.ts`, structurally identical to `newsBrief.ts` (§7.14): a
+`githubWatchPreview` writable populated by `fetchGithubWatchPreview()` (`GET /api/github/watch/preview`,
+read-only, never calls GitHub) and `openGithubWatch()` (`POST /api/github/watch/refresh`, always fetches
+fresh — same "a button literally labeled Refresh should never silently reuse stale content" rationale
+§7.14/§7.18 already established for the News block).
+
+**Panel.** `PreviewsPanel.svelte`'s reserved GitHub block (§7.14) is replaced with a live one, same shape
+as the News block (§7.14) rather than the still-reserved Hacker News block below it: a single underlined
+"GitHub Watch Feed Refresh" link, then each watched repo as a row reusing the existing
+`preview-news-article-*` CSS classes unchanged (repo name linked to its GitHub page, latest release
+tag/name + date, or "no releases yet", or "unavailable" on a per-repo error) — no new CSS needed. No
+"Ask about this" button (§7.16) — that pattern is specific to feeding a news article into chat context;
+this feed has no chat involvement at all. `onMount` now fires both `fetchNewsBriefPreview()` and
+`fetchGithubWatchPreview()`.
+
+A whole-feed failure (most commonly `GITHUB_TOKEN` unset or invalid) comes back from the backend as a
+single sentinel repo entry (`key: "_error"`) rather than an HTTP error — the panel special-cases that key
+and renders its `error` message alone in the same italic "unavailable" style used elsewhere, rather than
+one confusing-looking repo row named `_error`.
+
+**Known gap, accepted as-is.** `repos.length === 0` means either "never refreshed" or "refreshed, but you
+aren't watching any repos on GitHub" — both show the same "No watch feed generated yet — click the link
+above to generate" message. Same class of minor ambiguity the News block doesn't hit (a brief always
+produces at least a Top Stories section), left unfixed for now since it's cosmetic, not incorrect.
+
+Verified via `npm run check` (0 errors) and a headless-browser pass (Playwright, installed standalone in
+a scratchpad directory — not added as a project dependency) driving the actual running dev server:
+confirmed the refresh link renders and behaves identically to the News Brief link, and that a missing
+`GITHUB_TOKEN` degrades to the `"GITHUB_TOKEN not configured"` message with zero console errors rather
+than a broken UI. Live-verified again after the user generated a real classic PAT and added repos to
+their GitHub watch list — confirmed real repo rows with real release data render correctly.
