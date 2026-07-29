@@ -224,6 +224,14 @@ class TestControllerToolIntegration:
         session-reuse seam, 2026-07-03) so this stays a pure unit test —
         without it, dispatch() would attempt a real SSE connection before
         ever reaching the mocked _call_mcp_tool.
+
+        Instruction changed 2026-07-29 from "What are the latest oMLX
+        release notes?" — that phrasing now correctly (and intentionally)
+        routes to the new github_release tool instead (§14.11's
+        _GITHUB_RELEASE_KEYWORDS gate), a real behavior change, not a
+        regression; this test's own point is just "a successful tool
+        result reaches [TOOL RESULTS]," which any web_search-routed
+        instruction demonstrates equally well.
         """
         rt = MagicMock(spec=["infer", "embed"])
         rt.embed.return_value = [0.0] * 768
@@ -253,7 +261,7 @@ class TestControllerToolIntegration:
             side_effect=fake_call_mcp_tool,
         ):
             ctrl.handle_task({
-                "instruction": "What are the latest oMLX release notes?",
+                "instruction": "What's the current status of oMLX?",
                 "context":     {"project_context": "LORA"},
             })
 

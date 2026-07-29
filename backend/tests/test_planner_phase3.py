@@ -1024,6 +1024,98 @@ class TestPlannerP3Github:
 
 
 # ---------------------------------------------------------------------------
+# Priority 3-github-release — github_release tool routing
+# ---------------------------------------------------------------------------
+
+class TestPlannerP3GithubRelease:
+
+    # 1. The motivating case: no literal "github"/"repo" anywhere, just a
+    #    release-shaped phrase + project name — must route to github_release,
+    #    not fall through to plain web_search or nothing at all.
+    def test_release_notes_with_no_github_keyword_routes_to_github_release(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("fetch the oMLX 0.5.3 release notes and summarize them", context={})
+        assert plan.tools_to_call == ["github_release"]
+        assert plan.compound is True
+        assert plan.priority == 3
+        assert plan.tool_signal_source == "keyword"
+        assert plan.fetch_rag is False
+        assert plan.fetch_episodic is False
+
+    # 2. "changelog"/"latest release"/"new release" all match
+    #    _GITHUB_RELEASE_KEYWORDS too.
+    @pytest.mark.parametrize("instruction", [
+        "check the changelog for oMLX",
+        "what's the latest release of oMLX",
+        "is there a new release for oMLX yet?",
+    ])
+    def test_other_release_keywords_route_to_github_release(self, instruction):
+        p = Planner(runtime=make_runtime())
+        plan = p.route(instruction, context={})
+        assert plan.tools_to_call == ["github_release"]
+
+    # 3. github_release wins over the plain github_search match when both
+    #    signals are present in the same turn — P3-github-release runs
+    #    before P3-github in route().
+    def test_release_beats_plain_github_search(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("check the release notes for that github repo", context={})
+        assert plan.tools_to_call == ["github_release"]
+        assert "github_search" not in plan.tools_to_call
+
+    # 4. Bare "release" alone does NOT trigger github_release — deliberately
+    #    excluded from _GITHUB_RELEASE_KEYWORDS as too weak/ambiguous a
+    #    signal (see its module-level comment).
+    def test_bare_release_word_does_not_trigger(self):
+        p = Planner(runtime=make_runtime(infer_return="no"))
+        plan = p.route("please release the quarterly report", context={})
+        assert "github_release" not in plan.tools_to_call
+
+    # 5. file_op guard: a literal _FILE_OP_KEYWORDS hit defers to P3.
+    def test_file_op_guard_defers_to_p3(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("read the file about the oMLX release notes", context={})
+        assert plan.tools_to_call == ["file_op"]
+        assert "github_release" not in plan.tools_to_call
+
+    # 6. url_fetch guard: a raw URL defers to P3.
+    def test_url_guard_defers_to_p3(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("summarize these release notes: https://example.com/releases/v1", context={})
+        assert "url_fetch" in plan.tools_to_call
+        assert "github_release" not in plan.tools_to_call
+
+    # 7. Ordering regression: P3c (graph-query) beats P3-github-release, same
+    #    as it already beats P3-news/P3-github/plain P3.
+    def test_p3c_beats_github_release(self, tmp_path):
+        mm, node_ids = make_mm_with_nodes(tmp_path)
+        p = Planner(runtime=make_runtime(), memory_manager=mm)
+        plan = p.route("what links to lora-persona, any release notes?", context={})
+        assert plan.graph_query is not None
+        direction, node_id, resolved_stem = plan.graph_query
+        assert direction     == "incoming"
+        assert resolved_stem == "lora-persona"
+        assert node_id       == node_ids["lora-persona"]
+        assert "github_release" not in plan.tools_to_call
+
+    # 8. P1 beats P3-github-release: ingest keyword routes to wiki_agent
+    #    regardless of a release keyword also being present.
+    def test_p1_beats_p3_github_release(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("ingest this file, it's about some release notes", context={})
+        assert plan.agent == "wiki_agent"
+        assert "github_release" not in plan.tools_to_call
+
+    # 9. No release keyword at all → P3-github-release defers, falls through
+    #    normally.
+    def test_no_release_keyword_falls_through(self):
+        p = Planner(runtime=make_runtime(infer_return="no"))
+        plan = p.route("how do I bake bread?", context={})
+        assert plan.tools_to_call == []
+        assert plan.agent == "conversational_agent"
+
+
+# ---------------------------------------------------------------------------
 # Priority 1b — diff-only wiki update (standalone diff instructions scope doc)
 # ---------------------------------------------------------------------------
 

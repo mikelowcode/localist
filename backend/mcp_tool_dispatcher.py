@@ -5,26 +5,30 @@ Was originally a drop-in replacement for the now-deleted ToolDispatcher
 (tool_dispatcher.py) at the controller_agent.py dispatch seam; as of Phase
 4 (cleanup, 2026-07-03) that legacy class is gone entirely — "file_op",
 "url_fetch", "web_search", "research", "chart", "news_search", and
-"github_search"/"github_read" are the only tool names Planner ever routes
-to tools_to_call (see planner.py's P3/P3-news/P3-github/P3b), and all are
-served over the localist-mcp service (mcp_server/, port 8003) via the MCP
-SSE transport (research is a client-side loop over the same
-web_search/url_fetch MCP tools, not a distinct MCP tool of its own). Any
-other tool name is unrecognized and produces an inline error ToolResult —
-the one remaining piece of what used to be ToolDispatcher's "else" branch,
-ported inline rather than kept as an excuse to hold onto a whole extra
-class.
+"github_search"/"github_read"/"github_release" are the only tool names
+Planner ever routes to tools_to_call (see planner.py's
+P3/P3-news/P3-github/P3-github-release/P3b), and all are served over the
+localist-mcp service (mcp_server/, port 8003) via the MCP SSE transport
+(research is a client-side loop over the same web_search/url_fetch MCP
+tools, not a distinct MCP tool of its own). Any other tool name is
+unrecognized and produces an inline error ToolResult — the one remaining
+piece of what used to be ToolDispatcher's "else" branch, ported inline
+rather than kept as an excuse to hold onto a whole extra class.
 
-github_search/github_read: public-repo GitHub REST reads (search and
-file/README/directory content) — the GitHub counterpart to news_search,
-minus a fallback tier (GitHub's Search API has no NewsAPI-style
-miss/error split worth a second provider). github_search is routed by
-Planner's keyword gate (P3-github); github_read is reached only when a
+github_search/github_read/github_release: public-repo GitHub REST reads
+(search, file/README/directory content, and release notes) — the GitHub
+counterpart to news_search, minus a fallback tier (GitHub's Search API
+has no NewsAPI-style miss/error split worth a second provider).
+github_search and github_release are routed by Planner keyword gates
+(P3-github, P3-github-release); github_read is reached only when a
 caller supplies context["github_repo"] directly (same
 caller-supplied-pin convention as news_search's context["news_article_url"]),
-since Planner's keyword gate can only detect that a GitHub-shaped request
-was made, not which repo. See mcp_server/github.py for the tool
-implementations — both are read-only (GET-only), no archive/CLI paths.
+since Planner's keyword gates can only detect that a GitHub-shaped
+request was made, not which repo — github_release works around this for
+its own case by chaining a github_search call to resolve a bare project
+name to owner/repo (see _run_github_release). See mcp_server/github.py
+for the tool implementations — all three are read-only (GET-only), no
+archive/CLI paths.
 
 news_search (news-query-routing plan, 2026-07-22): tries the NewsAPI-backed
 news_search MCP tool first; on a miss (NewsAPI empty/errored result — see
@@ -113,6 +117,7 @@ from contextlib import AsyncExitStack
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -149,6 +154,23 @@ _FILE_OP_TOOL_MAP: dict[str, str] = {
 # user pasting a bracket- or paren-wrapped URL would hit the identical bug,
 # just not yet observed live.
 _URL_RE = re.compile(r"https?://[^\s\"'>\]\)]+")
+
+# github_release repo resolution — specifically the *bracketed* [{url}]
+# line search_format.py's docstring documents as load-bearing, not "the
+# first URL anywhere in the text" the way _URL_RE/_extract_first_url()
+# scan (an existing, narrower vulnerability those two share: a hit's own
+# description/summary text can legitimately contain an unrelated URL —
+# e.g. a project linking its Twitter/docs page — that appears earlier in
+# the string than the bracketed repo URL itself). Caught live, 2026-07-29:
+# searching "httpie" surfaced a top hit whose description embedded
+# "https://twitter.com/httpie" before its own "[https://github.com/
+# httpie/http-prompt]" line, and _URL_RE.search() (unanchored) grabbed
+# the Twitter URL first, which parses to only one path segment and
+# correctly fails the owner/repo check — but for the wrong reason, and
+# would have silently resolved to a bogus repo entirely if the stray URL
+# had happened to have two path segments instead of one. Anchoring to the
+# `[...]` wrapper specifically avoids this whole class of false match.
+_GITHUB_SEARCH_BRACKETED_URL_RE = re.compile(r"\[(https?://[^\s\]]+)\]")
 
 # Maximum number of web_search queries per dispatch call — same cap as
 # legacy ToolDispatcher._run_web_search.
@@ -221,6 +243,56 @@ _RESEARCH_REFORMULATE_SYSTEM_PROMPT: str = (
 _WEB_SEARCH_FILLER_PREFIXES: tuple[str, ...] = (
     "what are the ", "what is the ", "what is ", "find the ",
     "search for ", "look up ", "tell me about ",
+)
+
+# github_release — bare version/tag extraction from an instruction, e.g.
+# "fetch the oMLX 0.5.3 release notes" -> "0.5.3". Optional leading "v"
+# (some repos tag "v0.5.3", others "0.5.3" — github.py's github_release()
+# retries with the other form on a 404, so either is fine here) followed
+# by a 2- or 3-segment dotted numeric version.
+_GITHUB_VERSION_RE = re.compile(r"\bv?\d+\.\d+(?:\.\d+)?\b", re.IGNORECASE)
+
+# github_release query derivation — two strategies, tried in order:
+#
+# 1. _GITHUB_RELEASE_SUBJECT_RE: a trailing "for/of/on/about X" object at
+#    the very end of the instruction — the common "release notes FOR X"/
+#    "changelog OF X"/"latest release ON X" phrasing, where the project
+#    name comes *after* the release marker. Tried first since it's an
+#    unambiguous, deliberately-named subject when present.
+# 2. _GITHUB_RELEASE_MARKER_RE (fallback, see _derive_github_release_query):
+#    truncate at the first release-marker/version match, assuming the
+#    project name *precedes* it instead — "fetch the oMLX 0.5.3 release
+#    notes ..." truncates before "0.5.3", leaving "oMLX" once filler is
+#    stripped.
+#
+# Between the two, most natural phrasings of "get me the release notes
+# for/of X" or "X's release notes" are covered. Neither is a general
+# parser — a phrasing this doesn't handle (e.g. the project name and a
+# version both trailing a marker in the same clause, "release notes for X
+# 0.5.3") derives an imperfect query. Accepted as a known limitation, same
+# posture as this file's other simple, heuristic derivation helpers
+# (_derive_file_op_path, etc.).
+_GITHUB_RELEASE_SUBJECT_RE = re.compile(
+    r"\b(?:for|of|on|about|in)\s+([A-Za-z][\w.\-]*(?:\s+[A-Za-z][\w.\-]*){0,2})\s*[?.!]?\s*$",
+    re.IGNORECASE,
+)
+
+_GITHUB_RELEASE_MARKER_RE = re.compile(
+    r"\b(release notes|changelog|latest release|new release|release)\b",
+    re.IGNORECASE,
+)
+
+# github_release query derivation — filler prefixes stripped from the
+# candidate left after truncating at the first _GITHUB_RELEASE_MARKER_RE/
+# _GITHUB_VERSION_RE match. Kept separate from _WEB_SEARCH_FILLER_PREFIXES
+# (which web_search/news_search/research also use) rather than extending
+# that shared list, since "fetch"/"get" phrasing is specific to how people
+# ask for a release and has no reason to affect unrelated tools' query
+# derivation.
+_GITHUB_RELEASE_FILLER_PREFIXES: tuple[str, ...] = (
+    "fetch the ", "fetch ", "get the ", "get ", "find the ", "look up ",
+    "what are the ", "what is ", "show me ", "summarize the ", "summarize ",
+    "check the ", "check ",
 )
 
 # file_op action derivation — keyword groups checked in this priority order
@@ -298,10 +370,11 @@ def _normalize_mcp_error_text(text: str) -> str:
 class MCPToolDispatcher:
     """
     "file_op", "url_fetch", "web_search", "chart", and
-    "github_search"/"github_read" are served by the localist-mcp MCP
-    server; any other tool name is unrecognized (Planner never routes
-    tools_to_call to anything else — see planner.py's P3/P3b/P3-github)
-    and produces an inline error ToolResult, same shape the legacy
+    "github_search"/"github_read"/"github_release" are served by the
+    localist-mcp MCP server; any other tool name is unrecognized (Planner
+    never routes tools_to_call to anything else — see planner.py's
+    P3/P3b/P3-github/P3-github-release) and produces an inline error
+    ToolResult, same shape the legacy
     ToolDispatcher's "else" branch used to produce.
 
     Parameters
@@ -403,6 +476,10 @@ class MCPToolDispatcher:
                 elif tool_name == "github_read":
                     results.append(
                         await self._run_github_read(session, connect_error, instruction, ctx)
+                    )
+                elif tool_name == "github_release":
+                    results.extend(
+                        await self._run_github_release(session, connect_error, instruction, ctx)
                     )
                 elif tool_name == "research":
                     results.extend(
@@ -935,7 +1012,7 @@ class MCPToolDispatcher:
         )
 
     # -----------------------------------------------------------------------
-    # github_search / github_read — served by localist-mcp
+    # github_search / github_read / github_release — served by localist-mcp
     # -----------------------------------------------------------------------
 
     async def _run_github_search(
@@ -956,6 +1033,24 @@ class MCPToolDispatcher:
         """
         query = self._derive_initial_query(instruction, context)
         kind  = context.get("github_search_kind") or "repositories"
+        return await self._execute_github_search_query(session, connect_error, query, kind)
+
+    async def _execute_github_search_query(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        query:         str,
+        kind:          str = "repositories",
+    ) -> ToolResult:
+        """
+        Run one github_search call and wrap the result as a ToolResult.
+        Split out from _run_github_search so _run_github_release() can
+        reuse this same single-call path to resolve a bare repo name (e.g.
+        "oMLX") to a concrete owner/repo before fetching a release — same
+        "extracted, reusable single-query helper" shape
+        _execute_web_search_query()/_execute_news_search_query() already
+        established.
+        """
         params_str = f"query={query!r} kind={kind!r}"
 
         if session is None:
@@ -1097,6 +1192,197 @@ class MCPToolDispatcher:
             result     = data.get("content", ""),
             success    = True,
         )
+
+    def _derive_github_release_tag(self, instruction: str, context: dict[str, Any]) -> str | None:
+        """context["github_tag"] wins if supplied; otherwise the first
+        version-shaped token in the instruction (see _GITHUB_VERSION_RE).
+        None means "latest release" — github_release()'s own default."""
+        explicit = context.get("github_tag")
+        if explicit:
+            return explicit
+        match = _GITHUB_VERSION_RE.search(instruction)
+        return match.group(0) if match else None
+
+    def _derive_github_release_query(self, instruction: str) -> str:
+        """
+        Derive a repo-name search query from a release-shaped instruction
+        with no explicit context["github_repo"] pin. Two strategies, see
+        _GITHUB_RELEASE_SUBJECT_RE's module comment for both:
+
+          1. "release notes/changelog FOR/OF X" (name trails the marker)
+             -> subject_match captures "X" directly, used as-is.
+          2. "fetch the X 0.5.3 release notes ..." (name precedes the
+             marker) -> truncate before the earliest marker/version match,
+             strip filler.
+        """
+        subject_match = _GITHUB_RELEASE_SUBJECT_RE.search(instruction.strip())
+        if subject_match:
+            return subject_match.group(1).strip()[:120]
+
+        marker_match  = _GITHUB_RELEASE_MARKER_RE.search(instruction)
+        version_match = _GITHUB_VERSION_RE.search(instruction)
+        cut_points = [m.start() for m in (marker_match, version_match) if m]
+        candidate = instruction[:min(cut_points)] if cut_points else instruction
+
+        # Deliberately lstrip() only, not strip() — a filler prefix like
+        # "fetch the " carries its own trailing space, and pre-stripping
+        # the candidate's trailing space made that exact (longer, more
+        # complete) prefix fail to match, silently falling through to a
+        # shorter one ("fetch ") that left a dangling "the" behind as the
+        # whole "query" (caught live, 2026-07-29: "fetch the release notes
+        # for cli/cli" derived "the" instead of falling back to the full
+        # instruction). Trailing whitespace is trimmed at the very end
+        # instead, after all stripping is done.
+        stripped = candidate.lstrip()
+        for filler in _GITHUB_RELEASE_FILLER_PREFIXES:
+            if stripped.lower().startswith(filler):
+                stripped = stripped[len(filler):]
+                break
+        # \b\s* (not \s+) so a leftover bare article with nothing after it
+        # ("the" alone) is still stripped, not just one followed by more text.
+        stripped = re.sub(r"^\s*(the|a|an)\b\s*", "", stripped, flags=re.IGNORECASE)
+        stripped = stripped.strip()
+        return stripped[:120] or instruction.strip()[:120]
+
+    def _extract_owner_repo_from_search_result(self, result_text: str) -> tuple[str, str] | None:
+        """
+        Pulls the top hit's owner/repo out of a github_search ToolResult's
+        formatted text via the first *bracketed* URL specifically (see
+        _GITHUB_SEARCH_BRACKETED_URL_RE — deliberately not _URL_RE, which
+        would also match an unrelated URL embedded in a hit's own
+        description/summary text if one appears earlier in the string).
+        Returns None if no bracketed URL is found or it doesn't have at
+        least two path segments.
+        """
+        match = _GITHUB_SEARCH_BRACKETED_URL_RE.search(result_text)
+        if not match:
+            return None
+        parts = urlparse(match.group(1)).path.strip("/").split("/")
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            return None
+        return parts[0], parts[1]
+
+    async def _run_github_release(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        instruction:   str,
+        context:       dict[str, Any],
+    ) -> list[ToolResult]:
+        """
+        Fetch one release's notes — the latest release, or a specific
+        tagged one when the instruction (or context["github_tag"]) names
+        a version.
+
+        Unlike github_search/github_read, this is a two-step chain when
+        no explicit context["github_repo"] pin is supplied: a
+        github_search call first resolves a bare project name (e.g.
+        "oMLX") to a concrete owner/repo from its top hit, then
+        github_release fetches that repo's release. Same "search, then
+        fetch a specific record off the top hit" shape
+        _enrich_top_result() already established for web_search/
+        news_search — both ToolResults are returned (not just the
+        winner), stamped with a shared workflow_id, mirroring that
+        convention. When context["github_repo"] is already known (same
+        caller-supplied-pin convention as news_search's
+        context["news_article_url"] — no chat UI sets this yet, same as
+        github_read), the search step is skipped entirely and only the
+        release ToolResult is returned, no workflow_id.
+        """
+        tag = self._derive_github_release_tag(instruction, context)
+        repo_spec = context.get("github_repo") or ""
+        search_result: ToolResult | None = None
+
+        if "/" in repo_spec:
+            owner, _, repo = repo_spec.partition("/")
+        else:
+            query = self._derive_github_release_query(instruction)
+            search_result = await self._execute_github_search_query(
+                session, connect_error, query, "repositories"
+            )
+            if not search_result.success:
+                return [ToolResult(
+                    tool_name  = "github_release",
+                    parameters = f"query={query!r} tag={tag!r}",
+                    result     = search_result.result or f"ERROR: could not resolve a repo for {query!r}",
+                    success    = False,
+                )]
+
+            resolved = self._extract_owner_repo_from_search_result(search_result.result)
+            if resolved is None:
+                return [search_result, ToolResult(
+                    tool_name  = "github_release",
+                    parameters = f"query={query!r} tag={tag!r}",
+                    result     = f"ERROR: could not resolve owner/repo from github_search result for {query!r}",
+                    success    = False,
+                )]
+            owner, repo = resolved
+
+        params_str = f"owner={owner!r} repo={repo!r} tag={tag!r}"
+
+        def _finish(release_result: ToolResult) -> list[ToolResult]:
+            if search_result is None:
+                return [release_result]
+            workflow_id = str(uuid.uuid4())
+            return [
+                replace(search_result, workflow_id=workflow_id),
+                replace(release_result, workflow_id=workflow_id),
+            ]
+
+        if session is None:
+            return _finish(ToolResult(
+                tool_name  = "github_release",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {connect_error}",
+                success    = False,
+            ))
+
+        arguments: dict[str, Any] = {"owner": owner, "repo": repo}
+        if tag:
+            arguments["tag"] = tag
+
+        try:
+            text, is_error = await self._call_mcp_tool(session, "github_release", arguments)
+        except Exception as exc:
+            logger.warning(
+                "MCPToolDispatcher: localist-mcp unreachable for github_release "
+                "owner=%r repo=%r tag=%r: %s",
+                owner, repo, tag, exc,
+            )
+            return _finish(ToolResult(
+                tool_name  = "github_release",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {exc}",
+                success    = False,
+            ))
+
+        if is_error:
+            return _finish(ToolResult(
+                tool_name  = "github_release",
+                parameters = params_str,
+                result     = _normalize_mcp_error_text(text),
+                success    = False,
+            ))
+
+        try:
+            data = json.loads(text)
+        except Exception as exc:
+            return _finish(ToolResult(
+                tool_name  = "github_release",
+                parameters = params_str,
+                result     = f"ERROR: failed to parse github_release response — {exc}",
+                success    = False,
+            ))
+
+        header = f"{owner}/{repo} {data.get('name') or data.get('tag_name', '')} — {data.get('published_at', '')}"
+        result_text = f"{header}\n{data.get('body', '')}\n[{data.get('html_url', '')}]"
+
+        return _finish(ToolResult(
+            tool_name  = "github_release",
+            parameters = params_str,
+            result     = result_text,
+            success    = True,
+        ))
 
     # -----------------------------------------------------------------------
     # research — bounded search / evaluate / reformulate / fetch loop

@@ -711,6 +711,231 @@ class TestGithubRead:
         assert "unreachable" in results[0].result
 
 
+def _github_search_hit(full_name: str) -> str:
+    return json.dumps({
+        "query": full_name, "result_count": 1, "is_miss": False,
+        "result_text": f"• {full_name} — GitHub\n  desc\n  [https://github.com/{full_name}]",
+    })
+
+
+class TestGithubRelease:
+    """
+    github_release: reached via context["github_repo"] directly (same
+    pin convention as github_read), or — the new capability this class
+    mostly covers — by chaining a github_search call to resolve a bare
+    project name to owner/repo first, mirroring _enrich_top_result's
+    "search, then fetch a specific record off the top hit" shape.
+    """
+
+    def test_explicit_repo_skips_search(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            assert name == "github_release"
+            assert arguments == {"owner": "anthropics", "repo": "claude-code", "tag": "0.5.3"}
+            return json.dumps({
+                "owner": "anthropics", "repo": "claude-code", "tag_name": "v0.5.3",
+                "name": "v0.5.3", "body": "notes", "published_at": "2026-07-22",
+                "html_url": "https://github.com/anthropics/claude-code/releases/tag/v0.5.3",
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_release"],
+                instruction   = "fetch the 0.5.3 release notes",
+                context       = {"github_repo": "anthropics/claude-code"},
+            )
+
+        assert len(results) == 1
+        assert results[0].tool_name == "github_release"
+        assert results[0].success is True
+        assert results[0].workflow_id is None
+        assert "notes" in results[0].result
+        assert "[https://github.com/anthropics/claude-code/releases/tag/v0.5.3]" in results[0].result
+
+    def test_no_explicit_repo_resolves_via_search_then_release(self, dispatcher: MCPToolDispatcher):
+        seen_calls: list[tuple[str, dict]] = []
+
+        async def fake_call(session, name, arguments):
+            seen_calls.append((name, arguments))
+            if name == "github_search":
+                assert arguments["query"] == "oMLX"
+                return _github_search_hit("anthropics/oMLX"), False
+            assert name == "github_release"
+            assert arguments == {"owner": "anthropics", "repo": "oMLX", "tag": "0.5.3"}
+            return json.dumps({
+                "owner": "anthropics", "repo": "oMLX", "tag_name": "v0.5.3", "name": "v0.5.3",
+                "body": "Release notes body.", "published_at": "2026-07-22",
+                "html_url": "https://github.com/anthropics/oMLX/releases/tag/v0.5.3",
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_release"],
+                instruction   = "fetch the oMLX 0.5.3 release notes and summarize them",
+                context       = {},
+            )
+
+        assert [name for name, _ in seen_calls] == ["github_search", "github_release"]
+        assert len(results) == 2
+        assert results[0].tool_name == "github_search"
+        assert results[1].tool_name == "github_release"
+        assert results[1].success is True
+        assert "Release notes body." in results[1].result
+        # Both stamped with the same workflow_id — the multi-step-chain
+        # marker _enrich_top_result()/_run_research_loop() already use.
+        assert results[0].workflow_id is not None
+        assert results[0].workflow_id == results[1].workflow_id
+
+    def test_url_embedded_in_description_does_not_confuse_repo_resolution(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        """
+        Regression test for a real bug caught live (2026-07-29): searching
+        "httpie" surfaced a top hit whose own description embedded
+        "https://twitter.com/httpie" *before* its bracketed
+        "[https://github.com/httpie/http-prompt]" repo-URL line.
+        _extract_owner_repo_from_search_result() must anchor to the
+        bracketed line specifically, not "the first URL anywhere in the
+        text" — otherwise it resolves the wrong owner/repo (or, as
+        happened live, fails outright when the stray URL has only one
+        path segment).
+        """
+        search_hit_with_embedded_url = (
+            "• httpie/http-prompt — GitHub\n"
+            "  An interactive HTTP client. https://twitter.com/httpie\n"
+            "  [https://github.com/httpie/http-prompt]\n"
+            "  ⭐ 9000"
+        )
+
+        async def fake_call(session, name, arguments):
+            if name == "github_search":
+                return json.dumps({
+                    "query": arguments["query"], "result_count": 1, "is_miss": False,
+                    "result_text": search_hit_with_embedded_url,
+                }), False
+            assert name == "github_release"
+            assert arguments["owner"] == "httpie"
+            assert arguments["repo"] == "http-prompt"
+            return json.dumps({
+                "owner": "httpie", "repo": "http-prompt", "tag_name": "v1.0", "name": "v1.0",
+                "body": "notes", "published_at": "x", "html_url": "y",
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_release"],
+                instruction   = "check the changelog for httpie",
+                context       = {},
+            )
+
+        assert results[-1].tool_name == "github_release"
+        assert results[-1].success is True
+
+    def test_no_tag_in_instruction_omits_tag_argument(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            if name == "github_search":
+                return _github_search_hit("anthropics/oMLX"), False
+            assert name == "github_release"
+            assert "tag" not in arguments
+            return json.dumps({
+                "owner": "anthropics", "repo": "oMLX", "tag_name": "v2.0", "name": "v2.0",
+                "body": "latest notes", "published_at": "x", "html_url": "y",
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_release"],
+                instruction   = "what's the latest release for oMLX",
+                context       = {},
+            )
+        assert results[-1].success is True
+
+    def test_context_github_tag_overrides_derived_tag(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            assert name == "github_release"
+            assert arguments["tag"] == "v9.9.9"
+            return json.dumps({
+                "owner": "o", "repo": "r", "tag_name": "v9.9.9", "name": "v9.9.9",
+                "body": "notes", "published_at": "x", "html_url": "y",
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_release"],
+                instruction   = "fetch the 0.5.3 release notes",
+                context       = {"github_repo": "o/r", "github_tag": "v9.9.9"},
+            )
+        assert results[0].success is True
+
+    def test_search_miss_returns_error_without_calling_release(self, dispatcher: MCPToolDispatcher):
+        release_call = MagicMock()
+
+        async def fake_call(session, name, arguments):
+            if name == "github_search":
+                return json.dumps({
+                    "query": arguments["query"], "result_count": 0, "is_miss": True, "result_text": "",
+                }), False
+            release_call()
+            return "", False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_release"],
+                instruction   = "fetch the zzqqxxvv 1.0.0 release notes",
+                context       = {},
+            )
+
+        assert len(results) == 1
+        assert results[0].tool_name == "github_release"
+        assert results[0].success is False
+        release_call.assert_not_called()
+
+    def test_unparseable_search_result_returns_error(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            assert name == "github_search"
+            return json.dumps({
+                "query": arguments["query"], "result_count": 1, "is_miss": False,
+                "result_text": "• something with no bracketed url at all",
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_release"],
+                instruction   = "fetch the oMLX 0.5.3 release notes",
+                context       = {},
+            )
+
+        assert len(results) == 2
+        assert results[1].tool_name == "github_release"
+        assert results[1].success is False
+        assert "could not resolve owner/repo" in results[1].result
+
+    def test_tool_level_error_normalized_via_shared_helper(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            return "Error executing tool github_release: ERROR: github_release — o/r has no releases", True
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_release"],
+                instruction   = "fetch the release notes",
+                context       = {"github_repo": "o/r"},
+            )
+        assert results[0].success is False
+        assert results[0].result == "ERROR: github_release — o/r has no releases"
+
+    def test_connection_failure_returns_graceful_error(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            raise ConnectionRefusedError("Connection refused")
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["github_release"],
+                instruction   = "fetch the release notes",
+                context       = {"github_repo": "o/r"},
+            )
+        assert results[0].success is False
+        assert "unreachable" in results[0].result
+
+
 def _fetch_url_ok(url: str, cleaned_text: str = "Full article body text.") -> tuple[str, bool]:
     return json.dumps({
         "url": url, "title": "T", "author": "", "date_published": "",

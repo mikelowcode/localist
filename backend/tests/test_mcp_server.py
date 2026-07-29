@@ -5,9 +5,9 @@ retired standalone Fetcher microservice's /extract path in-process.
 Phase 3 adds web_search coverage (mcp_server/web_search.py) — ports the
 LangSearch integration in-process, no runtime.infer() fallback. A second
 provider (Brave) was later added behind the SEARCH_PROVIDER env var switch.
-Also covers github.github_search / github.github_read (mcp_server/github.py)
-— public-repo GitHub REST reads, GITHUB_TOKEN optional (used opportunistically,
-never required — see the module docstring).
+Also covers github.github_search / github.github_read / github.github_release
+(mcp_server/github.py) — public-repo GitHub REST reads, GITHUB_TOKEN optional
+(used opportunistically, never required — see the module docstring).
 
 Covers:
   - file_ops.read_file / write_file / append_file: sandboxing, truncation,
@@ -741,6 +741,125 @@ class TestGithubReadErrors:
 
 
 # ---------------------------------------------------------------------------
+# github.github_release — direct unit tests
+# ---------------------------------------------------------------------------
+
+def _github_release_response(data: dict, status_code: int = 200) -> httpx.Response:
+    request = httpx.Request("GET", f"{github._GITHUB_API_BASE}/repos/o/r/releases/latest")
+    return httpx.Response(status_code, json=data, request=request)
+
+
+class TestGithubReleaseSuccess:
+    def test_latest_release_returns_notes(self):
+        data = {
+            "tag_name": "v1.2.0", "name": "v1.2.0", "body": "Bug fixes and improvements.",
+            "published_at": "2026-07-22T00:00:00Z",
+            "html_url": "https://github.com/o/r/releases/tag/v1.2.0",
+        }
+        response = _github_release_response(data)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(github.github_release("o", "r"))
+
+        assert result["tag_name"] == "v1.2.0"
+        assert result["body"] == "Bug fixes and improvements."
+        assert result["truncated"] is False
+        assert result["html_url"] == "https://github.com/o/r/releases/tag/v1.2.0"
+
+    def test_exact_tag_match_hits_tags_endpoint_directly(self):
+        data = {"tag_name": "v0.5.3", "name": "0.5.3", "body": "notes", "published_at": "x", "html_url": "y"}
+        response = _github_release_response(data)
+        fake_get = AsyncMock(return_value=response)
+        with patch.object(httpx.AsyncClient, "get", fake_get):
+            result = asyncio.run(github.github_release("o", "r", tag="v0.5.3"))
+
+        assert result["tag_name"] == "v0.5.3"
+        assert fake_get.await_count == 1
+        called_url = fake_get.await_args.args[0]
+        assert called_url.endswith("/repos/o/r/releases/tags/v0.5.3")
+
+    def test_bare_version_retries_with_v_prefix_on_404(self):
+        not_found = httpx.Response(
+            404, json={"message": "Not Found"},
+            request=httpx.Request("GET", f"{github._GITHUB_API_BASE}/repos/o/r/releases/tags/0.5.3"),
+        )
+        found = _github_release_response({
+            "tag_name": "v0.5.3", "name": "0.5.3", "body": "notes",
+            "published_at": "2026-07-22T00:00:00Z", "html_url": "y",
+        })
+        fake_get = AsyncMock(side_effect=[not_found, found])
+        with patch.object(httpx.AsyncClient, "get", fake_get):
+            result = asyncio.run(github.github_release("o", "r", tag="0.5.3"))
+
+        assert result["tag_name"] == "v0.5.3"
+        assert fake_get.await_count == 2
+        second_url = fake_get.await_args_list[1].args[0]
+        assert second_url.endswith("/repos/o/r/releases/tags/v0.5.3")
+
+    def test_v_prefixed_tag_retries_without_v_on_404(self):
+        not_found = httpx.Response(
+            404, json={"message": "Not Found"},
+            request=httpx.Request("GET", f"{github._GITHUB_API_BASE}/repos/o/r/releases/tags/vfoo"),
+        )
+        found = _github_release_response({
+            "tag_name": "foo", "name": "foo", "body": "notes", "published_at": "x", "html_url": "y",
+        })
+        fake_get = AsyncMock(side_effect=[not_found, found])
+        with patch.object(httpx.AsyncClient, "get", fake_get):
+            result = asyncio.run(github.github_release("o", "r", tag="vfoo"))
+
+        assert result["tag_name"] == "foo"
+        second_url = fake_get.await_args_list[1].args[0]
+        assert second_url.endswith("/repos/o/r/releases/tags/foo")
+
+    def test_body_truncated_past_budget(self):
+        long_body = "x" * (github._GITHUB_RELEASE_BODY_CHARS + 500)
+        data = {"tag_name": "v1", "name": "v1", "body": long_body, "published_at": "x", "html_url": "y"}
+        response = _github_release_response(data)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(github.github_release("o", "r"))
+
+        assert result["truncated"] is True
+        assert len(result["body"]) == github._GITHUB_RELEASE_BODY_CHARS + 1  # + ellipsis
+        assert result["body"].endswith("…")
+
+
+class TestGithubReleaseErrors:
+    def test_no_releases_raises_clean_message(self):
+        response = httpx.Response(
+            404, json={"message": "Not Found"},
+            request=httpx.Request("GET", f"{github._GITHUB_API_BASE}/repos/o/r/releases/latest"),
+        )
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            with pytest.raises(ValueError, match="ERROR: github_release — o/r has no releases"):
+                asyncio.run(github.github_release("o", "r"))
+
+    def test_tag_not_found_after_both_attempts_raises_clean_message(self):
+        not_found = httpx.Response(
+            404, json={"message": "Not Found"},
+            request=httpx.Request("GET", f"{github._GITHUB_API_BASE}/repos/o/r/releases/tags/9.9.9"),
+        )
+        fake_get = AsyncMock(return_value=not_found)
+        with patch.object(httpx.AsyncClient, "get", fake_get):
+            with pytest.raises(ValueError, match="ERROR: github_release — o/r tag '9.9.9' not found"):
+                asyncio.run(github.github_release("o", "r", tag="9.9.9"))
+        assert fake_get.await_count == 2
+
+    def test_transport_error_raises_clean_message(self):
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(side_effect=httpx.ConnectError("refused"))):
+            with pytest.raises(ValueError, match="ERROR: github_release failed —"):
+                asyncio.run(github.github_release("o", "r"))
+
+    def test_rate_limited_raises_clean_message(self):
+        response = httpx.Response(
+            403, json={"message": "API rate limit exceeded"},
+            request=httpx.Request("GET", f"{github._GITHUB_API_BASE}/repos/o/r/releases/latest"),
+        )
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            with pytest.raises(ValueError, match="ERROR: github_release failed —"):
+                asyncio.run(github.github_release("o", "r"))
+
+
+# ---------------------------------------------------------------------------
 # chart.generate_chart — direct unit tests
 # ---------------------------------------------------------------------------
 
@@ -973,3 +1092,25 @@ class TestMCPToolsInProcess:
             text, is_error = asyncio.run(_call_tool("github_read", {"owner": "o", "repo": "r"}))
         assert is_error is True
         assert "not found" in text
+
+    def test_github_release_tool_success(self):
+        data = {
+            "tag_name": "v1.0", "name": "v1.0", "body": "notes",
+            "published_at": "x", "html_url": "y",
+        }
+        response = _github_release_response(data)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            text, is_error = asyncio.run(_call_tool("github_release", {"owner": "o", "repo": "r"}))
+        assert is_error is False
+        data_out = json.loads(text)
+        assert data_out["tag_name"] == "v1.0"
+
+    def test_github_release_tool_no_releases_surfaces_as_is_error(self):
+        response = httpx.Response(
+            404, json={"message": "Not Found"},
+            request=httpx.Request("GET", f"{github._GITHUB_API_BASE}/repos/o/r/releases/latest"),
+        )
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            text, is_error = asyncio.run(_call_tool("github_release", {"owner": "o", "repo": "r"}))
+        assert is_error is True
+        assert "has no releases" in text

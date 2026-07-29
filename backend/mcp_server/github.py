@@ -1,5 +1,6 @@
 """
-Localist MCP Server — github tool implementations (github_search, github_read)
+Localist MCP Server — github tool implementations (github_search, github_read,
+github_release)
 ========================================================
 Public-repo GitHub REST reads for on-demand crawling during chat — the
 GitHub counterpart to news_search.py. Both tools are read-only (GET-only,
@@ -42,6 +43,7 @@ _GITHUB_USER_AGENT: str = "localist-mcp"
 _GITHUB_SEARCH_COUNT: int = 5
 _GITHUB_SUMMARY_CHARS: int = 500
 _GITHUB_CONTENT_CHARS: int = 4000
+_GITHUB_RELEASE_BODY_CHARS: int = 3000
 
 _VALID_SEARCH_KINDS = frozenset({"repositories", "code"})
 
@@ -223,4 +225,102 @@ async def github_read(owner: str, repo: str, path: str | None = None) -> dict:
     return {
         "owner": owner, "repo": repo, "path": path,
         "kind": "file", "content": text, "truncated": truncated,
+    }
+
+
+async def github_release(owner: str, repo: str, tag: str | None = None) -> dict:
+    """
+    Fetch one release's notes — the latest release (tag=None) or a
+    specific tagged release — via GitHub's Releases API. A different
+    endpoint from github_read's Contents API (releases aren't repo
+    content) and from backend/github_watch.py's own latest-release lookup
+    (that one is scoped to the Watch Feed's single-repo-at-a-time,
+    latest-only use; this tool is the on-demand, any-repo, any-tag chat
+    counterpart — same deliberate cross-process duplication convention as
+    news_search.py/news_brief.py, see module docstring).
+
+    Parameters
+    ----------
+    owner : repo owner/org login.
+    repo  : repo name.
+    tag   : exact git tag name (e.g. "v0.5.3"). Omit (or pass None) for
+            the latest release. If a caller passes a bare version like
+            "0.5.3" and that exact tag doesn't exist, one retry is made
+            with a toggled "v" prefix (added if missing, stripped if
+            present) before giving up — real repos are inconsistent about
+            the "v" prefix and a caller asking about "0.5.3" has no way to
+            know which convention a given repo uses.
+
+    Returns
+    -------
+    dict with keys: owner, repo, tag_name, name, body (release notes
+    markdown, truncated to _GITHUB_RELEASE_BODY_CHARS), published_at,
+    html_url, truncated (bool).
+
+    Raises
+    ------
+    ValueError
+        "ERROR: github_release — <owner>/<repo> has no releases" when
+        tag=None and the repo has never cut a release, "ERROR:
+        github_release — <owner>/<repo> tag '<tag>' not found" when a
+        specific tag doesn't exist (after the v-prefix retry), or
+        "ERROR: github_release failed — <exc>" on any other network/HTTP/
+        parsing error.
+    """
+    endpoint = (
+        f"{_GITHUB_API_BASE}/repos/{owner}/{repo}/releases/latest"
+        if not tag
+        else f"{_GITHUB_API_BASE}/repos/{owner}/{repo}/releases/tags/{tag}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(endpoint, headers=_headers())
+    except Exception as exc:
+        logger.warning("github_release: failed for %s/%s tag=%r: %s", owner, repo, tag, exc)
+        raise ValueError(f"ERROR: github_release failed — {exc}") from exc
+
+    if resp.status_code == 404 and tag:
+        alt_tag = tag[1:] if tag.lower().startswith("v") else f"v{tag}"
+        alt_endpoint = f"{_GITHUB_API_BASE}/repos/{owner}/{repo}/releases/tags/{alt_tag}"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(alt_endpoint, headers=_headers())
+        except Exception as exc:
+            logger.warning(
+                "github_release: v-prefix retry failed for %s/%s tag=%r: %s",
+                owner, repo, alt_tag, exc,
+            )
+            raise ValueError(f"ERROR: github_release failed — {exc}") from exc
+
+    if resp.status_code == 404:
+        if tag:
+            raise ValueError(f"ERROR: github_release — {owner}/{repo} tag {tag!r} not found")
+        raise ValueError(f"ERROR: github_release — {owner}/{repo} has no releases")
+
+    try:
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        logger.warning("github_release: failed for %s/%s tag=%r: %s", owner, repo, tag, exc)
+        raise ValueError(f"ERROR: github_release failed — {exc}") from exc
+
+    body = (data.get("body") or "").strip()
+    truncated = len(body) > _GITHUB_RELEASE_BODY_CHARS
+    if truncated:
+        body = body[:_GITHUB_RELEASE_BODY_CHARS] + "…"
+
+    logger.info(
+        "github_release: complete for %s/%s tag=%r resolved_tag=%r chars=%d truncated=%s.",
+        owner, repo, tag, data.get("tag_name"), len(body), truncated,
+    )
+    return {
+        "owner":        owner,
+        "repo":         repo,
+        "tag_name":     data.get("tag_name", ""),
+        "name":         data.get("name") or data.get("tag_name", ""),
+        "body":         body,
+        "published_at": data.get("published_at", ""),
+        "html_url":     data.get("html_url", ""),
+        "truncated":    truncated,
     }

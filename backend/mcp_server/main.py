@@ -11,11 +11,11 @@ fallback), news_search (NewsAPI.org /v2/everything — first-tier provider
 for news-shaped queries; MCPToolDispatcher falls back to web_search on a
 miss, see news-query-routing plan §4), generate_chart (renders a
 bar/line/pie chart from structured data server-side via matplotlib), and
-github_search/github_read (public-repo GitHub REST reads — search and
-file/README/directory content, read-only, no archive/CLI capability; see
-mcp_server/github.py) — over SSE transport, using the official `mcp`
-Python SDK's FastMCP. See backend/mcp_tool_dispatcher.py for the dispatch
-seam.
+github_search/github_read/github_release (public-repo GitHub REST reads —
+search, file/README/directory content, and release notes, read-only, no
+archive/CLI capability; see mcp_server/github.py) — over SSE transport,
+using the official `mcp` Python SDK's FastMCP. See
+backend/mcp_tool_dispatcher.py for the dispatch seam.
 
 Endpoints
 ---------
@@ -46,16 +46,17 @@ Configuration
                                tier only (100 req/day, dev/test use only);
                                a paid tier is required if this code is
                                ever deployed off a single local machine.
-  GITHUB_TOKEN                 Optional for github_search / github_read —
-                               see mcp_server/github.py. Both are
-                               public-repo GitHub REST reads; the token is
-                               used opportunistically if present. Rate
-                               limits differ by endpoint: github_read
-                               (core REST bucket) gets 60 req/hr
-                               unauthenticated vs 5000 req/hr authenticated;
-                               github_search (Search API's separate,
-                               stricter bucket) gets 10 req/min
-                               unauthenticated vs 30 req/min authenticated.
+  GITHUB_TOKEN                 Optional for github_search / github_read /
+                               github_release — see mcp_server/github.py.
+                               All three are public-repo GitHub REST reads;
+                               the token is used opportunistically if
+                               present. Rate limits differ by endpoint:
+                               github_read/github_release (core REST
+                               bucket) get 60 req/hr unauthenticated vs
+                               5000 req/hr authenticated; github_search
+                               (Search API's separate, stricter bucket)
+                               gets 10 req/min unauthenticated vs 30
+                               req/min authenticated.
                                Also read by backend/github_watch.py in the
                                main backend process, where it is required
                                (not optional) — GET /user/subscriptions
@@ -165,6 +166,12 @@ async def github_read(owner: str, repo: str, path: str | None = None) -> dict:
     return await _github.github_read(owner, repo, path)
 
 
+@mcp.tool()
+async def github_release(owner: str, repo: str, tag: str | None = None) -> dict:
+    """Fetch one release's notes — the latest release (tag omitted) or a specific tagged release."""
+    return await _github.github_release(owner, repo, tag)
+
+
 # ── App ──────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -179,7 +186,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title       = "Localist MCP Server",
-    description = "MCP tool server for Localist — file_op tools (read_file/write_file/append_file), fetch_url, web_search, news_search, generate_chart, and github_search/github_read.",
+    description = "MCP tool server for Localist — file_op tools (read_file/write_file/append_file), fetch_url, web_search, news_search, generate_chart, and github_search/github_read/github_release.",
     version     = "1.0.0",
     lifespan    = lifespan,
 )

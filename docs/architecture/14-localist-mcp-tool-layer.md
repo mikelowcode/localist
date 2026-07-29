@@ -11,8 +11,8 @@ logging. It exposes tools over **MCP's SSE transport** (`GET /sse`,
 `GET /health` returning `{"status": "ok"}`.
 
 This is where `file_op`, `url_fetch`, `web_search`, `generate_chart`
-(§14.8), `news_search` (§14.9), and `github_search`/`github_read` (§14.11)
-actually execute.
+(§14.8), `news_search` (§14.9), `github_search`/`github_read` (§14.11),
+and `github_release` (§14.12) actually execute.
 `MCPToolDispatcher` (`backend/mcp_tool_dispatcher.py`) is the client —
 `controller_agent.py`'s `_execute_plan()` constructs one per dispatch call
 (the same single seam `ToolDispatcher` used to occupy) and calls it over
@@ -43,6 +43,7 @@ brought this document back in sync.
 | `news_search` | `mcp_server/news_search.py` | `(query: str) -> dict` | `{query, result_text, result_count, is_miss}` — see §14.9 |
 | `github_search` | `mcp_server/github.py` | `(query: str, kind: str = "repositories") -> dict` | `{query, result_text, result_count, is_miss}` — see §14.11 |
 | `github_read` | `mcp_server/github.py` | `(owner: str, repo: str, path: str \| None = None) -> dict` | `{owner, repo, path, kind, content, truncated}` — see §14.11 |
+| `github_release` | `mcp_server/github.py` | `(owner: str, repo: str, tag: str \| None = None) -> dict` | `{owner, repo, tag_name, name, body, published_at, html_url, truncated}` — see §14.12 |
 
 **`file_op` sandboxing:** every path is resolved against a sandbox root
 and rejected if the resolved absolute path escapes it — same check
@@ -295,12 +296,13 @@ NEWSAPI_API_KEY              Required for news_search (§14.9). Free
                               since Localist runs single-user on
                               localhost and never leaves it.
 
-GITHUB_TOKEN                 Optional for github_search/github_read
-                              (§14.11) — both are public-repo GitHub REST
-                              reads, used opportunistically when present.
-                              Rate limits differ by endpoint (confirmed
-                              live via response headers, §14.11):
-                              github_read uses GitHub's core REST bucket
+GITHUB_TOKEN                 Optional for github_search/github_read/
+                              github_release (§14.11/§14.12) — all three
+                              are public-repo GitHub REST reads, used
+                              opportunistically when present. Rate limits
+                              differ by endpoint (confirmed live via
+                              response headers): github_read/
+                              github_release use GitHub's core REST bucket
                               (60 req/hr unauth / 5000 req/hr auth);
                               github_search uses the Search API's separate,
                               much stricter bucket (10 req/min unauth /
@@ -374,6 +376,18 @@ LOCALIST_LOG_LEVEL           localist-mcp's root log level. Default: INFO.
   (`test_planner_phase3.py`), plus live verification against real GitHub
   REST traffic (unauthenticated and, later, with a real classic PAT) —
   see §14.11 and `sessions-log.md` under 2026-07-29.
+- `github_release` (§14.12, 2026-07-29) —
+  `TestGithubReleaseSuccess`/`TestGithubReleaseErrors` plus
+  `TestMCPToolsInProcess` additions (`test_mcp_server.py`),
+  `TestGithubRelease` (`test_mcp_tool_dispatcher.py` — includes a
+  regression test for a real live-caught bug, see §14.12), and
+  `TestPlannerP3GithubRelease` (`test_planner_phase3.py`), plus a
+  chart+web_search compound-detection regression fix
+  (`TestPlannerP3Chart::test_chart_compounds_with_web_search`) and an
+  unrelated test's instruction updated after it started correctly
+  matching the new routing (`test_tool_results_slot_present_in_prompt`,
+  `test_tool_dispatcher_phase6.py`) — see §14.12 and `sessions-log.md`
+  under 2026-07-29.
 
 ### 14.7 Open Items
 
@@ -1202,4 +1216,103 @@ matter at single-user, local scale, simple to add later if it does" posture §14
 NewsAPI's cap. No frontend surface yet calls `github_read` — it's reachable today only via a caller that
 sets `context["github_repo"]` directly (e.g. a future MCP client, or a manually-constructed task); no chat
 UI affordance analogous to §7.16's "Ask about this" exists for "read this specific repo" yet.
+
+### 14.12 `github_release` Tool — Release Notes, Keyword-Routable Without a URL (2026-07-29)
+
+Closes a real gap surfaced live the same day §14.11 shipped: neither `github_search` (Search API — no
+release index at all) nor `github_read` (Contents API — README/file/directory, not releases) could answer
+"fetch the oMLX 0.5.3 release notes and summarize them." The only release-fetching code that existed was
+`github_watch.py`'s `fetch_latest_release()` (§7.20), deliberately walled off from chat and scoped to
+*latest-only* releases of *watched* repos — not an arbitrary tagged version of an arbitrary repo. Before
+this, the only way to get a specific release's notes into chat was pasting its raw GitHub URL (routes to
+the pre-existing `url_fetch` tool via Planner's P3 raw-URL signal) — functional, but not what "ask LORA
+about a release" should require.
+
+**`github_release(owner: str, repo: str, tag: str | None = None) -> dict`** (`mcp_server/github.py`) —
+`tag=None` fetches `/repos/{owner}/{repo}/releases/latest`; a specific tag fetches
+`/repos/{owner}/{repo}/releases/tags/{tag}`. Real repos are inconsistent about the "v" prefix ("0.5.3" vs
+"v0.5.3") — on a 404 with an explicit tag, one retry is made with the prefix toggled before giving up.
+Returns `{owner, repo, tag_name, name, body, published_at, html_url, truncated}`; `body` (the release
+notes markdown) is truncated at `_GITHUB_RELEASE_BODY_CHARS = 3000`. Same core-REST rate-limit bucket as
+`github_read` (§14.4) — confirmed live, not assumed. Registered as a third `@mcp.tool()` wrapper in
+`mcp_server/main.py`, same shape as `github_search`/`github_read`.
+
+**The keyword-routable part — resolving a bare name with no owner/repo at all.** Planner's gate only knows
+"this instruction is release-shaped," never *which* repo. `MCPToolDispatcher._run_github_release()`
+chains its own `github_search` call to resolve a bare project name (e.g. "oMLX") to a concrete owner/repo
+from the top hit — same "search, then fetch a specific record off the top hit" shape
+`_enrich_top_result()` already established for `web_search`/`news_search` (§14.3), including stamping both
+`ToolResult`s with a shared `workflow_id` (only when the search step actually ran — `context["github_repo"]`
+being pre-supplied, same pin convention `github_read` uses, skips it entirely, no `workflow_id`).
+`_execute_github_search_query()` was split out of `_run_github_search()` (§14.11) as a standalone
+reusable single-call helper specifically so this chain could reuse it, mirroring how
+`_execute_web_search_query()`/`_execute_news_search_query()` already exist as the equivalent extracted
+helpers for `web_search`/`news_search`.
+
+**Query/tag derivation from free text** (`_derive_github_release_query()`/`_derive_github_release_tag()`)
+— two strategies tried in order: a trailing "release notes/changelog **for/of/on** X" object at the very
+end of the instruction (`_GITHUB_RELEASE_SUBJECT_RE`, tried first — unambiguous when present, covers the
+very common "what's the latest release **for** X"/"changelog **of** X" phrasing), falling back to
+truncating before the earliest release-marker/version match on the assumption the project name *precedes*
+it instead (`_GITHUB_RELEASE_MARKER_RE`/`_GITHUB_VERSION_RE`, covers "fetch the X 0.5.3 release notes...").
+Neither is a general parser — a phrasing neither strategy fits (e.g. both a trailing name *and* a trailing
+version in the same clause) derives an imperfect query; accepted as a known limitation, same posture as
+`_derive_file_op_path`/`_derive_initial_query`'s existing heuristics.
+
+**Chart-keyword guard.** `_priority3_github_release()`'s inline guard (mirrors P3-news's/P3-github's
+file_op/url_fetch/raw-URL guard) also defers on a `_CHART_KEYWORDS` hit — "release notes"/"changelog" are
+common enough as the *subject* of a chart request ("make a bar chart of the latest oMLX release notes")
+that without this guard, a legitimate chart+web_search compound instruction would get hijacked into a
+single raw-text `github_release` call instead. Caught by a pre-existing test
+(`test_chart_compounds_with_web_search`) failing once `_GITHUB_RELEASE_KEYWORDS` shipped — no equivalent
+guard exists on plain `_GITHUB_KEYWORDS` in P3-github, since that collision class is specific to how
+naturally release-shaped words show up as a chart's subject, not a general problem this addition
+introduced elsewhere.
+
+**Two real bugs found via live chat testing, not caught by mocked unit tests, fixed same day:**
+1. **Query-derivation artifact.** "fetch the release notes for cli/cli" derived the search query `"the"`
+   — not the intended full fallback. Root cause: the marker-truncation candidate's trailing space was
+   stripped (`.strip()`) *before* filler-prefix matching, so the exact prefix `"fetch the "` (with its own
+   trailing space) failed to match, silently falling through to the shorter `"fetch "` prefix instead and
+   leaving a dangling `"the"` behind. Fixed by only `.lstrip()`-ing before the filler-prefix loop (trailing
+   whitespace is trimmed at the very end instead) and changing the leftover-article cleanup regex from
+   `(the|a|an)\s+` to `(the|a|an)\b\s*` so a bare trailing article with nothing after it is also stripped,
+   not just one followed by more text.
+2. **Wrong-URL resolution.** Searching "httpie" surfaced a top hit whose own description embedded
+   `https://twitter.com/httpie` *before* its bracketed `[https://github.com/httpie/http-prompt]` repo-URL
+   line; `_extract_owner_repo_from_search_result()` used the same unanchored `_URL_RE.search()` pattern
+   `_extract_first_url()` (§14.3) already uses for enrichment, which grabbed the Twitter URL first — one
+   path segment, correctly failing the owner/repo check, but for the wrong reason, and would have silently
+   resolved to a bogus repo entirely had the stray URL happened to have two path segments instead of one.
+   Fixed with a new `_GITHUB_SEARCH_BRACKETED_URL_RE` anchored specifically to the `[{url}]` wrapper
+   `search_format.py`'s docstring already documents as load-bearing, rather than matching any URL anywhere
+   in the free text. Note: `_extract_first_url()` itself still has this same latent vulnerability for
+   `web_search`/`news_search` enrichment — out of scope to fix here (pre-existing code, different call
+   site, not part of what this session's build touched), flagged for a future look.
+
+**Test coverage.** `TestGithubReleaseSuccess`/`TestGithubReleaseErrors` (`test_mcp_server.py`) — latest and
+tagged fetch, the v-prefix retry in both directions, body truncation, no-releases/tag-not-found/rate-limit
+error taxonomy. `TestGithubRelease` (`test_mcp_tool_dispatcher.py`, 9 tests) — explicit-repo-pin skip,
+search-then-release chain with shared `workflow_id`, tag omission/override, search-miss/unparseable-result
+error paths, connection failure, and a dedicated regression test for the wrong-URL-resolution bug above.
+`TestPlannerP3GithubRelease` (`test_planner_phase3.py`, 11 tests) — the motivating no-github-keyword case,
+other `_GITHUB_RELEASE_KEYWORDS` phrasings, wins over plain `github_search`, bare "release" confirmed
+*not* triggering it, file_op/url_fetch/chart guards, P3c/P1 still win, no-match fallthrough.
+
+**Live verification (2026-07-29).** Direct calls against the real GitHub API (`cli/cli` — latest release
+and a specific tag, both real). Real chat instructions against the full running stack surfaced both bugs
+above — fixed, then re-verified live: "check the changelog for httpie" correctly resolved
+`owner='httpie' repo='http-prompt'` (search ranked it above `httpie/cli` for that query — a GitHub search
+relevance outcome, not a bug) and returned real release notes end to end, with `workflow_steps` showing
+both the `github_search` and `github_release` calls. Full suite: 1284 → 1315 passed (includes the two
+pre-existing-test fixes below).
+
+**Two pre-existing tests updated, not treated as regressions to work around.** `_GITHUB_RELEASE_KEYWORDS`
+firing on "release notes" is by design, not a bug, so two tests whose instructions happened to contain
+that exact phrase needed updating: `test_chart_compounds_with_web_search` needed the chart-keyword guard
+above (a real fix); `test_tool_results_slot_present_in_prompt` (`test_tool_dispatcher_phase6.py`) had its
+instruction changed from "What are the latest oMLX release notes?" to "What's the current status of
+oMLX?" — that phrasing now correctly routes to `github_release` instead of `web_search`, a real behavior
+change the user asked for, and the test's own point (a successful tool result reaches `[TOOL RESULTS]`)
+is demonstrated equally well by either tool.
 

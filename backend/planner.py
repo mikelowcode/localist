@@ -349,6 +349,23 @@ _GITHUB_KEYWORDS: frozenset[str] = frozenset({
     "github repo",
 })
 
+# Priority 3-github-release — github_release trigger keywords, checked
+# before P3-github (a release-shaped instruction should get github_release,
+# not a plain repo/code search) and standalone from _GITHUB_KEYWORDS — the
+# whole point is that "fetch the oMLX 0.5.3 release notes" has no literal
+# "github"/"repo" in it at all. Multi-word phrases only (no bare "release"
+# — too weak a signal on its own, real false-positive risk against
+# unrelated uses like "please release the report"); MCPToolDispatcher's
+# own release-keyword strip list (used only for query derivation, after
+# this gate has already fired) does include the bare word, since a false
+# positive there costs nothing.
+_GITHUB_RELEASE_KEYWORDS: frozenset[str] = frozenset({
+    "release notes",
+    "changelog",
+    "latest release",
+    "new release",
+})
+
 # Priority 3 — explicit-date web search signal, independent of both
 # _WEB_SEARCH_KEYWORDS and _SEMANTIC_GATE_THRESHOLDS. A query that names a
 # specific calendar date (month + year, with or without a day) is a
@@ -1077,6 +1094,7 @@ class Planner:
     _WEB_SEARCH_KEYWORDS:    frozenset[str]    = _WEB_SEARCH_KEYWORDS
     _NEWS_KEYWORDS:          frozenset[str]    = _NEWS_KEYWORDS
     _GITHUB_KEYWORDS:        frozenset[str]    = _GITHUB_KEYWORDS
+    _GITHUB_RELEASE_KEYWORDS: frozenset[str]   = _GITHUB_RELEASE_KEYWORDS
     _FILE_OP_KEYWORDS:       frozenset[str]    = _FILE_OP_KEYWORDS
     _CHART_KEYWORDS:         frozenset[str]    = _CHART_KEYWORDS
     _GATE1_ENV_VAR:          str               = _GATE1_ENV_VAR
@@ -1393,6 +1411,17 @@ class Planner:
         # uses). Must NOT run before P3c or P1/P2 — same ordering rule P3c
         # already documents relative to P3.
         plan = self._priority3_news(instruction, lowered)
+        if plan is not None:
+            return plan
+
+        # Priority 3-github-release — release-notes query ("release notes",
+        # "changelog", etc.). Runs before Priority 3-github so a
+        # release-shaped instruction gets github_release (which can resolve
+        # a bare project name to owner/repo itself, see
+        # MCPToolDispatcher._run_github_release) rather than the plain
+        # repo/code search — same "more specific match wins" rationale as
+        # P3c beating plain P3.
+        plan = self._priority3_github_release(instruction, lowered)
         if plan is not None:
             return plan
 
@@ -2180,6 +2209,69 @@ class Planner:
             fetch_episodic     = False,
             fetch_rag          = False,
             tools_to_call      = ["news_search"],
+            compound           = True,
+            priority           = 3,
+            tool_signal_source = "keyword",
+        )
+
+    def _priority3_github_release(self, instruction: str, lowered: str) -> RoutingPlan | None:
+        """
+        Priority 3-github-release — release-notes query ("release notes",
+        "changelog", "latest release", "new release"). Runs before
+        Priority 3-github so a release-shaped instruction gets
+        github_release rather than the plain repo/code search; same tier
+        and same inline file_op/url_fetch guard as P3-news/P3-github.
+
+        Deterministic keyword match only — see _GITHUB_RELEASE_KEYWORDS'
+        module-level comment for why the bare word "release" is
+        deliberately excluded from the gate (too weak/ambiguous a signal
+        on its own).
+
+        Returns None (deferring to normal priority evaluation) if:
+          - file_op or url_fetch keywords/a raw URL are present (inline
+            guard, same pattern P3-news/P3-github/P3c use), OR
+          - a _CHART_KEYWORDS hit is present — "release notes"/"changelog"
+            are common enough phrasing for the *subject* of a chart
+            request ("make a bar chart of the latest oMLX release notes")
+            that this gate must not steal it into a single raw-text
+            github_release call; P3's normal chart+web_search compounding
+            needs to run instead. No such guard exists against plain
+            _GITHUB_KEYWORDS in P3-github — this is specific to how much
+            more naturally "release"-shaped words show up as a chart's
+            subject than "github"/"repo" do, caught live via
+            test_chart_compounds_with_web_search, OR
+          - no _GITHUB_RELEASE_KEYWORDS match is present.
+
+        On match, returns a RoutingPlan routing to github_release only.
+        github_release itself resolves owner/repo via context["github_repo"]
+        when supplied, or otherwise chains its own github_search call to
+        resolve a bare project name — Planner doesn't need to know which
+        case applies, same as it doesn't decide news_search's
+        NewsAPI-vs-Brave fallback tier.
+        """
+        if (
+            self._any_whole_word(_FILE_OP_KEYWORDS, lowered)
+            or any(p.search(instruction) for p in _FILE_OP_PATH_PATTERNS)
+            or self._any_whole_word(_FETCH_KEYWORDS, lowered)
+            or re.search(r"https?://", lowered)
+            or self._any_whole_word(_CHART_KEYWORDS, lowered)
+        ):
+            return None
+
+        release_kw = self._any_whole_word(_GITHUB_RELEASE_KEYWORDS, lowered)
+        if not release_kw:
+            return None
+
+        logger.debug(
+            "Planner: Priority 3-github-release — github_release signal detected (%r).",
+            release_kw,
+        )
+
+        return RoutingPlan(
+            agent              = "conversational_agent",
+            fetch_episodic     = False,
+            fetch_rag          = False,
+            tools_to_call      = ["github_release"],
             compound           = True,
             priority           = 3,
             tool_signal_source = "keyword",
