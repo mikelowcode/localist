@@ -992,6 +992,68 @@ def test_apply_unified_diff_recovers_from_bullet_marker_collision():
     assert updated_lines[1].startswith("- **Local Tools & Libraries:**")
 
 
+def test_apply_unified_diff_recovers_from_context_bullet_marker_collision():
+    """Regression test generalizing the 2026-07-09 bullet/diff-marker fix to
+    the mirror-image collision confirmed live but left unfixed at the time
+    (docs/architecture/17-wiki-agent-diff-target.md §17.7 point 3): an
+    unchanged CONTEXT line that itself starts with a markdown bullet can
+    have its leading " " marker dropped, reproducing the bullet's own "- "
+    dash verbatim — which then reads exactly like a removed/added line
+    whose marker char happens to be that same dash. Must recognize the
+    dropped-context-marker shape and apply at the correct position rather
+    than raising (previously a safe 409, not a corruption, but a block)."""
+    original = (
+        "- **A:** foo\n"
+        "- **B:** bar\n"
+        "- **C:** baz\n"
+    )
+    # Line 1 is unchanged CONTEXT but dropped its leading " " marker instead
+    # of reading " - **A:** foo". Lines 2/3 are correctly-formatted
+    # removed/added bulleted lines (proper double marker+bullet dash).
+    diff_text = (
+        "@@ -1,3 +1,3 @@\n"
+        "- **A:** foo\n"
+        "-- **B:** bar\n"
+        "+- **B:** bar UPDATED\n"
+        " - **C:** baz\n"
+    )
+
+    updated = apply_unified_diff(original, diff_text)
+    updated_lines = updated.splitlines(keepends=True)
+
+    assert updated_lines[0] == "- **A:** foo\n"
+    assert updated_lines[1] == "- **B:** bar UPDATED\n"
+    assert updated_lines[2] == "- **C:** baz\n"
+
+
+def test_apply_unified_diff_recovers_from_both_bullet_collisions_in_one_hunk():
+    """Both collision directions can occur in the same hunk: a genuinely
+    removed/added bulleted line with its own "- " dropped (recover_bullet_
+    marker), and a separate unchanged context bulleted line with its
+    leading " " marker dropped (recover_context_bullet_marker). Neither
+    single-hypothesis recovery resolves this alone; the combined-mode
+    fallback must."""
+    original = (
+        "- **A:** foo\n"
+        "- **B:** bar\n"
+        "- **C:** baz\n"
+    )
+    diff_text = (
+        "@@ -1,3 +1,3 @@\n"
+        "- **A:** foo\n"          # context, dropped its " " marker
+        "-**B:** bar\n"           # removed, dropped its own "- " bullet
+        "+**B:** bar UPDATED\n"   # added, dropped its own "- " bullet
+        " - **C:** baz\n"         # correctly-formatted context
+    )
+
+    updated = apply_unified_diff(original, diff_text)
+    updated_lines = updated.splitlines(keepends=True)
+
+    assert updated_lines[0] == "- **A:** foo\n"
+    assert updated_lines[1] == "- **B:** bar UPDATED\n"
+    assert updated_lines[2] == "- **C:** baz\n"
+
+
 def test_apply_unified_diff_missing_trailing_newline_mid_file_does_not_merge_lines():
     """Regression test for the third live failure shape
     (POST /wiki/apply-diff, gemma4:31b-cloud, 2026-07-09): the model's

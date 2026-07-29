@@ -164,7 +164,7 @@ Tests are organized by phase (memory substrate, routing, controller dispatch, ex
 - ✅ Daily News Brief Live Feed panel, always-fresh regeneration
 - ✅ Related Memory panel now does real semantic similarity, not exact-turn matching
 - ✅ Hand-rolled BM25 keyword scoring (`backend/bm25.py`) replacing Jaccard, for corpus + episodic recall when no embedding is available
+- ✅ Generalize the bullet/diff-marker collision edge case
 
 **Open**
-- ⬜ Generalize the bullet/diff-marker collision edge case
 - ⬜ macOS `.app` packaging via PyInstaller + Tauri

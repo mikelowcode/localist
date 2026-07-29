@@ -184,13 +184,12 @@ confirmed-open edge case:**
    `wiki/localist-software-stack.md`, which briefly left the file in a corrupted state; repaired
    immediately and confirmed clean afterward. Fixed with a post-apply newline-normalization pass in
    `apply_unified_diff()`.
-3. **Bullet/diff-marker collision on context lines (confirmed, not fixed — safe, open
-   limitation).** §17.4's bullet-collision fix covered removed/added lines; live testing confirmed
-   the same collision can also occur on unchanged context lines within a hunk. Unlike the two bugs
-   above, this fails safely today — the system correctly rejects the apply with a 409 rather than
-   writing corrupted content — so it's being left as a known, non-corrupting limitation rather than
-   fixed in this pass. Revisit if it starts blocking real diffs often enough to be worth generalizing
-   `_extract_hunk_lines()`'s recovery further.
+3. **Bullet/diff-marker collision on context lines (confirmed at the time, not fixed in this pass —
+   safe, open limitation; closed 2026-07-28, see §17.12).** §17.4's bullet-collision fix covered
+   removed/added lines; live testing confirmed the same collision can also occur on unchanged
+   context lines within a hunk. Unlike the two bugs above, this failed safely — the system correctly
+   rejected the apply with a 409 rather than writing corrupted content — so it was left as a known,
+   non-corrupting limitation rather than fixed in this pass.
 
 **Test suite:** 636/636 passed after this addition (up from 613). Frontend typechecks clean
 (2 pre-existing unrelated errors, unchanged). Live end-to-end verification performed in a real
@@ -201,8 +200,7 @@ conversations left untouched).
 ### 17.8 Open items
 
 - **Wiki write safety net — CLOSED, see §17.9.**
-- **Bullet/diff-marker collision on context lines.** See §17.7 point 3 — confirmed, fails safely
-  (409, no corruption), intentionally left unfixed for now.
+- **Bullet/diff-marker collision on context lines — CLOSED, see §17.12.**
 - **Multi-diff turns — CLOSED (verified, not a code change), see §17.11.**
 
 ### 17.9 Wiki write safety net — Added 2026-07-10 (closes the item above)
@@ -393,3 +391,37 @@ rendering/apply/discard logic directly for multi-diff episodes — no
 separate generalization work was a real prerequisite, contrary to what
 `episode-browsing-ui-plan.md`'s "Open question 5" flagged as an open risk
 before this investigation.
+
+### 17.12 Context-line bullet/diff-marker collision — Closed (2026-07-28)
+
+Closes §17.8's "Bullet/diff-marker collision on context lines" open item, confirmed live and
+deliberately left unfixed at §17.7 point 3 pending it becoming worth generalizing
+`_extract_hunk_lines()`'s recovery further.
+
+**The gap.** §17.4's fix only recovered one collision direction: a removed/added bulleted line
+whose own `"- "` collapses into the diff's `-`/`+` marker. Live testing separately confirmed the
+mirror case — an unchanged *context* line that itself starts with a markdown bullet can drop its
+leading `" "` marker instead, reproducing the bullet's own dash verbatim. The resulting raw line is
+shape-identical to a collapsed removed/added bulleted line, so with only one recovery hypothesis
+available this failed safely (a `_locate_hunk()` miss → 409, no corruption) but blocked a legitimate
+diff.
+
+**Fix.** The two collisions are distinguishable by content: stripping the leading marker char off a
+genuinely-collapsed removed/added bulleted line leaves no space (`"-**Bold**"` → `"**Bold**"`),
+while stripping one char off a collapsed-context bulleted line leaves the bullet's own space intact
+(dash+space+text format ⇒ `"- **Bold**"` → `" **Bold**"`). `_extract_hunk_lines()` gained a second
+recovery flag, `recover_context_bullet_marker`, that reclassifies any `-`/`+` line whose stripped
+content starts with a space as unchanged context instead of removed/added.
+
+`apply_unified_diff()`'s two-tier `try`/`except` (as-authored, then bullet-recovered) was
+generalized into a loop over an ordered `_RECOVERY_MODES` tuple — as-authored, bullet-recovered,
+context-recovered, and both combined (for the rare case where a single hunk suffers both collision
+directions at once) — tried in order against `_locate_hunk()`, first match wins, falling through to
+the original (as-authored) `ValueError` if none match. This is now the natural place to add a fifth
+mode if another collision shape ever turns up, rather than hand-nesting another `except`.
+
+**Tests.** Two new cases in `test_wiki_agent.py`:
+`test_apply_unified_diff_recovers_from_context_bullet_marker_collision` (the context-drop shape
+alone) and `test_apply_unified_diff_recovers_from_both_bullet_collisions_in_one_hunk` (both
+directions in the same hunk, requiring the combined-mode fallback). Full suite: 1230 passed, 0
+failed, no regressions in the existing bullet-marker-collision or trailing-newline tests.

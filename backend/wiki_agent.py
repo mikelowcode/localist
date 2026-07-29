@@ -796,11 +796,34 @@ def apply_unified_diff(original: str, diff_text: str) -> str:
     file's own last line is normalized to end with "\n" after all hunks are
     applied, regardless of which hunk's `after` lines were missing one.
 
+    BUG FIX (2026-07-28, generalizing the second finding above): the bullet/
+    marker collision can also happen in the other direction — an unchanged
+    CONTEXT line (marker " ") whose own text happens to start with a
+    markdown bullet ("- "/"* ") can have its leading " " marker dropped by
+    the model, leaving a raw line that is shape-identical to a collapsed
+    removed/added bulleted line. Previously this only had one recovery
+    hypothesis to try (recover_bullet_marker) and, when the true cause was
+    this context-side drop, fell through to a safe-but-blocked 409 (see
+    docs/architecture/17-wiki-agent-diff-target.md §17.7 point 3 — confirmed
+    live, deliberately left unfixed at the time). The two collisions are
+    distinguishable by content: a removed/added line missing its bullet
+    entirely has no leading space once its marker char is stripped (e.g.
+    "-**Bold**" strips to "**Bold**"), whereas a context line that dropped
+    its " " marker while keeping its own bullet dash intact still has a
+    leading space after stripping one char (e.g. "- **Bold**" strips to
+    " **Bold**", since the bullet format is dash+space+text). See
+    recover_context_bullet_marker in _extract_hunk_lines().
+    apply_unified_diff() now tries a small ordered list of interpretations
+    per hunk (as-authored, bullet-recovered, context-recovered, and both
+    recoveries combined) against _locate_hunk(), taking the first one that
+    actually matches file content, rather than hard-coding exactly two
+    tiers.
+
     Raises
     ------
     ValueError
         If the diff contains no @@ hunks, or if a hunk's content does not
-        match anywhere in the file (under either interpretation).
+        match anywhere in the file under any interpretation.
     """
     hunks = _parse_unified_hunks(diff_text)
     if not hunks:
@@ -809,32 +832,43 @@ def apply_unified_diff(original: str, diff_text: str) -> str:
     result_lines = original.splitlines(keepends=True)
 
     for orig_start, hunk_lines in hunks:
-        before, after = _extract_hunk_lines(hunk_lines)
+        primary_exc: ValueError | None = None
+        before: list[str] | None = None
+        after:  list[str] | None = None
+        idx = 0
+        tried: set[tuple[str, ...]] = set()
 
         # Recomputed against the *current* state of result_lines on every
         # hunk — deliberately not offset-tracked across hunks, since each
         # hunk's position is now found by content, not carried arithmetic.
-        try:
-            idx = _locate_hunk(result_lines, before, orig_start)
-        except ValueError as primary_exc:
-            recovered_before, recovered_after = _extract_hunk_lines(
-                hunk_lines, recover_bullet_marker=True
-            )
-            if recovered_before == before:
-                # Recovery changes nothing (no -/+ lines, or none of them
-                # were bullet-collision candidates) — re-raise the
-                # original, more informative error rather than a second,
-                # identical failure.
-                raise
+        for attempt, kwargs in enumerate(_RECOVERY_MODES):
+            candidate_before, candidate_after = _extract_hunk_lines(hunk_lines, **kwargs)
+            key = tuple(candidate_before)
+            if key in tried:
+                # This recovery hypothesis produced the same before-block as
+                # one already tried (e.g. a hunk with no -/+ lines at all) —
+                # skip the redundant lookup rather than re-raising or
+                # re-searching.
+                continue
+            tried.add(key)
             try:
-                idx = _locate_hunk(result_lines, recovered_before, orig_start)
-            except ValueError:
-                raise primary_exc from None
-            before, after = recovered_before, recovered_after
-            logger.debug(
-                "apply_unified_diff: recovered from bullet-marker/diff-marker "
-                "collision at hunk originally headed '@@ -%d'.", orig_start,
-            )
+                idx = _locate_hunk(result_lines, candidate_before, orig_start)
+            except ValueError as exc:
+                if attempt == 0:
+                    primary_exc = exc
+                continue
+            before, after = candidate_before, candidate_after
+            if attempt:
+                logger.debug(
+                    "apply_unified_diff: recovered via %r at hunk originally "
+                    "headed '@@ -%d'.", kwargs, orig_start,
+                )
+            break
+
+        if before is None:
+            # No interpretation matched — re-raise the original (as-authored)
+            # failure, the most informative one, rather than the last one tried.
+            raise primary_exc
 
         result_lines[idx : idx + len(before)] = after
 
@@ -849,32 +883,72 @@ def apply_unified_diff(original: str, diff_text: str) -> str:
     return "".join(result_lines)
 
 
+# Ordered interpretations tried by apply_unified_diff() for each hunk, most
+# to least literal. Each entry is the kwargs passed to _extract_hunk_lines().
+# The last entry (both recoveries at once) covers a hunk unlucky enough to
+# suffer both collision directions at once — rare, but each flag only acts
+# on the lines its own signal actually matches (see _extract_hunk_lines()),
+# so combining them is safe even when only one direction is actually present.
+_RECOVERY_MODES: tuple[dict[str, bool], ...] = (
+    {},
+    {"recover_bullet_marker": True},
+    {"recover_context_bullet_marker": True},
+    {"recover_bullet_marker": True, "recover_context_bullet_marker": True},
+)
+
+
 def _extract_hunk_lines(
-    hunk_lines:           list[str],
-    recover_bullet_marker: bool = False,
+    hunk_lines:                    list[str],
+    recover_bullet_marker:         bool = False,
+    recover_context_bullet_marker: bool = False,
 ) -> tuple[list[str], list[str]]:
     """
     Split one hunk's raw lines into (before, after) — the removed+context
     lines and the added+context lines, in file order.
 
     recover_bullet_marker=True re-derives before/after under the hypothesis
-    that the model collapsed a markdown bullet's "- " into its own "-"/"+"
-    diff marker (see apply_unified_diff()'s second 2026-07-09 bug-fix note):
-    every removed/added line gets "- " prepended back. Context lines are
-    never touched by either mode — the marker/bullet collision is only
-    possible on removed/added lines, since context lines use a distinct
-    " " marker that doesn't collide with "-".
+    that a removed/added bulleted line collapsed its markdown bullet's "- "
+    into its own "-"/"+" diff marker (see apply_unified_diff()'s second
+    2026-07-09 bug-fix note): the line dropped its "- " prefix entirely, so
+    every removed/added line gets it prepended back. A dropped bullet always
+    leaves no space directly after the marker char (e.g. "-**Bold**" strips
+    to "**Bold**") — that's what recover_context_bullet_marker below uses to
+    tell the two collisions apart.
+
+    recover_context_bullet_marker=True re-derives before/after under the
+    complementary hypothesis (2026-07-28, generalizing the above): a hunk's
+    unchanged CONTEXT line that itself starts with a markdown bullet dropped
+    its leading " " marker instead, reproducing the bullet's own "- "/"* "
+    dash verbatim — which then reads exactly like a removed/added line whose
+    marker char happens to equal the bullet's dash. The two are
+    distinguishable by content: stripping one char off a genuinely collapsed
+    removed/added bulleted line leaves no leading space ("**Bold**"), while
+    stripping one char off a collapsed-context bulleted line leaves the
+    bullet's own space intact (dash+space+text format ⇒ " **Bold**"). Only
+    -/+ lines whose stripped content starts with a space are reclassified as
+    unchanged context; every other -/+ line is handled by recover_bullet_
+    marker (or left as-authored, if that's also False) — content that
+    doesn't look like a bullet has no plausible context-collision reading.
+
+    Context lines using the correctly-formatted " " marker are never touched
+    by either recovery mode — both hypotheses only apply to lines that begin
+    with "-" or "+".
     """
     before: list[str] = []
     after:  list[str] = []
 
     for line in hunk_lines:
-        if line.startswith("-"):
+        if line.startswith("-") or line.startswith("+"):
             content = line[1:]
-            before.append(("- " + content) if recover_bullet_marker else content)
-        elif line.startswith("+"):
-            content = line[1:]
-            after.append(("- " + content) if recover_bullet_marker else content)
+            if recover_context_bullet_marker and content.startswith(" "):
+                before.append(line)
+                after.append(line)
+                continue
+            recovered = ("- " + content) if recover_bullet_marker else content
+            if line.startswith("-"):
+                before.append(recovered)
+            else:
+                after.append(recovered)
         else:
             ctx = line[1:] if line.startswith(" ") else line
             before.append(ctx)
