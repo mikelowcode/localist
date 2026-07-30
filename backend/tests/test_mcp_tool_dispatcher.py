@@ -628,6 +628,113 @@ class TestGithubSearch:
         assert "unreachable" in results[0].result
 
 
+class TestHackerNewsSearch:
+    """
+    hacker_news_search: single query, no fallback tier (see
+    _run_hacker_news_search's docstring) — same shape as github_search's
+    own single-call, no-fallback contract.
+    """
+
+    def test_success_returns_single_result(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            assert name == "hacker_news_search"
+            assert "query" in arguments
+            return json.dumps({
+                "query": arguments["query"], "result_text": "• A story — Hacker News\n  ...",
+                "result_count": 1, "is_miss": False,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["hacker_news_search"],
+                instruction   = "what's the latest on hacker news about rust",
+                context       = {},
+            )
+
+        assert len(results) == 1
+        assert results[0].tool_name == "hacker_news_search"
+        assert results[0].success is True
+
+    def test_miss_returns_success_false(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            return json.dumps({
+                "query": arguments["query"], "result_text": "", "result_count": 0, "is_miss": True,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["hacker_news_search"],
+                instruction   = "hacker news discussion of some obscure topic",
+                context       = {},
+            )
+        assert len(results) == 1
+        assert results[0].success is False
+
+    def test_tool_level_error_normalized_via_shared_helper(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            return "Error executing tool hacker_news_search: ERROR: hacker_news_search failed — boom", True
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["hacker_news_search"],
+                instruction   = "search hacker news for something",
+                context       = {},
+            )
+        assert results[0].success is False
+        assert results[0].result == "ERROR: hacker_news_search failed — boom"
+
+    def test_connection_failure_returns_graceful_error(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            raise ConnectionRefusedError("Connection refused")
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["hacker_news_search"],
+                instruction   = "search hacker news for something",
+                context       = {},
+            )
+        assert len(results) == 1
+        assert results[0].success is False
+        assert "unreachable" in results[0].result
+
+    def test_hn_story_url_context_pins_the_tool_call(self, dispatcher: MCPToolDispatcher):
+        """
+        Live Feed panel's "Ask about this" button on a Hacker News story
+        supplies context["hn_story_url"] — same caller-supplied-pin
+        convention as news_search's context["news_article_url"].
+        """
+        async def fake_call(session, name, arguments):
+            assert arguments["url"] == "https://example.com/story"
+            return json.dumps({
+                "query": arguments["query"], "result_text": "• Story — Hacker News\n  ...",
+                "result_count": 1, "is_miss": False,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["hacker_news_search"],
+                instruction   = 'Tell me more about this Hacker News story: "Story"',
+                context       = {"hn_story_url": "https://example.com/story"},
+            )
+        assert results[0].success is True
+        assert "url='https://example.com/story'" in results[0].parameters
+
+    def test_no_hn_story_url_omits_url_argument(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            assert "url" not in arguments
+            return json.dumps({
+                "query": arguments["query"], "result_text": "x", "result_count": 1, "is_miss": False,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["hacker_news_search"],
+                instruction   = "search hacker news for something",
+                context       = {},
+            )
+        assert results[0].success is True
+
+
 class TestGithubRead:
     """
     github_read: only ever reached when a caller supplies

@@ -4,10 +4,11 @@ LORA — MCP Tool Dispatcher
 Was originally a drop-in replacement for the now-deleted ToolDispatcher
 (tool_dispatcher.py) at the controller_agent.py dispatch seam; as of Phase
 4 (cleanup, 2026-07-03) that legacy class is gone entirely — "file_op",
-"url_fetch", "web_search", "research", "chart", "news_search", and
-"github_search"/"github_read"/"github_release" are the only tool names
-Planner ever routes to tools_to_call (see planner.py's
-P3/P3-news/P3-github/P3-github-release/P3b), and all are served over the
+"url_fetch", "web_search", "research", "chart", "news_search",
+"github_search"/"github_read"/"github_release", and "hacker_news_search"
+are the only tool names Planner ever routes to tools_to_call (see
+planner.py's P3/P3-news/P3-github/P3-github-release/P3-hacker-news/P3b),
+and all are served over the
 localist-mcp service (mcp_server/, port 8003) via the MCP SSE transport
 (research is a client-side loop over the same web_search/url_fetch MCP
 tools, not a distinct MCP tool of its own). Any other tool name is
@@ -480,6 +481,10 @@ class MCPToolDispatcher:
                 elif tool_name == "github_release":
                     results.extend(
                         await self._run_github_release(session, connect_error, instruction, ctx)
+                    )
+                elif tool_name == "hacker_news_search":
+                    results.append(
+                        await self._run_hacker_news_search(session, connect_error, instruction, ctx)
                     )
                 elif tool_name == "research":
                     results.extend(
@@ -1383,6 +1388,95 @@ class MCPToolDispatcher:
             result     = result_text,
             success    = True,
         ))
+
+    # -----------------------------------------------------------------------
+    # hacker_news_search — served by localist-mcp
+    # -----------------------------------------------------------------------
+
+    async def _run_hacker_news_search(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        instruction:   str,
+        context:       dict[str, Any],
+    ) -> ToolResult:
+        """
+        Execute one hacker_news_search query — Hacker News story/discussion
+        search via Algolia's HN Search API. Single query only, same
+        "no NewsAPI-style fallback tier" shape as github_search (Algolia's
+        HN Search API has no "miss vs. error" distinction worth a second
+        provider) — reuses the same query resolution web_search/
+        news_search/github_search already use via _derive_initial_query.
+
+        context["hn_story_url"], when supplied (the Live Feed panel's
+        "Ask about this" button on a Hacker News story), pins the result to
+        that one already-known story — same caller-supplied-pin convention
+        as news_search's context["news_article_url"].
+        """
+        query = self._derive_initial_query(instruction, context)
+        story_url = context.get("hn_story_url") or None
+        params_str = f"query={query!r}" if not story_url else f"query={query!r}, url={story_url!r}"
+
+        if session is None:
+            return ToolResult(
+                tool_name  = "hacker_news_search",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {connect_error}",
+                success    = False,
+            )
+
+        tool_args: dict[str, Any] = {"query": query}
+        if story_url:
+            tool_args["url"] = story_url
+
+        try:
+            text, is_error = await self._call_mcp_tool(
+                session, "hacker_news_search", tool_args
+            )
+        except Exception as exc:
+            logger.warning(
+                "MCPToolDispatcher: localist-mcp unreachable for hacker_news_search query=%r: %s",
+                query, exc,
+            )
+            return ToolResult(
+                tool_name  = "hacker_news_search",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {exc}",
+                success    = False,
+            )
+
+        if is_error:
+            return ToolResult(
+                tool_name  = "hacker_news_search",
+                parameters = params_str,
+                result     = _normalize_mcp_error_text(text),
+                success    = False,
+            )
+
+        try:
+            data = json.loads(text)
+        except Exception as exc:
+            return ToolResult(
+                tool_name  = "hacker_news_search",
+                parameters = params_str,
+                result     = f"ERROR: failed to parse hacker_news_search response — {exc}",
+                success    = False,
+            )
+
+        if data.get("is_miss", False):
+            return ToolResult(
+                tool_name  = "hacker_news_search",
+                parameters = params_str,
+                result     = "",
+                success    = False,
+            )
+
+        return ToolResult(
+            tool_name  = "hacker_news_search",
+            parameters = params_str,
+            result     = data.get("result_text", ""),
+            success    = True,
+        )
 
     # -----------------------------------------------------------------------
     # research — bounded search / evaluate / reformulate / fetch loop

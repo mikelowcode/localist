@@ -366,6 +366,23 @@ _GITHUB_RELEASE_KEYWORDS: frozenset[str] = frozenset({
     "new release",
 })
 
+# Priority 3-hacker-news — hacker_news_search trigger keywords, same tier
+# as _NEWS_KEYWORDS/_GITHUB_KEYWORDS (checked before P3 so a match wins over
+# the generic web_search-only P3 branch). Bare "hn" is included (unlike
+# _GITHUB_RELEASE_KEYWORDS' deliberate exclusion of bare "release") — it's
+# standard tech/dev shorthand for Hacker News specifically, and
+# _any_whole_word's \b-anchored matching already rules out the main false-
+# positive risk (matching inside an unrelated word); accepted tradeoff:
+# a rare bare "hn" used as some other two-letter token in an otherwise
+# unrelated instruction would still misroute here.
+_HACKER_NEWS_KEYWORDS: frozenset[str] = frozenset({
+    "hacker news",
+    "hackernews",
+    "hn",
+    "y combinator",
+    "ycombinator",
+})
+
 # Priority 3 — explicit-date web search signal, independent of both
 # _WEB_SEARCH_KEYWORDS and _SEMANTIC_GATE_THRESHOLDS. A query that names a
 # specific calendar date (month + year, with or without a day) is a
@@ -1095,6 +1112,7 @@ class Planner:
     _NEWS_KEYWORDS:          frozenset[str]    = _NEWS_KEYWORDS
     _GITHUB_KEYWORDS:        frozenset[str]    = _GITHUB_KEYWORDS
     _GITHUB_RELEASE_KEYWORDS: frozenset[str]   = _GITHUB_RELEASE_KEYWORDS
+    _HACKER_NEWS_KEYWORDS:   frozenset[str]    = _HACKER_NEWS_KEYWORDS
     _FILE_OP_KEYWORDS:       frozenset[str]    = _FILE_OP_KEYWORDS
     _CHART_KEYWORDS:         frozenset[str]    = _CHART_KEYWORDS
     _GATE1_ENV_VAR:          str               = _GATE1_ENV_VAR
@@ -1402,6 +1420,16 @@ class Planner:
         # web_search-only P3 match; P3c's inline guard defers to P3 when
         # file_op/url_fetch signals are present)
         plan = self._priority3c_graph_query(instruction, lowered)
+        if plan is not None:
+            return plan
+
+        # Priority 3-hacker-news — Hacker News query. Runs before P3-news
+        # (not just before generic P3) because "hacker news" itself
+        # contains the bare word "news" — every _HACKER_NEWS_KEYWORDS match
+        # would otherwise get stolen by P3-news's plain "news" gate first;
+        # same "more specific match wins" rationale as P3-github-release
+        # running before P3-github.
+        plan = self._priority3_hacker_news(instruction, lowered)
         if plan is not None:
             return plan
 
@@ -2164,8 +2192,11 @@ class Planner:
         """
         Priority 3-news — News query ("news", "headlines", "breaking",
         "top stories", etc.). Wins over a web_search-only P3 match (hence
-        its placement before P3 in route()) but loses to P3c graph-query
-        and to P1/P2 (handled by route()'s call order, not here).
+        its placement before P3 in route()) but loses to P3c graph-query,
+        to P3-hacker-news (a "hacker news" phrase always contains the bare
+        word "news" too, so the more specific tool must be checked first —
+        see _priority3_hacker_news's docstring), and to P1/P2 (handled by
+        route()'s call order, not here).
 
         Deterministic keyword match only for now — see _NEWS_KEYWORDS'
         module-level comment for why the semantic "news_request" secondary
@@ -2325,6 +2356,57 @@ class Planner:
             fetch_episodic     = False,
             fetch_rag          = False,
             tools_to_call      = ["github_search"],
+            compound           = True,
+            priority           = 3,
+            tool_signal_source = "keyword",
+        )
+
+    def _priority3_hacker_news(self, instruction: str, lowered: str) -> RoutingPlan | None:
+        """
+        Priority 3-hacker-news — Hacker News query ("hacker news",
+        "y combinator", etc.). Runs before Priority 3-news (see route()'s
+        placement comment — every _HACKER_NEWS_KEYWORDS phrase contains the
+        bare word "news", which would otherwise match P3-news's own gate
+        first) and before Priority 3-github; wins over a web_search-only P3
+        match, loses to P3c graph-query and to P1/P2 (handled by route()'s
+        call order, not here).
+
+        Deterministic keyword match only — see _HACKER_NEWS_KEYWORDS'
+        module-level comment.
+
+        Returns None (deferring to normal priority evaluation) if:
+          - file_op or url_fetch keywords/a raw URL are present (inline
+            guard, same pattern P3-news/P3-github/P3c use — an explicit
+            "fetch this URL" or "read the file" instruction should never
+            get hijacked into a hacker_news_search), OR
+          - no _HACKER_NEWS_KEYWORDS match is present.
+
+        On match, returns a RoutingPlan routing to hacker_news_search only.
+        """
+        # 1. Inline file_op/url_fetch guard — duplicates _priority3_tool()'s
+        #    file_op/url_fetch detection, same deliberate duplication
+        #    P3c/P3-news/P3-github already use. Keep in sync with all
+        #    copies if any of them changes.
+        if (
+            self._any_whole_word(_FILE_OP_KEYWORDS, lowered)
+            or any(p.search(instruction) for p in _FILE_OP_PATH_PATTERNS)
+            or self._any_whole_word(_FETCH_KEYWORDS, lowered)
+            or re.search(r"https?://", lowered)
+        ):
+            return None
+
+        # 2. Hacker News keyword match.
+        hn_kw = self._any_whole_word(_HACKER_NEWS_KEYWORDS, lowered)
+        if not hn_kw:
+            return None
+
+        logger.debug("Planner: Priority 3-hacker-news — hacker_news_search signal detected (%r).", hn_kw)
+
+        return RoutingPlan(
+            agent              = "conversational_agent",
+            fetch_episodic     = False,
+            fetch_rag          = False,
+            tools_to_call      = ["hacker_news_search"],
             compound           = True,
             priority           = 3,
             tool_signal_source = "keyword",

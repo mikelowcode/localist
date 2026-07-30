@@ -18,6 +18,15 @@
     githubWatchError,
     openGithubWatch
   } from '$lib/stores/githubWatch';
+  import {
+    hackerNewsPreview,
+    fetchHackerNewsPreview,
+    hackerNewsOpening,
+    hackerNewsError,
+    openHackerNews,
+    type HackerNewsStory
+  } from '$lib/stores/hackerNews';
+  import { previewBlocksCollapsed, togglePreviewBlock } from '$lib/stores/previewBlocks';
   import { tasksStore, submitTask } from '$lib/stores/tasks';
   import { chatHistoryStore } from '$lib/stores/chatHistory';
   import { currentConversationId, isFirstTurnOfConversation } from '$lib/stores/conversation';
@@ -29,6 +38,7 @@
   onMount(() => {
     void fetchNewsBriefPreview();
     void fetchGithubWatchPreview();
+    void fetchHackerNewsPreview();
   });
 
   async function handleOpenBrief(): Promise<void> {
@@ -51,6 +61,16 @@
     const ok = await openGithubWatch();
     if (ok) {
       await fetchGithubWatchPreview();
+    }
+  }
+
+  // Same pattern as handleOpenGithubWatch — /refresh already wrote a fresh
+  // hacker_news_cache by the time it responds, but this panel's own store
+  // is only ever populated once on mount, so it needs an explicit re-fetch.
+  async function handleOpenHackerNews(): Promise<void> {
+    const ok = await openHackerNews();
+    if (ok) {
+      await fetchHackerNewsPreview();
     }
   }
 
@@ -95,6 +115,50 @@
     );
     await goto(`/conversation/${conversationId}`);
   }
+
+  // Same pattern as handleAskAboutArticle — the instruction names "Hacker
+  // News" explicitly so Planner's P3-hacker-news gate fires (it runs ahead
+  // of P3-news precisely because "hacker news" contains the bare word
+  // "news", see planner.py), and hn_story_url pins hacker_news_search to
+  // this one already-known story rather than trusting the title text alone
+  // to find it again among similarly-titled submissions.
+  async function handleAskAboutHackerNewsStory(story: HackerNewsStory): Promise<void> {
+    if ($tasksStore.finalizing) return;
+
+    const instruction = `Tell me more about this Hacker News story: "${story.title}"`;
+    const task_id = crypto.randomUUID();
+    const now = Date.now();
+    const conversationId = get(currentConversationId);
+
+    let conversationTitle: string | undefined;
+    if (get(isFirstTurnOfConversation)) {
+      conversationTitle = instruction.length > 60 ? instruction.slice(0, 60) + '…' : instruction;
+      isFirstTurnOfConversation.set(false);
+    }
+
+    chatHistoryStore.update((turns) => [
+      ...turns,
+      { role: 'user', content: instruction, task_id, timestamp: now },
+      {
+        role: 'assistant',
+        content: '',
+        task_id,
+        timestamp: now + 1,
+        status: 'planning',
+        status_message: 'Planning…',
+        sources: []
+      }
+    ]);
+
+    await submitTask(
+      instruction,
+      { hn_story_url: story.url },
+      task_id,
+      conversationId,
+      conversationTitle
+    );
+    await goto(`/conversation/${conversationId}`);
+  }
 </script>
 
 {#if $previewsPanelCollapsed}
@@ -123,52 +187,130 @@
     <div class="previews-panel-body">
       <!-- News block — live, moved out of StatusBar's cramped hover popover -->
       <section class="preview-block">
-        <button
-          type="button"
-          class="preview-block-refresh-link"
-          on:click={handleOpenBrief}
-          disabled={$newsBriefOpening}
-        >{$newsBriefOpening ? 'Refreshing…' : 'Daily News Brief Refresh'}</button>
-        <div class="preview-block-body">
-          {#if $newsBriefPreview.sections.length === 0}
-            <p class="preview-empty">No brief generated yet today — click the link above to generate.</p>
-          {:else}
-            {#each $newsBriefPreview.sections as section (section.key)}
-              <div class="preview-news-section">
-                <div class="preview-news-section-label">{section.label}</div>
-                {#if section.error}
-                  <p class="preview-news-unavailable">unavailable</p>
-                {:else if section.articles.length === 0}
-                  <p class="preview-news-unavailable">no articles found</p>
-                {:else}
-                  {#each section.articles.slice(0, 3) as article}
-                    <div class="preview-news-article-row">
-                      <a
-                        class="preview-news-article"
-                        href={article.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                      >
-                        <span class="preview-news-article-title">{article.title}</span>
-                        <span class="preview-news-article-source">{article.source}</span>
-                      </a>
-                      <button
-                        type="button"
-                        class="preview-news-article-ask"
-                        on:click={() => handleAskAboutArticle(article)}
-                        disabled={$tasksStore.finalizing}
-                        title="Ask about this story in the current chat"
-                      >Ask about this</button>
-                    </div>
-                  {/each}
-                {/if}
-              </div>
-            {/each}
-          {/if}
-          {#if $newsBriefError}
-            <p class="preview-error">{$newsBriefError}</p>
-          {/if}
+        <div class="preview-block-header">
+          <span class="preview-block-title">Daily News Brief</span>
+          <button
+            type="button"
+            class="preview-block-collapse-btn"
+            on:click={() => togglePreviewBlock('news')}
+            aria-label={$previewBlocksCollapsed.news ? 'Expand Daily News Brief' : 'Collapse Daily News Brief'}
+            title={$previewBlocksCollapsed.news ? 'Expand' : 'Collapse'}
+          >{$previewBlocksCollapsed.news ? '▸' : '▾'}</button>
         </div>
+        {#if !$previewBlocksCollapsed.news}
+          <button
+            type="button"
+            class="preview-block-refresh-link"
+            on:click={handleOpenBrief}
+            disabled={$newsBriefOpening}
+          >{$newsBriefOpening ? 'Refreshing…' : 'Daily News Brief Refresh'}</button>
+          <div class="preview-block-body">
+            {#if $newsBriefPreview.sections.length === 0}
+              <p class="preview-empty">No brief generated yet today — click the link above to generate.</p>
+            {:else}
+              {#each $newsBriefPreview.sections as section (section.key)}
+                <div class="preview-news-section">
+                  <div class="preview-news-section-label">{section.label}</div>
+                  {#if section.error}
+                    <p class="preview-news-unavailable">unavailable</p>
+                  {:else if section.articles.length === 0}
+                    <p class="preview-news-unavailable">no articles found</p>
+                  {:else}
+                    {#each section.articles.slice(0, 3) as article}
+                      <div class="preview-news-article-row">
+                        <a
+                          class="preview-news-article"
+                          href={article.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          <span class="preview-news-article-title">{article.title}</span>
+                          <span class="preview-news-article-source">{article.source}</span>
+                        </a>
+                        <button
+                          type="button"
+                          class="preview-news-article-ask"
+                          on:click={() => handleAskAboutArticle(article)}
+                          disabled={$tasksStore.finalizing}
+                          title="Ask about this story in the current chat"
+                        >Ask about this</button>
+                      </div>
+                    {/each}
+                  {/if}
+                </div>
+              {/each}
+            {/if}
+            {#if $newsBriefError}
+              <p class="preview-error">{$newsBriefError}</p>
+            {/if}
+          </div>
+        {/if}
+      </section>
+
+      <!-- Hacker News block — live. Same shape as the News block above
+           (single refresh link + preview.stories rendered generically,
+           with a per-story "Ask about this" button — unlike GitHub Watch,
+           this feed does touch chat via the hacker_news_search MCP tool,
+           see mcp_server/hacker_news.py). Each story links straight to the
+           original article; self-posts (Ask HN/Show HN) fall back to the
+           HN discussion page since they have no external article. -->
+      <section class="preview-block">
+        <div class="preview-block-header">
+          <span class="preview-block-title">Hacker News</span>
+          <button
+            type="button"
+            class="preview-block-collapse-btn"
+            on:click={() => togglePreviewBlock('hackerNews')}
+            aria-label={$previewBlocksCollapsed.hackerNews ? 'Expand Hacker News' : 'Collapse Hacker News'}
+            title={$previewBlocksCollapsed.hackerNews ? 'Expand' : 'Collapse'}
+          >{$previewBlocksCollapsed.hackerNews ? '▸' : '▾'}</button>
+        </div>
+        {#if !$previewBlocksCollapsed.hackerNews}
+          <button
+            type="button"
+            class="preview-block-refresh-link"
+            on:click={handleOpenHackerNews}
+            disabled={$hackerNewsOpening}
+          >{$hackerNewsOpening ? 'Refreshing…' : 'Hacker News Refresh'}</button>
+          <div class="preview-block-body">
+            {#if $hackerNewsPreview.stories.length === 0}
+              <p class="preview-empty">No top stories fetched yet — click the link above to generate.</p>
+            {:else if $hackerNewsPreview.stories[0].key === '_error'}
+              <p class="preview-news-unavailable">{$hackerNewsPreview.stories[0].error}</p>
+            {:else}
+              {#each $hackerNewsPreview.stories as story (story.key)}
+                <div class="preview-news-article-row">
+                  {#if story.error}
+                    <p class="preview-news-unavailable">story unavailable</p>
+                  {:else}
+                    <a
+                      class="preview-news-article"
+                      href={story.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      <span class="preview-news-article-title">{story.title}</span>
+                      <span class="preview-news-article-source">
+                        {#if story.score !== null}{story.score} points{/if}
+                        {#if story.by} · {story.by}{/if}
+                      </span>
+                    </a>
+                    <button
+                      type="button"
+                      class="preview-news-article-ask"
+                      on:click={() => handleAskAboutHackerNewsStory(story)}
+                      disabled={$tasksStore.finalizing}
+                      title="Ask about this story in the current chat"
+                    >Ask about this</button>
+                  {/if}
+                </div>
+              {/each}
+            {/if}
+            {#if $hackerNewsError}
+              <p class="preview-error">{$hackerNewsError}</p>
+            {/if}
+          </div>
+        {/if}
       </section>
 
       <!-- GitHub Watch Feed block — live. Same shape as the News block
@@ -176,56 +318,59 @@
            no "Ask about this" button — this feed never touches chat
            (github_watch.py has no Planner/MCPToolDispatcher involvement). -->
       <section class="preview-block">
-        <button
-          type="button"
-          class="preview-block-refresh-link"
-          on:click={handleOpenGithubWatch}
-          disabled={$githubWatchOpening}
-        >{$githubWatchOpening ? 'Refreshing…' : 'GitHub Watch Feed Refresh'}</button>
-        <div class="preview-block-body">
-          {#if $githubWatchPreview.repos.length === 0}
-            <p class="preview-empty">No watch feed generated yet — click the link above to generate.</p>
-          {:else if $githubWatchPreview.repos[0].key === '_error'}
-            <p class="preview-news-unavailable">{$githubWatchPreview.repos[0].error}</p>
-          {:else}
-            {#each $githubWatchPreview.repos as repo (repo.key)}
-              <div class="preview-news-article-row">
-                <a
-                  class="preview-news-article"
-                  href={repo.repo_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <span class="preview-news-article-title">{repo.label}</span>
-                  {#if repo.error}
-                    <span class="preview-news-article-source">unavailable</span>
-                  {:else if repo.latest_release}
-                    <span class="preview-news-article-source">
-                      {repo.latest_release.name || repo.latest_release.tag_name}
-                      {#if repo.latest_release.published_at}
-                        · {repo.latest_release.published_at.slice(0, 10)}
-                      {/if}
-                    </span>
-                  {:else}
-                    <span class="preview-news-article-source">no releases yet</span>
-                  {/if}
-                </a>
-              </div>
-            {/each}
-          {/if}
-          {#if $githubWatchError}
-            <p class="preview-error">{$githubWatchError}</p>
-          {/if}
-        </div>
-      </section>
-
-      <!-- Reserved block — layout only, not wired to a live API yet. -->
-      <section class="preview-block preview-block-reserved">
         <div class="preview-block-header">
-          <span class="preview-block-title">💬 Hacker News</span>
-          <span class="preview-block-badge">Coming soon</span>
+          <span class="preview-block-title">GitHub Watch Feed</span>
+          <button
+            type="button"
+            class="preview-block-collapse-btn"
+            on:click={() => togglePreviewBlock('github')}
+            aria-label={$previewBlocksCollapsed.github ? 'Expand GitHub Watch Feed' : 'Collapse GitHub Watch Feed'}
+            title={$previewBlocksCollapsed.github ? 'Expand' : 'Collapse'}
+          >{$previewBlocksCollapsed.github ? '▸' : '▾'}</button>
         </div>
-        <p class="preview-empty">Top stories will appear here.</p>
+        {#if !$previewBlocksCollapsed.github}
+          <button
+            type="button"
+            class="preview-block-refresh-link"
+            on:click={handleOpenGithubWatch}
+            disabled={$githubWatchOpening}
+          >{$githubWatchOpening ? 'Refreshing…' : 'GitHub Watch Feed Refresh'}</button>
+          <div class="preview-block-body">
+            {#if $githubWatchPreview.repos.length === 0}
+              <p class="preview-empty">No watch feed generated yet — click the link above to generate.</p>
+            {:else if $githubWatchPreview.repos[0].key === '_error'}
+              <p class="preview-news-unavailable">{$githubWatchPreview.repos[0].error}</p>
+            {:else}
+              {#each $githubWatchPreview.repos as repo (repo.key)}
+                <div class="preview-news-article-row">
+                  <a
+                    class="preview-news-article"
+                    href={repo.repo_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <span class="preview-news-article-title">{repo.label}</span>
+                    {#if repo.error}
+                      <span class="preview-news-article-source">unavailable</span>
+                    {:else if repo.latest_release}
+                      <span class="preview-news-article-source">
+                        {repo.latest_release.name || repo.latest_release.tag_name}
+                        {#if repo.latest_release.published_at}
+                          · {repo.latest_release.published_at.slice(0, 10)}
+                        {/if}
+                      </span>
+                    {:else}
+                      <span class="preview-news-article-source">no releases yet</span>
+                    {/if}
+                  </a>
+                </div>
+              {/each}
+            {/if}
+            {#if $githubWatchError}
+              <p class="preview-error">{$githubWatchError}</p>
+            {/if}
+          </div>
+        {/if}
       </section>
     </div>
   </div>
@@ -319,8 +464,6 @@
     padding: var(--sp-3);
   }
 
-  .preview-block-reserved { opacity: 0.6; }
-
   .preview-block-header {
     display: flex;
     align-items: center;
@@ -335,12 +478,24 @@
     color: var(--text-primary);
   }
 
-  .preview-block-badge {
-    font-size: 10.5px;
-    color: var(--text-tertiary);
-    background: var(--bg-active);
+  .preview-block-collapse-btn {
+    width: 18px;
+    height: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     border-radius: var(--radius-sm);
-    padding: 2px var(--sp-2);
+    background: transparent;
+    border: none;
+    color: var(--text-tertiary);
+    font-size: 10px;
+    line-height: 1;
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+  }
+  .preview-block-collapse-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-secondary);
   }
 
   .preview-block-refresh-link {

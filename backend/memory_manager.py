@@ -151,7 +151,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION   = 11         # increment when schema changes require migration
+_SCHEMA_VERSION   = 12         # increment when schema changes require migration
 _EMBEDDING_DIM    = 768        # EmbeddingGemma-300M-4bit output dimension
 _EMBEDDING_FORMAT = ">768f"    # big-endian float32 × 768
 
@@ -638,6 +638,12 @@ class MemoryManager:
                             content_json    TEXT    NOT NULL,
                             generated_at    REAL    NOT NULL
                         );
+
+                        CREATE TABLE IF NOT EXISTS hacker_news_cache (
+                            id              INTEGER PRIMARY KEY CHECK (id = 1),
+                            content_json    TEXT    NOT NULL,
+                            generated_at    REAL    NOT NULL
+                        );
                     """)
 
                     conn.execute(
@@ -705,6 +711,17 @@ class MemoryManager:
                 # (schema v11, GitHub Watch Feed).
                 conn.executescript("""
                     CREATE TABLE IF NOT EXISTS github_watch_cache (
+                        id              INTEGER PRIMARY KEY CHECK (id = 1),
+                        content_json    TEXT    NOT NULL,
+                        generated_at    REAL    NOT NULL
+                    );
+                """)
+                conn.commit()
+
+                # Same self-heal, same rationale, for hacker_news_cache
+                # (schema v12, Hacker News Live Feed panel).
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS hacker_news_cache (
                         id              INTEGER PRIMARY KEY CHECK (id = 1),
                         content_json    TEXT    NOT NULL,
                         generated_at    REAL    NOT NULL
@@ -914,6 +931,16 @@ class MemoryManager:
             logger.info("Applying migration v10→v11: creating github_watch_cache table.")
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS github_watch_cache (
+                    id              INTEGER PRIMARY KEY CHECK (id = 1),
+                    content_json    TEXT    NOT NULL,
+                    generated_at    REAL    NOT NULL
+                );
+            """)
+
+        if from_version < 12:
+            logger.info("Applying migration v11→v12: creating hacker_news_cache table.")
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS hacker_news_cache (
                     id              INTEGER PRIMARY KEY CHECK (id = 1),
                     content_json    TEXT    NOT NULL,
                     generated_at    REAL    NOT NULL
@@ -2244,6 +2271,54 @@ class MemoryManager:
                 )
                 conn.commit()
                 logger.info("set_github_watch_cache: repos=%d.", len(content))
+            finally:
+                conn.close()
+
+    def get_hacker_news_cache(self) -> dict[str, Any] | None:
+        """
+        Read the current hacker_news_cache row.
+
+        Returns None when the top-stories feed has never been generated.
+        There is only ever one row — same "not day-keyed" reasoning as
+        github_watch_cache; a new refresh overwrites it via
+        set_hacker_news_cache().
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT content_json, generated_at FROM hacker_news_cache WHERE id = 1"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if row is None:
+            return None
+        return {
+            "content":      json.loads(row["content_json"]),
+            "generated_at": row["generated_at"],
+        }
+
+    def set_hacker_news_cache(self, content: list[dict[str, Any]]) -> None:
+        """
+        Insert or update hacker_news_cache (row id=1) after a fresh
+        refresh. Always overwrites the whole row — see get_hacker_news_cache().
+        """
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO hacker_news_cache (id, content_json, generated_at)
+                    VALUES (1, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        content_json = excluded.content_json,
+                        generated_at = excluded.generated_at
+                    """,
+                    (json.dumps(content), now),
+                )
+                conn.commit()
+                logger.info("set_hacker_news_cache: stories=%d.", len(content))
             finally:
                 conn.close()
 

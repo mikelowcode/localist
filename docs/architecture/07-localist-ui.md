@@ -777,3 +777,55 @@ confirmed the refresh link renders and behaves identically to the News Brief lin
 `GITHUB_TOKEN` degrades to the `"GITHUB_TOKEN not configured"` message with zero console errors rather
 than a broken UI. Live-verified again after the user generated a real classic PAT and added repos to
 their GitHub watch list — confirmed real repo rows with real release data render correctly.
+
+### 7.21 Hacker News Live Feed Block, Per-Block Collapse, and "Ask about this" Parity (2026-07-30)
+
+§7.14's remaining reserved block ("💬 Hacker News — Coming soon", positioned *after* the GitHub block) is
+replaced with a live one, moved to sit *between* the News Brief and GitHub Watch blocks per an explicit
+user requirement — unlike GitHub Watch (§7.20), this block *does* touch chat, via the new
+`hacker_news_search` MCP tool (§14.13), so it was built with News Brief's fuller feature set as the
+template, not GitHub Watch's chat-free one.
+
+**Store.** `$lib/stores/hackerNews.ts`, structurally identical to `githubWatch.ts`/`newsBrief.ts`:
+`hackerNewsPreview` populated by `fetchHackerNewsPreview()` (`GET /api/hacker-news/top/preview`,
+read-only) and `openHackerNews()` (`POST /api/hacker-news/top/refresh`, always fetches fresh — same
+"Refresh never silently reuses stale content" rationale). Backend data source is
+`backend/hacker_news.py` — HN's public Firebase API (`topstories.json` + per-item lookup, no key), top
+10 stories, `hacker_news_cache` table (schema v11→v12). Zero inference cost, zero chat involvement at
+this layer — same "lives in the main backend process, not `mcp_server/`" split `github_watch.py`/
+`news_brief.py` already establish; the separate chat-callable `hacker_news_search` MCP tool (§14.13) is
+an intentionally independent implementation, not a wrapper around this one.
+
+**Panel.** Same row shape as GitHub Watch (§7.20) — each story's title links to its external article URL
+(or the HN discussion page for a self-post with no external link), with points/author as a subtitle line
+— plus a per-story "Ask about this" button (hover-reveal, `preview-news-article-ask`), the same control
+the News Brief block has (§7.16) and GitHub Watch correctly lacks. Sends an instruction naming "Hacker
+News" explicitly (so Planner's P3-hacker-news gate fires, §14.13) plus `context.hn_story_url` to pin the
+answer to the exact clicked story via `hacker_news_search`'s new `url` param.
+
+**Per-block collapse/expand — new, and applied to all three Live Feed blocks, not just this one.** New
+store `$lib/stores/previewBlocks.ts`: a `{news, github, hackerNews}` collapsed-state record, persisted to
+`localStorage` (`lora-preview-blocks-collapsed`), defaulting all three to expanded — a sibling to
+`previewsPanel.ts` (§7.14), which owns the *whole-panel* collapse and defaults to collapsed instead, since
+that's the "don't eat space until the user opts in" default for a whole new panel, whereas per-block
+collapse is a decluttering action once the panel is already open. Each of the three `preview-block`
+sections gained a header row (title + a small chevron toggle button, `preview-block-collapse-btn`,
+visually consistent with the panel's own `previews-collapse-btn`) — the refresh link and body render only
+when that block isn't collapsed; the header always renders so a collapsed block stays identifiable and
+reversible. The previously-unused `.preview-block-reserved`/`.preview-block-badge` CSS (only ever
+referenced by the now-removed "Coming soon" placeholder) was deleted as dead code.
+
+**Real bug found and fixed via live testing (see §14.13 for the tool-side detail): comment fabrication.**
+The first live test of the "Ask about this" button surfaced the model inventing a specific, plausible
+"one commenter noted..." paraphrase with zero real grounding — `hacker_news_search`'s pinned-story result
+carried only a bare comment count at the time, never comment text. Root-caused by reproducing the exact
+tool call directly (confirmed the raw `result_text` had no comment content at all) rather than accepting
+the plausible-looking output at face value. Fixed at the tool layer (§14.13's `fetch_top_comments()`); no
+frontend change was needed here since the panel just renders whatever `result_text` the model was given.
+
+**Test coverage / verification.** `npm run check`: 0 errors throughout all three build passes. Backend:
+1330 → 1371 passed across the panel, MCP tool, URL-pinning, and comment-fix work combined (full breakdown
+at §14.13). Live-verified end to end through the real running stack at each pass: the three-block
+ordering and collapse/expand behavior confirmed visually by the user; the "Ask about this" flow confirmed
+via a direct `/task` call reproducing exactly what the button sends, both before the comment fix
+(fabricated paraphrase, now understood) and after (real comments, real usernames, grounded).

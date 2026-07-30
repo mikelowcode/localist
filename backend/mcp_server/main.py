@@ -13,9 +13,12 @@ miss, see news-query-routing plan §4), generate_chart (renders a
 bar/line/pie chart from structured data server-side via matplotlib), and
 github_search/github_read/github_release (public-repo GitHub REST reads —
 search, file/README/directory content, and release notes, read-only, no
-archive/CLI capability; see mcp_server/github.py) — over SSE transport,
-using the official `mcp` Python SDK's FastMCP. See
-backend/mcp_tool_dispatcher.py for the dispatch seam.
+archive/CLI capability; see mcp_server/github.py), and hacker_news_search
+(on-demand Hacker News story search via Algolia's HN Search API — the
+chat-callable counterpart to backend/hacker_news.py's Live Feed panel
+data source; see mcp_server/hacker_news.py) — over SSE transport, using
+the official `mcp` Python SDK's FastMCP. See backend/mcp_tool_dispatcher.py
+for the dispatch seam.
 
 Endpoints
 ---------
@@ -66,6 +69,8 @@ Configuration
                                fine-grained PAT cannot call
                                GET /user/subscriptions at all (no
                                corresponding account permission exists).
+  (no key needed for hacker_news_search — Algolia's HN Search API is
+   public and unauthenticated; see mcp_server/hacker_news.py.)
 
 Start
 -----
@@ -92,6 +97,7 @@ from mcp_server import (
     chart as _chart,
     file_ops,
     github as _github,
+    hacker_news as _hacker_news,
     news_search as _news_search,
     url_fetch as _url_fetch,
     web_search as _web_search,
@@ -172,6 +178,12 @@ async def github_release(owner: str, repo: str, tag: str | None = None) -> dict:
     return await _github.github_release(owner, repo, tag)
 
 
+@mcp.tool()
+async def hacker_news_search(query: str, url: str | None = None) -> dict:
+    """Search Hacker News stories via Algolia's HN Search API. Pass url to pin the result to one already-known story."""
+    return await _hacker_news.hacker_news_search(query, url)
+
+
 # ── App ──────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -186,7 +198,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title       = "Localist MCP Server",
-    description = "MCP tool server for Localist — file_op tools (read_file/write_file/append_file), fetch_url, web_search, news_search, generate_chart, and github_search/github_read/github_release.",
+    description = "MCP tool server for Localist — file_op tools (read_file/write_file/append_file), fetch_url, web_search, news_search, generate_chart, github_search/github_read/github_release, and hacker_news_search.",
     version     = "1.0.0",
     lifespan    = lifespan,
 )

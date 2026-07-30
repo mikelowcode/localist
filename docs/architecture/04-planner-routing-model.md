@@ -655,6 +655,56 @@ or closing without `"done": true`) and passing through a validly-terminated
 zero-content stream as an empty string. The gap was entirely in the layers
 above not validating the result before completing the task.
 
+*Update 2026-07-30 — recurrence with real tool grounding present; the
+stated trigger condition doesn't fully explain it. OPEN, not yet
+investigated.* Live-observed again while verifying the Hacker News Live
+Feed/MCP-tool work (§7.21, §14.13): a turn routed to `tools_to_call =
+["hacker_news_search"]` only built a well-formed 1276-char prebuilt prompt
+carrying real, on-topic tool grounding (title, points, comment count, and
+— after that same day's comment-fetch fix — real top-comment text), and
+`infer_stream()` still returned `0` chars (`ollama_runtime_client: infer()
+← 0 chars received.`, ~1s round trip, no timeout, no exception — a
+validly-terminated empty stream, same shape this section already
+describes). `ControllerAgent._execute_plan()`'s retry-then-fallback (1.
+above) caught it and succeeded on the next attempt (`web_search` forced
+in, 1000 chars back) — the guard performed exactly as designed; nothing
+user-visible broke.
+
+This is the same *mechanism* as the original 2026-07-17 bug, but not
+obviously the same *trigger*: the original finding above attributes the
+zero-content stream to "the model has no tool grounding for a query it
+structurally can't answer from training alone" — this occurrence had real,
+populated tool grounding already in the prompt, which the model would only
+need to summarize, not answer from bare training knowledge. Worth logging
+as a discrepancy from the documented rationale rather than silently folding
+into it — the true trigger condition may be broader than "no grounding,"
+or there may be a second, distinct cause producing an identical symptom.
+
+**Not yet investigated:** no diagnostic run, no reproduction rate
+established, no correlation tested against prompt length/shape, tool
+identity, temperature (`0.30` here, same as the 2026-07-17 baseline),
+model, or backend (`OllamaRuntimeClient` specifically — unconfirmed
+whether `OMLXRuntimeClient`/`FoundryRuntimeClient` share this behavior at
+all). The existing retry/fallback machinery already absorbs every known
+occurrence transparently, so there is no user-visible failure today; this
+item exists to scope *whether the zero-content completion itself* is
+worth root-causing (cost: one extra full inference round-trip + prompt
+rebuild per occurrence, paid silently) or whether the current fallback is
+a sufficient permanent mitigation on its own.
+
+**Suggested future scope, not started:** (1) passive instrumentation —
+log the full prompt/params on every zero-content completion (not just the
+current generic warning), so a real occurrence can be diagnosed from
+captured state rather than reconstructed after the fact, same discipline
+§8.8 Open Item 11 wishes it had had; (2) once several real occurrences are
+logged, a diagnostic sweep varying temperature/prompt length/tool
+identity/backend to establish an actual reproduction rate and any
+correlating factor, rather than a single anecdotal data point per
+incident; (3) decide whether a fix (if warranted at all) belongs in
+`OllamaRuntimeClient` (backend-specific) or stays entirely at the
+`ControllerAgent` retry layer (backend-agnostic, today's approach, and
+arguably sufficient on its own regardless of root cause).
+
 ### 4.7 Gemma 4B Behavioral Constraints
 
 Live testing revealed several behavioral constraints of `gemma-4-e4b-it-4bit`

@@ -147,6 +147,7 @@ from controller_agent import ControllerAgent, TaskStatus, _MEMORY_MD_PATH
 from conversational_agent import ConversationalAgent
 from embedding_engine import EmbeddingEngine
 import github_watch
+import hacker_news
 from memory_manager import MemoryManager, EpisodicMemoryWriter, EpisodicMemoryReader
 import news_brief
 from runtime_factory import available_backends, create_runtime
@@ -971,6 +972,35 @@ class GithubWatchPreviewResponse(BaseModel):
 
 class GithubWatchOpenResponse(BaseModel):
     """Response body for POST /github/watch/refresh — always a fresh fetch."""
+    success: bool = True
+
+
+class HackerNewsStory(BaseModel):
+    """One story's entry in the Hacker News Live Feed."""
+    key:    str
+    title:  str
+    url:    str
+    hn_url: str
+    score:  int | None = None
+    by:     str | None = None
+    error:  str | None = None
+
+
+class HackerNewsPreviewResponse(BaseModel):
+    """
+    Response body for GET /hacker-news/top/preview.
+
+    Read-only — never calls Hacker News. `available=False` means the top-
+    stories feed has never been generated yet (no same-day staleness check,
+    same as GithubWatchPreviewResponse — top stories aren't day-keyed).
+    """
+    available:    bool
+    generated_at: float | None = None
+    stories:      list[HackerNewsStory] = Field(default_factory=list)
+
+
+class HackerNewsOpenResponse(BaseModel):
+    """Response body for POST /hacker-news/top/refresh — always a fresh fetch."""
     success: bool = True
 
 
@@ -2400,6 +2430,50 @@ async def post_github_watch_refresh() -> GithubWatchOpenResponse:
     await asyncio.to_thread(mm.set_github_watch_cache, repos)
 
     return GithubWatchOpenResponse()
+
+
+@app.get(
+    "/hacker-news/top/preview",
+    response_model = HackerNewsPreviewResponse,
+    summary        = "Read the cached Hacker News top-stories feed, if any",
+)
+async def get_hacker_news_preview() -> HackerNewsPreviewResponse:
+    """
+    Read-only, for the Previews panel's Hacker News section. Never calls
+    Hacker News — only ever reads hacker_news_cache.
+    """
+    mm = _require_memory_manager()
+    cache = await asyncio.to_thread(mm.get_hacker_news_cache)
+    if cache is None:
+        return HackerNewsPreviewResponse(available=False)
+    return HackerNewsPreviewResponse(
+        available    = True,
+        generated_at = cache["generated_at"],
+        stories      = [HackerNewsStory(**s) for s in cache["content"]],
+    )
+
+
+@app.post(
+    "/hacker-news/top/refresh",
+    response_model = HackerNewsOpenResponse,
+    summary        = "Refresh the Hacker News top-stories feed for the Previews panel",
+)
+async def post_hacker_news_refresh() -> HackerNewsOpenResponse:
+    """
+    The Previews panel's Hacker News section refresh handler.
+
+    Always fetches a fresh feed and writes it to hacker_news_cache (so
+    GET /hacker-news/top/preview reflects it) — same "a refresh always
+    hits the network" rationale as POST /github/watch/refresh.
+    hacker_news.build_top_stories() never raises (a failed top-story
+    listing degrades to a single error entry — see its docstring), so no
+    try/except is needed here, same as github_watch.build_watch_feed().
+    """
+    mm = _require_memory_manager()
+    stories = await hacker_news.build_top_stories()
+    await asyncio.to_thread(mm.set_hacker_news_cache, stories)
+
+    return HackerNewsOpenResponse()
 
 
 @app.get(

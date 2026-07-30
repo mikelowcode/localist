@@ -1316,3 +1316,79 @@ oMLX?" — that phrasing now correctly routes to `github_release` instead of `we
 change the user asked for, and the test's own point (a successful tool result reaches `[TOOL RESULTS]`)
 is demonstrated equally well by either tool.
 
+### 14.13 `hacker_news_search` Tool — Story Search, URL-Pinning, and Real Comment Grounding (2026-07-30)
+
+A sixth crawl-style tool, the chat-callable counterpart to `backend/hacker_news.py`'s Live Feed panel
+data source (§7.20 update below) — same "deliberate cross-process duplication" relationship
+`news_search`/`news_brief.py` and `github_release`/`github_watch.py` already have, not a shared
+implementation. Built same day as the Live Feed panel box, in three passes: base tool, URL-pinning
+parity with `news_search`, and a same-day live-testing fix for a real fabrication bug (below).
+
+**`hacker_news_search(query: str, url: str | None = None) -> dict`** (`mcp_server/hacker_news.py`) —
+Algolia's HN Search API (`hn.algolia.com/api/v1/search`, `tags=story`, public/unauthenticated, no key),
+the only real full-text search surface for HN; the Firebase API `backend/hacker_news.py` uses has no
+search endpoint at all, only ranked-id listing and single-item lookup. Same `{query, result_text,
+result_count, is_miss}` return shape as `github_search`/`news_search`, formatted via the shared
+`search_format` module. Each result's `url` is the story's external article link, or the HN discussion
+page itself (`news.ycombinator.com/item?id={id}`) for a self-post (Ask HN/Show HN) with no external URL
+— same fallback the Live Feed panel uses.
+
+**Planner gate — ordered *before* P3-news, not just before generic P3.** New `_HACKER_NEWS_KEYWORDS`
+(`"hacker news"`, `"hackernews"`, `"hn"`, `"y combinator"`, `"ycombinator"`) and
+`_priority3_hacker_news()`, same inline file_op/url_fetch/raw-URL guard shape as P3-news/P3-github. The
+real finding: every `_HACKER_NEWS_KEYWORDS` phrase containing "hacker news" also contains the bare word
+"news" — since `_priority3_news()` ran first in `route()`, every hacker-news-shaped instruction was being
+stolen by the plain news gate before P3-hacker-news ever got a chance, caught by
+`test_hacker_news_beats_web_search_p3` failing on first write. Fixed by moving the
+`_priority3_hacker_news()` call ahead of `_priority3_news()` in `route()` — same "more specific match
+wins" precedent P3-github-release-before-P3-github already established, just discovered from the
+opposite direction (a *newer* gate needing to jump *ahead* of an *existing* one, not the reverse). Bare
+`"hn"` was initially left out (mirroring `_GITHUB_RELEASE_KEYWORDS`' exclusion of bare `"release"`) but
+added back after review — `_any_whole_word()`'s `\b`-anchored matching already rules out the main
+false-positive risk (substring collision), and "HN" is standard-enough tech shorthand that leaving it out
+meant "what's on HN today" silently routed nowhere (zero tools, direct P6 answer) rather than to a real
+search; accepted residual risk: a rare unrelated two-letter "hn" token.
+
+**URL-pinning** — `url` param filters Algolia hits to the one exact article-URL match, falling back to
+the unfiltered top-5 on no match; same caller-supplied-pin convention as `news_search`'s `url` param
+(§14.10). `MCPToolDispatcher._run_hacker_news_search()` reads `context["hn_story_url"]`, mirroring
+`context["news_article_url"]`. Frontend: `PreviewsPanel.svelte` gained a per-story "Ask about this"
+button (hover-reveal, same `preview-news-article-ask` markup/CSS as the News Brief block) sending an
+instruction that names "Hacker News" explicitly (so the Planner gate above fires) plus
+`context.hn_story_url` — bringing the Hacker News Live Feed block to full parity with the News Brief
+block; GitHub Watch remains the one Live Feed block without this button, correctly, since it has no
+chat-callable tool behind it at all.
+
+**Real bug found via live testing, fixed same day: comment fabrication.** Before this fix, a pinned
+query's tool result carried only a bare comment *count* (`num_comments`) — never comment bodies (Algolia's
+Search API doesn't return them). Live-tested: asking "tell me more about this Hacker News story" for a
+243-comment thread produced a specific, plausible-sounding "one commenter noted..." paraphrase attributed
+to no one — reproduced directly by calling the tool with the exact same query/url and confirming the raw
+`result_text` contained nothing but a title, URL, and a `"375 points · 244 comments"` line; the model had
+invented the rest from a bare number. Fixed with `fetch_top_comments()` (Algolia's *item* API,
+`hn.algolia.com/api/v1/items/{id}`, the only Algolia endpoint that returns comment bodies) and
+`_clean_comment_text()` (tag-strip + entity-unescape, no full HTML parser — comment bodies are simple
+enough not to need `readability-lxml`). Deliberately scoped to the pinned single-story case only — an
+unpinned multi-result search never fetches comments, which would be up to 5 extra HTTP calls of
+mostly-irrelevant noise for a query just browsing several stories, not asking about one. A comment-fetch
+failure degrades to no comment block (never raises) — same never-raise convention as every other
+per-item enrichment in this codebase. Re-verified live against the same story/query that originally
+fabricated: real usernames (`bakugo`, `simonw`, `pavpanchekha`) and real comment text now appear, with no
+detectable fabrication risk left in this path — the model has nothing to invent from anymore when
+comments genuinely exist and were fetched.
+
+**Test coverage.** `TestHackerNewsSearchSuccess`/`Errors`/`Comments`, `TestCleanCommentText`,
+`TestFetchTopComments` (`test_mcp_server.py`) — story formatting, self-post HN-URL fallback, miss
+handling, URL-pin filter + no-match fallback, comment fetch/clean/count-limit/deleted-comment-skip,
+comment-fetch-failure graceful degradation, pinned-vs-unpinned comment-fetch gating.
+`TestHackerNewsSearch` (`test_mcp_tool_dispatcher.py`) — single-call no-fallback shape (mirrors
+`github_search`), `hn_story_url` context pin-through, connection/tool-error paths.
+`TestPlannerP3HackerNews` (`test_planner_phase3.py`, 8 tests) — keyword variants including bare `"hn"`,
+wins over web_search-only P3, wins over P3-news (the ordering fix above), file_op/url_fetch guards, P3c/P1
+still win, no-match fallthrough. Full suite: 1330 → 1371 passed across all three build passes.
+
+**Live verification.** Full round trip through the real running stack confirmed at each pass: Planner
+routing (`tools_fired=["hacker_news_search"]`), real Algolia results (genuine `news.ycombinator.com`
+links), URL-pinning locking onto the exact clicked story rather than a similarly-titled one, and — after
+the comment fix — real quoted commentary replacing the earlier fabricated paraphrase.
+

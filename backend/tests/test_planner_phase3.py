@@ -1116,6 +1116,91 @@ class TestPlannerP3GithubRelease:
 
 
 # ---------------------------------------------------------------------------
+# Priority 3-hacker-news — hacker_news_search tool routing
+# ---------------------------------------------------------------------------
+
+class TestPlannerP3HackerNews:
+
+    # 1. Basic keyword match routes to hacker_news_search only.
+    def test_hacker_news_keyword_routes_to_hacker_news_search(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("what's trending on hacker news today?", context={})
+        assert plan.tools_to_call == ["hacker_news_search"]
+        assert plan.compound is True
+        assert plan.priority == 3
+        assert plan.tool_signal_source == "keyword"
+        assert plan.fetch_rag is False
+        assert plan.fetch_episodic is False
+
+    # 2. "y combinator"/"ycombinator"/"hackernews"/bare "hn" all match too.
+    @pytest.mark.parametrize("instruction", [
+        "any discussion of this on hackernews?",
+        "what's y combinator saying about this",
+        "search ycombinator for this topic",
+        "what's on hn today",
+        "check hn for this",
+    ])
+    def test_other_hacker_news_keywords_route_to_hacker_news_search(self, instruction):
+        p = Planner(runtime=make_runtime())
+        plan = p.route(instruction, context={})
+        assert plan.tools_to_call == ["hacker_news_search"]
+
+    # 3. hacker_news_search wins over a web_search-only P3 match on the same
+    #    turn — "recent" is a _WEB_SEARCH_KEYWORDS entry; P3-hacker-news
+    #    runs before P3.
+    def test_hacker_news_beats_web_search_p3(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("any recent discussion of this on hacker news?", context={})
+        assert plan.tools_to_call == ["hacker_news_search"]
+        assert "web_search" not in plan.tools_to_call
+
+    # 4. file_op guard: a literal _FILE_OP_KEYWORDS hit ("read the file")
+    #    alongside "hacker news" defers P3-hacker-news to P3, which resolves
+    #    it as file_op.
+    def test_file_op_guard_defers_to_p3(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("read the file about that hacker news story", context={})
+        assert plan.tools_to_call == ["file_op"]
+        assert "hacker_news_search" not in plan.tools_to_call
+
+    # 5. url_fetch guard: a raw URL alongside "hacker news" defers to P3.
+    def test_url_guard_defers_to_p3(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("summarize this hacker news page: https://example.com/article", context={})
+        assert "url_fetch" in plan.tools_to_call
+        assert "hacker_news_search" not in plan.tools_to_call
+
+    # 6. Ordering regression: P3c (graph-query) beats P3-hacker-news, same as
+    #    it already beats plain P3 web_search/P3-news/P3-github.
+    def test_p3c_beats_hacker_news_search(self, tmp_path):
+        mm, node_ids = make_mm_with_nodes(tmp_path)
+        p = Planner(runtime=make_runtime(), memory_manager=mm)
+        plan = p.route("what links to lora-persona, any hacker news discussion?", context={})
+        assert plan.graph_query is not None
+        direction, node_id, resolved_stem = plan.graph_query
+        assert direction     == "incoming"
+        assert resolved_stem == "lora-persona"
+        assert node_id       == node_ids["lora-persona"]
+        assert "hacker_news_search" not in plan.tools_to_call
+
+    # 7. P1 beats P3-hacker-news: ingest keyword routes to wiki_agent
+    #    regardless of a hacker news keyword also being present.
+    def test_p1_beats_p3_hacker_news(self):
+        p = Planner(runtime=make_runtime())
+        plan = p.route("ingest this file, it's about a hacker news story", context={})
+        assert plan.agent == "wiki_agent"
+        assert "hacker_news_search" not in plan.tools_to_call
+
+    # 8. No hacker news keyword at all → P3-hacker-news defers, falls
+    #    through normally (P6 direct answer).
+    def test_no_hacker_news_keyword_falls_through(self):
+        p = Planner(runtime=make_runtime(infer_return="no"))
+        plan = p.route("how do I bake bread?", context={})
+        assert plan.tools_to_call == []
+        assert plan.agent == "conversational_agent"
+
+
+# ---------------------------------------------------------------------------
 # Priority 1b — diff-only wiki update (standalone diff instructions scope doc)
 # ---------------------------------------------------------------------------
 

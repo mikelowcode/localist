@@ -41,7 +41,7 @@ import pytest
 
 from mcp.shared.memory import create_connected_server_and_client_session
 
-from mcp_server import chart, file_ops, github, news_search, search_format, url_fetch, web_search
+from mcp_server import chart, file_ops, github, hacker_news, news_search, search_format, url_fetch, web_search
 from mcp_server.main import mcp as mcp_app
 
 
@@ -860,6 +860,179 @@ class TestGithubReleaseErrors:
 
 
 # ---------------------------------------------------------------------------
+# hacker_news.hacker_news_search — direct unit tests
+# ---------------------------------------------------------------------------
+
+def _hn_search_response(hits: list[dict], status_code: int = 200) -> httpx.Response:
+    request = httpx.Request("GET", hacker_news._HN_ALGOLIA_SEARCH_ENDPOINT)
+    return httpx.Response(status_code, json={"hits": hits}, request=request)
+
+
+def _hn_item_response(children: list[dict], object_id: str = "1", status_code: int = 200) -> httpx.Response:
+    request = httpx.Request("GET", hacker_news._HN_ALGOLIA_ITEM_ENDPOINT.format(object_id))
+    return httpx.Response(status_code, json={"children": children}, request=request)
+
+
+class TestHackerNewsSearchSuccess:
+    def test_story_with_url_formatted_with_points_and_comments(self):
+        hits = [{
+            "objectID": "12345", "title": "A great story",
+            "url": "https://example.com/article", "points": 200, "num_comments": 42,
+        }]
+        response = _hn_search_response(hits)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(hacker_news.hacker_news_search("great story"))
+
+        assert result["is_miss"] is False
+        assert result["result_count"] == 1
+        text = result["result_text"]
+        assert text.startswith("• A great story — Hacker News\n")
+        assert "[https://example.com/article]" in text
+        assert text.endswith("200 points · 42 comments")
+
+    def test_self_post_falls_back_to_hn_discussion_url(self):
+        hits = [{"objectID": "999", "title": "Ask HN: something", "url": None, "points": 5, "num_comments": 1}]
+        response = _hn_search_response(hits)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(hacker_news.hacker_news_search("ask hn"))
+
+        assert "[https://news.ycombinator.com/item?id=999]" in result["result_text"]
+
+    def test_no_hits_is_miss(self):
+        response = _hn_search_response([])
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(hacker_news.hacker_news_search("nothing found query"))
+        assert result["is_miss"] is True
+        assert result["result_text"] == ""
+
+    def test_pinned_url_filters_to_matching_hit_only(self):
+        hits = [
+            {"objectID": "1", "title": "Story one", "url": "https://example.com/one", "points": 10, "num_comments": 1},
+            {"objectID": "2", "title": "Story two", "url": "https://example.com/two", "points": 20, "num_comments": 2},
+        ]
+        response = _hn_search_response(hits)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(hacker_news.hacker_news_search("story", url="https://example.com/two"))
+
+        assert result["result_count"] == 1
+        assert "Story two" in result["result_text"]
+        assert "Story one" not in result["result_text"]
+
+    def test_pinned_url_with_no_match_falls_back_to_unfiltered(self):
+        hits = [{"objectID": "1", "title": "Story one", "url": "https://example.com/one", "points": 10, "num_comments": 1}]
+        response = _hn_search_response(hits)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(hacker_news.hacker_news_search("story", url="https://example.com/nonexistent"))
+
+        assert result["result_count"] == 1
+        assert "Story one" in result["result_text"]
+
+
+class TestHackerNewsSearchErrors:
+    def test_transport_error_raises_clean_message(self):
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(side_effect=httpx.ConnectError("refused"))):
+            with pytest.raises(ValueError, match="ERROR: hacker_news_search failed —"):
+                asyncio.run(hacker_news.hacker_news_search("q"))
+
+    def test_http_error_raises_clean_message(self):
+        response = httpx.Response(
+            500, json={"error": "boom"},
+            request=httpx.Request("GET", hacker_news._HN_ALGOLIA_SEARCH_ENDPOINT),
+        )
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            with pytest.raises(ValueError, match="ERROR: hacker_news_search failed —"):
+                asyncio.run(hacker_news.hacker_news_search("q"))
+
+
+class TestCleanCommentText:
+    def test_strips_tags_and_unescapes_entities(self):
+        raw = "&gt; quoted bit<p>Actual reply &amp; more &quot;text&quot;.</p>"
+        assert hacker_news._clean_comment_text(raw) == '> quoted bit Actual reply & more "text".'
+
+    def test_collapses_whitespace(self):
+        raw = "line one\n\n  line   two"
+        assert hacker_news._clean_comment_text(raw) == "line one line two"
+
+
+class TestFetchTopComments:
+    def test_returns_author_and_cleaned_text(self):
+        children = [
+            {"author": "alice", "text": "<p>First point.</p>"},
+            {"author": "bob", "text": "Second point &amp; more."},
+        ]
+        response = _hn_item_response(children)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(hacker_news.fetch_top_comments("1"))
+
+        assert result == [
+            {"author": "alice", "text": "First point."},
+            {"author": "bob", "text": "Second point & more."},
+        ]
+
+    def test_deleted_comments_skipped(self):
+        children = [
+            {"author": None, "text": None},
+            {"author": "bob", "text": "Still here."},
+        ]
+        response = _hn_item_response(children)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(hacker_news.fetch_top_comments("1"))
+        assert result == [{"author": "bob", "text": "Still here."}]
+
+    def test_respects_count_argument(self):
+        children = [{"author": f"user{i}", "text": f"comment {i}"} for i in range(10)]
+        response = _hn_item_response(children)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(hacker_news.fetch_top_comments("1", count=2))
+        assert len(result) == 2
+
+    def test_transport_error_raises(self):
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(side_effect=httpx.ConnectError("refused"))):
+            with pytest.raises(httpx.ConnectError):
+                asyncio.run(hacker_news.fetch_top_comments("1"))
+
+
+class TestHackerNewsSearchComments:
+    def test_pinned_story_includes_real_comment_text(self):
+        hits = [{"objectID": "1", "title": "Story", "url": "https://example.com/one", "points": 10, "num_comments": 2}]
+        search_response = _hn_search_response(hits)
+        item_response = _hn_item_response([
+            {"author": "alice", "text": "<p>This is a great point.</p>"},
+            {"author": "bob", "text": "I disagree &amp; here is why."},
+        ])
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(side_effect=[search_response, item_response])):
+            result = asyncio.run(hacker_news.hacker_news_search("story", url="https://example.com/one"))
+
+        text = result["result_text"]
+        assert "Top comments:" in text
+        assert "alice: This is a great point." in text
+        assert "bob: I disagree & here is why." in text
+
+    def test_unpinned_search_never_fetches_comments(self):
+        hits = [{"objectID": "1", "title": "Story", "url": "https://example.com/one", "points": 10, "num_comments": 2}]
+        response = _hn_search_response(hits)
+        fake_get = AsyncMock(return_value=response)
+        with patch.object(httpx.AsyncClient, "get", fake_get):
+            result = asyncio.run(hacker_news.hacker_news_search("story"))
+
+        assert "Top comments:" not in result["result_text"]
+        fake_get.assert_awaited_once()
+
+    def test_comment_fetch_failure_degrades_gracefully_without_raising(self):
+        hits = [{"objectID": "1", "title": "Story", "url": "https://example.com/one", "points": 10, "num_comments": 2}]
+        search_response = _hn_search_response(hits)
+        with patch.object(
+            httpx.AsyncClient, "get",
+            AsyncMock(side_effect=[search_response, httpx.ConnectError("refused")]),
+        ):
+            result = asyncio.run(hacker_news.hacker_news_search("story", url="https://example.com/one"))
+
+        assert result["is_miss"] is False
+        assert "Top comments:" not in result["result_text"]
+        assert "10 points · 2 comments" in result["result_text"]
+
+
+# ---------------------------------------------------------------------------
 # chart.generate_chart — direct unit tests
 # ---------------------------------------------------------------------------
 
@@ -1114,3 +1287,36 @@ class TestMCPToolsInProcess:
             text, is_error = asyncio.run(_call_tool("github_release", {"owner": "o", "repo": "r"}))
         assert is_error is True
         assert "has no releases" in text
+
+    def test_hacker_news_search_tool_success(self):
+        hits = [{"objectID": "1", "title": "t", "url": "https://e.com", "points": 1, "num_comments": 0}]
+        response = _hn_search_response(hits)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            text, is_error = asyncio.run(_call_tool("hacker_news_search", {"query": "test query"}))
+        assert is_error is False
+        data = json.loads(text)
+        assert data["result_count"] == 1
+
+    def test_hacker_news_search_tool_miss_surfaces_empty_result(self):
+        response = _hn_search_response([])
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            text, is_error = asyncio.run(_call_tool("hacker_news_search", {"query": "nothing found query"}))
+        assert is_error is False
+        data = json.loads(text)
+        assert data["is_miss"] is True
+
+    def test_hacker_news_search_tool_url_pins_result(self):
+        hits = [
+            {"objectID": "1", "title": "one", "url": "https://e.com/one", "points": 1, "num_comments": 0},
+            {"objectID": "2", "title": "two", "url": "https://e.com/two", "points": 2, "num_comments": 0},
+        ]
+        response = _hn_search_response(hits)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            text, is_error = asyncio.run(
+                _call_tool("hacker_news_search", {"query": "test query", "url": "https://e.com/two"})
+            )
+        assert is_error is False
+        data = json.loads(text)
+        assert data["result_count"] == 1
+        assert "two" in data["result_text"]
+        assert "one" not in data["result_text"]
