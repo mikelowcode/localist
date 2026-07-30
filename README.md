@@ -8,7 +8,7 @@ Inference-engine-agnostic: ships with oMLX, Ollama (including Ollama Cloud model
 
 ## Architecture
 
-SvelteKit frontend → FastAPI backend (port 8001). The backend's `ControllerAgent` runs each task through `Planner` (a priority-ordered rule engine, plus an explicit `/chart`/`/research` slash-command bypass ahead of it) and dispatches to `ConversationalAgent` (answers/tools) or `WikiAgent` (document ingestion). Tool calls go through `MCPToolDispatcher` to **localist-mcp** (port 8003), a standalone MCP server exposing `web_search`, `fetch_url`, `file_op`, `generate_chart`, and `news_search` tools. All inference runs through a `BaseRuntimeClient` implementation selected via `LOCALIST_RUNTIME_BACKEND` — swappable live, without a restart, via the Settings UI or `POST /settings/runtime-backend`. Episodic memory and embeddings live in SQLite (WAL mode), surviving restarts.
+SvelteKit frontend → FastAPI backend (port 8001). The backend's `ControllerAgent` runs each task through `Planner` (a priority-ordered rule engine, plus an explicit `/chart`/`/research` slash-command bypass ahead of it) and dispatches to `ConversationalAgent` (answers/tools) or `WikiAgent` (document ingestion). Tool calls go through `MCPToolDispatcher` to **localist-mcp** (port 8003), a standalone MCP server exposing `web_search`, `fetch_url`, `file_op`, `generate_chart`, `news_search`, and `github_search`/`github_read`/`github_release` tools. All inference runs through a `BaseRuntimeClient` implementation selected via `LOCALIST_RUNTIME_BACKEND` — swappable live, without a restart, via the Settings UI or `POST /settings/runtime-backend`. Episodic memory and embeddings live in SQLite (WAL mode), surviving restarts.
 
 ```
 Localist UI ──HTTP──► FastAPI :8001
@@ -27,7 +27,8 @@ Localist UI ──HTTP──► FastAPI :8001
    │                                    ├─ fetch_url
    │                                    ├─ file_op
    │                                    ├─ generate_chart
-   │                                    └─ news_search (NewsAPI → Brave fallback)
+   │                                    ├─ news_search (NewsAPI → Brave fallback)
+   │                                    └─ github_search / github_read / github_release
    └── MemoryManager (SQLite episodic + RAG)
 ```
 
@@ -71,6 +72,7 @@ Copy `backend/.env.example` to `backend/.env`. Only an API key for the active `w
 | `LANGSEARCH_API_KEY` | *(none)* | Required when `SEARCH_PROVIDER=langsearch`; without it, `web_search` fails and falls back to corpus |
 | `BRAVE_API_KEY` | *(none)* | Required when `SEARCH_PROVIDER=brave`; without it, `web_search` fails and falls back to corpus |
 | `NEWSAPI_API_KEY` | *(none)* | Optional — powers `news_search` (falls back to Brave-backed `web_search` without it) and the Daily News Brief Live Feed panel (individual sections degrade to "unavailable" without it, no fallback). Free Developer tier only (100 req/day); not licensed for production use |
+| `GITHUB_TOKEN` | *(none)* | Optional for `github_search`/`github_read`/`github_release` (works unauthenticated at a lower rate limit); **required** for the GitHub Watch Feed Live Feed panel (`GET /user/subscriptions` needs an authenticated identity). A classic PAT with no scopes selected is sufficient — public data only, read-only, nothing is ever written back to GitHub |
 | `LOCALIST_MCP_URL` | `http://localhost:8003` | localist-mcp server URL |
 | `LOCALIST_EPISODIC_WRITE_APPROVAL` | `false` | Gate implicit memory writes behind approve/reject |
 | `LOCALIST_RESEARCH_LOOP_ENABLED` | `false` | Upgrade `web_search` to a bounded search/evaluate/fetch/reformulate loop for price/spec-lookup queries — a request can also always force this loop directly with a leading `/research`, regardless of this flag (see Tools below) |
@@ -88,9 +90,9 @@ See `backend/.env.example` for the full list (embedding engine, wiki/raw directo
 
 **Slash commands** — `/chart <data>` and `/research <question>` bypass the normal detection paths and force that tool directly, even on input that wouldn't otherwise trigger it (a bare `/chart` with no data still reaches the tool and degrades gracefully; `/research` runs the full search/evaluate/fetch/reformulate loop even when `LOCALIST_RESEARCH_LOOP_ENABLED` is off). An explicit, user-invoked escape hatch — normal (non-slash) instructions are routed exactly as before.
 
-**Tools** — served over MCP/SSE by localist-mcp: `web_search` (LangSearch or Brave), `fetch_url` (readability-lxml extraction), sandboxed `file_op` (`read_file`/`write_file`/`append_file`, versioned on collision), `generate_chart` (bar/line/pie charts rendered server-side and as an interactive Chart.js widget in the UI), and `news_search` (NewsAPI.org, purpose-built for news-shaped queries — headlines, breaking news — that `web_search` has no freshness/source concept for; falls back to the existing Brave-backed `web_search` on a NewsAPI miss or error). File writes for not-yet-generated content are deferred until after the answer, then confirmed inline. A bounded research loop (search → evaluate → fetch → reformulate, capped at 3 iterations, with a relevance-aware gate that checks the candidate text actually answers the question asked rather than just containing pricing-shaped content) can upgrade `web_search` for price/spec-lookup queries a single search snippet can't resolve — automatically above a semantic-intent threshold when `LOCALIST_RESEARCH_LOOP_ENABLED` is on (off by default), or always on-demand via `/research`.
+**Tools** — served over MCP/SSE by localist-mcp: `web_search` (LangSearch or Brave), `fetch_url` (readability-lxml extraction), sandboxed `file_op` (`read_file`/`write_file`/`append_file`, versioned on collision), `generate_chart` (bar/line/pie charts rendered server-side and as an interactive Chart.js widget in the UI), `news_search` (NewsAPI.org, purpose-built for news-shaped queries — headlines, breaking news — that `web_search` has no freshness/source concept for; falls back to the existing Brave-backed `web_search` on a NewsAPI miss or error), and a public-GitHub crawl trio — `github_search` (repo/code search), `github_read` (README or file/directory contents via the Contents API), and `github_release` (a specific or latest release's notes, defaulting to latest; resolves a bare project name to owner/repo by chaining an internal `github_search` call, so "fetch the oMLX 0.5.3 release notes" is keyword-routable without a pasted URL). File writes for not-yet-generated content are deferred until after the answer, then confirmed inline. A bounded research loop (search → evaluate → fetch → reformulate, capped at 3 iterations, with a relevance-aware gate that checks the candidate text actually answers the question asked rather than just containing pricing-shaped content) can upgrade `web_search` for price/spec-lookup queries a single search snippet can't resolve — automatically above a semantic-intent threshold when `LOCALIST_RESEARCH_LOOP_ENABLED` is on (off by default), or always on-demand via `/research`.
 
-**Live Feed** — a collapsible right-side panel (collapsed by default to a slim vertical tab) surfacing daily-update content outside the normal chat flow. Its Daily News Brief block shows the latest cached World/National/Local + 3 user-chosen special-interest topics (home country, local-area keyword, and topic picker configured under Settings), with a "Daily News Brief Refresh" link that always fetches a fresh brief from NewsAPI and opens it in a brand-new chat conversation — never silently reopens a stale one, so a follow-up question always lands in a conversation whose working memory actually contains that brief's content. Two further blocks, GitHub and Hacker News, are reserved layout for future daily-update sources and aren't wired to a live API yet.
+**Live Feed** — a collapsible right-side panel (collapsed by default to a slim vertical tab) surfacing daily-update content outside the normal chat flow. Its Daily News Brief block shows the latest cached World/National/Local + 3 user-chosen special-interest topics (home country, local-area keyword, and topic picker configured under Settings), with a "Daily News Brief Refresh" link that always fetches a fresh brief from NewsAPI and opens it in a brand-new chat conversation — never silently reopens a stale one, so a follow-up question always lands in a conversation whose working memory actually contains that brief's content. A GitHub Watch Feed block below it mirrors that same refresh-link pattern: it lists the repos you watch (GitHub's native Watch feature, via `GET /user/subscriptions`) and each one's latest release, cached in SQLite until the next explicit refresh; a missing `GITHUB_TOKEN` surfaces as a single inline "not configured" message rather than an error. A further Hacker News block is reserved layout for a future daily-update source and isn't wired to a live API yet.
 
 **Attachments** — the paperclip in the chat UI uploads a local file into an ephemeral, session-scoped cache injected into every subsequent prompt; a second, bookmark-icon control pins an *existing wiki page* into the same cache instead, so asking Assistant to propose a diff against a specific page hands it the real, current file content rather than the model's own (possibly stale) memory of it. Either kind bypasses Planner routing and wiki indexing entirely for as long as it's attached, and clears on backend restart.
 
@@ -122,7 +124,8 @@ localist/
 │   ├── runtime_factory.py       # Backend selection (foundry/omlx/ollama), live-swappable
 │   ├── chart_tool_schema.py     # generate_chart argument extraction/validation
 │   ├── news_brief.py            # Daily News Brief: NewsAPI calls, formatting (Live Feed panel)
-│   ├── mcp_server/              # localist-mcp — port 8003 (web_search, fetch_url, file_op, generate_chart, news_search)
+│   ├── github_watch.py          # GitHub Watch Feed: watched-repo releases (Live Feed panel)
+│   ├── mcp_server/              # localist-mcp — port 8003 (web_search, fetch_url, file_op, generate_chart, news_search, github_search/github_read/github_release)
 │   ├── wiki/                    # Persona, user profile, indexed pages, MEMORY.md/index.md/logs.md
 │   ├── tests/                   # Unit + integration tests by phase
 │   └── requirements.txt
@@ -165,6 +168,7 @@ Tests are organized by phase (memory substrate, routing, controller dispatch, ex
 - ✅ Related Memory panel now does real semantic similarity, not exact-turn matching
 - ✅ Hand-rolled BM25 keyword scoring (`backend/bm25.py`) replacing Jaccard, for corpus + episodic recall when no embedding is available
 - ✅ Generalize the bullet/diff-marker collision edge case
+- ✅ GitHub integration: Watch Feed Live Feed panel (watched-repo releases) + `github_search`/`github_read`/`github_release` crawl tools, the latter keyword-routable without a pasted URL
 
 **Open**
 - ⬜ macOS `.app` packaging via PyInstaller + Tauri
