@@ -502,6 +502,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         format  = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
         datefmt = "%H:%M:%S",
     )
+    # The MCP SDK's SSE transport logs every raw JSON-RPC message (full tool
+    # schemas, full results) at DEBUG — useless noise even under
+    # LOCALIST_LOG_LEVEL=DEBUG. Keep warnings/errors from it, drop the rest.
+    logging.getLogger("mcp.client.sse").setLevel(logging.INFO)
+    # httpcore logs per-socket connection-pool trace events
+    # (connect_tcp.started, send_request_headers.complete, ...) at DEBUG —
+    # noise, not signal. "httpcore" covers its http11/http2/connection/proxy/
+    # socks children since none of them set their own level. httpx itself
+    # only logs one INFO line per request, which stays — that's signal.
+    logging.getLogger("httpcore").setLevel(logging.INFO)
     logger.info("LORA backend starting up.")
 
     project_root = _PROJECT_ROOT

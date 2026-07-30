@@ -1392,3 +1392,36 @@ routing (`tools_fired=["hacker_news_search"]`), real Algolia results (genuine `n
 links), URL-pinning locking onto the exact clicked story rather than a similarly-titled one, and — after
 the comment fix — real quoted commentary replacing the earlier fabricated paraphrase.
 
+### 14.14 Backend Log Readability — MCP-Client and `httpcore` DEBUG Noise Suppressed (2026-07-30)
+
+User running the backend with `LOCALIST_LOG_LEVEL=DEBUG` reported the output unreadable: every MCP
+tool-list handshake and tool call was logging its full raw JSON-RPC frame — the complete tool schema
+list (all input/output schemas for every tool in this file) at session open, and full call
+args/results on every dispatch — under logger `mcp.client.sse` (`mcp` SDK's own
+`logger.debug(f"Received server message: {message}")` / `f"Sending client message: {session_message}")`
+calls in `sse_client`). Separately, `httpcore`'s `Trace` helper logs one `logger.debug()` call per
+connection-pool lifecycle event (`connect_tcp.started`, `send_request_headers.complete`, etc.) across
+its `http11`/`http2`/`connection`/`proxy`/`socks` sub-loggers — none of which set an explicit level of
+their own, so they all resolve their effective level up to whatever the `httpcore` parent logger is
+set to.
+
+Fixed in `backend/main.py`'s `lifespan()`, immediately after the existing `logging.basicConfig()` call
+(§14.4's `LOCALIST_LOG_LEVEL` sets the *root* level there): three explicit per-logger floors —
+`logging.getLogger("mcp.client.sse").setLevel(logging.INFO)` and
+`logging.getLogger("httpcore").setLevel(logging.INFO)`. Raising a logger's own level above the root's
+only suppresses that logger's *sub-root-level* records (its DEBUG calls here); its WARNING/ERROR/
+`exception()` calls are unaffected, so real MCP transport errors and connection failures still surface
+even under this change. `httpx`'s own logger was deliberately left untouched — it has no DEBUG-level
+logging at all, only one `INFO` line per request (`"HTTP Request: POST ... 200 OK"`), which is real
+signal (what HTTP calls were actually made), not noise, unlike the `httpcore` transport layer beneath
+it.
+
+This is a backend-process-only (port 8001) fix — `mcp.client.sse` only exists in the process holding
+the MCP *client* (`MCPToolDispatcher`, via `sse_client`), which is the backend, not localist-mcp
+(port 8003, its own separate `logging.basicConfig()` call and its own `LOCALIST_LOG_LEVEL` read per
+§14.4) which only ever plays the server role. Verified with a standalone script exercising the same
+three loggers at DEBUG: the app's own DEBUG lines and `httpx`'s INFO request line still print;
+`mcp.client.sse`'s and `httpcore`'s DEBUG chatter does not; a forced `httpcore` WARNING still surfaces.
+Full suite re-run clean (1371 passed) after each of the two edits — no test asserts on log output, so
+this was a behavior-preserving change confirmed by manual log inspection, not by the suite.
+
