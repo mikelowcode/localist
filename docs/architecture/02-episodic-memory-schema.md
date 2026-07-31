@@ -80,10 +80,10 @@ Episodes are **never deleted**. The `status` field manages their lifecycle.
 
 | Status | Meaning | Transition |
 |---|---|---|
-| `active` | Trusted. Eligible for injection into context, retrieval, and `MEMORY.md` (§2.9). | Default on creation, or set by `EpisodicMemoryWriter.approve()` from `pending`. |
+| `active` | Trusted. Eligible for injection into context, retrieval, and `MEMORY.md` (§2.9). | Default on creation, set by `EpisodicMemoryWriter.approve()` from `pending`, or set by `EpisodicMemoryWriter.reactivate()` from `retracted` (2026-07-31, below). |
 | `pending` | Staged, unreviewed. **Not** eligible for injection, retrieval, or `MEMORY.md` — invisible to every retrieval mode in §2.6 until resolved. | Set on creation only when the write-approval gate is active for that write (§2.11); never a transition target. |
-| `superseded` | Replaced by a newer episode with the same `subject` and `episode_type`. | Set on the old record when a conflicting new **`active`** record is inserted — a `pending` write does not supersede or get superseded by anything until it is approved (§2.11). |
-| `retracted` | Explicitly invalidated by user command, or a `pending` write that was rejected. | Set directly; no new record required. |
+| `superseded` | Replaced by a newer episode with the same `subject` and `episode_type`. | Set on the old record when a conflicting new **`active`** record is inserted, or when `reactivate()` restores an older retracted record for the same `(subject, episode_type)` over a currently-active one — a `pending` write does not supersede or get superseded by anything until it is approved (§2.11). |
+| `retracted` | Explicitly invalidated by user command, a `pending` write that was rejected, or expired by the global retention TTL sweep (`docs/architecture/20-episode-browsing-ui.md` §20.10). | Set directly; no new record required. Reversible via `reactivate()`, below. |
 
 **Supersession rule:** When a new episode is inserted with `initial_status =
 'active'` and an `active` record with the same `subject` and `episode_type`
@@ -91,6 +91,29 @@ already exists, the existing record is updated to `status = 'superseded'`
 before the new record is inserted. Both records are retained for audit.
 Writes with `initial_status = 'pending'` skip this step entirely — an
 unreviewed guess must never retire a confirmed fact.
+
+**Reactivation rule (2026-07-31) — `retracted → active`, the one reversal
+transition.** `EpisodicMemoryWriter.reactivate(episode_id)` treats any
+`retracted` row the same regardless of how it got there — an explicit
+`retract()`/`retract_by_id()`, a rejected `pending` write, or the global
+retention TTL sweep all land a row at `status='retracted'`, and
+`reactivate()` doesn't distinguish between them. Unlike `approve()` (which
+does **not** run the supersession step, and documents the resulting
+two-simultaneously-active-rows edge case as unresolved), `reactivate()`
+*does* run it: if a different episode is currently `active` for the same
+`(subject, episode_type)` — e.g. a correction was written after the
+original was retracted — that newer row is marked `superseded` first, so
+reactivating a row can never leave two active rows for one subject. This
+asymmetry with `approve()` is deliberate: approving accepts a new,
+previously-unreviewed guess (safer to leave for a human to resolve),
+whereas reactivating is a deliberate choice to restore this exact row as
+canonical. `POST /memory/episodes/{id}/reactivate` (`main.py`) exposes
+this, retriggering the same Phase B graph hook `approve()` does (§8.9;
+safe to call unconditionally since `upsert_graph_node_for_episode()` is an
+upsert). Frontend: `EpisodesPanel.svelte`'s new "Retracted" filter chip and
+a "Reactivate" button per card (`/memory` route only — the separate
+read-only `/episodes` browsing route, §20, only ever surfaces
+`status='active'` rows by design and is unaffected).
 
 **Retraction rule:** Explicit user commands (`"forget that"`,
 `"that's no longer true"`) trigger a retraction write. The record is marked

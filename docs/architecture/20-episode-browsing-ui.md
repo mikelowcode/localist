@@ -232,3 +232,32 @@ of the v12→v13 migration/self-heal blocks — the new `CREATE INDEX ... ON epi
 unconditional and failed with `no such table: episodes` against those fixtures; fixed by gating the
 index creation on `episodes` actually being present, same defensive style already used for the
 table-rename check. Full suite: 1376 passed, 0 failed.
+
+### 20.11 Reactivating Retracted Episodes (2026-07-31)
+
+§20.10's soft-retract design claimed retracted episodes "stay reversible," but no reversal path
+existed — `episodes.status` only had one-way transitions (§2.5 of the Episodic Memory Schema doc).
+This closes that gap: `EpisodicMemoryWriter.reactivate(episode_id)` (`memory_manager.py`) flips a
+`retracted` row back to `active`, treating any retracted row the same regardless of how it got
+there (explicit retract, rejected pending write, or the §20.10 TTL sweep). Unlike `approve()` —
+which does not resolve the "two active rows for one subject" edge case and documents it as
+out of scope — `reactivate()` runs the existing `_supersede_existing()` helper first, so
+reactivating an older retracted row over a newer active one for the same `(subject, episode_type)`
+supersedes the newer row rather than leaving both active. Full design rationale and the lifecycle
+table update are in §2.5 of the Episodic Memory Schema doc, not duplicated here.
+
+Exposed via `POST /memory/episodes/{id}/reactivate` (`main.py`), mirroring `approve()`'s structure
+exactly, including retriggering the Phase B graph hook
+(`ControllerAgent._write_episode_graph_node()`) — safe to call unconditionally since
+`upsert_graph_node_for_episode()` is an upsert. Frontend: `EpisodesPanel.svelte` (the `/memory`
+route) gets a new "Retracted" filter chip and a single "Reactivate" action button per retracted
+card, reusing the existing generic `runAction()`/`ActionState` machinery already used for
+approve/reject. The read-only `/episodes` browsing route (§20.6) is unaffected — it only ever
+surfaces `status='active'` rows by design.
+
+Test coverage: `backend/tests/test_memory_phase1.py`'s new `TestReactivate` class (writer-level:
+basic reactivate, no-ops on active/pending/nonexistent rows, idempotency, rejected-pending rows
+treated the same as retract()-retracted ones, supersede-on-reactivate, MEMORY.md regeneration) and
+`backend/tests/test_main_memory_episodes.py`'s new `TestReactivateEndpoint`/
+`TestReactivateEndpointGraphHook` classes (endpoint-level, mirroring the existing
+`TestApproveEndpoint`/`TestApproveEndpointGraphHook` structure). Full suite: 1390 passed, 0 failed.

@@ -1845,6 +1845,48 @@ async def reject_memory_episode(episode_id: int) -> EpisodeApprovalResponse:
     )
 
 
+@app.post(
+    "/memory/episodes/{episode_id}/reactivate",
+    response_model = EpisodeApprovalResponse,
+    summary        = "Reactivate a retracted episode",
+)
+async def reactivate_memory_episode(episode_id: int) -> EpisodeApprovalResponse:
+    """
+    Transition a retracted episode back to active — the reversal path for
+    retract()/retract_by_id()/reject() and the global-retention TTL sweep
+    (MemoryManager.sweep_expired_memory()), all of which land a row at
+    status='retracted'. If a different episode is currently active for the
+    same (subject, episode_type), that row is superseded first — see
+    EpisodicMemoryWriter.reactivate()'s docstring for why this differs from
+    approve(), which does not resolve that edge case. Also retriggers the
+    Phase B graph hook, same as approve() — safe to call unconditionally
+    since it's an upsert.
+
+    Idempotent: reactivating an id that's already active/pending, or that
+    doesn't exist, returns updated=False rather than an error.
+    """
+    mm = _state.memory_manager
+    if mm is None:
+        raise HTTPException(status_code=503, detail="MemoryManager not initialised.")
+
+    writer = EpisodicMemoryWriter(
+        db_path=getattr(mm, "_db_path", None), memory_md_path=_MEMORY_MD_PATH,
+    )
+    count = await asyncio.to_thread(writer.reactivate, episode_id)
+    if count > 0:
+        subject = await asyncio.to_thread(writer.get_episode_subject, episode_id)
+        controller = _state.controller
+        if controller is not None and subject is not None:
+            await asyncio.to_thread(
+                controller._write_episode_graph_node, episode_id, subject,
+            )
+    return EpisodeApprovalResponse(
+        episode_id = episode_id,
+        status     = "active",
+        updated    = count > 0,
+    )
+
+
 # ---------------------------------------------------------------------------
 # File management endpoints
 # ---------------------------------------------------------------------------

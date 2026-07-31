@@ -4026,6 +4026,74 @@ class EpisodicMemoryWriter:
             finally:
                 conn.close()
 
+    def reactivate(self, episode_id: int) -> int:
+        """
+        Transition a retracted episode back to active — the reversal path
+        for retract()/retract_by_id()/reject() and the global-retention TTL
+        sweep (MemoryManager.sweep_expired_memory()), all of which land a
+        row at status='retracted'. No distinction is made between "was
+        active, then retracted" and "was pending, then rejected" — both are
+        status='retracted' today, and reactivate() treats them the same.
+
+        Unlike approve() (which does NOT run _supersede_existing() and
+        documents that a second active row for the same (subject,
+        episode_type) is an unresolved edge case), reactivate() DOES run
+        it: if a different episode is currently active for this row's
+        (subject, episode_type) — e.g. a correction was written after this
+        one was retracted — that newer active row is marked superseded
+        first, so reactivating never results in two simultaneously active
+        rows for the same subject. This is a deliberate choice: approving a
+        pending row is accepting a new, previously-unreviewed guess (safer
+        to leave ambiguity for a human to resolve), while reactivating is a
+        deliberate choice to restore this exact row as canonical.
+
+        Parameters
+        ----------
+        episode_id :
+            Primary key of the episode to reactivate.
+
+        Returns
+        -------
+        int
+            1 if a matching retracted record was reactivated, 0 if the id
+            does not exist or is not currently retracted.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    """
+                    SELECT subject, episode_type FROM episodes
+                    WHERE  id = ? AND status = 'retracted'
+                    """,
+                    (episode_id,),
+                ).fetchone()
+                if row is None:
+                    return 0
+
+                superseded = self._supersede_existing(conn, row["subject"], row["episode_type"])
+                cursor = conn.execute(
+                    """
+                    UPDATE episodes
+                    SET    status = 'active'
+                    WHERE  id     = ?
+                      AND  status = 'retracted'
+                    """,
+                    (episode_id,),
+                )
+                count = cursor.rowcount
+                conn.commit()
+                logger.info(
+                    "reactivate: reactivated %d episode(s) for id=%d "
+                    "(superseded %d conflicting active row(s)).",
+                    count, episode_id, superseded,
+                )
+                if count:
+                    self._write_memory_md(conn)
+                return count
+            finally:
+                conn.close()
+
     def get_episode_subject(self, episode_id: int) -> str | None:
         """
         Look up the ``subject`` of a single episode by id.

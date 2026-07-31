@@ -7,6 +7,7 @@
     refreshPendingCount,
     approveEpisode,
     rejectEpisode,
+    reactivateEpisode,
     EPISODE_TYPES,
     TYPE_LABELS,
     TYPE_COLORS,
@@ -36,6 +37,12 @@
     loadEpisodes({ typeFilter: '', statusFilter: 'pending', offset: 0 });
   }
 
+  function applyRetractedFilter() {
+    typeFilter = '';
+    statusFilter = 'retracted';
+    loadEpisodes({ typeFilter: '', statusFilter: 'retracted', offset: 0 });
+  }
+
   function formatDate(ts: number): string {
     return new Date(ts * 1000).toLocaleDateString([], {
       month: 'short', day: 'numeric', year: 'numeric',
@@ -51,17 +58,17 @@
     return `background:${col.bg};color:${col.color};border-color:${col.border};`;
   }
 
-  // Per-card approve/reject in-flight + error state, keyed by episode id.
-  // Kept local rather than on episodesStore — a failed action on one card
-  // must not disturb the rest of the list. `action` records which button
-  // was clicked so only that button's label changes to the "…ing" form
-  // while busy (both buttons are disabled either way).
-  interface ActionState { busy: boolean; action: 'approve' | 'reject' | null; error: string | null; }
+  // Per-card approve/reject/reactivate in-flight + error state, keyed by
+  // episode id. Kept local rather than on episodesStore — a failed action
+  // on one card must not disturb the rest of the list. `action` records
+  // which button was clicked so only that button's label changes to the
+  // "…ing" form while busy (all buttons are disabled either way).
+  interface ActionState { busy: boolean; action: 'approve' | 'reject' | 'reactivate' | null; error: string | null; }
   let actionState: Record<number, ActionState> = {};
 
   async function runAction(
     ep: EpisodeItem,
-    action: 'approve' | 'reject',
+    action: 'approve' | 'reject' | 'reactivate',
     call: (id: number) => Promise<boolean>,
   ) {
     actionState = { ...actionState, [ep.id]: { busy: true, action, error: null } };
@@ -93,8 +100,9 @@
     }
   }
 
-  const handleApprove = (ep: EpisodeItem) => runAction(ep, 'approve', approveEpisode);
-  const handleReject  = (ep: EpisodeItem) => runAction(ep, 'reject', rejectEpisode);
+  const handleApprove    = (ep: EpisodeItem) => runAction(ep, 'approve', approveEpisode);
+  const handleReject     = (ep: EpisodeItem) => runAction(ep, 'reject', rejectEpisode);
+  const handleReactivate = (ep: EpisodeItem) => runAction(ep, 'reactivate', reactivateEpisode);
 
   onMount(() => {
     loadEpisodes({ typeFilter: '' });
@@ -144,6 +152,11 @@
       class:active={statusFilter === 'pending'}
       on:click={applyPendingFilter}
     >Pending ({$pendingCount})</button>
+    <button
+      class="filter-chip filter-chip-retracted"
+      class:active={statusFilter === 'retracted'}
+      on:click={applyRetractedFilter}
+    >Retracted</button>
   </div>
 
   <!-- Content -->
@@ -207,6 +220,17 @@
                 on:click={() => handleReject(ep)}
                 disabled={actionState[ep.id]?.busy}
               >{actionState[ep.id]?.action === 'reject' ? 'Rejecting…' : 'Reject'}</button>
+            </div>
+            {#if actionState[ep.id]?.error}
+              <p class="episode-action-error">{actionState[ep.id]?.error}</p>
+            {/if}
+          {:else if ep.status === 'retracted'}
+            <div class="episode-actions">
+              <button
+                class="episode-action-btn episode-action-approve"
+                on:click={() => handleReactivate(ep)}
+                disabled={actionState[ep.id]?.busy}
+              >{actionState[ep.id]?.action === 'reactivate' ? 'Reactivating…' : 'Reactivate'}</button>
             </div>
             {#if actionState[ep.id]?.error}
               <p class="episode-action-error">{actionState[ep.id]?.error}</p>

@@ -166,3 +166,10 @@ export async function rejectEpisode(id: number): Promise<boolean> {
   const data: { episode_id: number; status: string; updated: boolean } = await res.json();
   return data.updated;
 }
+
+export async function reactivateEpisode(id: number): Promise<boolean> {
+  const res = await fetch(`/api/memory/episodes/${id}/reactivate`, { method: 'POST' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data: { episode_id: number; status: string; updated: boolean } = await res.json();
+  return data.updated;
+}

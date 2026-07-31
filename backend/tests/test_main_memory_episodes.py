@@ -186,6 +186,97 @@ class TestRejectEndpoint:
         assert second.json()["updated"] is False
 
 
+class TestReactivateEndpoint:
+
+    def test_reactivate_retracted_row_returns_updated_true_and_activates(self, client):
+        writer = EpisodicMemoryWriter(db_path=main._state.memory_manager._db_path)
+        episode_id = writer.insert("preference", "theme", "Prefers dark mode.", "explicit")
+        writer.retract_by_id(episode_id)
+
+        resp = client.post(f"/memory/episodes/{episode_id}/reactivate")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body == {"episode_id": episode_id, "status": "active", "updated": True}
+        assert _status(main._state.memory_manager, episode_id) == "active"
+
+    def test_reactivate_nonexistent_id_returns_updated_false(self, client):
+        resp = client.post("/memory/episodes/999999/reactivate")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body == {"episode_id": 999999, "status": "active", "updated": False}
+
+    def test_reactivate_already_active_row_returns_updated_false(self, client):
+        writer = EpisodicMemoryWriter(db_path=main._state.memory_manager._db_path)
+        row_id = writer.insert("preference", "x", "y.", "explicit")
+
+        resp = client.post(f"/memory/episodes/{row_id}/reactivate")
+        assert resp.status_code == 200
+        assert resp.json()["updated"] is False
+        assert _status(main._state.memory_manager, row_id) == "active"
+
+    def test_reactivate_without_controller_still_succeeds_no_graph_node(self, client):
+        assert main._state.controller is None
+        writer = EpisodicMemoryWriter(db_path=main._state.memory_manager._db_path)
+        episode_id = writer.insert("preference", "theme", "Prefers dark mode.", "explicit")
+        writer.retract_by_id(episode_id)
+
+        resp = client.post(f"/memory/episodes/{episode_id}/reactivate")
+
+        assert resp.status_code == 200
+        assert resp.json()["updated"] is True
+        assert _graph_node_type(
+            main._state.memory_manager, f"episode://{episode_id}",
+        ) is None
+
+
+class TestReactivateEndpointGraphHook:
+    """
+    Reactivating a retracted episode must retrigger
+    ControllerAgent._write_episode_graph_node(), same as approve() —
+    upsert_graph_node_for_episode() is idempotent, so this is a correct
+    no-op-ish refresh for a row that already had a graph node (was active
+    before retraction) and the correct first write for one that never did
+    (was rejected while still pending).
+    """
+
+    @pytest.fixture()
+    def controller(self, client):
+        from unittest.mock import MagicMock
+
+        from controller_agent import ControllerAgent
+
+        prev_controller = main._state.controller
+        main._state.controller = ControllerAgent(
+            runtime        = MagicMock(),
+            agents         = [],
+            memory_manager = main._state.memory_manager,
+        )
+        yield main._state.controller
+        main._state.controller = prev_controller
+
+    def test_reactivate_creates_episode_graph_node(self, client, controller):
+        writer = EpisodicMemoryWriter(db_path=main._state.memory_manager._db_path)
+        episode_id = writer.insert("preference", "theme", "Prefers dark mode.", "explicit")
+        writer.retract_by_id(episode_id)
+
+        resp = client.post(f"/memory/episodes/{episode_id}/reactivate")
+
+        assert resp.status_code == 200
+        assert resp.json()["updated"] is True
+        assert _graph_node_type(
+            main._state.memory_manager, f"episode://{episode_id}",
+        ) == "episode"
+
+    def test_reactivate_nonexistent_id_does_not_call_graph_hook(self, client, controller):
+        resp = client.post("/memory/episodes/999999/reactivate")
+
+        assert resp.status_code == 200
+        assert resp.json()["updated"] is False
+        assert _graph_node_type(
+            main._state.memory_manager, "episode://999999",
+        ) is None
+
+
 class TestGetEpisodesTotalCount:
 
     def test_total_reflects_full_count_not_capped_by_limit(self, client):

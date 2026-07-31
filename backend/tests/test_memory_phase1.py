@@ -866,6 +866,81 @@ class TestWriteApprovalGate:
 
 
 # ---------------------------------------------------------------------------
+# EpisodicMemoryWriter.reactivate() — reversal path for retracted episodes
+# ---------------------------------------------------------------------------
+
+class TestReactivate:
+
+    def test_reactivate_retracted_row_sets_active(self, writer, db_path):
+        row_id = writer.insert("preference", "theme", "Prefers dark mode.", "explicit")
+        writer.retract_by_id(row_id)
+
+        count = writer.reactivate(row_id)
+        assert count == 1
+        assert _row(db_path, row_id)["status"] == "active"
+
+    def test_reactivate_noop_on_active_row(self, writer, db_path):
+        row_id = writer.insert("preference", "x", "y.", "explicit")
+        assert writer.reactivate(row_id) == 0
+        assert _row(db_path, row_id)["status"] == "active"
+
+    def test_reactivate_noop_on_pending_row(self, writer, db_path):
+        row_id = writer.insert(
+            "project_fact", "staged fact", "Some staged fact.",
+            "model_extracted", confidence=0.7, initial_status="pending",
+        )
+        assert writer.reactivate(row_id) == 0
+        assert _row(db_path, row_id)["status"] == "pending"
+
+    def test_reactivate_noop_on_nonexistent_id(self, writer):
+        assert writer.reactivate(999999) == 0
+
+    def test_reactivate_is_idempotent(self, writer, db_path):
+        row_id = writer.insert("preference", "theme", "Prefers dark mode.", "explicit")
+        writer.retract_by_id(row_id)
+        assert writer.reactivate(row_id) == 1
+        assert writer.reactivate(row_id) == 0   # already active
+
+    def test_reactivate_works_on_rejected_pending_row(self, writer, db_path):
+        # reject() also lands a row at status='retracted' — reactivate()
+        # must treat it the same as a retract()-retracted row, per the
+        # "uniform on any retracted row" design decision.
+        row_id = writer.insert(
+            "project_fact", "staged fact", "Some staged fact.",
+            "model_extracted", confidence=0.7, initial_status="pending",
+        )
+        writer.reject(row_id)
+        assert _row(db_path, row_id)["status"] == "retracted"
+
+        assert writer.reactivate(row_id) == 1
+        assert _row(db_path, row_id)["status"] == "active"
+
+    def test_reactivate_supersedes_conflicting_active_row(self, writer, db_path):
+        # id_a is retracted, then id_b is written active for the same
+        # (subject, episode_type) — reactivating id_a must not result in
+        # two simultaneously active rows for "theme".
+        id_a = writer.insert("preference", "theme", "Prefers dark mode.", "explicit")
+        writer.retract_by_id(id_a)
+        id_b = writer.insert("preference", "theme", "Prefers light mode now.", "explicit")
+        assert _row(db_path, id_b)["status"] == "active"
+
+        count = writer.reactivate(id_a)
+        assert count == 1
+        assert _row(db_path, id_a)["status"] == "active"
+        assert _row(db_path, id_b)["status"] == "superseded"
+
+    def test_reactivate_regenerates_memory_md(self, db_path, tmp_path):
+        md_path = tmp_path / "MEMORY.md"
+        writer = EpisodicMemoryWriter(db_path=db_path, memory_md_path=md_path)
+        row_id = writer.insert("preference", "search engine", "Prefers Brave.", "explicit")
+        writer.retract_by_id(row_id)
+        assert "Prefers Brave." not in md_path.read_text()
+
+        writer.reactivate(row_id)
+        assert "Prefers Brave." in md_path.read_text()
+
+
+# ---------------------------------------------------------------------------
 # MemoryManager.count_episodes()
 # ---------------------------------------------------------------------------
 
