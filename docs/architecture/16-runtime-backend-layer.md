@@ -879,3 +879,55 @@ a differently-shaped 400 falls through to the pre-existing generic-error path un
 oMLX server was used for any of this — all HTTP is mocked, consistent with the rest of this suite
 per `CLAUDE.md`. Real end-to-end KV-cache-reuse verification (e.g. via oMLX's `/admin/api/cache/probe`,
 §3.7c) was not performed this session and remains an explicit open item.
+
+### §16.13 — Scoped and rejected: oMLX Context Benchmark API integration (decision record, 2026-07-31)
+
+**No code changes.** oMLX v0.5.4rc1's release notes introduced a "Context Benchmark" tool
+("measures the largest context the current Mac can prefill, verifies it with a real request, and
+applies the result to model settings," available via "Admin API, web dashboard, and macOS app") —
+a natural-looking candidate to feed §16.10/§16.11's `max_model_len`-based budget from a fresher,
+Localist-triggered measurement instead of just reading oMLX's own reported value. Investigated live
+against a real oMLX 0.5.4rc1 instance (upgraded in-place via `brew upgrade omlx` from 0.4.4, no
+re-tap needed) to determine whether the "Admin API" claim was a stable, scriptable contract or just
+the dashboard hitting its own internal routes.
+
+**Findings.** The routes are real, live under `/admin/api/bench/context/`
+(`start`/`active`/`{bench_id}/results`/`{bench_id}/stream` SSE/`{bench_id}/cancel`) — confirmed via
+`/openapi.json` (one combined schema for `/v1/*` and `/admin/*`; no separate `/admin/openapi.json`)
+and by reading the installed package source directly, since every one of these routes has an
+untyped (`{}`) response schema in OpenAPI. Four properties make this a poor integration target:
+
+- **No dry-run.** Every successful run ends by writing `max_context_window` into the model's own
+  settings as a side effect (`context_benchmark.py`'s "apply" phase) — there is no request field to
+  read the measured number without oMLX applying it.
+- **Disruptive side effect.** Starting a run force-unloads every other currently-loaded model first
+  (needed for a clean memory measurement), then reloads — not safe to trigger silently or on a
+  schedule against a live system something else might be using.
+- **Fragile surface.** `POST start` with no/malformed body threw an unhandled 500, not a clean 4xx,
+  during testing — rc-quality, not a hardened contract.
+- **Environment-dependent auth.** `/admin/*` routes gate on a session cookie via `/admin/api/login`
+  (`require_admin`), not the bearer-token scheme `/v1/*` uses — a heavier flow than this codebase's
+  existing runtime clients implement, and the test machine's `skip_api_key_verification=true` (which
+  bypasses it entirely) can't be assumed for other installs.
+
+No CLI equivalent exists (`omlx --help` exposes only `{start, stop, restart, serve, launch,
+diagnose}`) — this feature is HTTP-only. **Stability verdict: low-to-medium confidence** — the
+routes live under `/admin/api/`, not the versioned `/v1/` surface §16.10 already reads from, with
+untyped responses and rc-quality error handling; expect the contract to move without notice across
+oMLX releases.
+
+**Decision: Localist will not integrate with the Context Benchmark API.** Separation of concerns
+stays exactly where §16.11 already put it — oMLX (the inference engine) owns measuring and setting
+its own context ceiling; a user who wants to run the Context Benchmark does so directly in oMLX's
+own admin panel, which can present its own model-unload warning and apply its own result. Localist
+stays a consumer only, reading `max_model_len` via `OMLXRuntimeClient.health_check()` (§16.10) and
+deriving `working_memory_tokens` from it (§16.11), unchanged. No `OMLXBenchmarkClient`, no
+admin-session-cookie auth handling, no SSE/polling logic, no version-compatibility shim for an
+unstable rc endpoint was added. This also means Localist never calls `start`, so it never triggers
+the disruptive multi-model unload or the no-dry-run auto-apply behavior described above.
+
+**Reopen only if:** oMLX moves this benchmark under the versioned `/v1/` surface with typed
+responses (a real stability signal), or a concrete product reason emerges for Localist to trigger
+benchmarking on the user's behalf rather than pointing them at oMLX's own panel — and re-verify the
+endpoint shapes fresh against whatever oMLX version is current at that time rather than trusting
+this section's specifics indefinitely; they were measured against one rc build on one machine.
