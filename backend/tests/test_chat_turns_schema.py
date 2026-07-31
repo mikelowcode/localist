@@ -1,8 +1,8 @@
 """
 Tests for the v5→v6 chat_turns/chat_turns_fts/chat_history_settings schema
-(Chat History Tab feature), plus the add_chat_turn() write path.
-
-No read endpoints or eviction sweep exist yet — those are later steps.
+(Chat History Tab feature, chat_history_settings later renamed to
+retention_settings in v12→v13 — see TestRetentionSettings), plus the
+add_chat_turn() write path.
 """
 
 import json
@@ -150,7 +150,7 @@ class TestChatTurnsFreshSchema:
 
         assert "chat_turns" in names
         assert "chat_turns_fts" in names
-        assert "chat_history_settings" in names
+        assert "retention_settings" in names
         assert "chat_turns_ai" in names
         assert "chat_turns_ad" in names
         assert "chat_turns_au" in names
@@ -189,13 +189,13 @@ class TestChatTurnsFreshSchema:
         assert match_after_delete is None
         conn.close()
 
-    def test_chat_history_settings_has_no_default_row(self, tmp_path):
+    def test_retention_settings_has_no_default_row(self, tmp_path):
         path = tmp_path / "settings.db"
         MemoryManager(db_path=path)
 
         conn = sqlite3.connect(str(path))
         count = conn.execute(
-            "SELECT COUNT(*) FROM chat_history_settings"
+            "SELECT COUNT(*) FROM retention_settings"
         ).fetchone()[0]
         conn.close()
 
@@ -222,8 +222,10 @@ class TestChatTurnsMigration:
         assert "chat_history_settings" not in tables_before
 
         # Open with MemoryManager → triggers _migrate(from_version=5) →
-        # v5→v6→v7→...→current (chat_turns objects land at v6; v6→v7 then
-        # adds conversation_id/conversation_title on top, per §12.3).
+        # v5→v6→...→current (chat_turns objects land at v6; v6→v7 then adds
+        # conversation_id/conversation_title on top, per §12.3;
+        # chat_history_settings itself is later renamed to retention_settings
+        # at v12→v13, see TestRetentionSettings).
         MemoryManager(db_path=path)
 
         conn = sqlite3.connect(str(path))
@@ -236,7 +238,8 @@ class TestChatTurnsMigration:
         assert version_after == _SCHEMA_VERSION
         assert "chat_turns" in names_after
         assert "chat_turns_fts" in names_after
-        assert "chat_history_settings" in names_after
+        assert "retention_settings" in names_after
+        assert "chat_history_settings" not in names_after
         assert "chat_turns_ai" in names_after
         assert "chat_turns_ad" in names_after
         assert "chat_turns_au" in names_after
@@ -436,40 +439,40 @@ class TestMarkDiffApplied:
 
 
 # ---------------------------------------------------------------------------
-# TestChatHistorySettings — eviction preset read/write
-# (memory_manager.MemoryManager.get/set_chat_history_eviction_preset)
+# TestRetentionSettings — global retention preset read/write
+# (memory_manager.MemoryManager.get/set_retention_preset)
 # ---------------------------------------------------------------------------
 
-class TestChatHistorySettings:
+class TestRetentionSettings:
 
     @pytest.fixture()
     def mm(self, tmp_path) -> MemoryManager:
-        return MemoryManager(db_path=tmp_path / "chat_history_settings.db")
+        return MemoryManager(db_path=tmp_path / "retention_settings.db")
 
     def test_get_returns_none_on_fresh_db(self, mm):
-        assert mm.get_chat_history_eviction_preset() is None
+        assert mm.get_retention_preset() is None
 
     @pytest.mark.parametrize("preset", ["7d", "30d", "90d", "forever"])
     def test_set_then_get_round_trips(self, mm, preset):
-        mm.set_chat_history_eviction_preset(preset)
-        assert mm.get_chat_history_eviction_preset() == preset
+        mm.set_retention_preset(preset)
+        assert mm.get_retention_preset() == preset
 
     def test_set_twice_overwrites_not_duplicates(self, mm):
-        mm.set_chat_history_eviction_preset("7d")
-        mm.set_chat_history_eviction_preset("90d")
-        assert mm.get_chat_history_eviction_preset() == "90d"
+        mm.set_retention_preset("7d")
+        mm.set_retention_preset("90d")
+        assert mm.get_retention_preset() == "90d"
 
         conn = sqlite3.connect(str(mm._db_path))
-        count = conn.execute("SELECT COUNT(*) FROM chat_history_settings").fetchone()[0]
+        count = conn.execute("SELECT COUNT(*) FROM retention_settings").fetchone()[0]
         conn.close()
         assert count == 1
 
     def test_set_invalid_preset_raises_value_error(self, mm):
         with pytest.raises(ValueError, match="60d"):
-            mm.set_chat_history_eviction_preset("60d")
+            mm.set_retention_preset("60d")
 
         # No row should have been written on rejection.
-        assert mm.get_chat_history_eviction_preset() is None
+        assert mm.get_retention_preset() is None
 
 
 # ---------------------------------------------------------------------------

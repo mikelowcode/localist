@@ -5,7 +5,7 @@
  *   GET /api/news/preferences — read current home_country/local_query/topics
  *   PUT /api/news/preferences — set them
  *
- * Follows chatHistorySettings.ts's pattern exactly: on a failed write, state
+ * Follows retentionSettings.ts's pattern exactly: on a failed write, state
  * is left untouched (no optimistic update) — the UI must reflect the
  * server's actual last-known state, not a pending guess.
  */

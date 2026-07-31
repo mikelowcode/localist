@@ -151,7 +151,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION   = 12         # increment when schema changes require migration
+_SCHEMA_VERSION   = 13         # increment when schema changes require migration
 _EMBEDDING_DIM    = 768        # EmbeddingGemma-300M-4bit output dimension
 _EMBEDDING_FORMAT = ">768f"    # big-endian float32 × 768
 
@@ -175,8 +175,16 @@ _EPISODES_REEMBED_WARN_ROW_COUNT = 500
 # visible in logs rather than silently slow.
 _CHAT_TURNS_SEMANTIC_SCAN_WARN_ROW_COUNT = 2000
 
-# Closed set of valid chat_history_settings.eviction_preset values.
-_CHAT_HISTORY_EVICTION_PRESETS: frozenset[str] = frozenset({"7d", "30d", "90d", "forever"})
+# Closed set of valid retention_settings.eviction_preset values.
+_RETENTION_PRESETS: frozenset[str] = frozenset({"7d", "30d", "90d", "forever"})
+
+# Seconds-per-preset for the retention sweep (sweep_expired_memory()). "forever"
+# is intentionally absent — it means "no sweep", not "sweep with an infinite TTL".
+_RETENTION_PRESET_SECONDS: dict[str, int] = {
+    "7d":  7 * 86400,
+    "30d": 30 * 86400,
+    "90d": 90 * 86400,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +546,8 @@ class MemoryManager:
                             ON episodes (subject, status);
                         CREATE INDEX IF NOT EXISTS idx_episodes_project
                             ON episodes (project_context, status);
+                        CREATE INDEX IF NOT EXISTS idx_episodes_created
+                            ON episodes (created_at);
 
                         CREATE TABLE IF NOT EXISTS graph_nodes (
                             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -612,7 +622,7 @@ class MemoryManager:
                             INSERT INTO chat_turns_fts(rowid, content) VALUES (new.id, new.content);
                         END;
 
-                        CREATE TABLE IF NOT EXISTS chat_history_settings (
+                        CREATE TABLE IF NOT EXISTS retention_settings (
                             id              INTEGER PRIMARY KEY CHECK (id = 1),
                             eviction_preset TEXT
                         );
@@ -727,6 +737,25 @@ class MemoryManager:
                         generated_at    REAL    NOT NULL
                     );
                 """)
+                conn.commit()
+
+                # Same self-heal, same rationale, for the chat_history_settings
+                # → retention_settings rename (schema v13, global retention TTL).
+                tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()}
+                if "chat_history_settings" in tables and "retention_settings" not in tables:
+                    conn.execute("ALTER TABLE chat_history_settings RENAME TO retention_settings")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS retention_settings (
+                        id              INTEGER PRIMARY KEY CHECK (id = 1),
+                        eviction_preset TEXT
+                    );
+                """)
+                if "episodes" in tables:
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_episodes_created ON episodes (created_at)"
+                    )
                 conn.commit()
 
             finally:
@@ -946,6 +975,28 @@ class MemoryManager:
                     generated_at    REAL    NOT NULL
                 );
             """)
+
+        if from_version < 13:
+            logger.info(
+                "Applying migration v12→v13: renaming chat_history_settings to "
+                "retention_settings (now governs both chat_turns and episodes "
+                "TTL) and indexing episodes(created_at) for the retention sweep."
+            )
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()}
+            if "chat_history_settings" in tables and "retention_settings" not in tables:
+                conn.execute("ALTER TABLE chat_history_settings RENAME TO retention_settings")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS retention_settings (
+                    id              INTEGER PRIMARY KEY CHECK (id = 1),
+                    eviction_preset TEXT
+                );
+            """)
+            if "episodes" in tables:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_episodes_created ON episodes (created_at)"
+                )
 
         conn.execute(
             "UPDATE schema_version SET version = ?", (_SCHEMA_VERSION,)
@@ -2025,12 +2076,12 @@ class MemoryManager:
         ]
 
     # -----------------------------------------------------------------------
-    # Chat history settings  (Chat History Tab — eviction preset read/write)
+    # Retention settings  (Settings tab — global TTL for chat_turns + episodes)
     # -----------------------------------------------------------------------
 
-    def get_chat_history_eviction_preset(self) -> str | None:
+    def get_retention_preset(self) -> str | None:
         """
-        Read the current chat_turns eviction preset.
+        Read the current global retention preset.
 
         Returns None when no row exists yet — this is the expected default
         state (the user has never set a preset), not an error.
@@ -2038,31 +2089,31 @@ class MemoryManager:
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT eviction_preset FROM chat_history_settings WHERE id = 1"
+                "SELECT eviction_preset FROM retention_settings WHERE id = 1"
             ).fetchone()
         finally:
             conn.close()
 
         return row["eviction_preset"] if row is not None else None
 
-    def set_chat_history_eviction_preset(self, preset: str) -> None:
+    def set_retention_preset(self, preset: str) -> None:
         """
-        Insert or update the chat_turns eviction preset (row id=1).
+        Insert or update the global retention preset (row id=1).
 
         Parameters
         ----------
         preset :
-            Must be one of _CHAT_HISTORY_EVICTION_PRESETS.
+            Must be one of _RETENTION_PRESETS.
 
         Raises
         ------
         ValueError
             If preset is not one of the allowed values.
         """
-        if preset not in _CHAT_HISTORY_EVICTION_PRESETS:
+        if preset not in _RETENTION_PRESETS:
             raise ValueError(
                 f"preset {preset!r} not in allowed set. "
-                f"Valid: {sorted(_CHAT_HISTORY_EVICTION_PRESETS)}"
+                f"Valid: {sorted(_RETENTION_PRESETS)}"
             )
 
         with self._lock:
@@ -2070,7 +2121,7 @@ class MemoryManager:
             try:
                 conn.execute(
                     """
-                    INSERT INTO chat_history_settings (id, eviction_preset)
+                    INSERT INTO retention_settings (id, eviction_preset)
                     VALUES (1, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         eviction_preset = excluded.eviction_preset
@@ -2078,7 +2129,62 @@ class MemoryManager:
                     (preset,),
                 )
                 conn.commit()
-                logger.info("set_chat_history_eviction_preset: preset=%r.", preset)
+                logger.info("set_retention_preset: preset=%r.", preset)
+            finally:
+                conn.close()
+
+    def sweep_expired_memory(self) -> dict[str, int]:
+        """
+        Enforce the global retention preset: hard-delete chat_turns and
+        soft-retract episodes older than the configured TTL.
+
+        No-ops (returns zero counts) when no preset is set or the preset is
+        "forever" — an absent/forever preset means "keep everything", not
+        "sweep with an infinite TTL". chat_turns rows are deleted outright
+        (no lifecycle column exists on that table); episodes are marked
+        status='retracted' rather than deleted, matching the existing
+        approve/reject/retract lifecycle so expired episodes stay reversible
+        and are automatically excluded from every status='active' retrieval
+        path (by_subject, by_recency, _score_all_active, get_by_ids).
+
+        Does NOT regenerate MEMORY.md itself — that snapshot is owned by
+        EpisodicMemoryWriter (a separate class; see approve()/reject() in
+        main.py for the same split), which this method has no reference to.
+        Callers should invoke EpisodicMemoryWriter(...).regenerate_memory_md()
+        afterward when episodes_retracted > 0 (main.py's lifespan() does this
+        for the startup sweep).
+        """
+        preset = self.get_retention_preset()
+        if preset is None or preset == "forever":
+            return {"chat_turns_deleted": 0, "episodes_retracted": 0}
+
+        cutoff = time.time() - _RETENTION_PRESET_SECONDS[preset]
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                chat_turns_deleted = conn.execute(
+                    "DELETE FROM chat_turns WHERE created_at < ?", (cutoff,)
+                ).rowcount
+                episodes_retracted = conn.execute(
+                    """
+                    UPDATE episodes
+                    SET    status = 'retracted'
+                    WHERE  status = 'active'
+                      AND  created_at < ?
+                    """,
+                    (cutoff,),
+                ).rowcount
+                conn.commit()
+                logger.info(
+                    "sweep_expired_memory: preset=%r cutoff=%.0f "
+                    "chat_turns_deleted=%d episodes_retracted=%d.",
+                    preset, cutoff, chat_turns_deleted, episodes_retracted,
+                )
+                return {
+                    "chat_turns_deleted": chat_turns_deleted,
+                    "episodes_retracted": episodes_retracted,
+                }
             finally:
                 conn.close()
 
@@ -2094,7 +2200,7 @@ class MemoryManager:
         Returns None when no row exists yet (the user has never set
         preferences) — the caller (main.py's GET /news/preferences)
         supplies defaults in that case, same posture as
-        get_chat_history_eviction_preset().
+        get_retention_preset().
         """
         conn = self._connect()
         try:

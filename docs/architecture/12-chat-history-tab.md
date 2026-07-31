@@ -30,7 +30,19 @@ searchable, paginated turn list.
   `chatHistorySettings.ts` and `chatHistoryList.ts`; new `Sidebar.svelte` nav
   entry.
 
-**Explicitly not implemented (see §12.7):** eviction sweep execution.
+**Update 2026-07-31 — retention rename + sweep implemented (§20.10).**
+`chat_history_settings`/`get_chat_history_eviction_preset()`/
+`set_chat_history_eviction_preset()`/`GET`&`PUT /chat/history/settings`/
+`chatHistorySettings.ts` were all renamed to `retention_settings`/
+`get_retention_preset()`/`set_retention_preset()`/`GET`&`PUT
+/settings/retention`/`retentionSettings.ts` — the setting now governs both
+`chat_turns` (hard delete) and episodes (soft-retract, §20) under one
+shared global preset, enforced by a real startup sweep
+(`MemoryManager.sweep_expired_memory()`). See §20.10 for the full
+rationale and design; this section's prose below still describes the
+2026-07-01 chat-history-only shipped state except where updated inline.
+
+**Explicitly not implemented as of 2026-07-01 (see §12.7, closed 2026-07-31):** eviction sweep execution.
 
 ### 12.2 Design Decisions
 
@@ -331,10 +343,13 @@ every full page reload by design, the other explicitly does not.
 unlinked from nav since the 2026-07-02 merge above; deleted outright once
 the Episode Browsing UI's `/episodes` route (§20) made it a strict subset
 (same FTS search + list, superseded by that route's semantic search,
-filters, detail pane, and tool-result rendering). `chatHistorySettings.ts`
-is unaffected — its retention-preset control already lived on `/settings`
-independently and still does; only the duplicate copy on `/history` and
-the dedicated `chatHistoryList.ts` list store were removed.
+filters, detail pane, and tool-result rendering). The retention-preset
+control already lived on `/settings` independently and still does; only
+the duplicate copy on `/history` and the dedicated `chatHistoryList.ts`
+list store were removed. That `/settings` control (`chatHistorySettings.ts`
+at the time) was itself renamed to `retentionSettings.ts` on 2026-07-31
+when it became the shared chat-history+episodes retention setting — see
+§20.10.
 
 ### 12.6 Live Verification
 
@@ -376,12 +391,14 @@ correctly end-to-end.
 
 ### 12.7 Open Items
 
-**Open Item 1 — Eviction sweep execution not yet implemented.**
-`chat_history_settings` can be read and written via the two settings
-endpoints, but nothing currently acts on the stored preset. No scheduled
-job, no request-time sweep, no manual trigger exists. A future
-implementation must treat an absent row as "no policy set — do nothing,"
-per §12.2.
+**Open Item 1 — CLOSED 2026-07-31, see §20.10.** Eviction sweep execution
+is now implemented as `MemoryManager.sweep_expired_memory()`, called once
+at backend startup from `lifespan()` (`main.py`). It governs both
+`chat_turns` (hard delete) and episodes (soft-retract) under the renamed
+`retention_settings` table — an absent row (or `"forever"`) is a true
+no-op, matching the original design intent above. Still no request-time
+sweep or manual trigger — only a startup sweep, mirroring the pre-existing
+wiki-snapshot TTL sweep pattern (§17).
 
 **Open Item 2 — Leading-`\n` in assistant answers (cosmetic, out-of-scope).**
 Assistant `content` values sometimes begin with a literal `\n` (e.g.

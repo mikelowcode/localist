@@ -657,6 +657,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("Wiki snapshot TTL sweep skipped — wiki_dir does not exist yet (%s).", wiki_dir)
 
+    try:
+        sweep_result = await asyncio.to_thread(memory_manager.sweep_expired_memory)
+        logger.info(
+            "Retention sweep at startup — chat_turns_deleted=%d episodes_retracted=%d",
+            sweep_result["chat_turns_deleted"], sweep_result["episodes_retracted"],
+        )
+        if sweep_result["episodes_retracted"] > 0:
+            writer = EpisodicMemoryWriter(
+                db_path=memory_manager._db_path, memory_md_path=_MEMORY_MD_PATH,
+            )
+            await asyncio.to_thread(writer.regenerate_memory_md)
+    except Exception as exc:
+        logger.warning("Retention sweep failed at startup (non-fatal): %s", exc)
+
     # -- Store resolved paths in state so endpoints can inject them ----------
 
     _state.wiki_dir      = wiki_dir
@@ -1014,13 +1028,13 @@ class HackerNewsOpenResponse(BaseModel):
     success: bool = True
 
 
-class ChatHistorySettingsResponse(BaseModel):
-    """Response body for GET/PUT /chat/history/settings."""
+class RetentionSettingsResponse(BaseModel):
+    """Response body for GET/PUT /settings/retention."""
     eviction_preset: str | None = None
 
 
-class ChatHistorySettingsRequest(BaseModel):
-    """Payload accepted by PUT /chat/history/settings."""
+class RetentionSettingsRequest(BaseModel):
+    """Payload accepted by PUT /settings/retention."""
     eviction_preset: Literal["7d", "30d", "90d", "forever"]
 
 
@@ -2232,44 +2246,46 @@ async def pin_wiki_page(body: PinWikiPageRequest):
 
 
 # ---------------------------------------------------------------------------
-# Chat history settings  (Chat History Tab — eviction preset only)
+# Retention settings  (Settings tab — global TTL for chat_turns + episodes)
 # ---------------------------------------------------------------------------
 
 @app.get(
-    "/chat/history/settings",
-    response_model = ChatHistorySettingsResponse,
-    summary        = "Read the chat history eviction preset",
+    "/settings/retention",
+    response_model = RetentionSettingsResponse,
+    summary        = "Read the global retention preset",
 )
-async def get_chat_history_settings() -> ChatHistorySettingsResponse:
+async def get_retention_settings() -> RetentionSettingsResponse:
     """
-    Return the current chat_turns eviction preset.
+    Return the current global retention preset.
 
     ``eviction_preset`` is None when the user has never set one.
     """
     mm = _require_memory_manager()
-    preset = await asyncio.to_thread(mm.get_chat_history_eviction_preset)
-    return ChatHistorySettingsResponse(eviction_preset=preset)
+    preset = await asyncio.to_thread(mm.get_retention_preset)
+    return RetentionSettingsResponse(eviction_preset=preset)
 
 
 @app.put(
-    "/chat/history/settings",
-    response_model = ChatHistorySettingsResponse,
-    summary        = "Set the chat history eviction preset",
+    "/settings/retention",
+    response_model = RetentionSettingsResponse,
+    summary        = "Set the global retention preset",
 )
-async def put_chat_history_settings(
-    request: ChatHistorySettingsRequest,
-) -> ChatHistorySettingsResponse:
+async def put_retention_settings(
+    request: RetentionSettingsRequest,
+) -> RetentionSettingsResponse:
     """
-    Set the chat_turns eviction preset.
+    Set the global retention preset.
 
-    Does not trigger an eviction sweep — this endpoint only persists the
-    preference. Returns the value re-read from the database to confirm the
-    write landed.
+    Governs both chat_turns (hard-deleted) and episodes (soft-retracted via
+    status='retracted') once the TTL sweep runs. The sweep itself only runs
+    at backend startup (MemoryManager.sweep_expired_memory(), called from
+    lifespan()) — this endpoint only persists the preference and returns the
+    value re-read from the database to confirm the write landed.
     """
     mm = _require_memory_manager()
-    await asyncio.to_thread(mm.set_chat_history_eviction_preset, request.eviction_preset)
-    preset = await asyncio.to_thread(mm.get_chat_history_eviction_preset)
-    return ChatHistorySettingsResponse(eviction_preset=preset)
+    await asyncio.to_thread(mm.set_retention_preset, request.eviction_preset)
+    preset = await asyncio.to_thread(mm.get_retention_preset)
+    return RetentionSettingsResponse(eviction_preset=preset)
 
 
 # ---------------------------------------------------------------------------

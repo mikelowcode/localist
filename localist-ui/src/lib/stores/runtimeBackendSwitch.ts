@@ -7,7 +7,7 @@
  *   GET  /api/settings/runtime-backend/{backend}/models      — fetchBackendModels()
  *   POST /api/settings/runtime-backend/{backend}/chat-model  — pinChatModel()
  *
- * Follows chatHistorySettings.ts's pattern: on failure, state is left
+ * Follows retentionSettings.ts's pattern: on failure, state is left
  * untouched (no optimistic update) — the UI must reflect the server's actual
  * last-known state, not a pending guess.
  */

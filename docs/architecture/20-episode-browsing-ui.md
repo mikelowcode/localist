@@ -139,9 +139,9 @@ extra filter dimensions), different route.
 `src/routes/history/+page.svelte` and `src/lib/stores/chatHistoryList.ts` deleted outright.
 Rationale: the route had zero nav-link reachability already (unlinked since the 2026-07-02 Chat +
 History merge, §12.5/§12.7 Open Item 4), its retention-preset section duplicated a control that
-already lived independently on `/settings` (`chatHistorySettings.ts`, unaffected), and its
-turn-list + FTS-search section is a strict subset of `/episodes`. No functionality was lost; see
-§12.7's closed Open Item 4 for the full before/after.
+already lived independently on `/settings` (`chatHistorySettings.ts` at the time, later renamed —
+see §20.10), and its turn-list + FTS-search section is a strict subset of `/episodes`. No
+functionality was lost; see §12.7's closed Open Item 4 for the full before/after.
 
 ### 20.8 Test Coverage
 
@@ -173,3 +173,62 @@ still open, not introduced by this feature). Verified via `svelte-check` (0 erro
   to be compiled in) — both are correct today because exactly three keys exist, but either would
   need revisiting if a fourth tool-result metadata key is ever added under a name that could
   collide with the substring check.
+
+### 20.10 Global Retention TTL (2026-07-31)
+
+The user had Chat History's 7-day retention preset set in Settings and asked for the same TTL
+control over episodes (808 saved at the time). Investigation found the existing preset was stored
+but **never enforced** — no sweep existed anywhere in the codebase (§12.7's now-closed Open Item 1)
+— so this arc both extended the setting to episodes and built real enforcement for the first time.
+
+**One shared global preset, not two.** Per explicit user choice, a single retention preset governs
+both `chat_turns` and episodes rather than two independent settings — "Data Retention" is one
+segmented control on `/settings` (7d/30d/90d/Forever), same as before.
+
+**Renamed, not duplicated.** `chat_history_settings` was renamed to `retention_settings` outright
+(`memory_manager.py` migration v12→v13 — `ALTER TABLE ... RENAME TO`, with a self-heal fallback
+mirroring the existing drift-recovery pattern for `chat_turns.embedding`/`news_preferences`/etc.),
+rather than adding a second table — this repo's convention is no backwards-compat shims. Renamed
+throughout: `get_chat_history_eviction_preset()`/`set_chat_history_eviction_preset()` →
+`get_retention_preset()`/`set_retention_preset()`; `GET`/`PUT /chat/history/settings` →
+`GET`/`PUT /settings/retention`; `ChatHistorySettingsResponse`/`Request` →
+`RetentionSettingsResponse`/`Request`; `chatHistorySettings.ts` → `retentionSettings.ts`. Deliberately
+**not** named "memory retention" — the app already has a separate `/memory` nav tab (episode
+browsing), and that name would have read as if it configured that tab instead.
+
+**Episodes soft-retract, chat_turns hard-delete.** `episodes` has no lifecycle column comparable to
+`chat_turns` — it already has one (`status`, values `active`/`pending`/`superseded`/`retracted`),
+used by the existing approve/reject/retract flow (§20's `EpisodeAnnotations.svelte` /
+`EpisodesPanel.svelte`). The sweep reuses that convention (`UPDATE episodes SET status='retracted'
+WHERE status='active' AND created_at < cutoff`) rather than hard-deleting — reversible, and
+automatically excluded from every existing `status='active'` retrieval path (`by_subject`,
+`by_recency`, `_score_all_active`, `get_by_ids`, `list_episodes()`/`count_episodes()`'s default
+filter — no query-site changes needed anywhere). `chat_turns` rows are hard-deleted
+(`DELETE FROM chat_turns WHERE created_at < cutoff`), matching the "evicted" language the original
+§12 UI copy already used. A new `idx_episodes_created` index (`episodes(created_at)`) was added in
+the same migration for the sweep's range scan — cheap at 808 rows today, insurance at scale.
+
+**`MemoryManager.sweep_expired_memory()`** is the new enforcement method: no-ops
+(`{"chat_turns_deleted": 0, "episodes_retracted": 0}`) when no preset is set or the preset is
+`"forever"` — absence means "keep everything," not "sweep with an infinite TTL," preserving the
+original §12.2 semantics. It does **not** regenerate `MEMORY.md` itself — that snapshot is owned by
+the separate `EpisodicMemoryWriter` class (`_write_memory_md()`/`regenerate_memory_md()`), which
+`MemoryManager` has no reference to; the caller is responsible for triggering it when
+`episodes_retracted > 0`, exactly like `POST /memory/episodes/{id}/approve`/`reject` already do in
+`main.py`.
+
+**Startup-only sweep, no on-write pruning, no manual trigger.** Wired into `lifespan()`
+(`main.py`) immediately after the existing wiki-snapshot TTL sweep (§17) — same non-fatal
+`try/except`, same logging convention. `_state.memory_manager` is already non-`None` by that point
+in startup. If `episodes_retracted > 0`, `lifespan()` also constructs an `EpisodicMemoryWriter` and
+calls `regenerate_memory_md()`, per the note above.
+
+**Test coverage:** new `backend/tests/test_retention_sweep.py` (no-preset/`"forever"` no-op,
+mixed-age chat_turns+episodes sweep, already-retracted episodes not double-counted, idempotency).
+`test_chat_turns_schema.py` and `test_main_task_chat_turns.py` updated in place for the rename
+(table/method/endpoint names); `test_memory_manager_github_watch.py`/`test_memory_manager_hacker_news.py`'s
+minimal synthetic pre-v13 DB fixtures (no `episodes` table) surfaced a real bug in the first version
+of the v12→v13 migration/self-heal blocks — the new `CREATE INDEX ... ON episodes(created_at)` was
+unconditional and failed with `no such table: episodes` against those fixtures; fixed by gating the
+index creation on `episodes` actually being present, same defensive style already used for the
+table-rename check. Full suite: 1376 passed, 0 failed.

@@ -12,13 +12,13 @@
   import { theme } from '$lib/stores/theme';
   import { browser } from '$app/environment';
   import {
-    chatHistorySettings,
-    chatHistorySettingsLoading,
-    chatHistorySettingsError,
-    loadChatHistorySettings,
-    setChatHistoryEvictionPreset,
+    retentionSettings,
+    retentionSettingsLoading,
+    retentionSettingsError,
+    loadRetentionSettings,
+    setRetentionPreset,
     type EvictionPreset
-  } from '$lib/stores/chatHistorySettings';
+  } from '$lib/stores/retentionSettings';
   import {
     reembedLoading,
     reembedError,
@@ -40,7 +40,7 @@
   ];
 
   onMount(() => {
-    loadChatHistorySettings();
+    loadRetentionSettings();
     loadMemoryStats();
     void loadNewsPreferences().then(() => {
       homeCountryInput = $newsPreferences.home_country;
@@ -437,23 +437,23 @@
       </div>
     </section>
 
-    <!-- Chat history eviction -->
+    <!-- Data retention (chat history + episodes) -->
     <section class="settings-card">
-      <div class="card-title">Chat History</div>
-      <p class="card-desc">Choose how long chat turns are kept before they're automatically evicted.</p>
+      <div class="card-title">Data Retention</div>
+      <p class="card-desc">Choose how long chat history and saved episodes are kept before they're automatically cleaned up.</p>
       <div class="segmented">
         {#each EVICTION_PRESETS as p}
           <button
             type="button"
             class="seg-btn"
-            class:active={$chatHistorySettings.eviction_preset === p.value}
-            disabled={$chatHistorySettingsLoading}
-            on:click={() => setChatHistoryEvictionPreset(p.value)}
+            class:active={$retentionSettings.eviction_preset === p.value}
+            disabled={$retentionSettingsLoading}
+            on:click={() => setRetentionPreset(p.value)}
           >{p.label}</button>
         {/each}
       </div>
-      {#if $chatHistorySettingsError}
-        <p class="card-hint" style="color:var(--error)">{$chatHistorySettingsError}</p>
+      {#if $retentionSettingsError}
+        <p class="card-hint" style="color:var(--error)">{$retentionSettingsError}</p>
       {/if}
     </section>
 
