@@ -54,6 +54,30 @@ ToolDispatcher._run_url_fetch did. This retired the standalone Fetcher
 microservice (port 8002) — fetch_url ports its /extract path in-process on
 localist-mcp instead.
 
+url_fetch / Ollama Cloud (ollama-web-search-mcp-tool-scoping.md §5,
+2026-07-31): Ollama Cloud's web_fetch API is a fallback-only tier
+underneath fetch_url — no primary mode, no config toggle, no Planner
+visibility (§5.4), unlike web_search's WEB_SEARCH_PROVIDER. When
+_execute_fetcher_url_fetch's result has success=False — and the failure
+isn't localist-mcp itself being unreachable (_MCP_UNREACHABLE_PREFIX, same
+suppression rule as web_search's fallback) — _run_url_fetch falls through
+to the shared _run_ollama_url_fetch() helper, retagging the result
+tool_name="url_fetch:ollama_fallback". Note there is no distinct
+"successful but empty" case to detect here the way web_search has
+result_count==0: mcp_server/url_fetch.py's _extract() already raises
+ValueError on empty extraction (paywalls/login walls), which surfaces as
+is_error=True indistinguishable from any other tool-level failure by the
+time it reaches this dispatcher — so the fallback trigger is simply "not
+success", confirmed by reading the actual extraction code rather than
+assumed. ollama_web_fetch's MCP-layer response is pre-normalized to
+fetch_url's own dict shape (mcp_server/ollama_web_fetch.py), so both
+tiers share one result-formatting helper (_format_fetch_result_text) —
+nothing downstream needs to branch on which tier answered. Since
+_run_url_fetch is the single call point shared by the direct "url_fetch"
+tool dispatch, _enrich_top_result's web_search follow-up fetch, and
+_run_research_loop's candidate-URL fetch, all three transparently gain
+Ollama coverage from this one change.
+
 web_search (Phase 3): ports ToolDispatcher._run_web_search's query
 resolution verbatim (explicit context["web_search_queries"], else derived
 from the instruction) and calls the web_search MCP tool once per query, up
@@ -62,6 +86,22 @@ hallucination fallback for a missing LANGSEARCH_API_KEY is gone — that
 path now produces a clean success=False ToolResult, same as any other
 web_search failure, so controller_agent.py's existing corpus fallback
 (Step 3b) is what grounds the answer instead.
+
+web_search / Ollama Cloud (ollama-web-search-mcp-tool-scoping.md,
+2026-07-31): Ollama Cloud is a second provider underneath web_search,
+selected by WEB_SEARCH_PROVIDER (default "brave", read fresh on every
+call — see _execute_web_search_query). "ollama" makes it the sole
+primary — Brave is never called, works with BRAVE_API_KEY entirely
+absent. "brave" (default) tries the existing web_search tool first and
+falls through to the same _run_ollama_web_search() helper when Brave's
+result is empty (result_count == 0) or failed, retagging the fallback
+tool_name="web_search:ollama_fallback" (primary-Ollama results are
+tagged "web_search:ollama_primary") — the Planner-facing tool identity
+never changes; tools_to_call is still only ever "web_search". Since
+_execute_web_search_query is the single per-query call point shared by
+_run_web_search, _run_news_search's tier-2 fallback, and
+_run_research_loop, all three transparently gained Ollama coverage from
+one change.
 
 research: a bounded search/evaluate/reformulate/fetch loop
 (_run_research_loop) that Planner routes to instead of "web_search" when
@@ -368,6 +408,37 @@ def _normalize_mcp_error_text(text: str) -> str:
     return stripped if stripped.startswith("ERROR:") else text
 
 
+# Literal prefix every "session is None" / "_call_mcp_tool raised" branch in
+# this file uses for its result text (ad hoc f-string at each of ~15 call
+# sites, not currently a shared constant elsewhere — introduced for
+# _execute_web_search_query's use, see its docstring, and reused by
+# _run_url_fetch's Ollama fallback for the identical reason: distinguishes
+# "localist-mcp itself is unreachable" from "the tool call reached
+# localist-mcp and failed there", since only the latter should trigger a
+# fallback).
+_MCP_UNREACHABLE_PREFIX = "ERROR: localist-mcp unreachable"
+
+
+def _format_fetch_result_text(url: str, data: dict) -> str:
+    """
+    Render a fetch_url-shaped response dict ({"title", "url", "word_count",
+    "cleaned_text", ...}) as the "Title/Source/Words/body" text every
+    url_fetch ToolResult uses. Shared verbatim between
+    _execute_fetcher_url_fetch (the in-process fetch_url tool) and
+    _run_ollama_url_fetch (the Ollama Cloud fallback tier) — the latter's
+    MCP-layer response is pre-normalized to this same dict shape (see
+    mcp_server/ollama_web_fetch.py) specifically so this one function can
+    format both tiers identically, with nothing downstream able to tell
+    which tier answered.
+    """
+    return (
+        f"Title: {data.get('title', '')}\n"
+        f"Source: {data.get('url', url)}\n"
+        f"Words: {data.get('word_count', 0)}\n\n"
+        f"{data.get('cleaned_text', '')}"
+    )
+
+
 class MCPToolDispatcher:
     """
     "file_op", "url_fetch", "web_search", "chart", and
@@ -633,6 +704,17 @@ class MCPToolDispatcher:
         instruction:   str,
         context:       dict[str, Any],
     ) -> ToolResult:
+        """
+        Resolve the target URL (context["fetch_url"] override, else the
+        first http(s):// URL in the instruction), then fetch it via the
+        in-process fetch_url tool, falling back to Ollama Cloud
+        (_run_ollama_url_fetch) when that fails — see this module's
+        docstring ("url_fetch / Ollama Cloud") for the precise fallback
+        trigger and why there's no separate empty-result check needed
+        here. The fallback is skipped when the failure is localist-mcp
+        itself being unreachable, same suppression rule
+        _execute_web_search_query uses.
+        """
         url: str = context.get("fetch_url", "")
         if not url:
             match = _URL_RE.search(instruction)
@@ -649,6 +731,35 @@ class MCPToolDispatcher:
                 success    = False,
             )
 
+        fetch_result = await self._execute_fetcher_url_fetch(session, connect_error, url)
+        if fetch_result.success or fetch_result.result.startswith(_MCP_UNREACHABLE_PREFIX):
+            return fetch_result
+
+        logger.info(
+            "MCPToolDispatcher: url_fetch (fetcher) failed for url=%r — "
+            "falling back to Ollama Cloud.",
+            url,
+        )
+        fallback = await self._run_ollama_url_fetch(session, connect_error, url)
+        return replace(fallback, tool_name="url_fetch:ollama_fallback")
+
+    async def _execute_fetcher_url_fetch(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        url:           str,
+    ) -> ToolResult:
+        """
+        Execute one fetch against the in-process fetch_url MCP tool (ports
+        the retired port-8002 Fetcher microservice's /extract path — see
+        mcp_server/url_fetch.py). Empty extraction (paywalls/login walls)
+        already raises ValueError inside that tool's own _extract(),
+        surfacing here as is_error=True indistinguishable from a
+        transport/HTTP failure — confirmed by reading the actual
+        extraction code, not assumed. So there is no separate "successful
+        but empty" branch to check for, unlike
+        _execute_brave_web_search_query's result_count==0.
+        """
         params_str = f"url={url!r}"
 
         if session is None:
@@ -691,15 +802,83 @@ class MCPToolDispatcher:
                 success    = False,
             )
 
-        result_text = (
-            f"Title: {data.get('title', '')}\n"
-            f"Source: {data.get('url', url)}\n"
-            f"Words: {data.get('word_count', 0)}\n\n"
-            f"{data.get('cleaned_text', '')}"
-        )
+        result_text = _format_fetch_result_text(url, data)
 
         logger.info(
             "MCPToolDispatcher: url_fetch complete — url=%r  words=%d  chars=%d",
+            url, data.get("word_count", 0), len(result_text),
+        )
+        return ToolResult(
+            tool_name  = "url_fetch",
+            parameters = params_str,
+            result     = result_text,
+            success    = True,
+        )
+
+    async def _run_ollama_url_fetch(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        url:           str,
+    ) -> ToolResult:
+        """
+        Call the ollama_web_fetch MCP tool (Ollama Cloud) for one URL —
+        the fallback tier when _execute_fetcher_url_fetch fails. Unlike
+        web_search's Ollama helper, there is no "primary" mode here: the
+        scoping doc's Track B (§5) is fallback-only, no config toggle, no
+        Planner visibility (§5.4). ollama_web_fetch's MCP-layer response
+        is already normalized to fetch_url's own dict shape (see
+        mcp_server/ollama_web_fetch.py), so _format_fetch_result_text
+        formats both tiers identically — this method has no opinion on
+        being the fallback tier; the caller retags .tool_name afterward
+        ("url_fetch:ollama_fallback").
+        """
+        params_str = f"url={url!r}"
+
+        if session is None:
+            return ToolResult(
+                tool_name  = "url_fetch",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {connect_error}",
+                success    = False,
+            )
+
+        try:
+            text, is_error = await self._call_mcp_tool(session, "ollama_web_fetch", {"url": url})
+        except Exception as exc:
+            logger.warning(
+                "MCPToolDispatcher: localist-mcp unreachable for ollama_web_fetch url=%r: %s",
+                url, exc,
+            )
+            return ToolResult(
+                tool_name  = "url_fetch",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {exc}",
+                success    = False,
+            )
+
+        if is_error:
+            return ToolResult(
+                tool_name  = "url_fetch",
+                parameters = params_str,
+                result     = _normalize_mcp_error_text(text),
+                success    = False,
+            )
+
+        try:
+            data = json.loads(text)
+        except Exception as exc:
+            return ToolResult(
+                tool_name  = "url_fetch",
+                parameters = params_str,
+                result     = f"ERROR: failed to parse ollama_web_fetch response — {exc}",
+                success    = False,
+            )
+
+        result_text = _format_fetch_result_text(url, data)
+
+        logger.info(
+            "MCPToolDispatcher: ollama_web_fetch complete — url=%r  words=%d  chars=%d",
             url, data.get("word_count", 0), len(result_text),
         )
         return ToolResult(
@@ -828,6 +1007,106 @@ class MCPToolDispatcher:
         connect_error: Exception | None,
         query:         str,
     ) -> ToolResult:
+        """
+        Execute one web_search query via the configured provider.
+
+        WEB_SEARCH_PROVIDER (default "brave") is read fresh on every call,
+        not cached at import time — same convention already used for
+        SEARCH_PROVIDER (controller_agent.py, mcp_server/web_search.py):
+        this is live-swappable config, so it must be resolved at request
+        time rather than captured once and held onto (CLAUDE.md's runtime
+        backend rule applies to any config that can change without a
+        process restart, not just LOCALIST_RUNTIME_BACKEND).
+
+        provider == "ollama": Ollama Cloud answers directly as primary via
+        _run_ollama_web_search() — Brave is never called, not even as a
+        fallback, so this works correctly even with BRAVE_API_KEY entirely
+        absent from the environment. Result is retagged tool_name=
+        "web_search:ollama_primary".
+
+        provider == "brave" (default): Brave answers first via
+        _execute_brave_web_search_query(). If that result is empty or
+        failed (success=False — see that method's docstring for the exact
+        "empty or failed" definition, using Brave/LangSearch's actual
+        result_count field, not an assumed shape), falls through to the
+        same _run_ollama_web_search() helper the primary-mode branch above
+        uses — one shared helper, not two separate Ollama-calling code
+        paths — and retags the fallback's result tool_name="web_search:
+        ollama_fallback". Mirrors _run_news_search's NewsAPI→Brave
+        tiered-fallback shape, just one layer further down inside
+        web_search itself (ollama-web-search-mcp-tool-scoping.md §0.2). On
+        a genuine Brave success, the result is returned completely
+        unchanged — tool_name stays "web_search", no new tagging for the
+        unchanged common-case path.
+
+        Exception: when Brave's failure is localist-mcp itself being
+        unreachable (session is None, or _call_mcp_tool raised — see
+        _MCP_UNREACHABLE_PREFIX) rather than a Brave-specific problem, the
+        Ollama fallback is skipped — Ollama is served by the same
+        localist-mcp process, so retrying through an already-known-dead
+        session would just fail identically. This preserves the existing
+        "one call, fail fast" contract for a total outage (see
+        TestSessionReuse.test_connection_down_degrades_every_tool_call_not_
+        just_first / TestWebSearch.test_connection_failure_returns_graceful_
+        error / TestResearchLoop.test_connectivity_failure_stops_
+        immediately_without_synthetic_result) — the fallback exists to
+        route around a Brave-side problem, not to double up on retries
+        during an infrastructure outage.
+
+        Because this is the single point _run_web_search(), _run_news_search
+        (tier-2 fallback), and _run_research_loop (each iteration) all call
+        for one query, all three transparently gain Ollama coverage from
+        this one change — none of their own bodies need to change.
+        """
+        provider = os.environ.get("WEB_SEARCH_PROVIDER", "brave").lower()
+
+        if provider == "ollama":
+            primary = await self._run_ollama_web_search(session, connect_error, query)
+            return replace(primary, tool_name="web_search:ollama_primary")
+
+        brave_result = await self._execute_brave_web_search_query(session, connect_error, query)
+        if brave_result.success or brave_result.result.startswith(_MCP_UNREACHABLE_PREFIX):
+            return brave_result
+
+        logger.info(
+            "MCPToolDispatcher: web_search (Brave) empty/failed for query=%r — "
+            "falling back to Ollama Cloud.",
+            query,
+        )
+        fallback = await self._run_ollama_web_search(session, connect_error, query)
+        return replace(fallback, tool_name="web_search:ollama_fallback")
+
+    async def _execute_brave_web_search_query(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        query:         str,
+    ) -> ToolResult:
+        """
+        Execute one query against the generic "web_search" MCP tool — the
+        "brave" branch of _execute_web_search_query()'s provider dispatch.
+
+        Note this calls the MCP tool literally named "web_search"
+        regardless of whether that tool is itself backed by Brave or
+        LangSearch — SEARCH_PROVIDER (mcp_server/web_search.py) is a
+        separate, MCP-server-local setting this dispatcher doesn't
+        inspect. WEB_SEARCH_PROVIDER's "brave" branch name just means
+        "try the existing web_search tool before reaching for Ollama" —
+        it happens to be Brave in this deployment's current .env
+        (SEARCH_PROVIDER=brave), same as the scoping doc's framing.
+
+        A successful call with zero results — result_count == 0, both
+        mcp_server/web_search.py's _web_search_brave and
+        _web_search_langsearch return
+        {"result_text": "No results found.", "result_count": 0} on an
+        empty response, grepped directly rather than assumed — is treated
+        as a miss: success=False, result_text preserved as-is. This is
+        the new "successful-but-zero-results" case
+        _execute_web_search_query()'s fallback needs to catch, distinct
+        from the transport/MCP/parse failures below (unchanged, already
+        existing) which also produce success=False but with an
+        "ERROR: ..." result_text instead of "No results found.".
+        """
         params_str = f"query={query!r}"
 
         if session is None:
@@ -874,7 +1153,74 @@ class MCPToolDispatcher:
             tool_name  = "web_search",
             parameters = params_str,
             result     = data.get("result_text", ""),
-            success    = True,
+            success    = data.get("result_count", 0) > 0,
+        )
+
+    async def _run_ollama_web_search(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        query:         str,
+    ) -> ToolResult:
+        """
+        Call the ollama_web_search MCP tool (Ollama Cloud) for one query.
+
+        Used identically by _execute_web_search_query() whether Ollama is
+        running as the configured primary (WEB_SEARCH_PROVIDER=ollama) or
+        as the fallback tier when Brave is empty/failed (default config)
+        — this method has no opinion on which case it's being called for;
+        the caller retags .tool_name afterward ("web_search:ollama_primary"
+        / "web_search:ollama_fallback") to distinguish the two in logs and
+        transcripts. Same shape as _execute_brave_web_search_query, just
+        against the "ollama_web_search" MCP tool instead of "web_search".
+        """
+        params_str = f"query={query!r}"
+
+        if session is None:
+            return ToolResult(
+                tool_name  = "web_search",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {connect_error}",
+                success    = False,
+            )
+
+        try:
+            text, is_error = await self._call_mcp_tool(session, "ollama_web_search", {"query": query})
+        except Exception as exc:
+            logger.warning(
+                "MCPToolDispatcher: localist-mcp unreachable for ollama_web_search query=%r: %s",
+                query, exc,
+            )
+            return ToolResult(
+                tool_name  = "web_search",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {exc}",
+                success    = False,
+            )
+
+        if is_error:
+            return ToolResult(
+                tool_name  = "web_search",
+                parameters = params_str,
+                result     = _normalize_mcp_error_text(text),
+                success    = False,
+            )
+
+        try:
+            data = json.loads(text)
+        except Exception as exc:
+            return ToolResult(
+                tool_name  = "web_search",
+                parameters = params_str,
+                result     = f"ERROR: failed to parse ollama_web_search response — {exc}",
+                success    = False,
+            )
+
+        return ToolResult(
+            tool_name  = "web_search",
+            parameters = params_str,
+            result     = data.get("result_text", ""),
+            success    = data.get("result_count", 0) > 0,
         )
 
     # -----------------------------------------------------------------------

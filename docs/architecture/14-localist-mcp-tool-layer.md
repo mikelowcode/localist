@@ -12,7 +12,8 @@ logging. It exposes tools over **MCP's SSE transport** (`GET /sse`,
 
 This is where `file_op`, `url_fetch`, `web_search`, `generate_chart`
 (§14.8), `news_search` (§14.9), `github_search`/`github_read` (§14.11),
-and `github_release` (§14.12) actually execute.
+`github_release` (§14.12), and `ollama_web_search`/`ollama_web_fetch`
+(§14.15/§14.16) actually execute.
 `MCPToolDispatcher` (`backend/mcp_tool_dispatcher.py`) is the client —
 `controller_agent.py`'s `_execute_plan()` constructs one per dispatch call
 (the same single seam `ToolDispatcher` used to occupy) and calls it over
@@ -21,7 +22,12 @@ a tool name with no MCP-server-side counterpart, `"research"` — a
 client-side bounded loop over the `web_search`/`fetch_url` MCP tools
 above, not a tool implemented on `localist-mcp` itself; see §18. Similarly,
 `news_search`'s Brave fallback tier (§14.9) is a client-side reuse of the
-existing `web_search` tool, not a second MCP-server-side provider.
+existing `web_search` tool, not a second MCP-server-side provider. Ollama
+Cloud's fallback tiers (§14.15/§14.16) are also decided client-side, via
+`WEB_SEARCH_PROVIDER` for `web_search` and unconditionally for
+`url_fetch`, but *do* each back onto a genuinely new MCP-server-side tool
+(`ollama_web_search`/`ollama_web_fetch`), unlike `news_search`'s pure
+reuse of the existing `web_search` tool.
 
 Built across four phases (all 2026-07-03): Phase 1 migrated `file_op` and
 stood up the service; Phase 2 added `fetch_url`, retiring the standalone
@@ -44,6 +50,8 @@ brought this document back in sync.
 | `github_search` | `mcp_server/github.py` | `(query: str, kind: str = "repositories") -> dict` | `{query, result_text, result_count, is_miss}` — see §14.11 |
 | `github_read` | `mcp_server/github.py` | `(owner: str, repo: str, path: str \| None = None) -> dict` | `{owner, repo, path, kind, content, truncated}` — see §14.11 |
 | `github_release` | `mcp_server/github.py` | `(owner: str, repo: str, tag: str \| None = None) -> dict` | `{owner, repo, tag_name, name, body, published_at, html_url, truncated}` — see §14.12 |
+| `ollama_web_search` | `mcp_server/ollama_web_search.py` | `(query: str) -> dict` | `{query, result_text, result_count}` — Ollama Cloud second provider behind `web_search`, see §14.15 |
+| `ollama_web_fetch` | `mcp_server/ollama_web_fetch.py` | `(url: str) -> dict` | `{url, title, author, date_published, cleaned_text, word_count, fetch_duration_ms}` — normalized to `fetch_url`'s own shape, see §14.16 |
 
 **`file_op` sandboxing:** every path is resolved against a sandbox root
 and rejected if the resolved absolute path escapes it — same check
@@ -173,12 +181,15 @@ Phase 1. Internally:
   content flow (see §14.7, Open Item 1, for the gap this exposed).
 - **`url_fetch`** — URL resolved from `context["fetch_url"]` or a
   `https?://` regex over the instruction (same pattern the legacy
-  `_run_url_fetch` used), then calls `fetch_url`.
+  `_run_url_fetch` used), then calls `fetch_url`, falling back to Ollama
+  Cloud's `web_fetch` on failure — see §14.16 (2026-07-31).
 - **`web_search`** — query resolution ported verbatim from the legacy
   `_run_web_search`: explicit `context["web_search_queries"]` (max 3 used)
   if present, else derived from the instruction by stripping known filler
   prefixes (`"what is the "`, `"search for "`, etc.) and taking the first
-  120 characters. Calls `web_search` once per resolved query, up to 3.
+  120 characters. Calls `web_search` once per resolved query, up to 3,
+  routing through Ollama Cloud as fallback or configured primary per
+  `WEB_SEARCH_PROVIDER` — see §14.15 (2026-07-31).
   **Enrichment (2026-07-25, `_enrich_top_result()`):** each query's
   successful result gets one follow-up `fetch_url` call on a URL found in
   its result text — added because raising `_CEIL_TOOL`/each provider's
@@ -290,6 +301,27 @@ BRAVE_API_KEY                Required for web_search when
                               SEARCH_PROVIDER=brave. Same load_dotenv()
                               path as LANGSEARCH_API_KEY.
 
+WEB_SEARCH_PROVIDER          Selects whether web_search's Ollama Cloud
+                              tier (§14.15) runs as fallback or configured
+                              primary: "brave" (default) or "ollama". Read
+                              lazily by MCPToolDispatcher — the backend
+                              process, not localist-mcp — on every call,
+                              not cached. Distinct axis from
+                              SEARCH_PROVIDER above (that one picks
+                              langsearch vs. brave *inside* the web_search
+                              MCP tool on localist-mcp itself).
+
+OLLAMA_API_KEY               Required for ollama_web_search (§14.15) and
+                              ollama_web_fetch (§14.16). Read from
+                              backend/.env via localist-mcp's own
+                              load_dotenv() call, same path as the other
+                              provider keys above. A distinct credential
+                              from Ollama Cloud chat/embed inference
+                              (LOCALIST_RUNTIME_BACKEND=ollama, §16),
+                              which authenticates via the local Ollama
+                              daemon's own signed-in session and never
+                              sends an API key over HTTP.
+
 NEWSAPI_API_KEY              Required for news_search (§14.9). Free
                               Developer tier only (100 req/day, dev/test
                               use only per NewsAPI's terms) — acceptable
@@ -354,7 +386,9 @@ LOCALIST_LOG_LEVEL           localist-mcp's root log level. Default: INFO.
   2026-07-09 session entry for why (a pre-existing test-isolation bug,
   not part of the provider swap itself).
 - `backend/tests/conftest.py` (new, 2026-07-09) — autouse fixture
-  stripping `SEARCH_PROVIDER`/`BRAVE_API_KEY`/`LANGSEARCH_API_KEY` from
+  stripping `SEARCH_PROVIDER`/`BRAVE_API_KEY`/`LANGSEARCH_API_KEY` (later
+  joined by `LOCALIST_RESEARCH_LOOP_ENABLED`, 2026-07-16, and
+  `OLLAMA_API_KEY`/`WEB_SEARCH_PROVIDER`, 2026-07-31 — see §14.16) from
   `os.environ` before every test in the backend suite, so
   `mcp_server/main.py`'s import-time `load_dotenv()` can never leak
   `backend/.env`'s real values into an unrelated test. See
@@ -388,6 +422,16 @@ LOCALIST_LOG_LEVEL           localist-mcp's root log level. Default: INFO.
   matching the new routing (`test_tool_results_slot_present_in_prompt`,
   `test_tool_dispatcher_phase6.py`) — see §14.12 and `sessions-log.md`
   under 2026-07-29.
+- `web_search` → Ollama Cloud second provider (§14.15, 2026-07-31) —
+  `TestWebSearchProviderBranching` (`test_mcp_tool_dispatcher.py`, 9
+  tests) and `TestWebSearchProviderStep3bCorpusFallback`
+  (`test_controller_phase4.py`, 3 tests), plus live verification against
+  the real Ollama Cloud API in both fallback and configured-primary
+  modes — see §14.15 and `sessions-log.md` under 2026-07-31.
+- `url_fetch` → Ollama Cloud `web_fetch` fallback tier (§14.16,
+  2026-07-31) — `TestUrlFetchOllamaFallback` (`test_mcp_tool_dispatcher.py`,
+  4 tests), plus live verification against the real Ollama Cloud API —
+  see §14.16 and `sessions-log.md` under 2026-07-31.
 
 ### 14.7 Open Items
 
@@ -1424,4 +1468,198 @@ three loggers at DEBUG: the app's own DEBUG lines and `httpx`'s INFO request lin
 `mcp.client.sse`'s and `httpcore`'s DEBUG chatter does not; a forced `httpcore` WARNING still surfaces.
 Full suite re-run clean (1371 passed) after each of the two edits — no test asserts on log output, so
 this was a behavior-preserving change confirmed by manual log inspection, not by the suite.
+
+### 14.15 `web_search` — Ollama Cloud Second Provider (`WEB_SEARCH_PROVIDER`, 2026-07-31)
+
+Scoped in `ollama-web-search-mcp-tool-scoping.md` to make Ollama Cloud a second, fully-integrated
+provider underneath the single `web_search` tool — not a new Planner-visible tool — so that (1) a
+Brave-configured user gets silent coverage when Brave comes back empty or errors, with provenance
+visible in the transcript, and (2) a user with no Brave account can run Ollama Cloud as the sole
+provider via one config value. `tools_to_call` still only ever contains `"web_search"`; zero
+`planner.py` changes were needed for either behavior.
+
+**This is a dispatcher-side (client-side) branch, not a second MCP-server-side provider** — same
+framing §14.1 already uses for `news_search`'s Brave fallback, but with one structural difference:
+unlike that fallback (pure reuse of the existing `web_search` MCP tool, no new tool added),
+Ollama Cloud search *is* a genuinely new MCP-server-side tool, `ollama_web_search`
+(`mcp_server/ollama_web_search.py`), because it has its own distinct endpoint and auth. The
+dispatcher decides whether to call it at all.
+
+**Where the branch actually lives.** The scoping doc's own illustrative pseudocode named
+`_run_web_search()` as the method to restructure; the actual insertion point, confirmed by reading
+the real control flow rather than assumed, is one level down: `_execute_web_search_query()` — the
+single per-query call `_run_web_search()`'s multi-query loop invokes, and which
+`_run_news_search()`'s tier-2 Brave fallback and `_run_research_loop()`'s candidate search *also*
+call. Branching there rather than in any individual caller means all three transparently gained
+Ollama coverage from one change, confirmed by a dedicated cross-call-site test for each of the
+latter two (`test_mcp_tool_dispatcher.py`).
+
+```
+WEB_SEARCH_PROVIDER=brave   (default) → Brave first, Ollama Cloud as fallback on empty/failure
+WEB_SEARCH_PROVIDER=ollama              → Ollama Cloud only; Brave is never called
+```
+
+Read fresh via `os.environ.get("WEB_SEARCH_PROVIDER", "brave")` on every call inside
+`_execute_web_search_query()`, not cached — same live-config convention `SEARCH_PROVIDER` already
+uses one layer down (§14.2).
+
+- **`provider == "ollama"`:** calls the shared `_run_ollama_web_search()` helper directly as
+  primary — Brave is never attempted, not even as a fallback, so this works with `BRAVE_API_KEY`
+  entirely absent from the environment (live-verified, see below). Result tagged
+  `tool_name="web_search:ollama_primary"`.
+- **`provider == "brave"` (default):** calls `_execute_brave_web_search_query()` (the renamed
+  original Brave-calling body). If that result is empty or failed, falls through to the *same*
+  `_run_ollama_web_search()` helper the primary branch uses — one shared helper, not two
+  Ollama-calling code paths — tagged `tool_name="web_search:ollama_fallback"`. A genuine Brave
+  success is returned completely unchanged, `tool_name="web_search"`, no new tagging for the
+  common case.
+
+**"Empty" is Brave's own shape, not NewsAPI's.** `result_count == 0` (both `_web_search_brave()`
+and `_web_search_langsearch()` return `{"result_text": "No results found.", "result_count": 0}` on
+a zero-result response, grepped directly rather than assumed to match `news_search`'s `is_miss`
+field) is treated as a miss: `success=False`, distinct from a transport/MCP/parse failure only in
+that its `result_text` reads "No results found." instead of an `"ERROR: ..."` string — both end up
+`success=False`, which is what `_execute_web_search_query()`'s single fallback check needs.
+
+**Suppression rule — localist-mcp itself unreachable skips the fallback.** A true connectivity
+failure (`session is None`, or `_call_mcp_tool()` itself raising) must *not* trigger the Ollama
+fallback — retrying through an already-known-dead session/process would just double the failure,
+not route around a Brave-specific problem. Detected via a literal string-prefix match,
+`_MCP_UNREACHABLE_PREFIX = "ERROR: localist-mcp unreachable"`, against the failed `ToolResult`'s
+own text. **Known fragility, not yet hardened:** this is a coincidental string match, not a
+structured signal — nothing enforces that the ~15 other call sites in this file using the same
+literal f-string stay in sync with it, and it's over-broad in the direction that costs resilience:
+*any* exception `_call_mcp_tool()` raises (not just a genuine connection failure) gets bucketed as
+"unreachable" and suppresses the fallback, even if localist-mcp and Ollama were both actually
+reachable. Flagged during build, not fixed — a dedicated exception type or explicit flag would be
+the real fix if this becomes a live problem.
+
+**`ollama_web_search` MCP tool** (`mcp_server/ollama_web_search.py`), structured directly off
+`_web_search_brave()`'s auth-loading and error-handling shape: `POST
+https://ollama.com/api/web_search`, `Authorization: Bearer {OLLAMA_API_KEY}`, body `{"query":
+"<query>", "max_results": 5}`; response `{"results": [{"title", "url", "content"}, ...]}`, formatted
+via the same shared `search_format.py` module `web_search`/`news_search` already use (§14.2) so its
+bullet shape is indistinguishable from either. No fallback logic and no awareness of Brave inside
+this function — all orchestration lives in the dispatcher. Missing `OLLAMA_API_KEY` raises
+`ValueError("ERROR: OLLAMA_API_KEY not configured")`, same fail-loud contract as every other
+provider here.
+
+**Two regressions found and fixed during build, before either shipped:**
+
+1. The Ollama fallback was originally firing even on a total localist-mcp outage, doubling a
+   connectivity failure into two failed round trips and breaking three existing connectivity tests
+   — fixed by the suppression rule above.
+2. `test_web_search_missing_key_triggers_corpus_fallback`
+   (`test_tool_dispatcher_phase6.py`) started making a **live, authenticated call to the real
+   Ollama Cloud API** during the test suite, because its subprocess fixture blanked
+   `LANGSEARCH_API_KEY` to force a miss but never blanked `OLLAMA_API_KEY` — the newly-added
+   fallback then reached for a real key present in `backend/.env` and got a real network response.
+   Fixed by blanking `OLLAMA_API_KEY` in that fixture (same pattern as `LANGSEARCH_API_KEY`) and
+   pinning `WEB_SEARCH_PROVIDER=brave` explicitly in the test for determinism. A second, related
+   gap surfaced at the same time: `controller_agent.py`'s Step 3b corpus-fallback check did an exact
+   `tool_name == "web_search"` match, which silently stopped catching failures once retagged
+   `"web_search:ollama_fallback"`/`"web_search:ollama_primary"` — the identical gap `news_search`
+   hit before (§4.6.1's 2026-07-22 update) and fixed the same way: widened to
+   `tool_name.startswith("web_search")`, locked in by three new dedicated unit tests (one per tag
+   variant) in `test_controller_phase4.py` rather than left covered only incidentally.
+
+**Test coverage.** `TestWebSearchProviderBranching` (`test_mcp_tool_dispatcher.py`, 9 tests) —
+unset/explicit-`"brave"` success unaffected (asserting the Ollama mock is never invoked, not just
+inspecting output), Brave-empty triggers fallback, a genuine Brave-side failure with localist-mcp
+reachable triggers fallback, localist-mcp itself unreachable *skips* the fallback, `ollama`-provider
+never calls Brave, `ollama`-provider works with `BRAVE_API_KEY` entirely absent from the
+environment, and two cross-call-site tests (`_run_news_search`'s tier-2 fallback,
+`_run_research_loop`) confirming the same branch fires correctly in both without duplicating it.
+`TestWebSearchProviderStep3bCorpusFallback` (`test_controller_phase4.py`, 3 tests) locks in the
+`startswith()` widening above. Full suite: 1390 → 1402 passed, 0 failed.
+
+**Live verification (2026-07-31).** Against the real running stack (not fixtures): (1) forced a
+genuine Brave-side failure by temporarily pointing `_BRAVE_ENDPOINT` at a broken path — the real
+fallback fired against the real Ollama Cloud API, but the *first* `OLLAMA_API_KEY` provisioned
+turned out to be invalid (confirmed `401 Unauthorized` both through the live pipeline and an
+isolated `curl` test directly against `https://ollama.com/api/web_search`) — a credential problem,
+not an integration bug, reported back rather than papered over; (2) `WEB_SEARCH_PROVIDER=ollama`
+confirmed live, via the real backend reloaded with the config set — Brave never invoked at all
+(confirmed via `mcp_server.log`, only an `ollama_web_search` MCP call ever appears), tagged
+`"web_search:ollama_primary"`; (3) once the key was corrected, re-ran the forced-Brave-failure
+scenario against the real pipeline again — real `HTTP/1.1 200 OK` from `ollama.com`, real Zig
+release-notes content, correctly grounding the conversational agent's final answer instead of the
+model hallucinating a stale answer from its own training data (which is what happened, visibly, on
+the invalid-key attempt — both Brave and Ollama failed, and with no real grounding the model claimed
+"Web search returned: ..." verbatim over fabricated content instead of admitting the search failed;
+a separate, pre-existing model-honesty concern, not addressed here).
+
+### 14.16 `url_fetch` → Ollama Cloud `web_fetch` Fallback Tier (Track B, 2026-07-31)
+
+Same scoping doc, Track B (§5): a fallback-only tier underneath `url_fetch`, no primary mode, no
+config toggle, no Planner visibility — `url_fetch` is only ever routed by the same regex/context
+resolution it always used (§14.3).
+
+**The scoping doc's premise about a "port-8002 fetcher microservice" is stale.** That microservice
+was already retired (§5, §14.1) — `url_fetch` calls the in-process `fetch_url` MCP tool
+(`mcp_server/url_fetch.py`), a verbatim port of the old Fetcher's `/extract` path. The fallback was
+built against that, confirmed by reading the actual code rather than assumed, per the same "check,
+don't assume" instruction the scoping doc gave for §5.2's empty-result signature.
+
+**There is no distinct "successful but empty" case here, unlike `web_search`'s `result_count==0`.**
+`mcp_server/url_fetch.py`'s `_extract()` already raises `ValueError` →
+`FetchUrlError("extraction_failed", ...)` whenever readability produces empty content (paywalls,
+login walls) — confirmed by reading the extraction code directly. That raise surfaces through
+FastMCP's `isError` path exactly like a timeout or connection error, so by the time it reaches the
+dispatcher it is already indistinguishable from any other tool-level failure. The fallback trigger
+is therefore simply "not success" — no separate emptiness check to construct, unlike §14.15's
+`result_count==0`.
+
+**Where the branch lives.** `_run_url_fetch()` is the single call point shared by the direct
+`"url_fetch"` tool dispatch, `_enrich_top_result()`'s `web_search`/`news_search` follow-up fetch
+(§14.3), and `_run_research_loop()`'s candidate-URL fetch (§18) — same "one shared call point"
+shape as §14.15. It keeps its existing URL-resolution prologue unchanged, then delegates to the
+renamed `_execute_fetcher_url_fetch()` (the original fetch_url-calling body) and, on failure other
+than localist-mcp itself being unreachable (the identical `_MCP_UNREACHABLE_PREFIX` suppression
+rule from §14.15, reused rather than reimplemented), falls through to the new shared
+`_run_ollama_url_fetch()` helper, retagging the result `tool_name="url_fetch:ollama_fallback"`. All
+three callers transparently gained Ollama coverage from this one change.
+
+**`ollama_web_fetch` MCP tool** (`mcp_server/ollama_web_fetch.py`): `POST
+https://ollama.com/api/web_fetch`, `Authorization: Bearer {OLLAMA_API_KEY}` (same credential
+§14.15's `ollama_web_search` uses — no separate provisioning), body `{"url": "<url>"}`; response
+`{"title", "content", "links": [...]}`. This function normalizes that response into `fetch_url()`'s
+own success-path dict shape — `content` → `cleaned_text`, `word_count` computed from it,
+`author`/`date_published`/`fetch_duration_ms` defaulted (Ollama doesn't supply them), `links`
+dropped (no equivalent field) — specifically so a single shared dispatcher-side helper,
+`_format_fetch_result_text()`, can render both tiers' `"Title: ...\nSource: ...\nWords:
+...\n\n{body}"` text identically. Nothing downstream can tell which tier answered.
+
+**Test coverage.** `TestUrlFetchOllamaFallback` (`test_mcp_tool_dispatcher.py`, 4 tests) — fetcher
+success completely unaffected (Ollama mock never invoked), a forced fetcher failure triggers the
+fallback with content landing in the expected field, the real `extraction_failed` error text (not
+an invented "empty" shape) also triggers it, and a standalone check that the
+`"url_fetch:ollama_fallback"` provenance tag is present. The pre-existing
+`localist-mcp-unreachable-skips-fallback` case is already covered by
+`TestUrlFetch.test_connection_failure_returns_graceful_error`, unmodified and still green — not
+duplicated. Full suite: 1402 → 1406 passed, 0 failed.
+
+**Live verification (2026-07-31).** Forced a genuine fetch failure the same way as §14.15 — a
+temporary source edit (`_fetch()` raising `httpx.ConnectError` unconditionally) rather than hunting
+for a naturally-flaky page, since the point was proving the fallback fires against the real Ollama
+API, not finding a fragile URL. Against the real running stack: `fetch_url` genuinely failed, the
+dispatcher logged `"url_fetch (fetcher) failed ... falling back to Ollama Cloud"`, a real `POST
+https://ollama.com/api/web_fetch` returned `HTTP/1.1 200 OK` with real content
+(`https://ziglang.org/download/`, 422 words), tagged `"url_fetch:ollama_fallback"`, and that real
+content correctly grounded the conversational agent's final answer.
+
+**`conftest.py` env-isolation gap — RESOLVED same day (2026-07-31).** The autouse fixture
+stripping `SEARCH_PROVIDER`/`BRAVE_API_KEY`/`LANGSEARCH_API_KEY`/`LOCALIST_RESEARCH_LOOP_ENABLED`
+before every test — specifically to stop `mcp_server.main`'s import-time `load_dotenv()` from
+leaking real `backend/.env` values into unrelated tests — had never been extended to cover
+`OLLAMA_API_KEY`/`WEB_SEARCH_PROVIDER`. No test currently exercises `ollama_web_search`/
+`ollama_web_fetch` through the real in-process `FastMCP` session the way `test_mcp_server.py` does
+for `web_search`/`fetch_url` (§14.6), so this hadn't caused a live leak *through this fixture*
+specifically — but the identical leak had already happened once for `OLLAMA_API_KEY`, just through
+the *subprocess*-based fixture this autouse fixture explicitly doesn't protect (§14.15's regression
+#2). Closed proactively, before any in-process test for either new tool gets a chance to hit it:
+both vars added to `conftest.py`'s stripped tuple, matching the fixture's own stated policy ("add
+to the tuple as each new leak is confirmed" — read here as "as each new leak vector is confirmed
+plausible," not strictly "after one has already fired through this exact fixture"). Full suite
+re-run clean, 1406 passed, 0 failed — a pure test-isolation change, no production code touched.
 

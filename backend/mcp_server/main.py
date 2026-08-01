@@ -16,7 +16,15 @@ search, file/README/directory content, and release notes, read-only, no
 archive/CLI capability; see mcp_server/github.py), and hacker_news_search
 (on-demand Hacker News story search via Algolia's HN Search API — the
 chat-callable counterpart to backend/hacker_news.py's Live Feed panel
-data source; see mcp_server/hacker_news.py) — over SSE transport, using
+data source; see mcp_server/hacker_news.py), ollama_web_search
+(Ollama Cloud's web search API — a second provider underneath the
+Planner-facing web_search tool; the dispatcher decides fallback/primary
+orchestration between it and Brave/LangSearch, see
+mcp_server/ollama_web_search.py), and ollama_web_fetch (Ollama Cloud's web
+fetch API — a fallback-only tier underneath the Planner-facing url_fetch
+tool when the in-process fetch_url extraction fails; no primary mode, no
+Planner visibility, see ollama-web-search-mcp-tool-scoping.md §5 and
+mcp_server/ollama_web_fetch.py) — over SSE transport, using
 the official `mcp` Python SDK's FastMCP. See backend/mcp_tool_dispatcher.py
 for the dispatch seam.
 
@@ -71,6 +79,22 @@ Configuration
                                corresponding account permission exists).
   (no key needed for hacker_news_search — Algolia's HN Search API is
    public and unauthenticated; see mcp_server/hacker_news.py.)
+  OLLAMA_API_KEY                Required for ollama_web_search and
+                               ollama_web_fetch — see
+                               mcp_server/ollama_web_search.py and
+                               mcp_server/ollama_web_fetch.py. Loaded the
+                               same way as the other provider keys above
+                               (backend/.env via load_dotenv() below). This
+                               is a distinct credential from Ollama Cloud
+                               chat/embed (ollama_runtime_client.py), which
+                               authenticates via the local Ollama daemon's
+                               own signed-in session and never sends an
+                               API key over HTTP. Provisioned from an
+                               ollama.com account (2026-07-31) and
+                               confirmed working live against
+                               /api/web_search; /api/web_fetch uses the
+                               same key but has not itself been
+                               live-verified yet.
 
 Start
 -----
@@ -99,6 +123,8 @@ from mcp_server import (
     github as _github,
     hacker_news as _hacker_news,
     news_search as _news_search,
+    ollama_web_fetch as _ollama_web_fetch,
+    ollama_web_search as _ollama_web_search,
     url_fetch as _url_fetch,
     web_search as _web_search,
 )
@@ -155,6 +181,18 @@ async def news_search(query: str, url: str | None = None) -> dict:
 
 
 @mcp.tool()
+async def ollama_web_search(query: str) -> dict:
+    """Run one web search query via Ollama Cloud's web search API (https://ollama.com/api/web_search)."""
+    return await _ollama_web_search.ollama_web_search(query)
+
+
+@mcp.tool()
+async def ollama_web_fetch(url: str) -> dict:
+    """Fetch a URL via Ollama Cloud's web fetch API (https://ollama.com/api/web_fetch), normalized to fetch_url's own response shape."""
+    return await _ollama_web_fetch.ollama_web_fetch(url)
+
+
+@mcp.tool()
 def generate_chart(chart_type: str, labels: list[str], datasets: list[dict], title: str = "") -> dict:
     """Render a bar/line/pie chart from structured data and save it as a PNG. Returns summary, png_path, and chart_config."""
     return _chart.generate_chart(chart_type, labels, datasets, title)
@@ -198,7 +236,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title       = "Localist MCP Server",
-    description = "MCP tool server for Localist — file_op tools (read_file/write_file/append_file), fetch_url, web_search, news_search, generate_chart, github_search/github_read/github_release, and hacker_news_search.",
+    description = "MCP tool server for Localist — file_op tools (read_file/write_file/append_file), fetch_url, web_search, news_search, generate_chart, github_search/github_read/github_release, hacker_news_search, ollama_web_search, and ollama_web_fetch.",
     version     = "1.0.0",
     lifespan    = lifespan,
 )

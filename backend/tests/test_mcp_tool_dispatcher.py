@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -317,6 +318,149 @@ class TestUrlFetch:
         assert "unreachable" in results[0].result
 
 
+class TestUrlFetchOllamaFallback:
+    """
+    url_fetch -> Ollama Cloud web_fetch fallback tier (Track B,
+    ollama-web-search-mcp-tool-scoping.md §5, 2026-07-31). Fallback-only —
+    no primary mode, no config toggle (unlike web_search's
+    WEB_SEARCH_PROVIDER) — fires whenever _execute_fetcher_url_fetch
+    returns success=False for a reason other than localist-mcp itself
+    being unreachable (that suppression rule is already covered by the
+    pre-existing TestUrlFetch.test_connection_failure_returns_graceful_
+    error, still green after this fallback was added — not duplicated
+    here).
+
+    There is no separate "successful but empty" fixture shape to
+    construct, unlike web_search's result_count==0: confirmed while
+    building this in Prompt 6 that mcp_server/url_fetch.py's _extract()
+    already raises ValueError -> FetchUrlError("extraction_failed", ...)
+    whenever readability produces empty content, which surfaces as an
+    ordinary is_error=True tool-level failure — indistinguishable from a
+    transport/HTTP failure by the time it reaches the dispatcher. Test 3
+    below uses that exact real error text as its fixture.
+    """
+
+    @staticmethod
+    def _fetch_success(url: str, cleaned_text: str = "Real article body text.") -> tuple[str, bool]:
+        return json.dumps({
+            "url": url, "title": "Real Title", "author": "", "date_published": "",
+            "cleaned_text": cleaned_text, "word_count": len(cleaned_text.split()),
+            "fetch_duration_ms": 5.0,
+        }), False
+
+    @staticmethod
+    def _ollama_fetch_success(url: str, content: str = "Ollama fallback body text.") -> tuple[str, bool]:
+        return json.dumps({
+            "url": url, "title": "Ollama Title", "author": "", "date_published": "",
+            "cleaned_text": content, "word_count": len(content.split()),
+            "fetch_duration_ms": 0.0,
+        }), False
+
+    # -- 1. fetcher success: completely unaffected ------------------------
+
+    def test_fetcher_success_stays_plain_url_fetch(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            return self._fetch_success(arguments["url"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["url_fetch"],
+                instruction   = "summarize this link https://example.com/article please",
+                context       = {},
+            )
+
+        assert [c.args[1] for c in mock_call.call_args_list] == ["fetch_url"]
+        assert len(results) == 1
+        assert results[0].tool_name == "url_fetch"
+        assert results[0].success is True
+        assert "Real article body text." in results[0].result
+
+    # -- 2. forced fetcher failure (transport/HTTP-style) triggers fallback
+
+    def test_fetcher_failure_triggers_ollama_fallback(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            if name == "fetch_url":
+                return (
+                    "Error executing tool fetch_url: "
+                    "ERROR: http_server_error — Target returned HTTP 503. (Server Error)"
+                ), True
+            assert name == "ollama_web_fetch"
+            return self._ollama_fetch_success(arguments["url"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["url_fetch"],
+                instruction   = "fetch this https://flaky.example/page",
+                context       = {},
+            )
+
+        assert [c.args[1] for c in mock_call.call_args_list] == ["fetch_url", "ollama_web_fetch"]
+        assert len(results) == 1
+        assert results[0].tool_name == "url_fetch:ollama_fallback"
+        assert results[0].success is True
+        assert "Ollama fallback body text." in results[0].result
+
+    # -- 3. forced empty-extraction fixture (the real shape from Prompt 6) -
+
+    def test_empty_extraction_triggers_ollama_fallback(self, dispatcher: MCPToolDispatcher):
+        """
+        The real "empty extraction" error text mcp_server/url_fetch.py's
+        _extract() actually raises (FetchUrlError("extraction_failed",
+        "Content extraction failed.", "extraction produced empty text
+        after tag stripping")) once FastMCP wraps it — not an invented
+        "empty" shape. Paywalls/login walls are readability's own
+        motivating case for this (see _extract()'s docstring).
+        """
+        async def fake_call(session, name, arguments):
+            if name == "fetch_url":
+                return (
+                    "Error executing tool fetch_url: "
+                    "ERROR: extraction_failed — Content extraction failed. "
+                    "(extraction produced empty text after tag stripping)"
+                ), True
+            assert name == "ollama_web_fetch"
+            return self._ollama_fetch_success(arguments["url"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["url_fetch"],
+                instruction   = "fetch this https://paywalled.example/article",
+                context       = {},
+            )
+
+        assert [c.args[1] for c in mock_call.call_args_list] == ["fetch_url", "ollama_web_fetch"]
+        assert len(results) == 1
+        assert results[0].tool_name == "url_fetch:ollama_fallback"
+        assert results[0].success is True
+        assert "Ollama fallback body text." in results[0].result
+
+    # -- 4. fallback-provenance marker present and correct -----------------
+
+    def test_fallback_provenance_marker_present(self, dispatcher: MCPToolDispatcher):
+        """
+        Standalone check of the tool_name retag itself — overlaps
+        mechanically with tests 2/3 above but is broken out on its own so
+        a future refactor that accidentally drops the retag (while
+        content/success still look fine) fails a test whose name says
+        exactly what broke, rather than an assertion buried inside a
+        content-focused test.
+        """
+        async def fake_call(session, name, arguments):
+            assert name in ("fetch_url", "ollama_web_fetch")
+            if name == "fetch_url":
+                return "Error executing tool fetch_url: ERROR: timeout — Request timed out.", True
+            return self._ollama_fetch_success(arguments["url"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["url_fetch"],
+                instruction   = "fetch this https://slow.example/page",
+                context       = {},
+            )
+
+        assert results[0].tool_name == "url_fetch:ollama_fallback"
+
+
 class TestWebSearch:
     def test_explicit_queries_used_over_derived(self, dispatcher: MCPToolDispatcher):
         seen_queries: list[str] = []
@@ -413,6 +557,320 @@ class TestWebSearch:
         assert results[0].tool_name == "web_search"
         assert results[0].success is False
         assert "unreachable" in results[0].result
+
+
+class TestWebSearchProviderBranching:
+    """
+    WEB_SEARCH_PROVIDER (ollama-web-search-mcp-tool-scoping.md, 2026-07-31)
+    — the Brave-vs-Ollama-Cloud provider branch for the web_search tool.
+
+    The branch lives in _execute_web_search_query(), NOT in
+    _run_web_search() (confirmed against the actual code, not assumed —
+    _run_web_search is only the multi-query loop; _execute_web_search_query
+    is the single per-query call point it invokes once per query). That
+    same call point is also reused by _run_news_search's tier-2 Brave
+    fallback and by _run_research_loop, which is what makes the
+    cross-call-site tests at the bottom of this class meaningful — this
+    branch is not duplicated per call site.
+
+    WEB_SEARCH_PROVIDER is read fresh via os.environ.get() on every call
+    (no module-level caching), so each test drives it via
+    monkeypatch.setenv/delenv rather than reaching for a fixture-level
+    default.
+
+    Every "must NOT be called" assertion below reads mock_call.call_args_list
+    directly (the tool names actually invoked, in order) rather than just
+    inspecting the returned ToolResult content — a test that only checks
+    final output could pass for the wrong reason if Brave's and Ollama's
+    mocked responses happened to look alike.
+    """
+
+    @staticmethod
+    def _brave_success(query: str, text: str = "• Brave result\n  a real result\n") -> tuple[str, bool]:
+        return json.dumps({"query": query, "result_text": text, "result_count": 1}), False
+
+    @staticmethod
+    def _brave_empty(query: str) -> tuple[str, bool]:
+        return json.dumps({"query": query, "result_text": "No results found.", "result_count": 0}), False
+
+    @staticmethod
+    def _ollama_success(query: str, text: str = "• Ollama result\n  fallback content\n") -> tuple[str, bool]:
+        return json.dumps({"query": query, "result_text": text, "result_count": 1}), False
+
+    # -- 1. Default brave, success: completely unaffected ---------------
+
+    def test_unset_provider_brave_success_stays_plain_web_search(
+        self, dispatcher: MCPToolDispatcher, monkeypatch,
+    ):
+        """WEB_SEARCH_PROVIDER unset entirely — must behave exactly as it
+        did before this feature existed."""
+        monkeypatch.delenv("WEB_SEARCH_PROVIDER", raising=False)
+
+        async def fake_call(session, name, arguments):
+            return self._brave_success(arguments["query"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"],
+                instruction   = "what is the latest oMLX release",
+                context       = {},
+            )
+
+        assert [c.args[1] for c in mock_call.call_args_list] == ["web_search"]
+        assert len(results) == 1
+        assert results[0].tool_name == "web_search"
+        assert results[0].success is True
+        assert results[0].result == "• Brave result\n  a real result\n"
+
+    def test_explicit_brave_provider_success_stays_plain_web_search(
+        self, dispatcher: MCPToolDispatcher, monkeypatch,
+    ):
+        """Same as above but with WEB_SEARCH_PROVIDER explicitly set to
+        "brave" rather than left unset — both must behave identically."""
+        monkeypatch.setenv("WEB_SEARCH_PROVIDER", "brave")
+
+        async def fake_call(session, name, arguments):
+            return self._brave_success(arguments["query"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"],
+                instruction   = "what is the latest oMLX release",
+                context       = {},
+            )
+
+        assert [c.args[1] for c in mock_call.call_args_list] == ["web_search"]
+        assert len(results) == 1
+        assert results[0].tool_name == "web_search"
+        assert results[0].success is True
+
+    # -- 2. Default brave, empty result: Ollama fallback fires -----------
+
+    def test_brave_empty_result_triggers_ollama_fallback(
+        self, dispatcher: MCPToolDispatcher, monkeypatch,
+    ):
+        monkeypatch.delenv("WEB_SEARCH_PROVIDER", raising=False)
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return self._brave_empty(arguments["query"])
+            assert name == "ollama_web_search"
+            return self._ollama_success(arguments["query"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"],
+                instruction   = "what is the latest oMLX release",
+                context       = {},
+            )
+
+        assert [c.args[1] for c in mock_call.call_args_list] == ["web_search", "ollama_web_search"]
+        assert len(results) == 1
+        assert results[0].tool_name == "web_search:ollama_fallback"
+        assert results[0].success is True
+        assert results[0].result == "• Ollama result\n  fallback content\n"
+
+    # -- 3. Default brave, Brave-side failure (localist-mcp reachable):
+    #    Ollama fallback fires — must NOT be conflated with case 4 below --
+
+    def test_brave_side_failure_with_localist_mcp_reachable_triggers_ollama_fallback(
+        self, dispatcher: MCPToolDispatcher, monkeypatch,
+    ):
+        """
+        A genuine Brave-side failure — localist-mcp itself is reached and
+        answers, but the web_search tool's own Brave HTTP call blew up
+        (5xx/timeout/malformed body), surfaced via
+        mcp_server/web_search.py's ValueError(f"ERROR: web_search failed —
+        {exc}") -> FastMCP is_error=True. _call_mcp_tool does NOT raise
+        here (contrast with case 4, where it does) — this must still
+        trigger the Ollama fallback.
+        """
+        monkeypatch.delenv("WEB_SEARCH_PROVIDER", raising=False)
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return (
+                    "Error executing tool web_search: "
+                    "ERROR: web_search failed — 503 Service Unavailable"
+                ), True
+            assert name == "ollama_web_search"
+            return self._ollama_success(arguments["query"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"],
+                instruction   = "what is the latest oMLX release",
+                context       = {},
+            )
+
+        assert [c.args[1] for c in mock_call.call_args_list] == ["web_search", "ollama_web_search"]
+        assert len(results) == 1
+        assert results[0].tool_name == "web_search:ollama_fallback"
+        assert results[0].success is True
+
+    # -- 4. localist-mcp itself unreachable: fallback is SKIPPED ---------
+
+    def test_localist_mcp_unreachable_skips_ollama_fallback(
+        self, dispatcher: MCPToolDispatcher, monkeypatch,
+    ):
+        """
+        The suppression rule: when _call_mcp_tool itself raises — the
+        actual signal this codebase uses for "localist-mcp the process is
+        unreachable," distinct from case 3's "reached it, the tool itself
+        reported failure" — _execute_web_search_query must NOT attempt the
+        Ollama fallback (retrying through the same dead session/process
+        would just double the failure) and must surface the original
+        unreachable failure directly, tool_name unretagged.
+        """
+        monkeypatch.delenv("WEB_SEARCH_PROVIDER", raising=False)
+
+        async def fake_call(session, name, arguments):
+            raise ConnectionRefusedError("Connection refused")
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"],
+                instruction   = "what is the latest oMLX release",
+                context       = {},
+            )
+
+        assert [c.args[1] for c in mock_call.call_args_list] == ["web_search"]
+        assert len(results) == 1
+        assert results[0].tool_name == "web_search"
+        assert results[0].success is False
+        assert "unreachable" in results[0].result
+
+    # -- 5. WEB_SEARCH_PROVIDER=ollama: Brave never invoked --------------
+
+    def test_ollama_provider_never_calls_brave(
+        self, dispatcher: MCPToolDispatcher, monkeypatch,
+    ):
+        monkeypatch.setenv("WEB_SEARCH_PROVIDER", "ollama")
+
+        async def fake_call(session, name, arguments):
+            assert name == "ollama_web_search"
+            return self._ollama_success(arguments["query"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"],
+                instruction   = "what is the latest oMLX release",
+                context       = {},
+            )
+
+        assert [c.args[1] for c in mock_call.call_args_list] == ["ollama_web_search"]
+        assert len(results) == 1
+        assert results[0].tool_name == "web_search:ollama_primary"
+        assert results[0].success is True
+
+    # -- 6. WEB_SEARCH_PROVIDER=ollama with BRAVE_API_KEY entirely absent -
+
+    def test_ollama_provider_works_with_brave_api_key_entirely_absent(
+        self, dispatcher: MCPToolDispatcher, monkeypatch,
+    ):
+        """
+        Concrete proof of the scoping doc's §1 "no Brave account needed"
+        claim: BRAVE_API_KEY is deleted from the environment entirely (not
+        just set to ""), and WEB_SEARCH_PROVIDER=ollama still works
+        without ever attempting to call Brave.
+        """
+        monkeypatch.setenv("WEB_SEARCH_PROVIDER", "ollama")
+        monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+        assert "BRAVE_API_KEY" not in os.environ
+
+        async def fake_call(session, name, arguments):
+            assert name == "ollama_web_search"
+            return self._ollama_success(arguments["query"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"],
+                instruction   = "what is the latest oMLX release",
+                context       = {},
+            )
+
+        assert [c.args[1] for c in mock_call.call_args_list] == ["ollama_web_search"]
+        assert len(results) == 1
+        assert results[0].tool_name == "web_search:ollama_primary"
+        assert results[0].success is True
+
+    # -- 8. Cross-call-site: the branch also applies inside
+    #    _run_news_search's tier-2 fallback and _run_research_loop --------
+
+    def test_provider_branch_applies_inside_news_search_tier2_fallback(
+        self, dispatcher: MCPToolDispatcher, monkeypatch,
+    ):
+        """
+        _execute_web_search_query is the single per-query call point
+        _run_news_search's tier-2 fallback also calls (see
+        TestNewsSearch.test_tier1_miss_falls_back_to_brave_web_search) —
+        confirm WEB_SEARCH_PROVIDER=ollama applies there too: tier 2 must
+        go through ollama_web_search, Brave ("web_search") never invoked
+        at all. _run_news_search's own retag
+        (tool_name="news_search:brave_fallback") masks the inner
+        "web_search:ollama_primary" tag in the final result, so the actual
+        proof has to be the MCP tool names invoked, not the final label.
+        """
+        monkeypatch.setenv("WEB_SEARCH_PROVIDER", "ollama")
+
+        async def fake_call(session, name, arguments):
+            if name == "news_search":
+                return json.dumps({
+                    "query": arguments["query"], "result_text": "", "result_count": 0,
+                    "is_miss": True,
+                }), False
+            assert name == "ollama_web_search"
+            return self._ollama_success(arguments["query"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["news_search"],
+                instruction   = "what's the latest news on APC?",
+                context       = {},
+            )
+
+        called_tools = [c.args[1] for c in mock_call.call_args_list]
+        assert called_tools == ["news_search", "ollama_web_search"]
+        assert "web_search" not in called_tools
+        assert len(results) == 2
+        assert results[0].tool_name == "news_search" and results[0].success is False
+        assert results[1].tool_name == "news_search:brave_fallback"
+        assert results[1].success is True
+
+    def test_provider_branch_applies_inside_research_loop(
+        self, dispatcher: MCPToolDispatcher, monkeypatch,
+    ):
+        """
+        Same cross-call-site guarantee for _run_research_loop (contrast
+        with TestResearchLoop.test_gate_passes_immediately_stops_after_
+        one_iteration, which asserts name == "web_search" under the
+        default provider) — with WEB_SEARCH_PROVIDER=ollama, the loop's
+        search call must go through ollama_web_search instead, Brave
+        never invoked.
+        """
+        monkeypatch.setenv("WEB_SEARCH_PROVIDER", "ollama")
+
+        async def fake_call(session, name, arguments):
+            assert name == "ollama_web_search"
+            return json.dumps({
+                "query": arguments["query"],
+                "result_text": "The Basic plan costs $10/month.",
+                "result_count": 1,
+            }), False
+
+        dispatcher._runtime.infer.side_effect = lambda **kw: "yes"
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["research"],
+                instruction   = "what does the Basic plan cost",
+                context       = {},
+            )
+
+        assert [c.args[1] for c in mock_call.call_args_list] == ["ollama_web_search"]
+        assert len(results) == 1
+        assert results[0].tool_name == "web_search:ollama_primary"
+        assert results[0].success is True
 
 
 class TestNewsSearch:

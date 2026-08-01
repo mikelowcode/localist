@@ -135,6 +135,16 @@ def localist_mcp_server_no_langsearch_key(tmp_path: Path):
     *unpinned* subprocess would happily dispatch to Brave and succeed
     instead of failing, since only the LangSearch key is forced empty here.
 
+    OLLAMA_API_KEY is forced empty for the identical reason, added
+    2026-07-31 alongside mcp_tool_dispatcher.py's WEB_SEARCH_PROVIDER
+    fallback: without this, backend/.env's real OLLAMA_API_KEY would
+    survive into the subprocess (same load_dotenv()-reload gap as
+    LANGSEARCH_API_KEY above), and this test's forced Brave/LangSearch
+    failure would trigger a live, authenticated call to
+    https://ollama.com/api/web_search instead of a clean
+    "OLLAMA_API_KEY not configured" failure — confirmed happening in
+    practice before this fixture was updated.
+
     Used by test_web_search_missing_key_triggers_corpus_fallback (Phase 3)
     to prove controller_agent.py's Step 3b corpus fallback — see
     sessions-log.md, 2026-07-03, Phase 3.
@@ -148,6 +158,7 @@ def localist_mcp_server_no_langsearch_key(tmp_path: Path):
            "LOCALIST_LOG_LEVEL": "WARNING"}
     env["LANGSEARCH_API_KEY"] = ""
     env["SEARCH_PROVIDER"]    = "langsearch"
+    env["OLLAMA_API_KEY"]     = ""
 
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "mcp_server.main:app",
@@ -488,7 +499,7 @@ class TestControllerToolIntegration:
         assert "SQLite" in prompt
 
     def test_web_search_missing_key_triggers_corpus_fallback(
-        self, mm, tmp_path, localist_mcp_server_no_langsearch_key
+        self, mm, tmp_path, monkeypatch, localist_mcp_server_no_langsearch_key
     ):
         """
         Proves controller_agent.py's Step 3b corpus fallback actually fires
@@ -501,7 +512,16 @@ class TestControllerToolIntegration:
         extraction); if the removed runtime.infer() hallucination fallback
         were still being called anywhere on this path, the mock would raise
         StopIteration instead of the assertions below failing quietly.
+
+        WEB_SEARCH_PROVIDER is pinned to "brave" (mcp_tool_dispatcher.py's
+        default, 2026-07-31) so this test's outcome doesn't depend on
+        whatever a developer's own shell happens to export — the point
+        here is Brave/LangSearch failing and falling through to a
+        deliberately-unconfigured Ollama fallback (see
+        localist_mcp_server_no_langsearch_key's OLLAMA_API_KEY="" above),
+        not Ollama succeeding as primary.
         """
+        monkeypatch.setenv("WEB_SEARCH_PROVIDER", "brave")
         doc_path    = tmp_path / "zylophonic-notes.md"
         doc_content = "Zylophonic quarterly earnings update web search"
         doc_path.write_text(doc_content, encoding="utf-8")

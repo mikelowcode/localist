@@ -1409,9 +1409,19 @@ class ControllerAgent:
         # this check, the same gap "research" hit and fixed the same way.
         # startswith() (not ==) so it catches both the tier-1 "news_search"
         # entry and the retagged "news_search:brave_fallback" one.
+        #
+        # web_search / Ollama Cloud (mcp_tool_dispatcher._execute_web_search_
+        # query, ollama-web-search-mcp-tool-scoping.md, 2026-07-31) hits the
+        # identical gap: a Brave-empty/failed result that falls through to
+        # Ollama is retagged tool_name="web_search:ollama_fallback", and
+        # WEB_SEARCH_PROVIDER=ollama's primary-mode result is tagged
+        # "web_search:ollama_primary" — neither equals "web_search" exactly,
+        # so the first clause's == would miss a failure there the same way
+        # the news_search rename would have. startswith("web_search") (not
+        # ==) catches the unretagged tier and both retagged variants.
         rag_sources: list[RagSource] = []
         _web_search_failed = any(
-            (r.tool_name == "web_search" and not r.success)
+            (r.tool_name.startswith("web_search") and not r.success)
             or r.tool_name == "research"
             or (r.tool_name.startswith("news_search") and not r.success)
             for r in dispatched_tool_results

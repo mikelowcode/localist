@@ -391,6 +391,94 @@ class TestEmptyCompletionGuard:
 
 
 # ---------------------------------------------------------------------------
+# Step 3b — corpus fallback tool_name matching
+# (ollama-web-search-mcp-tool-scoping.md, 2026-07-31)
+# ---------------------------------------------------------------------------
+
+class TestWebSearchProviderStep3bCorpusFallback:
+    """
+    Regression coverage for the Step 3b tool_name-matching gap found (and
+    fixed) while building the WEB_SEARCH_PROVIDER Ollama fallback: a plain
+    `tool_name == "web_search"` equality check silently stopped catching
+    failures once mcp_tool_dispatcher.py started retagging fallback/primary
+    results "web_search:ollama_fallback" / "web_search:ollama_primary" —
+    the identical gap news_search hit before and fixed the same way
+    (startswith(), see controller_agent.py's Step 3b comment block). Fixed
+    by widening the first clause to tool_name.startswith("web_search").
+
+    These three tests are the fast, isolated unit-level lock-in for that
+    match itself — one per tag variant that can appear in
+    dispatched_tool_results — via the same wholesale-MCPToolDispatcher-mock
+    pattern TestEmptyCompletionGuard above uses, so no real localist-mcp
+    process is needed. The live, end-to-end proof that a real Brave/
+    LangSearch failure still grounds the answer (and that it no longer
+    makes a live Ollama call while doing so) lives in
+    test_tool_dispatcher_phase6.py's
+    test_web_search_missing_key_triggers_corpus_fallback — that test
+    already pins WEB_SEARCH_PROVIDER=brave and blanks OLLAMA_API_KEY as
+    part of the same fix, so it isn't duplicated here.
+    """
+
+    @staticmethod
+    def _plan() -> RoutingPlan:
+        return RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = False,
+            priority       = 6,
+            tools_to_call  = ["web_search"],
+        )
+
+    @staticmethod
+    def _failed_result(tool_name: str) -> _ToolResult:
+        return _ToolResult(
+            tool_name  = tool_name,
+            parameters = "query='Zylophonic quarterly earnings'",
+            result     = "ERROR: web_search failed",
+            success    = False,
+        )
+
+    def _run(self, mm, db_path, tool_name: str) -> str:
+        # Same content/instruction pair test_tool_dispatcher_phase6.py's
+        # corpus-fallback test already uses — proven to clear the 0.55
+        # Jaccard threshold Step 3b's corpus query filters on.
+        mm.index_document(
+            path     = db_path.parent / "zylophonic-notes.md",
+            doc_type = "raw",
+            content  = "Zylophonic quarterly earnings update web search",
+        )
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent("Here is what I found.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = self._plan()
+
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.return_value = [self._failed_result(tool_name)]
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch("controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            ctrl.handle_task({
+                "instruction": "do a web search for Zylophonic quarterly earnings update",
+            })
+
+        return conv._received[0].context["_prebuilt_prompt"]
+
+    def test_plain_web_search_failure_still_triggers_corpus_fallback(self, mm, db_path):
+        """Unretagged tool_name=="web_search" — the pre-existing case,
+        confirming the startswith() widening didn't regress it."""
+        prompt = self._run(mm, db_path, "web_search")
+        assert "[CONTEXT]" in prompt
+
+    def test_ollama_fallback_tagged_failure_triggers_corpus_fallback(self, mm, db_path):
+        prompt = self._run(mm, db_path, "web_search:ollama_fallback")
+        assert "[CONTEXT]" in prompt
+
+    def test_ollama_primary_tagged_failure_triggers_corpus_fallback(self, mm, db_path):
+        prompt = self._run(mm, db_path, "web_search:ollama_primary")
+        assert "[CONTEXT]" in prompt
+
+
+# ---------------------------------------------------------------------------
 # Path 2 — RAG path (Priority 4)
 # ---------------------------------------------------------------------------
 # P4 now fires on explicit wiki/vault trigger keywords, not corpus scoring.
