@@ -182,6 +182,103 @@ class TestFileOpErrorPaths:
         assert results[0].success is False
 
 
+class TestOcrExtractRouting:
+    """ocr_extract is never planner-routed (see MCPToolDispatcher's class
+    docstring) — always context-driven, no instruction-derivation to test."""
+
+    def test_success_maps_to_tool_result(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            assert name == "ocr_extract"
+            assert arguments == {"path": "img.png", "mime_type": "image/png"}
+            return "Recognized OCR text", False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["ocr_extract"],
+                instruction   = "",
+                context       = {"ocr_file_path": "img.png", "ocr_mime_type": "image/png"},
+            )
+
+        assert len(results) == 1
+        r = results[0]
+        assert r.tool_name == "ocr_extract"
+        assert r.result == "Recognized OCR text"
+        assert r.success is True
+
+    def test_tool_level_error_sets_success_false(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            return "ERROR: no readable text detected in 'blank.png'", True
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["ocr_extract"],
+                instruction   = "",
+                context       = {"ocr_file_path": "blank.png", "ocr_mime_type": "image/png"},
+            )
+
+        assert results[0].success is False
+        assert "no readable text detected" in results[0].result
+
+    def test_connection_failure_returns_graceful_error(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            raise ConnectionRefusedError("Connection refused")
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["ocr_extract"],
+                instruction   = "",
+                context       = {"ocr_file_path": "img.png", "ocr_mime_type": "image/png"},
+            )
+
+        assert len(results) == 1
+        assert results[0].tool_name == "ocr_extract"
+        assert results[0].success is False
+        assert "unreachable" in results[0].result
+
+    def test_missing_context_returns_error_without_calling_mcp(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool") as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["ocr_extract"],
+                instruction   = "",
+                context       = {},  # neither ocr_file_path nor ocr_mime_type
+            )
+
+        mock_call.assert_not_called()
+        assert results[0].success is False
+        assert "must both be provided" in results[0].result
+
+    def test_missing_mime_type_only_returns_error_without_calling_mcp(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool") as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["ocr_extract"],
+                instruction   = "",
+                context       = {"ocr_file_path": "img.png"},  # no ocr_mime_type
+            )
+
+        mock_call.assert_not_called()
+        assert results[0].success is False
+
+    def test_session_unreachable_returns_graceful_error(self, dispatcher: MCPToolDispatcher):
+        """_open_session itself failing (session=None) is a distinct code
+        path from _call_mcp_tool raising — both must degrade gracefully."""
+        async def raising_open_session(self, stack):
+            raise ConnectionError("localist-mcp down")
+
+        with patch.object(MCPToolDispatcher, "_open_session", raising_open_session):
+            results = dispatcher.dispatch(
+                tools_to_call = ["ocr_extract"],
+                instruction   = "",
+                context       = {"ocr_file_path": "img.png", "ocr_mime_type": "image/png"},
+            )
+
+        assert results[0].success is False
+        assert "unreachable" in results[0].result
+
+
 class TestUrlFetch:
     def test_url_extracted_from_instruction_and_success(self, dispatcher: MCPToolDispatcher):
         async def fake_call(session, name, arguments):

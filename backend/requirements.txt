@@ -45,3 +45,11 @@ matplotlib>=3.9.0
 # System memory introspection — context_profile.py's startup RAM headroom
 # check (local backends only), and diagnostics/diag_local_working_memory_ram_probe.py
 psutil>=7.0.0
+
+# localist-mcp service — ocr_extract tool. Apple Vision framework (images,
+# incl. HEIC, via ImageIO's system-wide codec) for OCR; PyMuPDF for PDF
+# text-layer extraction and page rasterization. macOS/Apple Silicon only —
+# see mcp_server/ocr.py's platform gate.
+pyobjc-framework-Vision>=10.1
+pyobjc-framework-Quartz>=10.1
+PyMuPDF>=1.24.0

@@ -230,8 +230,10 @@ stable prefix length on turns where session files are present.
   total budget would be exceeded. No silent LRU eviction.
 - Files are never wiki-ingested, never embedded, never written to `document_index`
   or any SQLite table. They are prompt context only.
-- PDF and image support deferred to a future session. oMLX and Gemma 4B natively
-  support both; the allowlist is the only gate.
+- PDF and image support RESOLVED 2026-08-01 — see §22. Not via oMLX's native
+  multimodal support (that would tie the feature to one runtime backend); a
+  local OCR tool extracts text once at upload time, so by the time content
+  reaches this slot it's plain text like any other session file.
 
 **PromptBuilder integration:**
 - `SessionFile` dataclass: `filename: str`, `content: str`.

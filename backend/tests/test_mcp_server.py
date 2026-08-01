@@ -36,12 +36,13 @@ import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import fitz  # PyMuPDF
 import httpx
 import pytest
 
 from mcp.shared.memory import create_connected_server_and_client_session
 
-from mcp_server import chart, file_ops, github, hacker_news, news_search, search_format, url_fetch, web_search
+from mcp_server import chart, file_ops, github, hacker_news, news_search, ocr, search_format, url_fetch, web_search
 from mcp_server.main import mcp as mcp_app
 
 
@@ -54,6 +55,13 @@ def _reset_project_root():
     """Every test sets its own root explicitly; avoid state leaking between tests."""
     yield
     file_ops.set_project_root(Path(__file__).resolve().parent.parent)
+
+
+@pytest.fixture(autouse=True)
+def _reset_ocr_upload_root():
+    """Same convention as _reset_project_root above, for ocr.py's sandbox root."""
+    yield
+    ocr.set_upload_root(Path(__file__).resolve().parent.parent)
 
 
 class TestFileOpsRead:
@@ -1132,6 +1140,178 @@ class TestGenerateChart:
 
 
 # ---------------------------------------------------------------------------
+# ocr.extract_text — direct unit tests
+#
+# _ocr_image_bytes (the actual PyObjC/Vision call) is mocked throughout —
+# Vision can't run in CI the way EmbeddingEngine.embed is already mocked in
+# this suite. Live-verified separately against the real Vision framework and
+# real PyMuPDF during development (see docs/architecture/22-local-ocr-service.md).
+# PDF fixtures are built with real PyMuPDF (fast, deterministic, already a
+# hard dependency) rather than mocking fitz's API surface.
+# ---------------------------------------------------------------------------
+
+def _write_image(tmp_path: Path, name: str = "photo.png") -> None:
+    (tmp_path / name).write_bytes(b"not-real-png-bytes-ocr-is-mocked-anyway")
+
+
+def _write_text_layer_pdf(tmp_path: Path, name: str = "doc.pdf", pages: int = 1) -> None:
+    doc = fitz.open()
+    for _ in range(pages):
+        page = doc.new_page(width=300, height=100)
+        page.insert_text((20, 50), "This page has a real embedded text layer.")
+    doc.save(str(tmp_path / name))
+    doc.close()
+
+
+def _write_blank_pdf(tmp_path: Path, name: str = "scanned.pdf", pages: int = 1) -> None:
+    """No text layer at all — triggers the rasterize+OCR fallback path.
+    get_pixmap() rasterizes fine on a blank page, and _ocr_image_bytes is
+    mocked in every test that uses this, so the actual pixel content
+    (or lack of it) never matters."""
+    doc = fitz.open()
+    for _ in range(pages):
+        doc.new_page(width=300, height=100)
+    doc.save(str(tmp_path / name))
+    doc.close()
+
+
+class TestOcrExtractImages:
+    def test_success_returns_ocr_text(self, tmp_path: Path):
+        ocr.set_upload_root(tmp_path)
+        _write_image(tmp_path)
+        with patch.object(ocr, "_is_apple_silicon", return_value=True), \
+             patch.object(ocr, "_ocr_image_bytes", return_value="Recognized text"):
+            result = ocr.extract_text("photo.png", "image/png")
+        assert result == "Recognized text"
+
+    def test_non_apple_silicon_platform_raises(self, tmp_path: Path):
+        ocr.set_upload_root(tmp_path)
+        _write_image(tmp_path)
+        with patch.object(ocr, "_is_apple_silicon", return_value=False):
+            with pytest.raises(ValueError, match="requires macOS on Apple Silicon"):
+                ocr.extract_text("photo.png", "image/png")
+
+    def test_missing_file_raises(self, tmp_path: Path):
+        ocr.set_upload_root(tmp_path)
+        with patch.object(ocr, "_is_apple_silicon", return_value=True):
+            with pytest.raises(ValueError, match="file not found"):
+                ocr.extract_text("ghost.png", "image/png")
+
+    def test_unsupported_mime_type_raises(self, tmp_path: Path):
+        ocr.set_upload_root(tmp_path)
+        _write_image(tmp_path)
+        with patch.object(ocr, "_is_apple_silicon", return_value=True):
+            with pytest.raises(ValueError, match="unsupported mime_type"):
+                ocr.extract_text("photo.png", "application/octet-stream")
+
+    def test_near_empty_result_raises(self, tmp_path: Path):
+        ocr.set_upload_root(tmp_path)
+        _write_image(tmp_path)
+        with patch.object(ocr, "_is_apple_silicon", return_value=True), \
+             patch.object(ocr, "_ocr_image_bytes", return_value="   "):
+            with pytest.raises(ValueError, match="no readable text detected"):
+                ocr.extract_text("photo.png", "image/png")
+
+    def test_path_traversal_blocked(self, tmp_path: Path):
+        ocr.set_upload_root(tmp_path)
+        with patch.object(ocr, "_is_apple_silicon", return_value=True):
+            with pytest.raises(ValueError, match="path traversal"):
+                ocr.extract_text("../../etc/passwd", "image/png")
+
+    def test_heic_uses_same_code_path_as_any_other_image(self, tmp_path: Path):
+        """No format-specific branching — HEIC support falls out of always
+        using VNImageRequestHandler's data-based initializer (see ocr.py's
+        module docstring), not a dedicated code path to test separately."""
+        ocr.set_upload_root(tmp_path)
+        (tmp_path / "photo.heic").write_bytes(b"not-real-heic-bytes")
+        with patch.object(ocr, "_is_apple_silicon", return_value=True), \
+             patch.object(ocr, "_ocr_image_bytes", return_value="Recognized HEIC text"):
+            result = ocr.extract_text("photo.heic", "image/heic")
+        assert result == "Recognized HEIC text"
+
+
+class TestOcrExtractPdf:
+    def test_text_layer_fast_path_skips_ocr(self, tmp_path: Path):
+        ocr.set_upload_root(tmp_path)
+        _write_text_layer_pdf(tmp_path)
+        with patch.object(ocr, "_is_apple_silicon", return_value=True), \
+             patch.object(ocr, "_ocr_image_bytes") as mock_ocr:
+            result = ocr.extract_text("doc.pdf", "application/pdf")
+        assert "real embedded text layer" in result
+        mock_ocr.assert_not_called()
+
+    def test_blank_pdf_falls_back_to_ocr(self, tmp_path: Path):
+        ocr.set_upload_root(tmp_path)
+        _write_blank_pdf(tmp_path)
+        with patch.object(ocr, "_is_apple_silicon", return_value=True), \
+             patch.object(ocr, "_ocr_image_bytes", return_value="Scanned page text"):
+            result = ocr.extract_text("scanned.pdf", "application/pdf")
+        assert "--- page 1 ---" in result
+        assert "Scanned page text" in result
+
+    def test_multi_page_blank_pdf_ocrs_each_page(self, tmp_path: Path):
+        ocr.set_upload_root(tmp_path)
+        _write_blank_pdf(tmp_path, pages=2)
+        with patch.object(ocr, "_is_apple_silicon", return_value=True), \
+             patch.object(ocr, "_ocr_image_bytes", side_effect=["Page one", "Page two"]):
+            result = ocr.extract_text("scanned.pdf", "application/pdf")
+        assert "--- page 1 ---\nPage one" in result
+        assert "--- page 2 ---\nPage two" in result
+
+    def test_page_cap_exceeded_raises(self, tmp_path: Path):
+        ocr.set_upload_root(tmp_path)
+        _write_blank_pdf(tmp_path, pages=3)
+        with patch.object(ocr, "_is_apple_silicon", return_value=True):
+            with pytest.raises(ValueError, match="exceeding the 2-page OCR limit"):
+                ocr.extract_text("scanned.pdf", "application/pdf", max_pdf_pages=2)
+
+    def test_explicit_zero_page_cap_is_not_treated_as_unset(self, tmp_path: Path):
+        """Regression test — max_pdf_pages=0 was previously swallowed by an
+        `or get_max_pdf_pages()` falsy-zero bug (0 is falsy in Python) that
+        silently fell back to the default cap instead of rejecting. Found
+        via live verification during Phase 1 build, fixed with an explicit
+        `is not None` check."""
+        ocr.set_upload_root(tmp_path)
+        _write_blank_pdf(tmp_path, pages=1)
+        with patch.object(ocr, "_is_apple_silicon", return_value=True):
+            with pytest.raises(ValueError, match="exceeding the 0-page OCR limit"):
+                ocr.extract_text("scanned.pdf", "application/pdf", max_pdf_pages=0)
+
+    def test_text_layer_pdf_ignores_page_cap(self, tmp_path: Path):
+        """A real text layer is read directly regardless of page count —
+        the cap only bounds the rasterize+OCR fallback path."""
+        ocr.set_upload_root(tmp_path)
+        _write_text_layer_pdf(tmp_path, pages=5)
+        with patch.object(ocr, "_is_apple_silicon", return_value=True), \
+             patch.object(ocr, "_ocr_image_bytes") as mock_ocr:
+            result = ocr.extract_text("doc.pdf", "application/pdf", max_pdf_pages=1)
+        assert "real embedded text layer" in result
+        mock_ocr.assert_not_called()
+
+    def test_near_empty_ocr_result_raises(self, tmp_path: Path):
+        ocr.set_upload_root(tmp_path)
+        _write_blank_pdf(tmp_path)
+        with patch.object(ocr, "_is_apple_silicon", return_value=True), \
+             patch.object(ocr, "_ocr_image_bytes", return_value=""):
+            with pytest.raises(ValueError, match="no readable text detected"):
+                ocr.extract_text("scanned.pdf", "application/pdf")
+
+
+class TestOcrGetMaxPdfPages:
+    def test_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv("LOCALIST_OCR_MAX_PDF_PAGES", raising=False)
+        assert ocr.get_max_pdf_pages() == ocr._DEFAULT_MAX_PDF_PAGES
+
+    def test_reads_valid_override(self, monkeypatch):
+        monkeypatch.setenv("LOCALIST_OCR_MAX_PDF_PAGES", "5")
+        assert ocr.get_max_pdf_pages() == 5
+
+    def test_invalid_value_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("LOCALIST_OCR_MAX_PDF_PAGES", "not-a-number")
+        assert ocr.get_max_pdf_pages() == ocr._DEFAULT_MAX_PDF_PAGES
+
+
+# ---------------------------------------------------------------------------
 # MCP tool wiring — in-process client session (no network)
 # ---------------------------------------------------------------------------
 
@@ -1320,3 +1500,23 @@ class TestMCPToolsInProcess:
         assert data["result_count"] == 1
         assert "two" in data["result_text"]
         assert "one" not in data["result_text"]
+
+    def test_ocr_extract_tool_success(self, tmp_path: Path):
+        ocr.set_upload_root(tmp_path)
+        _write_image(tmp_path)
+        with patch.object(ocr, "_is_apple_silicon", return_value=True), \
+             patch.object(ocr, "_ocr_image_bytes", return_value="Recognized via MCP"):
+            text, is_error = asyncio.run(
+                _call_tool("ocr_extract", {"path": "photo.png", "mime_type": "image/png"})
+            )
+        assert is_error is False
+        assert text == "Recognized via MCP"
+
+    def test_ocr_extract_tool_error_surfaces_as_is_error(self, tmp_path: Path):
+        ocr.set_upload_root(tmp_path)
+        with patch.object(ocr, "_is_apple_silicon", return_value=True):
+            text, is_error = asyncio.run(
+                _call_tool("ocr_extract", {"path": "ghost.png", "mime_type": "image/png"})
+            )
+        assert is_error is True
+        assert "file not found" in text

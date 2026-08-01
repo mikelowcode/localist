@@ -4,6 +4,15 @@ session_files.py — Ephemeral per-session file cache for LORA chat attachments.
 Stores uploaded text file content in a process-lifetime dict. Content is
 cleared on backend restart. No persistence, no wiki ingestion, no embedding.
 
+Image (incl. HEIC) and PDF extensions in ALLOWED_EXTENSIONS are text by the
+time they reach add_file() — main.py's POST /chat/files routes them through
+the local ocr_extract MCP tool first (Apple Vision + PyMuPDF, see
+mcp_server/ocr.py) and hands this module the extracted text, same as any
+other upload. This module has no OCR/image awareness at all — the whole
+point of that design (see docs/architecture/22-local-ocr-service.md) is
+that once content is text, it's just text here: same budget, same cache,
+same prompt-assembly slot.
+
 Public API
 ----------
 add_file(filename, content, source="upload") -> None | str
@@ -47,6 +56,10 @@ ALLOWED_EXTENSIONS: frozenset[str] = frozenset({
     ".yaml", ".yml", ".toml", ".sh", ".env", ".csv", ".xml",
     ".html", ".css", ".rs", ".go", ".rb", ".java", ".c", ".cpp",
     ".h", ".hpp", ".sql",
+    # OCR'd via mcp_server/ocr.py before reaching add_file() — see module
+    # docstring. Must stay in sync with main.py's _OCR_MIME_BY_EXTENSION
+    # and ChatPanel.svelte's ALLOWED_EXTENSIONS.
+    ".png", ".jpg", ".jpeg", ".webp", ".heic", ".pdf",
 })
 
 MAX_FILE_TOKENS:  int = 4_000

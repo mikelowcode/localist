@@ -24,7 +24,12 @@ mcp_server/ollama_web_search.py), and ollama_web_fetch (Ollama Cloud's web
 fetch API — a fallback-only tier underneath the Planner-facing url_fetch
 tool when the in-process fetch_url extraction fails; no primary mode, no
 Planner visibility, see ollama-web-search-mcp-tool-scoping.md §5 and
-mcp_server/ollama_web_fetch.py) — over SSE transport, using
+mcp_server/ollama_web_fetch.py), and ocr_extract (local text extraction from
+uploaded images — including HEIC — and PDFs via Apple's Vision framework
+and PyMuPDF, entirely independent of whichever chat inference backend is
+active; never planner-routed, called directly by backend/main.py's
+POST /chat/files at upload time — see mcp_server/ocr.py and
+docs/architecture/22-local-ocr-service.md) — over SSE transport, using
 the official `mcp` Python SDK's FastMCP. See backend/mcp_tool_dispatcher.py
 for the dispatch seam.
 
@@ -79,6 +84,17 @@ Configuration
                                corresponding account permission exists).
   (no key needed for hacker_news_search — Algolia's HN Search API is
    public and unauthenticated; see mcp_server/hacker_news.py.)
+  LOCALIST_MCP_UPLOAD_ROOT      Sandbox root for ocr_extract's temp uploaded
+                               images/PDFs. Leave blank to default to
+                               backend/ (parent of this package), same
+                               convention as LOCALIST_MCP_PROJECT_ROOT — see
+                               mcp_server/ocr.py.
+  LOCALIST_OCR_MAX_PDF_PAGES     Page cap for ocr_extract's rasterize+OCR
+                               fallback path (scanned PDFs only — a real
+                               text layer is read directly regardless of
+                               page count). Default 20 if unset/invalid.
+  (no key needed for ocr_extract — Apple's Vision framework is local and
+   requires no account/network; macOS on Apple Silicon only.)
   OLLAMA_API_KEY                Required for ollama_web_search and
                                ollama_web_fetch — see
                                mcp_server/ollama_web_search.py and
@@ -123,6 +139,7 @@ from mcp_server import (
     github as _github,
     hacker_news as _hacker_news,
     news_search as _news_search,
+    ocr as _ocr,
     ollama_web_fetch as _ollama_web_fetch,
     ollama_web_search as _ollama_web_search,
     url_fetch as _url_fetch,
@@ -222,13 +239,19 @@ async def hacker_news_search(query: str, url: str | None = None) -> dict:
     return await _hacker_news.hacker_news_search(query, url)
 
 
+@mcp.tool()
+def ocr_extract(path: str, mime_type: str, max_pdf_pages: int | None = None) -> str:
+    """Extract text from an uploaded image (incl. HEIC) or PDF via Apple's Vision framework and PyMuPDF, entirely locally. path is resolved relative to upload_root and sandboxed."""
+    return _ocr.extract_text(path, mime_type, max_pdf_pages)
+
+
 # ── App ──────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(
-        "Localist MCP Server starting on port 8003 — project_root=%s",
-        file_ops.get_project_root(),
+        "Localist MCP Server starting on port 8003 — project_root=%s upload_root=%s",
+        file_ops.get_project_root(), _ocr.get_upload_root(),
     )
     yield
     logger.info("Localist MCP Server shutting down.")
@@ -236,7 +259,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title       = "Localist MCP Server",
-    description = "MCP tool server for Localist — file_op tools (read_file/write_file/append_file), fetch_url, web_search, news_search, generate_chart, github_search/github_read/github_release, hacker_news_search, ollama_web_search, and ollama_web_fetch.",
+    description = "MCP tool server for Localist — file_op tools (read_file/write_file/append_file), fetch_url, web_search, news_search, generate_chart, github_search/github_read/github_release, hacker_news_search, ollama_web_search, ollama_web_fetch, and ocr_extract.",
     version     = "1.0.0",
     lifespan    = lifespan,
 )

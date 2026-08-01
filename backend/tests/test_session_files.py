@@ -71,6 +71,28 @@ class TestAddFileWikiPin:
         assert "not supported" in error
 
 
+class TestOcrExtensionsAllowed:
+    """Extensions routed through the local ocr_extract MCP tool (Phase 1-4,
+    docs/architecture/22-local-ocr-service.md). By the time add_file() sees
+    these, main.py has already replaced the raw bytes with OCR'd text —
+    this module has no OCR awareness at all, so a plain string is all
+    these tests need to prove the allowlist accepts them."""
+
+    def test_image_and_pdf_extensions_are_accepted(self):
+        for filename in ("photo.png", "photo.jpg", "photo.jpeg", "photo.webp", "photo.heic", "scan.pdf"):
+            error = session_files.add_file(filename, "extracted OCR text")
+            assert error is None, f"{filename} should be accepted, got: {error}"
+
+        files = {f.filename for f in session_files.get_files()}
+        assert files == {"photo.png", "photo.jpg", "photo.jpeg", "photo.webp", "photo.heic", "scan.pdf"}
+
+    def test_still_subject_to_normal_budget_rules(self):
+        oversized = "x" * ((session_files.MAX_FILE_TOKENS + 1) * session_files._CHARS_PER_TOKEN)
+        error = session_files.add_file("huge-scan.pdf", oversized)
+        assert error is not None
+        assert "is too large" in error
+
+
 class TestGetFilesPreservesMixedSources:
 
     def test_upload_and_pin_coexist_with_correct_sources(self):

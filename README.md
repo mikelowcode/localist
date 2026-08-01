@@ -33,6 +33,10 @@ Localist UI ──HTTP──► FastAPI :8001
    └── MemoryManager (SQLite episodic + RAG)
 ```
 
+`ocr_extract` is also served by localist-mcp but bypasses this whole path — called directly by
+`POST /chat/files` at upload time (Apple Vision framework + PyMuPDF), never planner-routed and never
+reached via `MCPToolDispatcher`'s normal chat-turn dispatch; see Attachments below.
+
 ---
 
 ## Prerequisites
@@ -40,6 +44,7 @@ Localist UI ──HTTP──► FastAPI :8001
 - Python 3.13, Node.js
 - One runtime backend: oMLX (chat model on :8000, macOS Apple Silicon only), [Ollama](https://ollama.com) (local or Ollama Cloud, :11434, any OS), or Azure AI Foundry
 - MLX EmbeddingGemma (the default local embedding model) requires Apple Silicon; on other platforms, set `LOCALIST_EMBEDDING_MODEL` to an Ollama-served embedding model instead (or fall back to keyword-only retrieval)
+- OCR'd image/PDF chat uploads (see Attachments below) require macOS on Apple Silicon (Apple Vision framework); on other platforms those uploads are cleanly rejected with an explanatory error, everything else in the app is unaffected
 
 ## Installation
 
@@ -95,7 +100,7 @@ See `backend/.env.example` for the full list (embedding engine, wiki/raw directo
 
 **Live Feed** — a collapsible right-side panel (collapsed by default to a slim vertical tab) surfacing daily-update content outside the normal chat flow, with three blocks — Daily News Brief, Hacker News, and GitHub Watch Feed, in that order — each independently collapsible/expandable (state persisted across reloads) on top of the whole-panel collapse. The Daily News Brief block shows the latest cached World/National/Local + 3 user-chosen special-interest topics (home country, local-area keyword, and topic picker configured under Settings), with a "Daily News Brief Refresh" link that always fetches a fresh brief from NewsAPI. The Hacker News block shows the current top 10 stories (HN's public Firebase API, no key), each linking straight to the original article (or the HN discussion page itself for a self-post with no external link); a "Hacker News Refresh" link always fetches fresh. The GitHub Watch Feed block mirrors that same refresh-link pattern: it lists the repos you watch (GitHub's native Watch feature, via `GET /user/subscriptions`) and each one's latest release, cached in SQLite until the next explicit refresh; a missing `GITHUB_TOKEN` surfaces as a single inline "not configured" message rather than an error. Both the News Brief and Hacker News blocks additionally have a per-story "Ask about this" button that sends just that one item into the current chat conversation, pinned to it specifically (`news_search`'s/`hacker_news_search`'s `url` param) rather than trusting a fresh query to find the same story again — GitHub Watch has no such button, correctly, since it has no chat-callable tool behind it.
 
-**Attachments** — the paperclip in the chat UI uploads a local file into an ephemeral, session-scoped cache injected into every subsequent prompt; a second, bookmark-icon control pins an *existing wiki page* into the same cache instead, so asking Assistant to propose a diff against a specific page hands it the real, current file content rather than the model's own (possibly stale) memory of it. Either kind bypasses Planner routing and wiki indexing entirely for as long as it's attached, and clears on backend restart.
+**Attachments** — the "+" button in the chat UI uploads a local file into an ephemeral, session-scoped cache injected into every subsequent prompt. Text files, images (including HEIC), and PDFs are all supported: images and PDFs are OCR'd to plain text once at upload time by a local `ocr_extract` MCP tool (Apple Vision framework for images, PyMuPDF for PDFs — text-layer extraction first, falling back to per-page rasterize+OCR for scanned PDFs) — entirely independent of whichever chat runtime backend is active, so the attach button works the same whether oMLX, Ollama, or Foundry is running. An "Extracting text…" state shows briefly (real OCR latency, not mocked) before the file lands in the same cache as a text upload — same budget, same prompt slot, no separate image handling anywhere downstream. A second, paperclip-icon control pins an *existing wiki page* into the same cache instead, so asking Assistant to propose a diff against a specific page hands it the real, current file content rather than the model's own (possibly stale) memory of it. Either kind bypasses Planner routing and wiki indexing entirely for as long as it's attached, and clears on backend restart.
 
 **Memory** — two SQLite-backed stores. Episodic memory captures typed facts (preferences, decisions, corrections, etc.) with confidence scores and a `pending → active → superseded/retracted` lifecycle; retrieval by subject, recency, or similarity — real cosine similarity where an embedding exists, hand-rolled Okapi BM25 keyword ranking otherwise (no embed_fn, or a stale corpus); retraction via semantic match, kept to a strict floor even in keyword-only mode since a false-positive retraction silently destroys the wrong memory. Every write scanned for prompt-injection/credential content before storing. A human-readable snapshot regenerates at `wiki/MEMORY.md`. The corpus (RAG) stores embeddings of wiki pages and documents, each following an OKF (Open Knowledge Framework)-aligned front-matter convention (`type` required; `title`/`description`/`resource`/`tags`/`timestamp` optional); the same cosine/BM25 split scores corpus retrieval, with results below a fixed relevance floor excluded only when the score is a genuine cosine similarity — a BM25 match is included on rank alone, since its raw score isn't on a comparable scale. A per-directory `index.md` and a dated `logs.md` changelog are deterministically regenerated from on-disk state after every write, never model-authored. `MEMORY.md`/`index.md`/`logs.md` are structural/generated files, always excluded from RAG indexing, the graph, and the attachment picker. A user profile (`wiki/users/user_name.md`) is embedded line-by-line and injected only where relevant (cosine ≥ 0.45).
 
@@ -127,7 +132,7 @@ localist/
 │   ├── news_brief.py            # Daily News Brief: NewsAPI calls, formatting (Live Feed panel)
 │   ├── github_watch.py          # GitHub Watch Feed: watched-repo releases (Live Feed panel)
 │   ├── hacker_news.py           # Hacker News: top-stories feed (Live Feed panel)
-│   ├── mcp_server/              # localist-mcp — port 8003 (web_search, fetch_url, file_op, generate_chart, news_search, github_search/github_read/github_release, hacker_news_search)
+│   ├── mcp_server/              # localist-mcp — port 8003 (web_search, fetch_url, file_op, generate_chart, news_search, github_search/github_read/github_release, hacker_news_search, ocr_extract)
 │   ├── wiki/                    # Persona, user profile, indexed pages, MEMORY.md/index.md/logs.md
 │   ├── tests/                   # Unit + integration tests by phase
 │   └── requirements.txt
@@ -172,6 +177,7 @@ Tests are organized by phase (memory substrate, routing, controller dispatch, ex
 - ✅ Generalize the bullet/diff-marker collision edge case
 - ✅ GitHub integration: Watch Feed Live Feed panel (watched-repo releases) + `github_search`/`github_read`/`github_release` crawl tools, the latter keyword-routable without a pasted URL
 - ✅ Hacker News integration: top-stories Live Feed panel block + `hacker_news_search` crawl tool (Algolia HN Search, URL-pinning + real comment grounding); per-block Live Feed collapse/expand
+- ✅ Local OCR service — chat image (incl. HEIC) and PDF uploads extracted to text at upload time via a local `ocr_extract` MCP tool (Apple Vision framework + PyMuPDF), independent of the active chat runtime backend
 
 **Open**
 - ⬜ macOS `.app` packaging via PyInstaller + Tauri

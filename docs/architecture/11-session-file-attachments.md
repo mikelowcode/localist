@@ -128,12 +128,14 @@ store. A future design pass is required: new `chat_turns` SQLite table, schema
 migration (v5 → v6), and Memory tab UI changes to surface chat history detail
 alongside a clear affordance. Not scoped.
 
-**Open Item 4 — PDF and image support.**
-oMLX and Gemma 4B natively support OCR, image, and PDF. The extension allowlist
-in `session_files.py` and the client-side set in `ChatPanel.svelte` are the only
-gate. Removing `.pdf` and image extensions from both and adding multipart/form-data
-content handling to the `POST /chat/files` endpoint is the full scope of the
-future work. Not scheduled.
+**Open Item 4 — PDF and image support. RESOLVED 2026-08-01.**
+Built differently than originally framed here: rather than routing through
+oMLX's native multimodal support (which would have tied the feature to one
+runtime backend), a dedicated local OCR tool (Apple Vision + PyMuPDF, entirely
+inference-engine-agnostic) extracts text from images and PDFs once at upload
+time. By the time content reaches this module, an OCR'd upload is plain text
+like any other — `ALLOWED_EXTENSIONS` widened, no other change needed here.
+Full design at §22.
 
 **Open Item 5 — UI freeze on tab navigation during in-flight streaming task; root
 cause unconfirmed, browser profiling required (2026-07-06).** A live incident: the

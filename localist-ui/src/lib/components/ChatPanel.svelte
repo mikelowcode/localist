@@ -19,6 +19,10 @@
     filename: string;
     tokenEstimate: number;
     source?: 'upload' | 'wiki_pin';
+    // True while an image/PDF upload's OCR extraction (mcp_server/ocr.py,
+    // routed via POST /chat/files) is still in flight — unlike a text
+    // upload's near-instant UTF-8 decode, this has real wall-clock latency.
+    extracting?: boolean;
   }
   let attachedFiles: AttachedFile[] = [];
   let fileInputEl: HTMLInputElement;
@@ -55,11 +59,17 @@
     }
   }
 
+  // OCR-routed extensions (mcp_server/ocr.py — Apple Vision + PyMuPDF) — a
+  // subset of ALLOWED_EXTENSIONS below. Must stay in sync with main.py's
+  // _OCR_MIME_BY_EXTENSION and session_files.py's ALLOWED_EXTENSIONS.
+  const OCR_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.heic', '.pdf']);
+
   const ALLOWED_EXTENSIONS = new Set([
     '.md', '.txt', '.py', '.ts', '.js', '.svelte', '.json',
     '.yaml', '.yml', '.toml', '.sh', '.env', '.csv', '.xml',
     '.html', '.css', '.rs', '.go', '.rb', '.java', '.c', '.cpp',
     '.h', '.hpp', '.sql',
+    ...OCR_EXTENSIONS,
   ]);
 
   async function handleFileSelect(e: Event) {
@@ -77,6 +87,15 @@
       return;
     }
 
+    // OCR (image/PDF) uploads have real wall-clock latency, unlike a text
+    // file's near-instant UTF-8 decode — show an "Extracting text…" pill
+    // immediately rather than leaving the attach button as the only
+    // feedback until the response comes back.
+    const isOcrUpload = OCR_EXTENSIONS.has(ext);
+    if (isOcrUpload) {
+      attachedFiles = [...attachedFiles, { filename: file.name, tokenEstimate: 0, extracting: true }];
+    }
+
     const form = new FormData();
     form.append('file', file);
 
@@ -84,11 +103,25 @@
       const res = await fetch('/api/chat/files', { method: 'POST', body: form });
       const body = await res.json();
       if (!res.ok) {
+        if (isOcrUpload) {
+          attachedFiles = attachedFiles.filter(f => !(f.filename === file.name && f.extracting));
+        }
         attachError = body.detail ?? `Upload failed (HTTP ${res.status}).`;
         return;
       }
-      attachedFiles = [...attachedFiles, { filename: body.filename, tokenEstimate: body.token_estimate }];
+      if (isOcrUpload) {
+        attachedFiles = attachedFiles.map(f =>
+          f.filename === file.name && f.extracting
+            ? { filename: body.filename, tokenEstimate: body.token_estimate }
+            : f
+        );
+      } else {
+        attachedFiles = [...attachedFiles, { filename: body.filename, tokenEstimate: body.token_estimate }];
+      }
     } catch (err) {
+      if (isOcrUpload) {
+        attachedFiles = attachedFiles.filter(f => !(f.filename === file.name && f.extracting));
+      }
       attachError = 'Could not reach the server. Is the backend running?';
     }
   }
@@ -517,30 +550,36 @@
     {#if attachedFiles.length > 0 || attachError}
       <div class="attached-files">
         {#each attachedFiles as f (f.filename)}
-          <span class="file-pill">
-            {#if f.source === 'wiki_pin'}
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-              </svg>
+          <span class="file-pill" class:file-pill-extracting={f.extracting}>
+            {#if f.extracting}
+              <span class="dot dot-success dot-pulse" aria-hidden="true" />
+              <span class="file-pill-name" title={f.filename}>{f.filename}</span>
+              <span class="file-pill-status">Extracting text…</span>
             {:else}
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <line x1="12" y1="5" x2="12" y2="19"/>
-                <line x1="5" y1="12" x2="19" y2="12"/>
-              </svg>
+              {#if f.source === 'wiki_pin'}
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                </svg>
+              {:else}
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <line x1="12" y1="5" x2="12" y2="19"/>
+                  <line x1="5" y1="12" x2="19" y2="12"/>
+                </svg>
+              {/if}
+              <span class="file-pill-name" title={f.filename}>{f.filename}</span>
+              <span class="file-pill-tokens">~{f.tokenEstimate.toLocaleString()}t</span>
+              <button
+                class="file-pill-remove"
+                on:click={() => removeAttachedFile(f.filename)}
+                aria-label="Remove {f.filename}"
+                title="Remove"
+              >
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
+                  <line x1="18" y1="6" x2="6" y2="18"/>
+                  <line x1="6" y1="6" x2="18" y2="18"/>
+                </svg>
+              </button>
             {/if}
-            <span class="file-pill-name" title={f.filename}>{f.filename}</span>
-            <span class="file-pill-tokens">~{f.tokenEstimate.toLocaleString()}t</span>
-            <button
-              class="file-pill-remove"
-              on:click={() => removeAttachedFile(f.filename)}
-              aria-label="Remove {f.filename}"
-              title="Remove"
-            >
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
-                <line x1="18" y1="6" x2="6" y2="18"/>
-                <line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
-            </button>
           </span>
         {/each}
         {#if attachError}
@@ -940,6 +979,16 @@
 
   .file-pill-tokens {
     color: var(--text-muted);
+    flex-shrink: 0;
+  }
+
+  .file-pill-extracting {
+    opacity: 0.85;
+  }
+
+  .file-pill-status {
+    color: var(--text-tertiary);
+    font-style: italic;
     flex-shrink: 0;
   }
 

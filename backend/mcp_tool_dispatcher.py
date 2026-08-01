@@ -449,6 +449,16 @@ class MCPToolDispatcher:
     ToolResult, same shape the legacy
     ToolDispatcher's "else" branch used to produce.
 
+    "ocr_extract" is also served by localist-mcp but is never planner-routed
+    at all — Planner's tools_to_call never names it. It exists solely for
+    backend/main.py's POST /chat/files to call directly at upload time
+    (dispatcher.dispatch(["ocr_extract"], "", {"ocr_file_path": ...,
+    "ocr_mime_type": ...})), reusing this same dispatch() entry point since
+    it already resolves real tool arguments from context when present (see
+    _run_file_op below) rather than requiring a natural-language instruction
+    to parse. See mcp_server/ocr.py and
+    docs/architecture/22-local-ocr-service.md.
+
     Parameters
     ----------
     runtime :
@@ -528,6 +538,10 @@ class MCPToolDispatcher:
                 if tool_name == "file_op":
                     results.append(
                         await self._run_file_op(session, connect_error, instruction, ctx)
+                    )
+                elif tool_name == "ocr_extract":
+                    results.append(
+                        await self._run_ocr_extract(session, connect_error, instruction, ctx)
                     )
                 elif tool_name == "url_fetch":
                     results.append(
@@ -688,6 +702,65 @@ class MCPToolDispatcher:
 
         return ToolResult(
             tool_name  = "file_op",
+            parameters = params_str,
+            result     = text,
+            success    = not is_error,
+        )
+
+    # -----------------------------------------------------------------------
+    # ocr_extract — served by localist-mcp. Never planner-routed (see class
+    # docstring); the caller always supplies both context values, never an
+    # instruction to parse.
+    # -----------------------------------------------------------------------
+
+    async def _run_ocr_extract(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        instruction:   str,
+        context:       dict[str, Any],
+    ) -> ToolResult:
+        file_path = context.get("ocr_file_path", "")
+        mime_type = context.get("ocr_mime_type", "")
+        params_str = f"path={file_path!r} mime_type={mime_type!r}"
+
+        if not file_path or not mime_type:
+            return ToolResult(
+                tool_name  = "ocr_extract",
+                parameters = params_str,
+                result     = "ERROR: ocr_file_path and ocr_mime_type must both be provided in context",
+                success    = False,
+            )
+
+        if session is None:
+            return ToolResult(
+                tool_name  = "ocr_extract",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {connect_error}",
+                success    = False,
+            )
+
+        try:
+            text, is_error = await self._call_mcp_tool(
+                session, "ocr_extract", {"path": file_path, "mime_type": mime_type}
+            )
+        except Exception as exc:
+            logger.warning(
+                "MCPToolDispatcher: localist-mcp unreachable for ocr_extract path=%r: %s",
+                file_path, exc,
+            )
+            return ToolResult(
+                tool_name  = "ocr_extract",
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {exc}",
+                success    = False,
+            )
+
+        if is_error:
+            text = _normalize_mcp_error_text(text)
+
+        return ToolResult(
+            tool_name  = "ocr_extract",
             parameters = params_str,
             result     = text,
             success    = not is_error,

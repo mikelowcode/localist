@@ -148,6 +148,8 @@ from conversational_agent import ConversationalAgent
 from embedding_engine import EmbeddingEngine
 import github_watch
 import hacker_news
+from mcp_server.ocr import get_upload_root as _ocr_upload_root
+from mcp_tool_dispatcher import MCPToolDispatcher
 from memory_manager import MemoryManager, EpisodicMemoryWriter, EpisodicMemoryReader
 import news_brief
 from runtime_factory import available_backends, create_runtime
@@ -2206,24 +2208,89 @@ async def post_wiki_apply_diff(body: ApplyDiffRequest) -> ApplyDiffResponse:
 # Chat file attachments (session-scoped, ephemeral, no wiki ingestion)
 # ---------------------------------------------------------------------------
 
+# Extensions routed through the local ocr_extract MCP tool (Apple Vision +
+# PyMuPDF, see mcp_server/ocr.py) instead of the UTF-8-decode path below.
+# Kept as an explicit map rather than mimetypes.guess_type() — .heic in
+# particular isn't reliably registered in the stdlib mimetypes database
+# across platforms, and this list must stay exactly in sync with
+# mcp_server/ocr.py's supported mime types (image/*, application/pdf) and
+# ChatPanel.svelte's ALLOWED_EXTENSIONS.
+_OCR_MIME_BY_EXTENSION: dict[str, str] = {
+    ".png":  "image/png",
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".heic": "image/heic",
+    ".pdf":  "application/pdf",
+}
+
+
+async def _extract_text_via_ocr(filename: str, raw: bytes, mime_type: str) -> str:
+    """
+    Write raw bytes to a temp file under the ocr_extract sandbox root
+    (mcp_server.ocr.get_upload_root() — imported directly so this process
+    and localist-mcp always agree on the same directory, rather than
+    duplicating LOCALIST_MCP_UPLOAD_ROOT resolution here) and OCR it via
+    MCPToolDispatcher, cleaning the temp file up afterward regardless of
+    outcome. Raises HTTPException(422) on any OCR failure — unsupported
+    platform, unreadable file, or near-empty extraction — same status code
+    the UTF-8-decode-failure branch below already uses for binary files.
+    """
+    upload_root = _ocr_upload_root()
+    tmp_name = f"{uuid.uuid4().hex}{os.path.splitext(filename)[1].lower()}"
+    tmp_path = upload_root / tmp_name
+    tmp_path.write_bytes(raw)
+
+    try:
+        dispatcher = MCPToolDispatcher(runtime=_require_runtime())
+        results = await asyncio.to_thread(
+            dispatcher.dispatch,
+            ["ocr_extract"],
+            "",
+            {"ocr_file_path": tmp_name, "ocr_mime_type": mime_type},
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    result = results[0]
+    if not result.success:
+        raise HTTPException(
+            status_code=422,
+            detail=f"'{filename}' could not be read — {result.result}",
+        )
+    return result.result
+
+
 @app.post("/chat/files")
 async def attach_chat_file(file: UploadFile = File(...)):
     """
-    Upload a text file into the ephemeral session file cache.
+    Upload a file into the ephemeral session file cache.
 
-    The file is read, decoded as UTF-8, and passed to session_files.add_file().
+    Text files are decoded as UTF-8 directly. Images (incl. HEIC) and PDFs
+    are routed through the local ocr_extract MCP tool instead — text is
+    extracted once at upload time, independent of whichever chat runtime
+    backend is active, then cached exactly like a text upload (same
+    session_files budget, no separate image cache). See
+    docs/architecture/22-local-ocr-service.md.
+
     Returns 200 + {filename, token_estimate} on success.
     Returns 400 + {detail} on rejection (type, size, or budget).
-    Returns 422 on encoding failure (binary/non-UTF-8 file).
+    Returns 422 on encoding failure (binary/non-UTF-8 text file) or OCR
+    failure (unsupported/unreadable image or PDF).
     """
     raw = await file.read()
-    try:
-        content = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        raise HTTPException(
-            status_code=422,
-            detail=f"'{file.filename}' could not be read as UTF-8 text. Binary files are not supported.",
-        )
+    ext = os.path.splitext(file.filename or "")[1].lower()
+
+    if ext in _OCR_MIME_BY_EXTENSION:
+        content = await _extract_text_via_ocr(file.filename, raw, _OCR_MIME_BY_EXTENSION[ext])
+    else:
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(
+                status_code=422,
+                detail=f"'{file.filename}' could not be read as UTF-8 text. Binary files are not supported.",
+            )
 
     error = session_files.add_file(file.filename, content)
     if error:
