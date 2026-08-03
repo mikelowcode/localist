@@ -216,7 +216,13 @@ class ConversationalAgent:
         max_tokens     = int(context.get("max_tokens",   1024))
         temperature    = float(context.get("temperature",  0.3))
         max_results    = int(context.get("max_results",   4))
-        system         = str(context.get("system", PromptBuilder._SYSTEM))
+        assistant_name = (
+            self._memory_manager.get_assistant_name()
+            if self._memory_manager is not None else None
+        )
+        system = str(
+            context.get("system") or _PROMPT_BUILDER._system_message(assistant_name)
+        )
 
         logger.info(
             "ConversationalAgent.run() — subtask=%s  chars=%d  max_results=%d  session_files=%d",
@@ -389,6 +395,7 @@ class ConversationalAgent:
             current_datetime = datetime.now().astimezone(),
             session_files    = _session_files.get_files(),
             rag_snippets     = rag_sources,
+            assistant_name   = assistant_name,
         )
 
         # -- Step 4: Inference -----------------------------------------------

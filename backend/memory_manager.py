@@ -151,7 +151,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION   = 13         # increment when schema changes require migration
+_SCHEMA_VERSION   = 14         # increment when schema changes require migration
 _EMBEDDING_DIM    = 768        # EmbeddingGemma-300M-4bit output dimension
 _EMBEDDING_FORMAT = ">768f"    # big-endian float32 × 768
 
@@ -177,6 +177,12 @@ _CHAT_TURNS_SEMANTIC_SCAN_WARN_ROW_COUNT = 2000
 
 # Closed set of valid retention_settings.eviction_preset values.
 _RETENTION_PRESETS: frozenset[str] = frozenset({"7d", "30d", "90d", "forever"})
+
+# Default assistant_settings.assistant_name when no row exists yet — the
+# spoken identity PromptBuilder falls back to, and what the Settings UI
+# shows before the user has ever changed it.
+_DEFAULT_ASSISTANT_NAME = "Localist"
+_ASSISTANT_NAME_MAX_LEN = 60
 
 # Seconds-per-preset for the retention sweep (sweep_expired_memory()). "forever"
 # is intentionally absent — it means "no sweep", not "sweep with an infinite TTL".
@@ -654,6 +660,11 @@ class MemoryManager:
                             content_json    TEXT    NOT NULL,
                             generated_at    REAL    NOT NULL
                         );
+
+                        CREATE TABLE IF NOT EXISTS assistant_settings (
+                            id              INTEGER PRIMARY KEY CHECK (id = 1),
+                            assistant_name  TEXT
+                        );
                     """)
 
                     conn.execute(
@@ -997,6 +1008,19 @@ class MemoryManager:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_episodes_created ON episodes (created_at)"
                 )
+
+        if from_version < 14:
+            logger.info(
+                "Applying migration v13→v14: creating assistant_settings table "
+                "(configurable assistant name, default %r).",
+                _DEFAULT_ASSISTANT_NAME,
+            )
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS assistant_settings (
+                    id              INTEGER PRIMARY KEY CHECK (id = 1),
+                    assistant_name  TEXT
+                );
+            """)
 
         conn.execute(
             "UPDATE schema_version SET version = ?", (_SCHEMA_VERSION,)
@@ -2130,6 +2154,72 @@ class MemoryManager:
                 )
                 conn.commit()
                 logger.info("set_retention_preset: preset=%r.", preset)
+            finally:
+                conn.close()
+
+    # -----------------------------------------------------------------------
+    # Assistant name  (Settings tab — user-configurable spoken identity)
+    # -----------------------------------------------------------------------
+
+    def get_assistant_name(self) -> str:
+        """
+        Read the current assistant name.
+
+        Unlike get_retention_preset(), always returns a usable string — the
+        default (_DEFAULT_ASSISTANT_NAME) when no row exists yet or the
+        stored value is NULL, never None. Callers (PromptBuilder call sites)
+        should never have to null-check this.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT assistant_name FROM assistant_settings WHERE id = 1"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if row is None or not row["assistant_name"]:
+            return _DEFAULT_ASSISTANT_NAME
+        return row["assistant_name"]
+
+    def set_assistant_name(self, name: str) -> None:
+        """
+        Insert or update the assistant name (row id=1).
+
+        Parameters
+        ----------
+        name :
+            Non-empty after stripping whitespace, at most
+            _ASSISTANT_NAME_MAX_LEN characters.
+
+        Raises
+        ------
+        ValueError
+            If name is empty/whitespace-only or exceeds the length cap.
+        """
+        stripped = name.strip()
+        if not stripped:
+            raise ValueError("assistant_name must not be empty.")
+        if len(stripped) > _ASSISTANT_NAME_MAX_LEN:
+            raise ValueError(
+                f"assistant_name must be at most {_ASSISTANT_NAME_MAX_LEN} "
+                f"characters (got {len(stripped)})."
+            )
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO assistant_settings (id, assistant_name)
+                    VALUES (1, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        assistant_name = excluded.assistant_name
+                    """,
+                    (stripped,),
+                )
+                conn.commit()
+                logger.info("set_assistant_name: name=%r.", stripped)
             finally:
                 conn.close()
 

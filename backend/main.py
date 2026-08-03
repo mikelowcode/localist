@@ -1048,6 +1048,16 @@ class RetentionSettingsRequest(BaseModel):
     eviction_preset: Literal["7d", "30d", "90d", "forever"]
 
 
+class AssistantNameResponse(BaseModel):
+    """Response body for GET/PUT /settings/assistant-name."""
+    assistant_name: str
+
+
+class AssistantNameRequest(BaseModel):
+    """Payload accepted by PUT /settings/assistant-name."""
+    assistant_name: str
+
+
 class ChatTurnItem(BaseModel):
     """A single chat_turns record returned by GET /chat/history."""
     id:                 int
@@ -2393,6 +2403,54 @@ async def put_retention_settings(
     await asyncio.to_thread(mm.set_retention_preset, request.eviction_preset)
     preset = await asyncio.to_thread(mm.get_retention_preset)
     return RetentionSettingsResponse(eviction_preset=preset)
+
+
+# ---------------------------------------------------------------------------
+# Assistant name  (Settings tab — user-configurable spoken identity)
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/settings/assistant-name",
+    response_model = AssistantNameResponse,
+    summary        = "Read the configured assistant name",
+)
+async def get_assistant_name_setting() -> AssistantNameResponse:
+    """
+    Return the current assistant name, defaulting to "Localist" when the
+    user has never set one.
+    """
+    mm = _require_memory_manager()
+    name = await asyncio.to_thread(mm.get_assistant_name)
+    return AssistantNameResponse(assistant_name=name)
+
+
+@app.put(
+    "/settings/assistant-name",
+    response_model = AssistantNameResponse,
+    summary        = "Set the assistant name",
+)
+async def put_assistant_name_setting(
+    request: AssistantNameRequest,
+) -> AssistantNameResponse:
+    """
+    Set the assistant name.
+
+    Persists to MemoryManager.assistant_settings, then invalidates
+    ControllerAgent's persona cache so the very next request re-fetches the
+    persona doc with the new name substituted in, rather than serving a
+    persona that still says the old one until the process restarts.
+    PromptBuilder's identity slot (Slot 1a) needs no separate invalidation —
+    it reads the name fresh on every build() call, never caches it.
+    """
+    mm = _require_memory_manager()
+    try:
+        await asyncio.to_thread(mm.set_assistant_name, request.assistant_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if _state.controller is not None:
+        _state.controller.invalidate_persona_cache()
+    name = await asyncio.to_thread(mm.get_assistant_name)
+    return AssistantNameResponse(assistant_name=name)
 
 
 # ---------------------------------------------------------------------------

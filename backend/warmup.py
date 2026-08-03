@@ -137,13 +137,19 @@ def run_cache_warmup(
         return
 
     # Step 2 — build the prompt. Persona is fetched via the controller's
-    # existing lazy-load path; falls back to None on any failure.
+    # existing lazy-load path; falls back to None on any failure. Same for
+    # assistant_name — resolved via the controller's own helper so the warm
+    # cache primes the identity string that will actually be used on the
+    # first real request (may be stale for one warmup cycle after a live
+    # name change; acceptable, see PUT /settings/assistant-name).
     try:
         persona = controller._load_persona()
+        assistant_name = controller._current_assistant_name()
         system_prompt, user_prompt = _WARMUP_BUILDER.build(
             instruction      = "Summarise the key themes from the tool results above.",
             current_datetime = datetime.now().astimezone(),
             persona          = persona,
+            assistant_name   = assistant_name,
             tool_results     = tool_results or None,
             working_memory   = working_memory or None,
         )

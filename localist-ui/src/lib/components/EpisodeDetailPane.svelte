@@ -4,6 +4,7 @@
   import DiffBlock from '$lib/components/DiffBlock.svelte';
   import WorkflowSteps from '$lib/components/WorkflowSteps.svelte';
   import EpisodeAnnotations from '$lib/components/EpisodeAnnotations.svelte';
+  import { assistantName } from '$lib/stores/assistantName';
 
   $: selected = $episodeTurns.find((t) => t.id === $selectedEpisodeId) ?? null;
 
@@ -36,7 +37,7 @@
 <div class="detail-pane">
   {#if selected}
     <div class="detail-header">
-      <span class="role-badge role-{selected.role}">{selected.role === 'user' ? 'You' : 'LORA'}</span>
+      <span class="role-badge role-{selected.role}">{selected.role === 'user' ? 'You' : $assistantName.assistant_name}</span>
       <span class="detail-date">{formatDate(selected.created_at)}</span>
     </div>
 

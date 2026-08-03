@@ -178,6 +178,7 @@ class TestFullPipeline:
 
         mm_mock = MagicMock()
         mm_mock.db_path = None                          # disable episodic hooks
+        mm_mock.get_assistant_name.return_value = "LORA"
         mm_mock.query_corpus.side_effect = query_side_effect
         mm_mock.get_context_window.return_value = []
 
@@ -208,6 +209,7 @@ class TestFullPipeline:
 
         mm_mock = MagicMock()
         mm_mock.db_path = None                          # disable episodic hooks
+        mm_mock.get_assistant_name.return_value = "LORA"
         mm_mock.query_corpus.return_value = [persona_doc]
         mm_mock.get_context_window.return_value = []
 

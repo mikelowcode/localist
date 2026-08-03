@@ -171,16 +171,22 @@ _WSU_TASK_INSTRUCTIONS = (
 )
 
 
-def _build_wsu_system(persona: str | None) -> str:
+def _build_wsu_system(persona: str | None, assistant_name: str | None = None) -> str:
     """
     Build the full system message for extract_working_state_update().
 
-    Prepends the same identity block that PromptBuilder._slot1_system(persona)
-    produces for the main conversational call, so oMLX's content-hash cache
-    treats both calls as the same block-0 lineage (§3.7c shared-prefix fix).
-    _WSU_TASK_INSTRUCTIONS follows after a double newline.
+    Prepends the same identity block that
+    PromptBuilder._slot1_system(persona, assistant_name) produces for the
+    main conversational call, so oMLX's content-hash cache treats both calls
+    as the same block-0 lineage (§3.7c shared-prefix fix) — callers must
+    pass the same assistant_name they resolved for the main call in the same
+    turn, or the two calls diverge and the cache-sharing trick silently
+    stops working. _WSU_TASK_INSTRUCTIONS follows after a double newline.
     """
-    return _PROMPT_BUILDER._slot1_system(persona) + "\n\n" + _WSU_TASK_INSTRUCTIONS
+    return (
+        _PROMPT_BUILDER._slot1_system(persona, assistant_name)
+        + "\n\n" + _WSU_TASK_INSTRUCTIONS
+    )
 
 # Per-bullet truncation ceiling for open_loops and recent_decisions entries.
 # Mirrors memory_manager._MAX_BULLET_CHARS (80 chars) — same 20-token convention.
@@ -904,6 +910,7 @@ def extract_working_state_update(
     previous_state: "WorkingStateRecord | None",
     runtime:        Any,
     persona:        "str | None" = None,
+    assistant_name: "str | None" = None,
 ) -> "tuple[str | None, list[str], list[str]] | None":
     """
     Extract updated Slot 6A Tier 2 fields from a conversation turn.
@@ -955,7 +962,7 @@ def extract_working_state_update(
     _t0 = time.perf_counter()
     try:
         raw = runtime.infer(
-            system      = _build_wsu_system(persona),
+            system      = _build_wsu_system(persona, assistant_name),
             prompt      = user_prompt,
             # §9.5 Open Item 4: live SSE inspection measured ~570-600 token
             # reasoning trace on this call; 200 caused deterministic
@@ -1036,12 +1043,13 @@ def extract_working_state_update(
 
 
 def process_working_state_update(
-    instruction: str,
-    response:    str,
-    mem_key:     str,
-    runtime:     Any,
-    db_path:     Any,   # Path
-    persona:     "str | None" = None,
+    instruction:    str,
+    response:       str,
+    mem_key:        str,
+    runtime:        Any,
+    db_path:        Any,   # Path
+    persona:        "str | None" = None,
+    assistant_name: "str | None" = None,
 ) -> "WorkingStateRecord | None":
     """
     Full working-state update pipeline: read → extract → resolve → write → return.
@@ -1069,6 +1077,10 @@ def process_working_state_update(
         RuntimeClient for the extraction inference call.
     db_path :
         Path to lora_memory.db.
+    persona, assistant_name :
+        Passed straight through to _build_wsu_system() so this call's
+        identity block matches the main conversational call's for the same
+        turn (§3.7c shared-prefix cache fix — see _build_wsu_system()).
 
     Returns
     -------
@@ -1108,6 +1120,7 @@ def process_working_state_update(
             previous_state = previous_state,
             runtime        = runtime,
             persona        = persona,
+            assistant_name = assistant_name,
         )
 
         # Read back diagnostic metadata set by extract_working_state_update().

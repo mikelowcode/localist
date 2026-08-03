@@ -11,6 +11,7 @@
     PAGE_SIZE,
     type EpisodeTurn
   } from '$lib/stores/episodeBrowser';
+  import { assistantName } from '$lib/stores/assistantName';
 
   function formatDate(ts: number): string {
     return new Date(ts * 1000).toLocaleString([], {
@@ -66,7 +67,7 @@
           on:click={() => selectTurn(turn.id)}
         >
           <div class="item-header">
-            <span class="role-badge role-{turn.role}">{turn.role === 'user' ? 'You' : 'LORA'}</span>
+            <span class="role-badge role-{turn.role}">{turn.role === 'user' ? 'You' : $assistantName.assistant_name}</span>
             <span class="item-date">{formatDate(turn.created_at)}</span>
           </div>
           <p class="item-content">{truncate(turn.content)}</p>

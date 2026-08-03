@@ -1275,10 +1275,10 @@ class TestBuildWSUSystem:
 
     _PB = PromptBuilder()
 
-    # 1. persona=None → output starts with PromptBuilder._SYSTEM; task instructions present.
+    # 1. persona=None → output starts with the identity string; task instructions present.
     def test_no_persona_starts_with_system_constant(self):
         result = _build_wsu_system(None)
-        assert result.startswith(PromptBuilder._SYSTEM)
+        assert result.startswith(self._PB._system_message())
         assert _WSU_TASK_INSTRUCTIONS in result
 
     # 2. persona present → leading portion is BYTE-IDENTICAL to _slot1_system(persona).

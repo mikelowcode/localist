@@ -23,8 +23,8 @@ Content stability ranking, most stable to least:
 
 | Rank | Content | Changes when |
 |---|---|---|
-| 1 | Identity constant | Never |
-| 2 | Persona | Wiki page updated |
+| 1 | Identity | User changes the assistant-name setting (`PUT /settings/assistant-name`) — added 2026-08-03, see Slot 1a below. Previously listed as "Never"; the identity *template* is still a constant, the name it's parameterized with is not. |
+| 2 | Persona | Wiki page updated, or the assistant-name setting changes (the persona's "You are {name}" line is re-substituted — see Slot 1b) |
 | 3 | Episodic memory | New episode written |
 | 4 | RAG snippets | Query topic changes |
 | 5 | Tool results | New tool call issued |
@@ -50,26 +50,67 @@ the user message in strict stability order.
 
 #### Slot 1a — Identity
 
-**Purpose:** Establishes who LORA is and how it reasons. The invariant
-anchor of every prompt. Never changes.
+**Purpose:** Establishes who the assistant is and how it reasons. The
+anchor of every prompt.
 
-**Token ceiling:** ~50 tokens (the canonical value is 43 tokens)
+**Updated 2026-08-03:** the assistant's name is now a user-configurable
+setting (default `"Localist"`), not a hardcoded constant. The surrounding
+template — behavioral constraint + epistemic stance — is still fixed and
+never changes; only the `{name}` it's parameterized with does, and only
+when the user explicitly changes it via the Settings page. This is a
+deliberate exception carved into the stability ranking above (Rank 1),
+not a design regression — see the KV-cache note below.
+
+**Token ceiling:** ~50 tokens (the canonical value is 43 tokens at the
+default name's length; a longer configured name eats into this budget,
+same as before — the ceiling remains advisory, not hard-enforced)
 
 **Content:** Identity name, core behavioral constraint, epistemic stance.
 
-**Canonical value:**
+**Canonical template** (`PromptBuilder._SYSTEM_TEMPLATE`):
 ```
-You are LORA, a local research assistant. You reason carefully, cite your
+You are {name}, a local research assistant. You reason carefully, cite your
 sources, and acknowledge when you don't know something. You do not simulate
 certainty.
 ```
 
+With the default name substituted (`PromptBuilder._DEFAULT_ASSISTANT_NAME
+= "Localist"`):
+```
+You are Localist, a local research assistant. You reason carefully, cite
+your sources, and acknowledge when you don't know something. You do not
+simulate certainty.
+```
+
 **Rules:**
-- This is a constant defined in `PromptBuilder._SYSTEM`. It is never
-  modified at runtime.
-- Keep it minimal. Every token here is cached unconditionally by all
-  backends — there is no cost to including it, but expanding it narrows
-  the headroom for dynamic slots.
+- The template is a constant defined in `PromptBuilder._SYSTEM_TEMPLATE`.
+  It is never modified at runtime. The name is resolved by each caller
+  (`ControllerAgent`, `ConversationalAgent`, `warmup.py`) from
+  `MemoryManager.get_assistant_name()` and passed into
+  `PromptBuilder.build(assistant_name=...)` / `_slot1_system(persona,
+  assistant_name)` on every call — `PromptBuilder` itself stays free of
+  any DB dependency and has no memory of the name between calls.
+  `assistant_name=None` (no `MemoryManager`, e.g. `ConversationalAgent`'s
+  ephemeral-memory mode) falls back to `_DEFAULT_ASSISTANT_NAME`.
+- Persisted in a one-row `assistant_settings` SQLite table
+  (`MemoryManager.get_assistant_name()`/`set_assistant_name()`), following
+  the same precedent as `retention_settings` — plain GET/PUT, no
+  health-check, no runtime-object rebuild, since this is a string
+  preference, not an external-service switch (contrast §16.5's
+  `/settings/runtime-backend`).
+- Changing the name is a real, immediate KV-cache cost: it invalidates
+  the stable system-message prefix (Slot 1a + 1b together — see §3.7a),
+  so the very next request after a change is a guaranteed full cache miss
+  on the system message. This is accepted as the same cost class as an
+  ordinary persona edit already had before this change — not a new
+  regression, just a second, user-triggerable way to pay it.
+  `ControllerAgent.invalidate_persona_cache()` is called by
+  `PUT /settings/assistant-name` so the change takes effect on the very
+  next request rather than waiting for the persona cache to notice on
+  its own (see Slot 1b).
+- Keep the template minimal. Every token here is cached unconditionally
+  by all backends — there is no cost to including it, but expanding it
+  narrows the headroom for dynamic slots.
 
 ---
 
@@ -86,9 +127,9 @@ when the wiki page exceeds this budget.
 is added; the persona content is inserted raw:
 
 ```
-You are LORA, a local research assistant. You reason carefully, cite your
-sources, and acknowledge when you don't know something. You do not simulate
-certainty.
+You are Localist, a local research assistant. You reason carefully, cite
+your sources, and acknowledge when you don't know something. You do not
+simulate certainty.
 
 {persona content from wiki/lora-persona.md}
 ```
@@ -105,8 +146,28 @@ As of the 2026-06-20 rewrite, `wiki/lora-persona.md` is five plain prose sentenc
 - WikiAgent's XML-only system prompt is a protected contract. WikiAgent
   does not pass `persona=` and never receives Slot 1b. See §3.5.
 - The persona must remain byte-stable within a session. Re-querying the
-  corpus on every turn would break prefix caching. The cache is
-  invalidated only when WikiAgent writes a new persona page.
+  corpus on every turn would break prefix caching.
+- **Updated 2026-08-03 — cache invalidation is now real, not aspirational.**
+  This bullet previously claimed the cache "is invalidated only when
+  WikiAgent writes a new persona page" — no code implementing that
+  existed anywhere in the codebase at the time; it was aspirational, not
+  a description of actual behavior. Real invalidation now exists, keyed
+  on the assistant name: `_load_persona()` tracks which name the cached
+  persona was last substituted with (`self._persona_cache_name`) and
+  compares it against `MemoryManager.get_assistant_name()`'s current value
+  on every call — a mismatch clears `self._persona_cache` and re-fetches.
+  `ControllerAgent.invalidate_persona_cache()` additionally lets
+  `PUT /settings/assistant-name` force this immediately rather than
+  waiting for the next `_load_persona()` call to notice on its own. A
+  future WikiAgent-write-triggered invalidation (the originally aspired
+  behavior) is not yet built.
+- `wiki/lora-persona.md`'s "You are LORA" line is a **substitution
+  target**, not hand-edited prose: `_load_persona()` does
+  `body.replace("LORA", assistant_name)` at cache-fill time — the exact
+  same mechanism already used for the `LangSearch` → provider-label swap
+  (see `_web_search_provider_label()` immediately below). The literal
+  string "LORA" staying in the source file is correct; it is the pattern
+  being matched, not a value to update by hand.
 - `lora-persona.md` is filtered from RAG results — it is already in the
   system message and must not appear twice in Slot 4.
 - `_load_persona()` fetches top-3 corpus results and filters by
@@ -639,6 +700,7 @@ class PromptBuilder:
         instruction:      str,
         current_datetime: datetime,
         persona:          str | None            = None,
+        assistant_name:   str | None            = None,  # added 2026-08-03, see Slot 1a
         episodic_summary: list[EpisodeBullet]   | None = None,
         rag_snippets:     list[RagSource]        | None = None,
         tool_results:     list[ToolResult]       | None = None,
@@ -653,6 +715,12 @@ class PromptBuilder:
         `datetime.now().astimezone()` on every call; PromptBuilder never
         reads the system clock itself (see Slot DT).
 
+        assistant_name: resolved by the caller from
+        `MemoryManager.get_assistant_name()` and interpolated into Slot 1a's
+        template. None falls back to `_DEFAULT_ASSISTANT_NAME` ("Localist").
+        PromptBuilder itself has no DB dependency and holds no memory of
+        this value between calls — see Slot 1a.
+
         emit_structured_working_memory: opt-in, default False (reproduces
         the 2-tuple return below exactly). When True, Slot 6 is omitted
         from user_prompt and returned instead as a third tuple element —
@@ -663,8 +731,9 @@ class PromptBuilder:
         Returns
         -------
         (system_prompt, user_prompt)
-            system_prompt : Slots 1a + 1b. Byte-stable when persona is
-                            unchanged — maximises KV-cache prefix reuse.
+            system_prompt : Slots 1a + 1b. Byte-stable when persona and
+                            assistant_name are both unchanged — maximises
+                            KV-cache prefix reuse.
             user_prompt   : Slot DT, then Slots 3–7 in stability order.
                             Slot DT is always present; empty optional
                             slots are omitted cleanly — no label, no
@@ -683,10 +752,12 @@ class PromptBuilder:
 ### 3.5 WikiAgent Prompt Exception
 
 WikiAgent's system prompt is a protected contract: a compact XML-only
-instruction block that must not be replaced by `PromptBuilder._SYSTEM` or
-extended with a persona. WikiAgent calls `PromptBuilder.build()` with
-`instruction=` only. The returned `system_prompt` is discarded; WikiAgent
-passes its own `SYSTEM_PROMPT` constant to `runtime.infer()` directly.
+instruction block that must not be replaced by `PromptBuilder`'s identity
+slot (`_SYSTEM_TEMPLATE`, renamed 2026-08-03 from `_SYSTEM` — see Slot 1a)
+or extended with a persona. WikiAgent calls `PromptBuilder.build()` with
+`instruction=` only (no `assistant_name=`, either). The returned
+`system_prompt` is discarded; WikiAgent passes its own `SYSTEM_PROMPT`
+constant to `runtime.infer()` directly.
 
 This exception is intentional and permanent.
 
@@ -819,7 +890,7 @@ Both options are **superseded by the single-turn-request finding**, not rejected
 
 This contract is the canonical boundary between cached and per-turn content. It is enforced by an automated test (`tests/test_prompt_builder.py`, `test_pb_e_build_enforces_dynamic_suffix_slot_order`) so that any future change to slot order is a deliberate, reviewed decision rather than a silent regression.
 
-**Stable prefix** (system message, passed as `system=`): Slot 1a (identity) + Slot 1b (persona). Byte-identical for the lifetime of a session once persona is cached by `ControllerAgent._load_persona()`. No new slot is introduced. "Static rules" is not a separate artifact — it denotes invariant scaffolding that may be written directly into `lora-persona.md` as plain prose, blended with voice and style content, with no internal section headers and no structural separation from the rest of the persona text. Persona may grow to absorb this kind of durable, non-instruction-dependent content, with no soft checkpoint or review threshold below the cap. The only constraint is the existing hard ceiling, `_CEIL_PERSONA = 500` tokens / 2000 chars in `prompt_builder.py`, which is unchanged and still governs KV-cache prefix stability. Current actual persona size: ~476 chars / ~119 tokens (roughly 24% of the cap) — substantial headroom (~381 tokens) exists.
+**Stable prefix** (system message, passed as `system=`): Slot 1a (identity) + Slot 1b (persona). Byte-identical for the lifetime of a session once persona is cached by `ControllerAgent._load_persona()` — **updated 2026-08-03:** and unchanged since the last assistant-name change, if any. Slot 1a's name is a user setting (`MemoryManager.get_assistant_name()`, default `"Localist"`, see Slot 1a above), not a true constant; changing it invalidates the persona cache (`ControllerAgent.invalidate_persona_cache()`) and forces a fresh substitution, which is a real full-prefix cache miss on the next request — the same cost class the wiki-page-update case already had, just now user-triggerable directly. No new slot is introduced. "Static rules" is not a separate artifact — it denotes invariant scaffolding that may be written directly into `lora-persona.md` as plain prose, blended with voice and style content, with no internal section headers and no structural separation from the rest of the persona text. Persona may grow to absorb this kind of durable, non-instruction-dependent content, with no soft checkpoint or review threshold below the cap. The only constraint is the existing hard ceiling, `_CEIL_PERSONA = 500` tokens / 2000 chars in `prompt_builder.py`, which is unchanged and still governs KV-cache prefix stability. Current actual persona size: ~476 chars / ~119 tokens (roughly 24% of the cap) — substantial headroom (~381 tokens) exists.
 
 **Dynamic suffix** (user message): Slot 3a (episodic) → Slot 3b (profile) → Slot 4 (RAG) → Slot 5 (tool results) → Slot 6 (working memory) → Slot 7 (instruction). This order is unchanged from the existing implementation and is preserved deliberately — it reflects conceptual layering (contextualizers → evidence providers → conversation scaffolding → instruction), not cache eligibility. Episodic and profile facts are *not* eligible to move into the stable prefix: profile is re-scored per turn via live cosine similarity; episodic presence is gated by routing path and session state. Freezing either into the prefix would defeat their purpose.
 
@@ -1087,7 +1158,9 @@ has practical cache value if it's long enough to cover a meaningful portion
 of block 0: `lora-persona.md` was grown from ~476 chars (~119 tokens) to
 1,951 chars (~487 tokens) — real, previously-authored content (an earlier
 draft of the persona, trimmed back down to fit the existing 500-token
-`_CEIL_PERSONA` ceiling) rather than invented padding. `_SYSTEM` (160 chars)
+`_CEIL_PERSONA` ceiling) rather than invented padding. `_SYSTEM` (160 chars
+— since renamed to `_SYSTEM_TEMPLATE` and parameterized by assistant name,
+2026-08-03; this measurement used the then-hardcoded "LORA", see Slot 1a)
 + this persona lands at ~528 tokens combined — 16 tokens past the 512-token
 block-0 boundary, meaning block 0 is now covered entirely by content
 genuinely shared across all three call sites, with a small uncontested
@@ -1162,7 +1235,8 @@ cross-check. The result is negative — documented here in full so it is not mis
 1. **Persona content and combined system-message length independently re-confirmed,
    byte-exact, from three separate sources this session:** `cat`'d directly from
    `wiki/lora-persona.md` (1,951 chars, matching the implementation record above exactly);
-   reconstructing `_SYSTEM + "\n\n" + persona` from this disk content produces exactly
+   reconstructing `_SYSTEM + "\n\n" + persona` (`_SYSTEM` since renamed to
+   `_SYSTEM_TEMPLATE`, 2026-08-03 — see Slot 1a) from this disk content produces exactly
    **2,113 characters**, matching both a real live backend log's own `system_chars=2113`
    debug field (from a `13:19:04` conversational turn this session) and an independently
    built `/admin/api/cache/probe` payload. All three agree exactly — there is no remaining

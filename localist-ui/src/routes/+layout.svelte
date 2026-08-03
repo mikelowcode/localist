@@ -9,6 +9,7 @@
   import { theme } from '$lib/stores/theme';
   import { sidebarWidth, sidebarCollapsed } from '$lib/stores/sidebar';
   import { previewsPanelCollapsed } from '$lib/stores/previewsPanel';
+  import { loadAssistantName } from '$lib/stores/assistantName';
 
   // #app-shell is the CSS grid container that sizes the sidebar/previews
   // columns; it lives in app.html outside this component's own DOM subtree,
@@ -28,6 +29,7 @@
       document.documentElement.setAttribute('data-theme', $theme);
     }
     startHealthPolling();
+    loadAssistantName();
   });
 
   onDestroy(() => {

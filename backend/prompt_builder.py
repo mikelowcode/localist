@@ -187,18 +187,25 @@ class PromptBuilder:
     - Stateless. Safe to call from multiple threads concurrently.
     - Callers pass full content; PromptBuilder enforces all token ceilings.
     - Empty optional slots produce no output whatsoever — not even a newline.
-    - Slot 1a is a constant. It is never overridden by callers.
+    - Slot 1a's template is a constant, never overridden by callers. The
+      assistant name it's parameterized with is not a constant — it's a
+      user setting (MemoryManager.get_assistant_name()) callers resolve and
+      pass in as `assistant_name`; omitting it falls back to
+      _DEFAULT_ASSISTANT_NAME.
     """
 
     # -----------------------------------------------------------------------
     # Slot 1a — canonical system prompt (§3.2, Slot 1)
-    # Ceiling: 50 tokens = 200 chars. This value is 174 chars / ~43 tokens.
+    # Ceiling: 50 tokens = 200 chars. This value is 174 chars / ~43 tokens
+    # at the default name's length; a longer configured name eats into that
+    # budget but the ceiling stays advisory, same as before.
     # -----------------------------------------------------------------------
-    _SYSTEM: str = (
-        "You are LORA, a local research assistant. "
+    _SYSTEM_TEMPLATE: str = (
+        "You are {name}, a local research assistant. "
         "You reason carefully, cite your sources, and acknowledge when you "
         "don't know something. You do not simulate certainty."
     )
+    _DEFAULT_ASSISTANT_NAME: str = "Localist"
 
     # -----------------------------------------------------------------------
     # Token ceilings (in tokens; multiply by 4 for char equivalent)
@@ -250,18 +257,35 @@ class PromptBuilder:
     # Slot builders (private)
     # -----------------------------------------------------------------------
 
-    def _slot1_system(self, persona: str | None = None) -> str:
+    def _system_message(self, assistant_name: str | None = None) -> str:
+        """
+        Return Slot 1a's identity string, interpolated with assistant_name.
+
+        Falls back to _DEFAULT_ASSISTANT_NAME when assistant_name is None
+        or empty — callers that don't resolve a name (or have no
+        MemoryManager to resolve one from) get today's default behavior.
+        """
+        return self._SYSTEM_TEMPLATE.format(
+            name=assistant_name or self._DEFAULT_ASSISTANT_NAME
+        )
+
+    def _slot1_system(
+        self,
+        persona: str | None = None,
+        assistant_name: str | None = None,
+    ) -> str:
         """
         Return Slot 1: system prompt, optionally with persona appended.
 
-        When persona is None or empty, returns the identity constant only.
+        When persona is None or empty, returns the identity string only.
         Otherwise appends the truncated persona (500-token ceiling) raw,
         separated by a double newline — no label is added.
         """
+        system = self._system_message(assistant_name)
         if not persona:
-            return self._SYSTEM
+            return system
         truncated = self._truncate_to_tokens(persona, self._CEIL_PERSONA)
-        return self._SYSTEM + "\n\n" + truncated
+        return system + "\n\n" + truncated
 
     def _slot_datetime(self, current_datetime: datetime) -> str:
         """
@@ -811,6 +835,7 @@ class PromptBuilder:
         current_datetime: datetime,
         session_files:    list[SessionFile]        | None = None,
         persona:          str | None              = None,
+        assistant_name:   str | None              = None,
         episodic_summary: list[EpisodeBullet]     | None = None,
         profile_facts:    list[UserProfileFact]   | None = None,
         rag_snippets:     list[RagSource]          | None = None,
@@ -845,6 +870,11 @@ class PromptBuilder:
         persona :
             Optional persona string (Slot 1b). Injected into the system
             message when provided; 500-token ceiling enforced.
+        assistant_name :
+            Optional assistant name (Slot 1a). Interpolated into the
+            identity template — callers resolve this from
+            MemoryManager.get_assistant_name() and pass it in; None falls
+            back to _DEFAULT_ASSISTANT_NAME ("Localist").
         episodic_summary :
             Pre-sorted EpisodeBullet list (Slot 3a). Caller is responsible
             for priority ordering. Pass None or [] to omit.
@@ -929,7 +959,7 @@ class PromptBuilder:
                             ordered oldest-first. [] when `working_memory`
                             is None/empty or nothing survives the ceiling.
         """
-        system_prompt = self._slot1_system(persona)
+        system_prompt = self._slot1_system(persona, assistant_name)
 
         working_memory_turns: list[Turn] | None = None
         if emit_structured_working_memory:

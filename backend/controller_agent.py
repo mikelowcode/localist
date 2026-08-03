@@ -799,6 +799,11 @@ class ControllerAgent:
         # IntentClassifier retired — routing is now handled by _RulePlanner
         self._memory_manager = memory_manager   # None → use ephemeral shim per request
         self._persona_cache: str | None = None
+        # Assistant name the cached persona was substituted with — compared
+        # against the current setting on every _load_persona() call so a
+        # name change invalidates the cache instead of serving a persona
+        # that still says the old name. None until the first successful load.
+        self._persona_cache_name: str | None = None
 
         # LOCALIST_EPISODIC_WRITE_APPROVAL (main.py Settings). When True,
         # model_extracted episodes (process_implicit_extraction()) are
@@ -848,15 +853,34 @@ class ControllerAgent:
         name (e.g. "It returns real results from LangSearch."); that literal
         substring is swapped for the SEARCH_PROVIDER-derived label once here,
         at cache time, rather than baked into the static wiki doc — see
-        _web_search_provider_label(). An unrecognized SEARCH_PROVIDER raises
-        before the corpus fetch below, so it propagates as a real error
-        instead of being caught by the broad except clause and silently
-        downgrading to "proceeding without persona".
+        _web_search_provider_label(). Likewise, the persona's "You are LORA"
+        line is swapped for the current MemoryManager.get_assistant_name()
+        value — same mechanism, same call site.  An unrecognized
+        SEARCH_PROVIDER raises before the corpus fetch below, so it
+        propagates as a real error instead of being caught by the broad
+        except clause and silently downgrading to "proceeding without
+        persona".
+
+        Cache invalidation: the cache is keyed on the assistant name it was
+        substituted with (self._persona_cache_name). If the current setting
+        no longer matches, the cache is stale (it still says the old name)
+        and is cleared before the normal cache-hit check — so a name change
+        takes effect on the very next call, not just after a process
+        restart. invalidate_persona_cache() additionally allows an external
+        caller (the PUT /settings/assistant-name endpoint) to force this
+        immediately, without waiting for _load_persona() to notice on its
+        own.
         """
-        if self._persona_cache is not None:
-            return self._persona_cache
         if self._memory_manager is None:
             return None
+        assistant_name = self._memory_manager.get_assistant_name()
+        if (
+            self._persona_cache is not None
+            and self._persona_cache_name != assistant_name
+        ):
+            self._persona_cache = None
+        if self._persona_cache is not None:
+            return self._persona_cache
         provider_label = _web_search_provider_label()
         try:
             docs = self._memory_manager.query_corpus(
@@ -872,13 +896,17 @@ class ControllerAgent:
             if persona_doc is not None:
                 parsed = parse_wiki_doc(persona_doc.content)
                 body = parsed.body[:2000]
-                self._persona_cache = body.replace("LangSearch", provider_label)
+                body = body.replace("LangSearch", provider_label)
+                self._persona_cache = body.replace("LORA", assistant_name)
+                self._persona_cache_name = assistant_name
                 logger.debug(
                     "_load_persona: persona loaded and cached — "
-                    "path=%s  chars=%d  web_search_provider=%s",
+                    "path=%s  chars=%d  web_search_provider=%s  "
+                    "assistant_name=%s",
                     persona_doc.path,
                     len(self._persona_cache),
                     provider_label,
+                    assistant_name,
                 )
             else:
                 logger.warning(
@@ -891,6 +919,27 @@ class ControllerAgent:
                 "proceeding without persona.", exc,
             )
         return self._persona_cache
+
+    def invalidate_persona_cache(self) -> None:
+        """
+        Force the next _load_persona() call to re-fetch and re-substitute,
+        instead of waiting for it to notice the assistant name changed on
+        its own. Called by PUT /settings/assistant-name (main.py) so a name
+        change takes effect on the very next request.
+        """
+        self._persona_cache = None
+        self._persona_cache_name = None
+
+    def _current_assistant_name(self) -> str | None:
+        """
+        Resolve the configured assistant name for a PromptBuilder.build()
+        call, or None when there's no MemoryManager to resolve it from
+        (ephemeral-memory mode) — PromptBuilder falls back to its own
+        default in that case, same null-safety shape as _load_persona().
+        """
+        if self._memory_manager is None:
+            return None
+        return self._memory_manager.get_assistant_name()
 
     def _load_user_profile(self) -> None:
         """
@@ -1861,6 +1910,7 @@ class ControllerAgent:
             instruction      = task.instruction,
             current_datetime = datetime.now().astimezone(),
             persona          = self._load_persona(),
+            assistant_name   = self._current_assistant_name(),
             episodic_summary = episodic_bullets         or None,
             profile_facts    = profile_facts            or None,
             rag_snippets     = rag_sources              or None,
@@ -2131,12 +2181,13 @@ class ControllerAgent:
                 ws_response = results[0].output.get("answer", "")
                 if ws_response:
                     process_working_state_update(
-                        instruction = task.instruction,
-                        response    = ws_response,
-                        mem_key     = mem_key,
-                        runtime     = self._runtime,
-                        db_path     = db_path,
-                        persona     = self._load_persona(),
+                        instruction    = task.instruction,
+                        response       = ws_response,
+                        mem_key        = mem_key,
+                        runtime        = self._runtime,
+                        db_path        = db_path,
+                        persona        = self._load_persona(),
+                        assistant_name = self._current_assistant_name(),
                     )
             except Exception as exc:
                 logger.warning(
@@ -2497,6 +2548,7 @@ class ControllerAgent:
                         instruction      = task.instruction,
                         current_datetime = datetime.now().astimezone(),
                         persona          = self._load_persona(),
+                        assistant_name   = self._current_assistant_name(),
                         episodic_summary = episodic_bullets or None,
                         profile_facts    = profile_facts    or None,
                         rag_snippets     = rag_sources       or None,

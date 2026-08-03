@@ -5,6 +5,7 @@
   import { chatHistoryStore, type Turn } from '$lib/stores/chatHistory';
   import { currentConversationId, isFirstTurnOfConversation } from '$lib/stores/conversation';
   import { loadWikiFiles, wikiFiles, wikiLoading, wikiError } from '$lib/stores/files';
+  import { assistantName } from '$lib/stores/assistantName';
   import MarkdownRenderer from '$lib/components/MarkdownRenderer.svelte';
   import ChartRenderer from '$lib/components/ChartRenderer.svelte';
   import DiffBlock from '$lib/components/DiffBlock.svelte';
@@ -361,13 +362,13 @@
           </svg>
         </div>
         <p class="empty-title">Start a conversation</p>
-        <p class="empty-sub">Ask LORA a question or give an instruction to get started.</p>
+        <p class="empty-sub">Ask {$assistantName.assistant_name} a question or give an instruction to get started.</p>
       </div>
     {:else}
       {#each $chatHistoryStore as turn (turn.timestamp)}
         <div class="turn turn-{turn.role} fade-in">
           <div class="turn-meta">
-            <span class="turn-role">{turn.role === 'user' ? 'You' : 'LORA'}</span>
+            <span class="turn-role">{turn.role === 'user' ? 'You' : $assistantName.assistant_name}</span>
             <span class="turn-time">{formatTime(turn.timestamp)}</span>
           </div>
 
@@ -525,7 +526,7 @@
         bind:value={instruction}
         on:keydown={handleKeydown}
         on:input={autoResizeTextarea}
-        placeholder="Ask LORA a question or give an instruction…"
+        placeholder="Ask {$assistantName.assistant_name} a question or give an instruction…"
         rows="1"
         class="chat-input"
         aria-label="Message input"

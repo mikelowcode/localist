@@ -1948,6 +1948,7 @@ class TestLoadPersonaWikiDoc:
     def test_no_frontmatter_byte_identical(self):
         """Zero-behavior-change: plain content → cache equals content[:2000] exactly."""
         mm = MagicMock()
+        mm.get_assistant_name.return_value = "LORA"
         mm.query_corpus.return_value = [
             _mock_doc("/wiki/lora-persona.md", _LORA_PERSONA_CONTENT)
         ]
@@ -1970,6 +1971,7 @@ class TestLoadPersonaWikiDoc:
             "You are helpful, concise, and precise.\n"
         )
         mm = MagicMock()
+        mm.get_assistant_name.return_value = "LORA"
         mm.query_corpus.return_value = [
             _mock_doc("/wiki/lora-persona.md", content)
         ]
@@ -1988,6 +1990,7 @@ class TestLoadPersonaWikiDoc:
         monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
         content = "Web search fires automatically. It returns real results from LangSearch."
         mm = MagicMock()
+        mm.get_assistant_name.return_value = "LORA"
         mm.query_corpus.return_value = [
             _mock_doc("/wiki/lora-persona.md", content)
         ]
@@ -2002,6 +2005,7 @@ class TestLoadPersonaWikiDoc:
         monkeypatch.setenv("SEARCH_PROVIDER", "brave")
         content = "Web search fires automatically. It returns real results from LangSearch."
         mm = MagicMock()
+        mm.get_assistant_name.return_value = "LORA"
         mm.query_corpus.return_value = [
             _mock_doc("/wiki/lora-persona.md", content)
         ]
@@ -2021,6 +2025,72 @@ class TestLoadPersonaWikiDoc:
         with pytest.raises(ValueError, match="ERROR: unknown SEARCH_PROVIDER 'bing'"):
             ctrl._load_persona()
         mm.query_corpus.assert_not_called()
+
+    def test_assistant_name_substituted_into_persona(self):
+        """"You are LORA" in the persona doc is swapped for the configured name."""
+        mm = MagicMock()
+        mm.get_assistant_name.return_value = "Percy"
+        mm.query_corpus.return_value = [
+            _mock_doc("/wiki/lora-persona.md", _LORA_PERSONA_CONTENT)
+        ]
+
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        ctrl._load_persona()
+
+        assert "You are Percy," in ctrl._persona_cache
+        assert "You are LORA" not in ctrl._persona_cache
+
+    def test_name_change_invalidates_cache_on_next_load(self):
+        """A changed get_assistant_name() value re-fetches and re-substitutes."""
+        mm = MagicMock()
+        mm.get_assistant_name.return_value = "Percy"
+        mm.query_corpus.return_value = [
+            _mock_doc("/wiki/lora-persona.md", _LORA_PERSONA_CONTENT)
+        ]
+
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        first = ctrl._load_persona()
+        assert "You are Percy," in first
+        assert mm.query_corpus.call_count == 1
+
+        mm.get_assistant_name.return_value = "Ada"
+        second = ctrl._load_persona()
+
+        assert "You are Ada," in second
+        assert "Percy" not in second
+        assert mm.query_corpus.call_count == 2, (
+            "a name change must trigger a real re-fetch, not just re-serve "
+            "the stale cached string"
+        )
+
+    def test_unchanged_name_serves_cache_without_requerying(self):
+        """Same name across calls hits the cache — no redundant corpus query."""
+        mm = MagicMock()
+        mm.get_assistant_name.return_value = "Percy"
+        mm.query_corpus.return_value = [
+            _mock_doc("/wiki/lora-persona.md", _LORA_PERSONA_CONTENT)
+        ]
+
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        ctrl._load_persona()
+        ctrl._load_persona()
+
+        assert mm.query_corpus.call_count == 1
+
+    def test_invalidate_persona_cache_forces_requery(self):
+        """invalidate_persona_cache() clears the cache even when the name hasn't changed."""
+        mm = MagicMock()
+        mm.get_assistant_name.return_value = "Percy"
+        mm.query_corpus.return_value = [
+            _mock_doc("/wiki/lora-persona.md", _LORA_PERSONA_CONTENT)
+        ]
+
+        ctrl = ControllerAgent(runtime=make_runtime(), agents=[], memory_manager=mm)
+        ctrl._load_persona()
+        ctrl.invalidate_persona_cache()
+        ctrl._load_persona()
+
+        assert mm.query_corpus.call_count == 2
 
 
 # ---------------------------------------------------------------------------

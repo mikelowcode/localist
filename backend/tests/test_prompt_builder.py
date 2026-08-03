@@ -32,11 +32,11 @@ _FIXED_DT = datetime(2026, 7, 17, 10, 10, 0, tzinfo=timezone.utc)
 
 
 def test_pb_a_no_persona_system_is_identity_only():
-    """build() with no persona returns bare _SYSTEM as system_prompt."""
+    """build() with no persona returns bare identity string as system_prompt."""
     pb = PromptBuilder()
     system_prompt, user_prompt = pb.build(instruction="hello", current_datetime=_FIXED_DT)
 
-    assert system_prompt == PromptBuilder._SYSTEM
+    assert system_prompt == pb._system_message()
     assert "[INSTRUCTION]" in user_prompt
     assert "hello" in user_prompt
 
@@ -47,7 +47,7 @@ def test_pb_b_persona_appended_to_system_not_in_user():
     persona = "I am LORA, your assistant."
     system_prompt, user_prompt = pb.build(instruction="hello", persona=persona, current_datetime=_FIXED_DT)
 
-    assert system_prompt == PromptBuilder._SYSTEM + "\n\n" + persona
+    assert system_prompt == pb._system_message() + "\n\n" + persona
     assert "[INSTRUCTION]" in user_prompt
     assert "I am LORA" not in user_prompt
 
@@ -58,7 +58,7 @@ def test_pb_c_persona_truncated_at_ceiling():
     long_persona = "word " * 600   # 3000 chars >> 2000-char (500-token) ceiling
     system_prompt, _ = pb.build(instruction="x", persona=long_persona, current_datetime=_FIXED_DT)
 
-    assert len(system_prompt) < len(PromptBuilder._SYSTEM) + len(long_persona)
+    assert len(system_prompt) < len(pb._system_message()) + len(long_persona)
     assert "… [truncated]" in system_prompt
 
 
@@ -126,7 +126,7 @@ def test_pb_e_build_enforces_dynamic_suffix_slot_order():
     )
 
     # Stable-prefix / dynamic-suffix boundary: persona goes into system, not user.
-    assert PromptBuilder._SYSTEM in system_prompt
+    assert pb._system_message() in system_prompt
     assert persona in system_prompt
     assert persona not in user_prompt
 
@@ -159,6 +159,51 @@ def test_pb_f_slot3_profile_only_precedes_context():
         f"[USER PROFILE] must precede [CONTEXT] in dynamic suffix (§3.7a): "
         f"profile={profile_pos} ctx={ctx_pos}"
     )
+
+
+# ---------------------------------------------------------------------------
+# TestAssistantName — Slot 1a identity is parameterized, not a constant
+# ---------------------------------------------------------------------------
+
+class TestAssistantName:
+
+    def test_default_name_when_omitted(self):
+        """build() with no assistant_name falls back to _DEFAULT_ASSISTANT_NAME."""
+        pb = PromptBuilder()
+        system_prompt, _ = pb.build(instruction="hello", current_datetime=_FIXED_DT)
+
+        assert f"You are {PromptBuilder._DEFAULT_ASSISTANT_NAME}," in system_prompt
+
+    def test_configured_name_interpolated(self):
+        """build() with assistant_name substitutes it into the identity string."""
+        pb = PromptBuilder()
+        system_prompt, _ = pb.build(
+            instruction="hello", current_datetime=_FIXED_DT, assistant_name="Percy",
+        )
+
+        assert "You are Percy," in system_prompt
+        assert PromptBuilder._DEFAULT_ASSISTANT_NAME not in system_prompt
+
+    def test_empty_string_name_falls_back_to_default(self):
+        """An empty/falsy assistant_name is treated the same as None."""
+        pb = PromptBuilder()
+        system_prompt, _ = pb.build(
+            instruction="hello", current_datetime=_FIXED_DT, assistant_name="",
+        )
+
+        assert f"You are {PromptBuilder._DEFAULT_ASSISTANT_NAME}," in system_prompt
+
+    def test_name_and_persona_combine_in_system_prompt(self):
+        """assistant_name and persona are independent — both land in system_prompt."""
+        pb = PromptBuilder()
+        persona = "Speak in short sentences."
+        system_prompt, _ = pb.build(
+            instruction="hello", current_datetime=_FIXED_DT,
+            assistant_name="Percy", persona=persona,
+        )
+
+        assert "You are Percy," in system_prompt
+        assert persona in system_prompt
 
 
 # ---------------------------------------------------------------------------

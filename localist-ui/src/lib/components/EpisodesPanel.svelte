@@ -13,6 +13,7 @@
     TYPE_COLORS,
     type EpisodeItem,
   } from '$lib/stores/episodes';
+  import { assistantName } from '$lib/stores/assistantName';
 
   $: state     = $episodesStore;
   $: episodes  = state.episodes;
@@ -180,7 +181,7 @@
 
     {:else if episodes.length === 0}
       <div class="state-msg">
-        No episodes stored yet. LORA will learn from your conversations.
+        No episodes stored yet. {$assistantName.assistant_name} will learn from your conversations.
       </div>
 
     {:else}

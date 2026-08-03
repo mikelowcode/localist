@@ -31,6 +31,13 @@
     loadNewsPreferences,
     setNewsPreferences
   } from '$lib/stores/newsPreferences';
+  import {
+    assistantName,
+    assistantNameLoading,
+    assistantNameError,
+    loadAssistantName,
+    setAssistantName
+  } from '$lib/stores/assistantName';
 
   const EVICTION_PRESETS: { value: EvictionPreset; label: string }[] = [
     { value: '7d',      label: '7 days' },
@@ -46,6 +53,9 @@
       homeCountryInput = $newsPreferences.home_country;
       localQueryInput  = $newsPreferences.local_query ?? '';
       selectedTopics   = $newsPreferences.topics;
+    });
+    void loadAssistantName().then(() => {
+      assistantNameInput = $assistantName.assistant_name;
     });
   });
 
@@ -211,6 +221,28 @@
       newsSaveResult = city
         ? `Saved — Local area set to "${city}".`
         : 'Saved — Local area cleared.';
+    }
+  }
+
+  // Assistant name — form state mirrors the store, saved explicitly via the
+  // Save button (not on every keystroke), same convention as News Preferences.
+  let assistantNameInput = 'Localist';
+  let assistantNameSaveResult: string | null = null;
+
+  $: assistantNameUnchanged =
+    assistantNameInput.trim() === '' ||
+    assistantNameInput.trim() === $assistantName.assistant_name;
+
+  async function handleSaveAssistantName() {
+    assistantNameSaveResult = null;
+    const trimmed = assistantNameInput.trim();
+    if (!trimmed) {
+      assistantNameError.set('Assistant name must not be empty.');
+      return;
+    }
+    const ok = await setAssistantName(trimmed);
+    if (ok) {
+      assistantNameSaveResult = `Saved — now called "${$assistantName.assistant_name}".`;
     }
   }
 </script>
@@ -435,6 +467,39 @@
           {/if}
         </div>
       </div>
+    </section>
+
+    <!-- Assistant name -->
+    <section class="settings-card">
+      <div class="card-title">Assistant Name</div>
+      <p class="card-desc">
+        What the assistant calls itself in chat — updates the system prompt
+        and persona on save; takes effect on your very next message.
+      </p>
+
+      <label class="news-field-label" for="assistant-name-input">Name</label>
+      <input
+        id="assistant-name-input"
+        class="news-text-input"
+        type="text"
+        maxlength="60"
+        bind:value={assistantNameInput}
+        placeholder="Localist"
+      />
+
+      <button
+        type="button"
+        class="seg-btn news-save-btn"
+        disabled={$assistantNameLoading || assistantNameUnchanged}
+        on:click={handleSaveAssistantName}
+      >Save</button>
+
+      {#if assistantNameSaveResult}
+        <p class="card-hint">{assistantNameSaveResult}</p>
+      {/if}
+      {#if $assistantNameError}
+        <p class="card-hint" style="color:var(--error)">{$assistantNameError}</p>
+      {/if}
     </section>
 
     <!-- Data retention (chat history + episodes) -->
