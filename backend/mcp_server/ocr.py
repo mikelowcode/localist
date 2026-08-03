@@ -42,6 +42,23 @@ _MIN_EXTRACTED_CHARS: int = 3
 
 _DEFAULT_MAX_PDF_PAGES: int = 20
 
+# Extensions routed through ocr_extract instead of a plain UTF-8-decode/text
+# path — shared by main.py's /chat/files and /files/upload routing and by
+# WikiAgent's raw_path ingest routing, so all three callers agree on exactly
+# which extensions are OCR-eligible. Kept as an explicit map rather than
+# mimetypes.guess_type() — .heic in particular isn't reliably registered in
+# the stdlib mimetypes database across platforms. Must stay in sync with this
+# module's own supported mime types (image/*, application/pdf) and
+# ChatPanel.svelte's/Sidebar.svelte's OCR extension lists.
+OCR_MIME_BY_EXTENSION: dict[str, str] = {
+    ".png":  "image/png",
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".heic": "image/heic",
+    ".pdf":  "application/pdf",
+}
+
 _upload_root: Path | None = None
 
 

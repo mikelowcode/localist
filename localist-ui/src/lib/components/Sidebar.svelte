@@ -21,6 +21,7 @@
     type FileEntry,
   } from '$lib/stores/files';
   import { selectedFile, selectFile, closeFile } from '$lib/stores/fileSelection';
+  import { OCR_EXTENSIONS, extOf } from '$lib/utils/ocr';
 
   $: active = $page.url.pathname;
   $: isChatActive  = active.startsWith('/conversation');
@@ -159,22 +160,34 @@
   }
 
   // ── Upload (raw files) ───────────────────────────────────────────
+  // .md/.txt plus the same OCR-eligible (image/PDF) extensions
+  // POST /files/upload accepts — see mcp_server/ocr.py's
+  // OCR_MIME_BY_EXTENSION. OCR-eligible uploads are saved as-is; WikiAgent
+  // extracts text from them lazily at ingest time, not here.
+  const RAW_UPLOAD_EXTENSIONS = new Set(['.md', '.txt', ...OCR_EXTENSIONS]);
+
   let uploading = false;
   let uploadError: string | null = null;
   let fileInputEl: HTMLInputElement;
 
   async function onFileInput(e: Event): Promise<void> {
     const input = e.target as HTMLInputElement;
-    const files = input.files;
+    // Snapshot into a plain array of File objects (immutable blobs) BEFORE
+    // resetting input.value — resetting .value empties the same live
+    // FileList object in place rather than replacing it with a fresh one,
+    // so a reference to the FileList itself (as opposed to the individual
+    // File objects) captured beforehand still reads back as length 0 once
+    // .value is cleared. Matches ChatPanel.svelte's handleFileSelect(),
+    // which extracts its File before resetting for the same reason.
+    const list = Array.from(input.files ?? []);
     input.value = '';
-    if (!files?.length) return;
+    if (!list.length) return;
 
     uploadError = null;
-    const list = Array.from(files);
     for (const f of list) {
-      const ext = f.name.split('.').pop()?.toLowerCase();
-      if (!['md', 'txt'].includes(ext ?? '')) {
-        uploadError = `Unsupported type: .${ext}. Only .md and .txt are accepted.`;
+      const ext = extOf(f.name);
+      if (!RAW_UPLOAD_EXTENSIONS.has(ext)) {
+        uploadError = `Unsupported type: ${ext}.`;
         return;
       }
     }
@@ -359,7 +372,7 @@
                 bind:this={fileInputEl}
                 type="file"
                 multiple
-                accept=".md,.txt"
+                accept={[...RAW_UPLOAD_EXTENSIONS].join(',')}
                 on:change={onFileInput}
                 class="sr-only"
               />
@@ -368,7 +381,7 @@
                 <span>Uploading…</span>
               {:else}
                 <span class="new-item-plus" aria-hidden="true">+</span>
-                <span>Upload .md / .txt</span>
+                <span>Upload file</span>
               {/if}
             </label>
             {#if uploadError}

@@ -8,6 +8,7 @@
   import MarkdownRenderer from '$lib/components/MarkdownRenderer.svelte';
   import ChartRenderer from '$lib/components/ChartRenderer.svelte';
   import DiffBlock from '$lib/components/DiffBlock.svelte';
+  import { OCR_EXTENSIONS, extOf } from '$lib/utils/ocr';
 
   let instruction = '';
   let messagesEl: HTMLElement;
@@ -59,11 +60,6 @@
     }
   }
 
-  // OCR-routed extensions (mcp_server/ocr.py — Apple Vision + PyMuPDF) — a
-  // subset of ALLOWED_EXTENSIONS below. Must stay in sync with main.py's
-  // _OCR_MIME_BY_EXTENSION and session_files.py's ALLOWED_EXTENSIONS.
-  const OCR_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.heic', '.pdf']);
-
   const ALLOWED_EXTENSIONS = new Set([
     '.md', '.txt', '.py', '.ts', '.js', '.svelte', '.json',
     '.yaml', '.yml', '.toml', '.sh', '.env', '.csv', '.xml',
@@ -81,7 +77,7 @@
     attachError = null;
 
     // Client-side extension check (defence in depth — server enforces the real gate)
-    const ext = '.' + file.name.split('.').pop()?.toLowerCase();
+    const ext = extOf(file.name);
     if (!ALLOWED_EXTENSIONS.has(ext)) {
       attachError = `File type '${ext}' is not supported.`;
       return;

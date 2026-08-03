@@ -1522,3 +1522,258 @@ def test_end_to_end_diff_only_run_regenerates_index_and_logs(tmp_path: Path):
     assert "[[existing-page]]" in index_out
     logs_out = (paths["wiki_dir"] / "logs.md").read_text(encoding="utf-8")
     assert "- Update: [[existing-page]]" in logs_out
+
+
+# ---------------------------------------------------------------------------
+# OCR raw_path ingest routing (docs/architecture/22-local-ocr-service.md
+# §22.8 follow-up: OCR-eligible image/PDF raw_path files are now extracted
+# via extract_raw_content_via_ocr() instead of read_text_file(), and always
+# take the infer() string-prompt path — never infer_with_file()/MarkItDown —
+# so ingestion behaves identically across oMLX/Ollama/Foundry.)
+# ---------------------------------------------------------------------------
+
+import wiki_agent as wiki_agent_module
+from prompt_builder import ToolResult
+
+
+class _RuntimeWithInferWithFile(_CapturingFakeRuntime):
+    """Fake runtime that DOES expose infer_with_file, unlike _FakeRuntime —
+    proves OCR routing wins over hasattr(runtime, 'infer_with_file') even
+    when the runtime looks like oMLX."""
+
+    def infer_with_file(self, *args, **kwargs) -> str:
+        raise AssertionError(
+            "infer_with_file must not be called for an OCR-eligible raw_path"
+        )
+
+
+def _make_ocr_ingest_subtask(tmp_path: Path, raw_path: Path) -> MagicMock:
+    wiki_dir      = tmp_path / "wiki"
+    wiki_dir.mkdir(exist_ok=True)
+    schema_path   = tmp_path / "SCHEMA.md"
+    schema_path.write_text("# Schema\n", encoding="utf-8")
+    templates_dir = tmp_path / "templates"
+    templates_dir.mkdir(exist_ok=True)
+
+    subtask = MagicMock()
+    subtask.subtask_id  = "ocr-test-0"
+    subtask.instruction = "ingest this file"
+    subtask.context = {
+        "raw_path":      str(raw_path),
+        "wiki_dir":      str(wiki_dir),
+        "schema_path":   str(schema_path),
+        "templates_dir": str(templates_dir),
+        "auto_apply":    False,
+    }
+    return subtask
+
+
+_OCR_RUN_XML = """\
+<actions>
+  <action name="create_page">
+    <page_name>ocr-ingested-page</page_name>
+    <page_type>RESEARCH_NOTE</page_type>
+    <content>
+## Summary
+
+OCR ingested.
+
+## Details
+
+### Extracted Concepts
+
+- A concept.
+
+### Mapped Pages
+
+- null
+
+### Proposed New Pages
+
+- null
+
+## Related Pages
+
+## Revision History
+
+- 2026-08-03 — Created.
+    </content>
+  </action>
+</actions>
+"""
+
+
+class TestOcrRawPathIngest:
+    """WikiAgent.run() routes OCR-eligible (image/PDF) raw_path files through
+    extract_raw_content_via_ocr() instead of read_text_file()/infer_with_file()."""
+
+    def test_ocr_eligible_raw_path_routes_through_ocr_no_infer_with_file(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        # Real, non-UTF-8 bytes — if this regressed to read_text_file(), it
+        # would raise UnicodeDecodeError and fail the test before OCR ever ran.
+        raw_path = tmp_path / "scan.png"
+        raw_path.write_bytes(b"\x89PNG\r\n\x1a\n\xff\xd8\xff\x00not-utf8\xfe")
+
+        subtask = _make_ocr_ingest_subtask(tmp_path, raw_path)
+
+        rt = _CapturingFakeRuntime(_OCR_RUN_XML)
+        assert not hasattr(rt, "infer_with_file")
+
+        extracted_calls = []
+
+        def _fake_extract(runtime, path, mime_type):
+            extracted_calls.append((runtime, path, mime_type))
+            return "OCR'd text: hello world"
+
+        monkeypatch.setattr(wiki_agent_module, "extract_raw_content_via_ocr", _fake_extract)
+
+        agent = WikiAgent(runtime=rt, project_root=tmp_path)
+        result = agent.run(subtask)
+
+        assert result.status == TaskStatus.COMPLETE
+        assert extracted_calls == [(rt, raw_path, "image/png")]
+        assert "OCR'd text: hello world" in rt.captured_prompt
+
+    def test_ocr_routing_wins_even_when_runtime_has_infer_with_file(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        raw_path = tmp_path / "scan.pdf"
+        raw_path.write_bytes(b"%PDF-1.4\xff\xfe not real pdf bytes")
+
+        subtask = _make_ocr_ingest_subtask(tmp_path, raw_path)
+
+        rt = _RuntimeWithInferWithFile(_OCR_RUN_XML)
+        assert hasattr(rt, "infer_with_file")
+
+        monkeypatch.setattr(
+            wiki_agent_module, "extract_raw_content_via_ocr",
+            lambda runtime, path, mime_type: "extracted pdf text",
+        )
+
+        agent = WikiAgent(runtime=rt, project_root=tmp_path)
+        result = agent.run(subtask)
+
+        assert result.status == TaskStatus.COMPLETE
+        assert "extracted pdf text" in rt.captured_prompt
+
+    def test_ocr_extraction_failure_returns_fail_result(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        raw_path = tmp_path / "blank-scan.png"
+        raw_path.write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe")
+
+        subtask = _make_ocr_ingest_subtask(tmp_path, raw_path)
+
+        rt = _FakeRuntime(_OCR_RUN_XML)
+
+        def _fake_extract(runtime, path, mime_type):
+            raise RuntimeError("no readable text detected")
+
+        monkeypatch.setattr(wiki_agent_module, "extract_raw_content_via_ocr", _fake_extract)
+
+        agent = WikiAgent(runtime=rt, project_root=tmp_path)
+        result = agent.run(subtask)
+
+        assert result.status == TaskStatus.FAILED
+        assert "OCR extraction error" in result.error
+        assert "no readable text detected" in result.error
+
+
+class TestExtractRawContentViaOcr:
+    """Unit tests for extract_raw_content_via_ocr() itself — temp-file
+    lifecycle and MCPToolDispatcher wiring, independent of WikiAgent.run()."""
+
+    def test_success_writes_temp_file_dispatches_and_cleans_up(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        upload_root = tmp_path / "chat_uploads"
+        upload_root.mkdir()
+        monkeypatch.setattr(wiki_agent_module, "_ocr_get_upload_root", lambda: upload_root)
+
+        dispatch_calls = []
+
+        class _FakeDispatcher:
+            def __init__(self, runtime=None, **kwargs):
+                self._runtime = runtime
+
+            def dispatch(self, tools_to_call, instruction, context=None):
+                dispatch_calls.append((tools_to_call, instruction, context))
+                tmp_file = upload_root / context["ocr_file_path"]
+                assert tmp_file.exists(), "temp file must exist at dispatch time"
+                return [ToolResult(
+                    tool_name="ocr_extract", parameters="", result="extracted!",
+                    success=True,
+                )]
+
+        monkeypatch.setattr(wiki_agent_module, "MCPToolDispatcher", _FakeDispatcher)
+
+        raw_path = tmp_path / "photo.jpg"
+        raw_path.write_bytes(b"\xff\xd8\xff not real jpeg bytes")
+
+        rt = object()
+        out = wiki_agent_module.extract_raw_content_via_ocr(rt, raw_path, "image/jpeg")
+
+        assert out == "extracted!"
+        assert len(dispatch_calls) == 1
+        tools_to_call, instruction, context = dispatch_calls[0]
+        assert tools_to_call == ["ocr_extract"]
+        assert context["ocr_mime_type"] == "image/jpeg"
+        # Temp file removed after dispatch, regardless of outcome.
+        assert list(upload_root.iterdir()) == []
+
+    def test_failure_still_cleans_up_temp_file_and_raises(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        upload_root = tmp_path / "chat_uploads"
+        upload_root.mkdir()
+        monkeypatch.setattr(wiki_agent_module, "_ocr_get_upload_root", lambda: upload_root)
+
+        class _FakeDispatcher:
+            def __init__(self, runtime=None, **kwargs):
+                pass
+
+            def dispatch(self, tools_to_call, instruction, context=None):
+                return [ToolResult(
+                    tool_name="ocr_extract", parameters="", success=False,
+                    result="ERROR: no readable text detected",
+                )]
+
+        monkeypatch.setattr(wiki_agent_module, "MCPToolDispatcher", _FakeDispatcher)
+
+        raw_path = tmp_path / "blank.png"
+        raw_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        with pytest.raises(RuntimeError, match="no readable text detected"):
+            wiki_agent_module.extract_raw_content_via_ocr(object(), raw_path, "image/png")
+
+        assert list(upload_root.iterdir()) == []
+
+
+class TestResolveRawPathOcrExtensions:
+    """_resolve_raw_path() accepts OCR-eligible extensions without requiring
+    valid UTF-8 text, while non-OCR extensions keep the existing gate."""
+
+    def test_accepts_binary_png(self, tmp_path: Path):
+        p = tmp_path / "scan.png"
+        p.write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe not utf-8 at all")
+        resolved = WikiAgent._resolve_raw_path({"raw_path": str(p)})
+        assert resolved == p
+
+    def test_accepts_binary_pdf(self, tmp_path: Path):
+        p = tmp_path / "doc.pdf"
+        p.write_bytes(b"%PDF-1.4\xff\xfe binary")
+        resolved = WikiAgent._resolve_raw_path({"raw_path": str(p)})
+        assert resolved == p
+
+    def test_still_rejects_unsupported_extension(self, tmp_path: Path):
+        p = tmp_path / "archive.zip"
+        p.write_bytes(b"PK\x03\x04")
+        with pytest.raises(ValueError, match=r"raw_path must be a \.md, \.txt, or OCR-eligible"):
+            WikiAgent._resolve_raw_path({"raw_path": str(p)})
+
+    def test_still_rejects_non_utf8_txt(self, tmp_path: Path):
+        p = tmp_path / "notes.txt"
+        p.write_bytes(b"\xff\xfe not valid utf-8")
+        with pytest.raises(ValueError, match="does not appear to be a UTF-8 text file"):
+            WikiAgent._resolve_raw_path({"raw_path": str(p)})

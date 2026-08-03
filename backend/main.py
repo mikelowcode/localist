@@ -55,18 +55,25 @@ Endpoints
       or not the corpus is currently stale.
 
   GET /files/raw
-      List all .md and .txt files in the raw/ directory.
+      List all .md/.txt and OCR-eligible (image/PDF, see mcp_server/ocr.py's
+      OCR_MIME_BY_EXTENSION) files in the raw/ directory.
 
   GET /files/wiki
       List all .md files in the wiki/ directory.
 
   GET /files/content?path=<absolute_path>
       Return the plain-text content of a file.  Only paths inside raw_dir
-      or wiki_dir are permitted — anything else returns HTTP 403.
+      or wiki_dir are permitted — anything else returns HTTP 403.  Not
+      meant for OCR-eligible raw files (image/PDF) — reads as UTF-8 text
+      and fails with HTTP 500 on binary content; use /files/download for
+      those instead.
 
   POST /files/upload
-      Accept a multipart .md or .txt file upload and save it to raw/.
-      Immediately indexes the file in MemoryManager.
+      Accept a multipart .md/.txt or OCR-eligible (image/PDF) file upload
+      and save it to raw/ unchanged (no OCR at upload time — WikiAgent
+      extracts text from OCR-eligible raw files lazily at ingest time).
+      Immediately indexes .md/.txt files in MemoryManager; OCR-eligible
+      files are skipped until ingested into a wiki page.
 
 Running locally
 ---------------
@@ -149,6 +156,7 @@ from embedding_engine import EmbeddingEngine
 import github_watch
 import hacker_news
 from mcp_server.ocr import get_upload_root as _ocr_upload_root
+from mcp_server.ocr import OCR_MIME_BY_EXTENSION as _OCR_MIME_BY_EXTENSION
 from mcp_tool_dispatcher import MCPToolDispatcher
 from memory_manager import MemoryManager, EpisodicMemoryWriter, EpisodicMemoryReader
 import news_brief
@@ -1914,7 +1922,10 @@ def _file_entry(p: "Path", type: Literal["raw", "wiki", "generated"]) -> FileEnt
     summary        = "List raw files",
 )
 async def get_files_raw() -> FilesResponse:
-    """Return metadata for every .md and .txt file in the raw/ directory."""
+    """
+    Return metadata for every .md/.txt or OCR-eligible (image/PDF) file in
+    the raw/ directory.
+    """
     if _state.raw_dir is None:
         raise HTTPException(status_code=503, detail="raw_dir not configured.")
     raw_dir = _state.raw_dir
@@ -1923,7 +1934,7 @@ async def get_files_raw() -> FilesResponse:
     files = [
         _file_entry(p, "raw")
         for p in sorted(raw_dir.iterdir())
-        if p.is_file() and p.suffix.lower() in {".md", ".txt"}
+        if p.is_file() and p.suffix.lower() in {".md", ".txt", *_OCR_MIME_BY_EXTENSION}
     ]
     return FilesResponse(files=files)
 
@@ -2107,19 +2118,23 @@ async def post_file_upload(file: UploadFile = File(...)) -> FileEntry:
     """
     Accept a multipart file upload and save it to raw/.
 
-    Only .md and .txt files are accepted.  If a file with the same name
-    already exists it is overwritten.  Returns the FileEntry for the
-    saved file.
+    .md and .txt files are accepted as-is, plus the same OCR-eligible
+    extensions .chat/files accepts (images incl. HEIC, PDF) — the raw
+    bytes are saved unchanged here; WikiAgent extracts text from them via
+    ocr_extract lazily at ingest time (§22 follow-up), not at upload time,
+    so the original file remains the canonical raw source on disk exactly
+    like .md/.txt already are. If a file with the same name already
+    exists it is overwritten. Returns the FileEntry for the saved file.
     """
     if _state.raw_dir is None:
         raise HTTPException(status_code=503, detail="raw_dir not configured.")
 
     filename = file.filename or "upload.md"
     suffix   = Path(filename).suffix.lower()
-    if suffix not in {".md", ".txt"}:
+    if suffix not in {".md", ".txt", *_OCR_MIME_BY_EXTENSION}:
         raise HTTPException(
             status_code=422,
-            detail=f"Only .md and .txt files are accepted, got: {suffix}",
+            detail=f"Unsupported file type, got: {suffix}",
         )
 
     raw_dir = _state.raw_dir
@@ -2207,23 +2222,6 @@ async def post_wiki_apply_diff(body: ApplyDiffRequest) -> ApplyDiffResponse:
 # ---------------------------------------------------------------------------
 # Chat file attachments (session-scoped, ephemeral, no wiki ingestion)
 # ---------------------------------------------------------------------------
-
-# Extensions routed through the local ocr_extract MCP tool (Apple Vision +
-# PyMuPDF, see mcp_server/ocr.py) instead of the UTF-8-decode path below.
-# Kept as an explicit map rather than mimetypes.guess_type() — .heic in
-# particular isn't reliably registered in the stdlib mimetypes database
-# across platforms, and this list must stay exactly in sync with
-# mcp_server/ocr.py's supported mime types (image/*, application/pdf) and
-# ChatPanel.svelte's ALLOWED_EXTENSIONS.
-_OCR_MIME_BY_EXTENSION: dict[str, str] = {
-    ".png":  "image/png",
-    ".jpg":  "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".heic": "image/heic",
-    ".pdf":  "application/pdf",
-}
-
 
 async def _extract_text_via_ocr(filename: str, raw: bytes, mime_type: str) -> str:
     """

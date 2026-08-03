@@ -3,7 +3,8 @@
   // sub-nav (see Sidebar.svelte) — this component is just the full-width
   // preview pane for whatever fileSelection.selectedFile currently holds.
   import {
-    selectedFile, fileContent, fileContentLoading, fileContentError, closeFile
+    selectedFile, fileContent, fileContentLoading, fileContentError,
+    filePreviewUnavailable, closeFile
   } from '$lib/stores/fileSelection';
   import { ingest, isIngesting, ingestFile, resetIngest } from '$lib/stores/files';
 
@@ -55,6 +56,13 @@
           <span class="spinner" aria-hidden="true"></span>
           <span class="text-tertiary text-sm">Loading…</span>
         </div>
+      {:else if $filePreviewUnavailable}
+        <div class="content-loading">
+          <span class="text-tertiary text-sm">
+            No text preview for this file type — use Download, or Ingest to
+            extract its text into the wiki.
+          </span>
+        </div>
       {:else if $fileContentError}
         <div class="content-loading">
           <span class="text-sm" style="color: var(--error)">{$fileContentError}</span>
@@ -66,6 +74,22 @@
 
     {#if $selectedFile.type === 'raw'}
       <div class="content-footer">
+        {#if $filePreviewUnavailable}
+          <a
+            class="ingest-btn-lg"
+            href={`/api/files/download?path=${encodeURIComponent($selectedFile.path)}`}
+            download={$selectedFile.filename}
+          >
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none"
+                 stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            Download
+          </a>
+        {/if}
         <button
           class="ingest-btn-lg"
           class:loading={$isIngesting}
@@ -232,6 +256,7 @@
     background: var(--bg-panel);
     display: flex;
     justify-content: flex-end;
+    gap: var(--sp-2);
   }
 
   .ingest-btn-lg {

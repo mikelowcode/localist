@@ -4,7 +4,13 @@
 
 Chat uploads accept images (incl. HEIC) and PDFs, extracted to plain text at
 upload time by a dedicated local OCR tool — entirely independent of whichever
-chat inference backend (oMLX/Ollama/Foundry) is active. This closes §11.6's
+chat inference backend (oMLX/Ollama/Foundry) is active. **This is text
+extraction only** — a photo, screenshot, or scan with visible text works; a
+photo with no text in it (a portrait, a movie poster with only stylized
+logo art, a landscape) does not describe or caption, it correctly finds
+nothing and rejects. See §22.10.
+
+This closes §11.6's
 Open Item 4 and the matching note in §3 (Slot SF), but *not* the way either
 originally proposed: both assumed oMLX's native multimodal support (Gemma
 4B's built-in OCR) would be routed into directly. That approach was scoped in
@@ -191,6 +197,8 @@ no real PDF/image handling on Ollama/Foundry. The new `ocr_extract` tool
 could close that gap too — same tool, second caller — but that's a separate,
 not-yet-scoped follow-up, not bundled into this feature.
 
+**Update, 2026-08-03:** closed — see §24.
+
 ### 22.9 Bugs Caught During Build
 
 Two real bugs were caught by testing, not by inspection — both are locked in
@@ -216,3 +224,35 @@ was confirmed visually by Michael directly against the running dev server —
 no browser-automation tool was available in the build environment, and the
 app was already running live under an active session at the time, so it was
 deliberately not driven or restarted programmatically.
+
+### 22.10 Known Limitation: Text Extraction Only, No General Image Understanding
+
+This service does OCR — literal text recognition — not image captioning or
+description. Live-reported by Michael (2026-08-01): uploading a photo/poster
+with no visible text (a movie poster, `Runaways 2021.jpg`) fails with:
+
+```
+'Runaways 2021.jpg' could not be read — ERROR: no readable text detected in
+'<temp-filename>.jpg' — extraction produced no usable content.
+```
+
+This is working as designed, not a bug. `_ocr_image_bytes()` (§22.2) uses
+Vision's `VNRecognizeTextRequest` specifically — a text-recognition request
+type that returns recognized text observations and nothing else. It has no
+concept of "describe what's in this image"; a photo with genuinely no
+legible text in it produces zero text observations, correctly triggering
+`extract_text()`'s near-empty-result rejection (`_MIN_EXTRACTED_CHARS`, same
+check that catches a blank scan). The tool cannot distinguish "this image
+has no text" from "OCR failed" — both look identical from `VNRecognizeText
+Request`'s output, so both get the same rejection message today.
+
+**Not in scope for this service.** General image understanding (captioning,
+object/scene description, "what's in this photo") is a fundamentally
+different capability — it needs a real vision-language model, not a
+text-recognition API. That's exactly the capability the rejected §21
+alternative would have used (oMLX's Gemma 4B multimodal support), but §21
+was rejected specifically for OCR-shaped uploads (§22.8) — a photo without
+text isn't an OCR use case, and routing it through Gemma 4B would reopen the
+backend-independence/multimodal-contract tradeoffs §22.8 rejected. If
+image captioning becomes a real want, it needs its own scoping pass, not a
+quiet extension of `ocr_extract`.

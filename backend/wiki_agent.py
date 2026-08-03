@@ -110,6 +110,7 @@ import os
 import re
 import textwrap
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -118,6 +119,8 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel, Field
 
 from build_graph import build_graph
+from mcp_server.ocr import OCR_MIME_BY_EXTENSION, get_upload_root as _ocr_get_upload_root
+from mcp_tool_dispatcher import MCPToolDispatcher
 from prompt_builder import PromptBuilder
 import wiki_maintenance_log
 from wiki_doc import META_WIKI_FILENAMES, parse_wiki_doc
@@ -241,6 +244,37 @@ class JournalEntry(BaseModel):
 
 def read_text_file(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def extract_raw_content_via_ocr(runtime: Any, raw_path: Path, mime_type: str) -> str:
+    """
+    Extract raw_path's text via the ocr_extract MCP tool (Apple Vision +
+    PyMuPDF — mcp_server/ocr.py), mirroring main.py's
+    _extract_text_via_ocr() for chat uploads (docs/architecture/
+    22-local-ocr-service.md). ocr_extract's sandboxing only resolves paths
+    under its own upload root (mcp_server.ocr.get_upload_root()), so
+    raw_path — which lives under the wiki's raw/ directory, a separate
+    sandbox — is copied to a temp file there first and removed afterward
+    regardless of outcome. Raises RuntimeError on any OCR failure.
+    """
+    upload_root = _ocr_get_upload_root()
+    tmp_name = f"{uuid.uuid4().hex}{raw_path.suffix.lower()}"
+    tmp_path = upload_root / tmp_name
+    tmp_path.write_bytes(raw_path.read_bytes())
+
+    try:
+        dispatcher = MCPToolDispatcher(runtime=runtime)
+        results = dispatcher.dispatch(
+            ["ocr_extract"], "",
+            {"ocr_file_path": tmp_name, "ocr_mime_type": mime_type},
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    result = results[0]
+    if not result.success:
+        raise RuntimeError(str(result.result))
+    return result.result
 
 
 def write_text_file(path: Path, content: str) -> None:
@@ -1242,11 +1276,28 @@ class WikiAgent:
         # no filesystem walk) or from disk (fallback when no manager is present).
         # raw_content is always loaded from disk — needed for build_wiki_context()
         # keyword scoring and for the string-prompt infer() path.
+        #
+        # OCR-eligible raw files (image/PDF — mcp_server.ocr.OCR_MIME_BY_
+        # EXTENSION) are extracted to plain text via the same ocr_extract MCP
+        # tool chat uploads use, rather than read as UTF-8 text — this is
+        # what makes ingestion backend-agnostic instead of depending on
+        # oMLX's infer_with_file()/MarkItDown path (§22.8 of the
+        # architecture spec). Done ahead of the try/except below so an OCR
+        # failure gets its own clear error message rather than "File load
+        # error".
+
+        ocr_mime_type = OCR_MIME_BY_EXTENSION.get(raw_path.suffix.lower())
+        if ocr_mime_type is not None:
+            try:
+                raw_content = extract_raw_content_via_ocr(self._runtime, raw_path, ocr_mime_type)
+            except Exception as exc:
+                return self._fail(subtask, f"OCR extraction error: {exc}")
 
         try:
             schema_text = read_text_file(schema_path)
             templates   = self._load_templates(templates_dir)
-            raw_content = read_text_file(raw_path)
+            if ocr_mime_type is None:
+                raw_content = read_text_file(raw_path)
 
             if self._memory_manager is not None:
                 wiki_pages = self._load_wiki_pages_from_index(wiki_dir)
@@ -1268,8 +1319,12 @@ class WikiAgent:
         wiki_context = build_wiki_context(wiki_pages, raw_content)
 
         # -- 5. Call model via RuntimeClient ---------------------------------
+        #
+        # Never true for an OCR-extracted raw file, even on oMLX — raw_content
+        # is already plain text at this point, so it takes the infer() string
+        # path below exactly like a .md/.txt raw file (§22.8).
 
-        use_file_upload = hasattr(self._runtime, "infer_with_file")
+        use_file_upload = ocr_mime_type is None and hasattr(self._runtime, "infer_with_file")
         logger.debug(
             "[%s] inference path: %s",
             self.name,
@@ -1741,9 +1796,15 @@ class WikiAgent:
             raise ValueError(f"raw_path does not exist: {path}")
         if not path.is_file():
             raise ValueError(f"raw_path is not a file: {path}")
-        if path.suffix.lower() not in {".md", ".txt"}:
+        suffix = path.suffix.lower()
+        if suffix in OCR_MIME_BY_EXTENSION:
+            # OCR-eligible (image/PDF) — extracted to text later in run();
+            # not UTF-8 text on disk, so is_text_file() below doesn't apply.
+            return path
+        if suffix not in {".md", ".txt"}:
             raise ValueError(
-                f"raw_path must be a .md or .txt file, got: {path.suffix}"
+                f"raw_path must be a .md, .txt, or OCR-eligible "
+                f"(image/PDF) file, got: {path.suffix}"
             )
         if not is_text_file(path):
             raise ValueError(

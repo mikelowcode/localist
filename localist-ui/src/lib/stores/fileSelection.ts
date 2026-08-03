@@ -6,15 +6,22 @@
 
 import { writable, get } from 'svelte/store';
 import type { FileEntry } from './files';
+import { isOcrExtension } from '$lib/utils/ocr';
 
 export const selectedFile = writable<FileEntry | null>(null);
 export const fileContent = writable<string | null>(null);
 export const fileContentLoading = writable(false);
 export const fileContentError = writable<string | null>(null);
+// Set instead of fetching /files/content for OCR-eligible (image/PDF) raw
+// files — that endpoint reads as UTF-8 text and 500s on binary content.
+export const filePreviewUnavailable = writable(false);
 
 export async function selectFile(file: FileEntry): Promise<void> {
   // Toggle off if re-selecting the already-open file.
-  if (get(selectedFile)?.path === file.path && get(fileContent) !== null) {
+  if (
+    get(selectedFile)?.path === file.path &&
+    (get(fileContent) !== null || get(filePreviewUnavailable))
+  ) {
     closeFile();
     return;
   }
@@ -22,6 +29,13 @@ export async function selectFile(file: FileEntry): Promise<void> {
   selectedFile.set(file);
   fileContent.set(null);
   fileContentError.set(null);
+  filePreviewUnavailable.set(false);
+
+  if (isOcrExtension(file.filename)) {
+    filePreviewUnavailable.set(true);
+    return;
+  }
+
   fileContentLoading.set(true);
 
   try {
@@ -40,4 +54,5 @@ export function closeFile(): void {
   selectedFile.set(null);
   fileContent.set(null);
   fileContentError.set(null);
+  filePreviewUnavailable.set(false);
 }
