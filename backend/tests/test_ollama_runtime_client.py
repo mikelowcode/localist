@@ -120,6 +120,140 @@ class TestHappyPath:
         assert chunks == ["answer"]
 
 
+class TestDoneMeta:
+    """
+    2026-08-04: `meta` out-param on _iter_ndjson_chunks, added as passive
+    instrumentation for the still-open §4.6.2 zero-content investigation
+    (docs/architecture/04-planner-routing-model.md). Previously the
+    terminal "done" line's diagnostic fields (done_reason, eval_count,
+    prompt_eval_count, total_duration) were read off the line and then
+    discarded — this captures them for the caller instead.
+    """
+
+    def test_meta_populated_from_done_line_when_provided(self):
+        response = _fake_response([
+            json.dumps({"message": {"content": "hi"}, "done": False}),
+            json.dumps({
+                "message": {"content": ""},
+                "done": True,
+                "done_reason": "stop",
+                "eval_count": 3,
+                "prompt_eval_count": 42,
+                "total_duration": 123456789,
+            }),
+        ])
+
+        meta: dict = {}
+        list(_iter_ndjson_chunks(response, meta=meta))
+
+        assert meta == {
+            "done_reason": "stop",
+            "eval_count": 3,
+            "prompt_eval_count": 42,
+            "total_duration": 123456789,
+        }
+
+    def test_meta_fields_default_to_none_when_ollama_omits_them(self):
+        """Ollama Cloud proxied responses, or older server versions, may
+        not send every diagnostic field — missing ones must resolve to
+        None, not raise or be absent from the dict."""
+        response = _fake_response([
+            json.dumps({"message": {"content": "hi"}, "done": True}),
+        ])
+
+        meta: dict = {}
+        list(_iter_ndjson_chunks(response, meta=meta))
+
+        assert meta == {
+            "done_reason": None,
+            "eval_count": None,
+            "prompt_eval_count": None,
+            "total_duration": None,
+        }
+
+    def test_meta_none_default_leaves_old_behavior_unchanged(self):
+        """Callers that don't pass meta (e.g. every call site before this
+        change) must see no behavioral difference — no crash, no implicit
+        dict created and thrown away in a way that changes output."""
+        response = _fake_response([
+            json.dumps({"message": {"content": "hi"}, "done": True}),
+        ])
+
+        chunks = list(_iter_ndjson_chunks(response))
+        assert chunks == ["hi"]
+
+    def test_meta_untouched_when_stream_raises_before_done(self):
+        """An error mid-stream means the done line is never reached — meta
+        must stay exactly as the caller initialized it, not be partially
+        populated."""
+        response = _fake_response([
+            json.dumps({"error": "rate limit exceeded"}),
+        ])
+
+        meta: dict = {}
+        with pytest.raises(RuntimeError):
+            list(_iter_ndjson_chunks(response, meta=meta))
+
+        assert meta == {}
+
+
+class TestZeroContentWarning:
+    """
+    2026-08-04: infer_stream() now escalates a zero-content completion
+    from silent debug logging to a warning carrying the captured done-line
+    metadata, model, call params, and the full prompt — see §4.6.2.
+    """
+
+    def _client(self) -> OllamaRuntimeClient:
+        return OllamaRuntimeClient(chat_model="test-model")
+
+    def test_zero_content_completion_logs_warning_with_diagnostics(self, caplog):
+        client = self._client()
+        response = _fake_response([
+            json.dumps({
+                "message": {"content": ""},
+                "done": True,
+                "done_reason": "stop",
+                "eval_count": 0,
+                "prompt_eval_count": 42,
+                "total_duration": 999,
+            }),
+        ])
+
+        with patch.object(_ollama_mod.requests, "post", return_value=response):
+            with caplog.at_level("WARNING", logger="ollama_runtime_client"):
+                chunks = list(client.infer_stream("some prompt", label="test-label"))
+
+        assert chunks == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "zero-content completion" in message
+        assert "test-model" in message
+        assert "done_reason=stop" in message
+        assert "eval_count=0" in message
+        assert "test-label" in message
+        assert "some prompt" in message
+
+    def test_nonempty_completion_does_not_log_warning(self, caplog):
+        client = self._client()
+        response = _fake_response([
+            json.dumps({
+                "message": {"content": "an answer"},
+                "done": True,
+                "done_reason": "stop",
+                "eval_count": 5,
+            }),
+        ])
+
+        with patch.object(_ollama_mod.requests, "post", return_value=response):
+            with caplog.at_level("WARNING", logger="ollama_runtime_client"):
+                chunks = list(client.infer_stream("some prompt"))
+
+        assert chunks == ["an answer"]
+        assert not any(r.levelname == "WARNING" for r in caplog.records)
+
+
 class TestMidStreamError:
     def test_error_field_raises_runtime_error_containing_message(self):
         response = _fake_response([
@@ -290,3 +424,46 @@ class TestIsLocalAndNumCtx:
 
         sent_payload = json.loads(mock_post.call_args.kwargs["data"])
         assert "num_ctx" not in sent_payload["options"]
+
+
+class TestThinkDisabled:
+    """
+    2026-08-04: `"think": false` added to every request payload — the
+    Finding A fix (docs/architecture/04-planner-routing-model.md §4.6.2).
+    Reasoning-capable Ollama models (confirmed live: gemma4:e4b-mlx) emit a
+    separate "thinking" field that draws from the same num_predict budget
+    as "content", and this client has never read it — a verbose reasoning
+    trace could consume the entire budget before any content token was
+    generated, producing a well-formed, validly-terminated, zero-content
+    stream 100% of the time in the diagnostic sweep
+    (diagnostics/diag_ollama_zero_content_repro.py). think=False confirmed
+    live to eliminate the thinking field entirely and confirmed harmless
+    (HTTP 200 no-op) against gemma4:31b-cloud, which never used thinking.
+    """
+
+    @pytest.mark.parametrize("chat_model", ["gemma4:31b-cloud", "gemma4:e4b-mlx"])
+    def test_think_false_sent_on_every_request(self, chat_model):
+        client = OllamaRuntimeClient(chat_model=chat_model)
+        response = _fake_response([
+            json.dumps({"message": {"content": "hi"}, "done": True}),
+        ])
+
+        with patch.object(_ollama_mod.requests, "post", return_value=response) as mock_post:
+            list(client.infer_stream("prompt"))
+
+        sent_payload = json.loads(mock_post.call_args.kwargs["data"])
+        assert sent_payload["think"] is False
+
+    def test_think_false_sent_via_infer_too(self):
+        """infer() delegates to infer_stream() — the payload built there
+        must carry think=False regardless of which entry point is used."""
+        client = OllamaRuntimeClient(chat_model="gemma4:e4b-mlx")
+        response = _fake_response([
+            json.dumps({"message": {"content": "hi"}, "done": True}),
+        ])
+
+        with patch.object(_ollama_mod.requests, "post", return_value=response) as mock_post:
+            client.infer("prompt")
+
+        sent_payload = json.loads(mock_post.call_args.kwargs["data"])
+        assert sent_payload["think"] is False

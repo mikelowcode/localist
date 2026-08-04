@@ -185,4 +185,3 @@ Tests are organized by phase (memory substrate, routing, controller dispatch, ex
 
 **Open**
 - ⬜ macOS `.app` packaging via PyInstaller + Tauri
-- ⬜ Investigate the Ollama zero-content (`done: true`, no tokens) empty-completion behavior — recurred with real tool grounding already present in the prompt, contradicting the originally-documented "no grounding" trigger condition; absorbed transparently today by the existing retry-then-fallback guard, so no user-visible failure, but not yet root-caused (`docs/architecture/04-planner-routing-model.md` §4.6.2)

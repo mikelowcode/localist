@@ -92,7 +92,10 @@ def _is_cloud_model(model: str) -> bool:
 # NDJSON streaming helper
 # ---------------------------------------------------------------------------
 
-def _iter_ndjson_chunks(response: requests.Response) -> Iterator[str]:
+def _iter_ndjson_chunks(
+    response: requests.Response,
+    meta:     dict | None = None,
+) -> Iterator[str]:
     """
     Yield text delta strings from an Ollama NDJSON chat stream.
 
@@ -108,6 +111,21 @@ def _iter_ndjson_chunks(response: requests.Response) -> Iterator[str]:
     lines that carry neither "message" content nor "error" nor "done"
     (e.g. a pure metadata line) — those are legitimate NDJSON shapes, not
     errors.
+
+    meta:
+        Optional out-param (2026-08-04). When given, the terminal "done"
+        line's diagnostic fields — done_reason, eval_count,
+        prompt_eval_count, total_duration — are written into it in place,
+        keyed by those exact names, each defaulting to None if Ollama
+        omitted it. Previously discarded entirely: only `content` and
+        `done` were ever read off that line, so a zero-content completion
+        left no trace of *why* (was a token actually generated and empty,
+        or was generation never attempted?). See §4.6.2's 2026-07-30
+        recurrence note in docs/architecture/04-planner-routing-model.md —
+        this exists to make the next occurrence diagnosable from the log
+        instead of reconstructed after the fact. None (default) preserves
+        the old behavior exactly; callers that don't pass it see no
+        change.
 
     2026-07-17: two failure modes were previously silent. Ollama sends
     {"error": "..."} instead of a normal content chunk mid-stream on a
@@ -147,6 +165,13 @@ def _iter_ndjson_chunks(response: requests.Response) -> Iterator[str]:
             yield content
 
         if data.get("done"):
+            if meta is not None:
+                meta.update({
+                    "done_reason":        data.get("done_reason"),
+                    "eval_count":         data.get("eval_count"),
+                    "prompt_eval_count":  data.get("prompt_eval_count"),
+                    "total_duration":     data.get("total_duration"),
+                })
             return
 
     raise RuntimeError(
@@ -413,6 +438,20 @@ class OllamaRuntimeClient:
             "model":    self._chat_model,
             "messages": messages,
             "stream":   True,
+            # Reasoning-capable models (confirmed live: gemma4:e4b-mlx) emit
+            # a separate "thinking" field this client has never read, and
+            # that field draws from the same num_predict budget as
+            # "content" — a verbose reasoning trace can consume the entire
+            # budget before any content token is ever generated, producing
+            # a well-formed "done": true stream with zero content
+            # (done_reason="length", eval_count==num_predict). Confirmed
+            # 100% reproducible (24/24) in diagnostics/
+            # diag_ollama_zero_content_repro.py's Finding A — see §4.6.2 of
+            # docs/architecture/04-planner-routing-model.md. think=False
+            # confirmed live to eliminate the thinking field entirely and
+            # return real content immediately; confirmed harmless (HTTP 200
+            # no-op) against gemma4:31b-cloud, which never used thinking.
+            "think": False,
             "options": {
                 "num_predict": max_tokens,
                 "temperature": temperature,
@@ -460,12 +499,39 @@ class OllamaRuntimeClient:
                 f"from {self._chat_endpoint}: {response.text[:400]}"
             )
 
+        stream_meta:  dict = {}
+        total_chars = 0
         try:
-            yield from _iter_ndjson_chunks(response)
+            for chunk in _iter_ndjson_chunks(response, meta=stream_meta):
+                total_chars += len(chunk)
+                yield chunk
         except Exception as exc:
             raise RuntimeError(
                 f"Error reading Ollama NDJSON stream: {exc}"
             ) from exc
+
+        if total_chars == 0:
+            # Passive instrumentation added 2026-08-04 — see §4.6.2's
+            # 2026-07-30 recurrence note. Escalated from the old bare
+            # debug-level "infer() ← 0 chars received." to a warning
+            # carrying everything needed to diagnose the next occurrence
+            # without reconstructing it after the fact: whether Ollama
+            # actually generated tokens (eval_count) and why it stopped
+            # (done_reason), alongside the call's own params and the full
+            # prompt. Does not change behavior — ControllerAgent's
+            # retry-then-fallback guard still owns recovery.
+            logger.warning(
+                "OllamaRuntimeClient: zero-content completion — model=%s "
+                "done_reason=%s eval_count=%s prompt_eval_count=%s "
+                "total_duration_ns=%s max_tokens=%d temperature=%.2f "
+                "prompt_chars=%d label=%s\nfull prompt:\n%s",
+                self._chat_model,
+                stream_meta.get("done_reason"),
+                stream_meta.get("eval_count"),
+                stream_meta.get("prompt_eval_count"),
+                stream_meta.get("total_duration"),
+                max_tokens, temperature, len(prompt), label, prompt,
+            )
 
     # -----------------------------------------------------------------------
     # Diagnostics

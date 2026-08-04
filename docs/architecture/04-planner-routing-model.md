@@ -692,18 +692,135 @@ worth root-causing (cost: one extra full inference round-trip + prompt
 rebuild per occurrence, paid silently) or whether the current fallback is
 a sufficient permanent mitigation on its own.
 
-**Suggested future scope, not started:** (1) passive instrumentation —
-log the full prompt/params on every zero-content completion (not just the
-current generic warning), so a real occurrence can be diagnosed from
-captured state rather than reconstructed after the fact, same discipline
-§8.8 Open Item 11 wishes it had had; (2) once several real occurrences are
-logged, a diagnostic sweep varying temperature/prompt length/tool
-identity/backend to establish an actual reproduction rate and any
-correlating factor, rather than a single anecdotal data point per
-incident; (3) decide whether a fix (if warranted at all) belongs in
-`OllamaRuntimeClient` (backend-specific) or stays entirely at the
-`ControllerAgent` retry layer (backend-agnostic, today's approach, and
-arguably sufficient on its own regardless of root cause).
+**Suggested future scope:** (1) passive instrumentation — log the full
+prompt/params on every zero-content completion (not just the current
+generic warning), so a real occurrence can be diagnosed from captured
+state rather than reconstructed after the fact, same discipline §8.8 Open
+Item 11 wishes it had had; (2) once several real occurrences are logged, a
+diagnostic sweep varying temperature/prompt length/tool identity/backend
+to establish an actual reproduction rate and any correlating factor,
+rather than a single anecdotal data point per incident; (3) decide
+whether a fix (if warranted at all) belongs in `OllamaRuntimeClient`
+(backend-specific) or stays entirely at the `ControllerAgent` retry layer
+(backend-agnostic, today's approach, and arguably sufficient on its own
+regardless of root cause).
+
+*Update 2026-08-04 — item (1) done.* `_iter_ndjson_chunks()` in
+`ollama_runtime_client.py` previously read only `content` and `done` off
+the terminal NDJSON line and discarded everything else; it now accepts an
+optional `meta` out-param and, on the `"done": true` line, writes
+`done_reason`, `eval_count`, `prompt_eval_count`, and `total_duration`
+into it (each `None` if Ollama omitted it — observed on at least the
+Ollama Cloud proxy path). `infer_stream()` passes this through and, when
+zero characters were yielded across the whole stream, escalates from the
+old bare debug-level `"infer() ← 0 chars received."` to a `logger.warning`
+carrying that metadata plus `model`, `max_tokens`, `temperature`,
+`prompt_chars`, `label`, and the full prompt text. `eval_count` is the
+load-bearing field to watch on the next occurrence: `0` means Ollama
+never generated a token at all (a request/prompt-shape problem upstream
+of generation), a nonzero value with empty `content` would mean tokens
+were generated but never surfaced as message content (a
+response-parsing/transport problem) — the two point to entirely different
+root causes and today's log line couldn't distinguish them. Purely
+additive: no behavior change, `ControllerAgent`'s retry-then-fallback
+guard (§4.6.2 above) still owns recovery. Covered by
+`TestDoneMeta`/`TestZeroContentWarning` in
+`tests/test_ollama_runtime_client.py`; full suite green (1498 passed) at
+implementation time. Item (3) remains not started.
+
+*Update 2026-08-04 — item (2) done: live reproduction sweep run, two
+distinct findings, one repro count each.* `diagnostics/
+diag_ollama_zero_content_repro.py` built real `(system_prompt,
+user_prompt)` pairs via the actual `PromptBuilder.build()` (not
+hand-rolled strings) and sent 68 trials directly to the live Ollama
+endpoint, crossing 4 prompt shapes (bare ungrounded, `hacker_news_search`-
+grounded, `web_search`-grounded, long ungrounded) × 2 models
+(`gemma4:31b-cloud` — the actual production model per
+`LOCALIST_CHAT_MODEL` — and `gemma4:e4b-mlx`, the only other chat model
+present in this machine's Ollama) × temperature (0.30 baseline, plus 0.0/
+0.70 secondary sweep on the two most relevant shapes, cloud-only). Raw
+results: `diagnostics/ollama_zero_content_repro_results.csv` (one row per
+trial); full run log:
+`diagnostics/ollama_zero_content_repro_run.log`.
+
+**Finding A — a new, 100%-reproducible, previously-unknown bug on
+`gemma4:e4b-mlx`, mechanistically distinct from the original mystery.
+FIXED 2026-08-04.** Every trial against this model (24/24, all four
+shapes, temp=0.30) came back `content_chars=0`, `done_reason="length"`,
+`eval_count=200` (exactly `num_predict`). Root cause was not a mystery
+for this one: this Ollama model streams a separate `"thinking"` field on
+each NDJSON line (chain-of-thought), confirmed directly against the raw
+stream — e.g. `{"message": {"content": "", "thinking": "Thinking"},
+"done": false}` — which `_iter_ndjson_chunks()` never read; it only ever
+inspected `message.content`. At `num_predict=200` the model's entire
+visible token budget was consumed by hidden reasoning tokens before it
+ever emitted real content, so the stream terminated validly (`done:
+true`) with zero `content` — the identical externally-observable symptom
+this section already describes, produced by a completely different and
+fully understood mechanism. Not the production model, but a live risk:
+§16.5's live runtime-backend switch (`POST /settings/runtime-backend`)
+could point at this model at any time with no restart, and it would have
+failed every single completion, not rarely.
+
+**Fix (deliberately scoped to just closing the bug — see decision
+below):** `OllamaRuntimeClient.infer_stream()` (and, by delegation,
+`infer()`) now sends `"think": false` in every request payload. Confirmed
+live: this suppresses the `thinking` field entirely — the same shape that
+100%-reproduced above now returns real content immediately (verified
+directly through the real `OllamaRuntimeClient`, not just raw
+`requests`). Confirmed harmless (HTTP 200, no-op) against
+`gemma4:31b-cloud`, which never emitted `thinking` in any of Finding B's
+trials, so this is safe to send unconditionally rather than needing a
+per-model branch. Covered by `TestThinkDisabled` in
+`tests/test_ollama_runtime_client.py`; full suite green (1501 passed) at
+implementation time.
+
+**Explicitly rejected: surfacing `thinking` live in the UI.** The
+alternative — keep `think: true` and stream reasoning deltas to the
+frontend so the user sees why they're waiting — was considered and
+declined. It would require a second, thinking-specific callback path
+alongside the existing `on_token` threading (`ConversationalAgent` →
+`ControllerAgent` → `main.py`'s SSE bridge → frontend), which only
+`OllamaRuntimeClient` could ever populate — `OMLXRuntimeClient` and
+`FoundryRuntimeClient` have no equivalent concept. That would make the
+streaming contract backend-specific for the first time; every other
+piece of it (`on_token`, the plain-`str` `Generator` return, the SSE
+`"token"` event) is deliberately backend-agnostic today. Rejected to
+preserve that, not on cost grounds — `think: false` alone fully closes
+the bug.
+
+**Finding B — genuine reproduction of the original bug, on the actual
+production model (`gemma4:31b-cloud`).** Rare at the documented baseline
+temperature: 0/24 trials at temp=0.30 in the formal sweep, but it did
+fire once in an ad hoc smoke-test call immediately before the formal
+sweep, under identical conditions (shape A, temp=0.30) — consistent with
+a low but nonzero base rate at 0.30, not zero; a formal N of 24-25 simply
+isn't enough to reliably catch a rare event. At temp=0.70 it reproduced
+in 2/10 trials (20%), both on the plainest shape (bare ungrounded
+question); 0/10 at temp=0.0. Every genuine cloud repro shares one exact
+signature: `content=""`, `done_reason="stop"` (natural termination — the
+model was **not** hitting a `max_tokens` cap the way Finding A's model
+was), `eval_count` small but nonzero (27, 28) — real tokens were
+generated and the model chose to stop, yet nothing ever reached
+`content`. No `"thinking"` field appears anywhere in this model's raw
+stream at any point in the sweep, so Finding A's mechanism does not
+explain Finding B. Prompt length and tool-grounding presence showed no
+correlation at all — the bug never fired on the long (7.9K-char) or
+either grounded shape, only ever on the short bare-question shape, and
+only at elevated temperature. Current best-supported lead: **temperature-
+correlated**, not grounding- or length-correlated — the opposite of what
+the original 2026-07-17 "no grounding" hypothesis predicted, and
+consistent with the 2026-07-30 recurrence already having falsified that
+hypothesis once. Still not root-caused at the token/sampling level (why a
+handful of real tokens at higher temperature would fail to surface as
+content is not yet understood) — status stays OPEN. Given the still-thin
+repro count (2 cloud occurrences from this sweep, on top of the 2
+original production incidents) and that `ControllerAgent`'s retry-then-
+fallback guard already absorbs every known occurrence transparently, no
+code fix is being attempted from this data alone; item (3)'s fix-location
+decision stays deferred until either a larger temperature-focused sweep
+or more real occurrences (now diagnosable via the Phase 1 warning log)
+firm up the correlation further.
 
 ### 4.7 Gemma 4B Behavioral Constraints
 
