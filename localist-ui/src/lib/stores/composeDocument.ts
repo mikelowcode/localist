@@ -105,3 +105,28 @@ export function addTurnToDocument(turnKey: string, content: string): void {
 export function clearComposeDraft(): void {
   composeDocument.update((s) => ({ ...s, draft: '', addedTaskIds: [] }));
 }
+
+// ── Panel width (drag-resize) ────────────────────────────────────────────
+// A layout preference, not document content — global rather than scoped per
+// conversation (mirrors stores/sidebar.ts's sidebarWidth, same drag-handle
+// pattern reused in ComposeDocumentPanel.svelte, mirrored from
+// Sidebar.svelte's own divider).
+
+const WIDTH_KEY = 'lora-compose-panel-width';
+const DEFAULT_WIDTH = 320;   // matches --previews-w, the panel's prior fixed width
+export const COMPOSE_MIN_WIDTH = 280;
+export const COMPOSE_MAX_WIDTH = 800;
+
+function readWidth(): number {
+  if (!browser) return DEFAULT_WIDTH;
+  const stored = Number(localStorage.getItem(WIDTH_KEY));
+  return Number.isFinite(stored) && stored >= COMPOSE_MIN_WIDTH && stored <= COMPOSE_MAX_WIDTH
+    ? stored
+    : DEFAULT_WIDTH;
+}
+
+export const composePanelWidth = writable<number>(readWidth());
+
+composePanelWidth.subscribe((w) => {
+  if (browser) localStorage.setItem(WIDTH_KEY, String(w));
+});

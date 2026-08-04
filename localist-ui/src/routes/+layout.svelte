@@ -10,7 +10,7 @@
   import { theme } from '$lib/stores/theme';
   import { sidebarWidth, sidebarCollapsed } from '$lib/stores/sidebar';
   import { previewsPanelCollapsed } from '$lib/stores/previewsPanel';
-  import { composeDocument } from '$lib/stores/composeDocument';
+  import { composeDocument, composePanelWidth } from '$lib/stores/composeDocument';
   import { loadAssistantName } from '$lib/stores/assistantName';
 
   // #app-shell is the CSS grid container that sizes the sidebar/previews/
@@ -26,7 +26,7 @@
       shell.style.gridTemplateColumns =
         `${$sidebarCollapsed ? 0 : $sidebarWidth}px 1fr ` +
         `${$previewsPanelCollapsed ? 'var(--previews-w-collapsed)' : 'var(--previews-w)'} ` +
-        `${$composeDocument.active ? 'var(--previews-w)' : '0px'}`;
+        `${$composeDocument.active ? `${$composePanelWidth}px` : '0px'}`;
     }
   }
 

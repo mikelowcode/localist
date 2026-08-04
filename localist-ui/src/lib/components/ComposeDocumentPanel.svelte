@@ -14,8 +14,11 @@
   // wired through ChatPanel.svelte) — both write through the same
   // composeDocument store. Saving reuses the same POST /files/generated
   // flow single-turn saves already use.
+  import { onMount, onDestroy } from 'svelte';
+  import { browser } from '$app/environment';
   import {
-    composeDocument, setComposeDraft, toggleComposeMode, clearComposeDraft
+    composeDocument, setComposeDraft, toggleComposeMode, clearComposeDraft,
+    composePanelWidth, COMPOSE_MIN_WIDTH, COMPOSE_MAX_WIDTH
   } from '$lib/stores/composeDocument';
   import { saveGeneratedFile } from '$lib/stores/files';
 
@@ -25,6 +28,55 @@
   let error: string | null = null;
   let savedAs: string | null = null;
   let confirmingClear = false;
+
+  // ── Resize (drag the left edge) ──────────────────────────────────────
+  // Mirrors Sidebar.svelte's divider exactly, except this panel is on the
+  // right side of the screen, so the sign is flipped: dragging the handle
+  // left (negative dx) grows the panel, not shrinks it.
+  let dragging = false;
+  let dragStartX = 0;
+  let dragStartW = 0;
+
+  function startResize(e: MouseEvent): void {
+    dragging = true;
+    dragStartX = e.clientX;
+    dragStartW = $composePanelWidth;
+    e.preventDefault();
+  }
+
+  function onMove(e: MouseEvent): void {
+    if (!dragging) return;
+    const dx = e.clientX - dragStartX;
+    const w = dragStartW - dx;
+    composePanelWidth.set(Math.max(COMPOSE_MIN_WIDTH, Math.min(COMPOSE_MAX_WIDTH, w)));
+  }
+
+  function onUp(): void {
+    dragging = false;
+  }
+
+  function onDividerKeydown(e: KeyboardEvent): void {
+    if (e.key === 'ArrowLeft') {
+      composePanelWidth.set(Math.min(COMPOSE_MAX_WIDTH, $composePanelWidth + 8));
+    } else if (e.key === 'ArrowRight') {
+      composePanelWidth.set(Math.max(COMPOSE_MIN_WIDTH, $composePanelWidth - 8));
+    } else {
+      return;
+    }
+    e.preventDefault();
+  }
+
+  onMount(() => {
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  });
+
+  onDestroy(() => {
+    if (browser) {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    }
+  });
 
   function handleDraftInput(e: Event) {
     setComposeDraft((e.target as HTMLTextAreaElement).value);
@@ -65,6 +117,20 @@
 
 {#if $composeDocument.active}
   <div class="compose-panel">
+    <!-- svelte-ignore a11y-no-noninteractive-tabindex -->
+    <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
+    <div
+      class="compose-divider"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize document panel"
+      aria-valuenow={$composePanelWidth}
+      aria-valuemin={COMPOSE_MIN_WIDTH}
+      aria-valuemax={COMPOSE_MAX_WIDTH}
+      tabindex="0"
+      on:mousedown={startResize}
+      on:keydown={onDividerKeydown}
+    />
     <div class="compose-panel-header">
       <span class="compose-panel-title">Document</span>
       <div class="compose-header-actions">
@@ -139,6 +205,7 @@
 
 <style>
   .compose-panel {
+    position: relative;
     grid-column: 4;
     grid-row: 1 / -1;
     height: 100%;
@@ -147,6 +214,16 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+  }
+
+  .compose-divider {
+    position: absolute;
+    top: 0;
+    left: -3px;
+    width: 6px;
+    height: 100%;
+    cursor: col-resize;
+    z-index: 6;
   }
 
   .compose-panel-header {
