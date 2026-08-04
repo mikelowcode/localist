@@ -2099,6 +2099,26 @@ class MemoryManager:
             for row in rows
         ]
 
+    def delete_conversation(self, conversation_id: str) -> int:
+        """
+        Delete every chat_turns row for a conversation_id.
+
+        The chat_turns_ad trigger keeps chat_turns_fts in sync automatically.
+        Returns the number of turns deleted (0 if the conversation_id didn't
+        exist — callers surface that as a 404).
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                deleted = conn.execute(
+                    "DELETE FROM chat_turns WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).rowcount
+                conn.commit()
+                return deleted
+            finally:
+                conn.close()
+
     # -----------------------------------------------------------------------
     # Retention settings  (Settings tab — global TTL for chat_turns + episodes)
     # -----------------------------------------------------------------------

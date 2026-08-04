@@ -71,6 +71,47 @@
     return `New conversation — ${ts}`;
   }
 
+  // Delete (same two-step inline-confirm pattern as the Files delete below).
+  let confirmDeleteConversationId: string | null = null;
+  let deletingConversationId: string | null = null;
+  let deleteConversationError: string | null = null;
+
+  function requestDeleteConversation(id: string, e: Event): void {
+    e.stopPropagation();
+    deleteConversationError = null;
+    confirmDeleteConversationId = id;
+  }
+
+  function cancelDeleteConversation(e: Event): void {
+    e.stopPropagation();
+    confirmDeleteConversationId = null;
+  }
+
+  async function confirmDeleteConversation(c: ConversationSummary, e: Event): Promise<void> {
+    e.stopPropagation();
+    deletingConversationId = c.conversation_id;
+    deleteConversationError = null;
+    try {
+      const res = await fetch(`/api/chat/history/conversations/${c.conversation_id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      await loadConversations();
+
+      // Deleted the conversation currently open in the main pane — same
+      // "spin up a fresh one" behavior as the New chat button, since the
+      // old id no longer resolves to anything.
+      if (c.conversation_id === $page.params.id) {
+        const id = startNewConversation();
+        await goto(`/conversation/${id}`);
+      }
+    } catch (err) {
+      deleteConversationError = err instanceof Error ? err.message : String(err);
+    } finally {
+      confirmDeleteConversationId = null;
+      deletingConversationId = null;
+    }
+  }
+
   function handleChatNavClick(): void {
     if (isChatActive) {
       chatHistoryExpanded = !chatHistoryExpanded;
@@ -305,17 +346,55 @@
               {#each conversations as c (c.conversation_id)}
                 {@const isActive = c.conversation_id === $page.params.id}
                 <li>
-                  <a
-                    href={`/conversation/${c.conversation_id}`}
-                    class="sub-nav-link"
-                    class:active={isActive}
-                    aria-current={isActive ? 'page' : undefined}
-                    title={conversationLabel(c)}
-                  >
-                    {conversationLabel(c)}
-                  </a>
+                  {#if confirmDeleteConversationId === c.conversation_id}
+                    <div class="delete-confirm">
+                      <span class="delete-confirm-text truncate" title={conversationLabel(c)}>
+                        Delete "{conversationLabel(c)}"?
+                      </span>
+                      <button
+                        type="button"
+                        class="delete-confirm-btn delete-confirm-yes"
+                        disabled={deletingConversationId === c.conversation_id}
+                        on:click={(e) => confirmDeleteConversation(c, e)}
+                      >{deletingConversationId === c.conversation_id ? 'Deleting…' : 'Delete'}</button>
+                      <button
+                        type="button"
+                        class="delete-confirm-btn delete-confirm-no"
+                        disabled={deletingConversationId === c.conversation_id}
+                        on:click={cancelDeleteConversation}
+                      >Cancel</button>
+                    </div>
+                  {:else}
+                    <div class="conversation-row">
+                      <a
+                        href={`/conversation/${c.conversation_id}`}
+                        class="sub-nav-link"
+                        class:active={isActive}
+                        aria-current={isActive ? 'page' : undefined}
+                        title={conversationLabel(c)}
+                      >
+                        {conversationLabel(c)}
+                      </a>
+                      <button
+                        type="button"
+                        class="conversation-row-delete"
+                        title="Delete conversation"
+                        on:click={(e) => requestDeleteConversation(c.conversation_id, e)}
+                      >
+                        <svg viewBox="0 0 24 24" width="11" height="11" fill="none"
+                             stroke="currentColor" stroke-width="2"
+                             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <polyline points="3 6 5 6 21 6"/>
+                          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                        </svg>
+                      </button>
+                    </div>
+                  {/if}
                 </li>
               {/each}
+              {#if deleteConversationError}
+                <li class="sub-nav-state" style="color:var(--error)">{deleteConversationError}</li>
+              {/if}
             {/if}
           </ul>
         {/if}
@@ -695,6 +774,35 @@
     font-size: 11px;
     color: var(--text-tertiary);
   }
+
+  /* Chat sub-nav: conversation row + hover-revealed delete button */
+  .conversation-row {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+  .conversation-row .sub-nav-link { flex: 1; min-width: 0; }
+
+  .conversation-row-delete {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: none;
+    border-radius: 5px;
+    color: var(--text-tertiary);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
+  }
+  .conversation-row:hover .conversation-row-delete,
+  .conversation-row-delete:focus-visible {
+    opacity: 1;
+  }
+  .conversation-row-delete:hover { color: var(--error); background: var(--error-dim); }
 
   /* Files sub-nav specifics */
   .files-sub-nav { gap: 1px; }

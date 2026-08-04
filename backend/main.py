@@ -1094,6 +1094,12 @@ class ConversationListResponse(BaseModel):
     conversations: list[ConversationSummary]
 
 
+class ConversationDeleteResponse(BaseModel):
+    """Response body for DELETE /chat/history/conversations/{conversation_id}."""
+    conversation_id: str
+    turns_deleted:   int
+
+
 class ApplyDiffRequest(BaseModel):
     """
     Payload accepted by POST /wiki/apply-diff.
@@ -2743,6 +2749,25 @@ async def get_conversations() -> ConversationListResponse:
     return ConversationListResponse(
         conversations = [ConversationSummary(**row) for row in rows]
     )
+
+
+@app.delete(
+    "/chat/history/conversations/{conversation_id}",
+    response_model = ConversationDeleteResponse,
+    summary        = "Delete a conversation and all its turns",
+)
+async def delete_conversation(conversation_id: str) -> ConversationDeleteResponse:
+    """
+    Permanently delete every chat_turns row for conversation_id (and its FTS
+    entries, via the chat_turns_ad trigger). Used by the sidebar's per-row
+    delete button.
+    """
+    mm = _require_memory_manager()
+    turns_deleted = await asyncio.to_thread(mm.delete_conversation, conversation_id)
+    if turns_deleted == 0:
+        raise HTTPException(status_code=404, detail=f"Conversation not found: {conversation_id}")
+
+    return ConversationDeleteResponse(conversation_id=conversation_id, turns_deleted=turns_deleted)
 
 
 # ---------------------------------------------------------------------------
