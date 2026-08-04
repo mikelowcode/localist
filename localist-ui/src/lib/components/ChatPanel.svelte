@@ -6,6 +6,7 @@
   import { currentConversationId, isFirstTurnOfConversation } from '$lib/stores/conversation';
   import { loadWikiFiles, wikiFiles, wikiLoading, wikiError } from '$lib/stores/files';
   import { assistantName } from '$lib/stores/assistantName';
+  import { composeDocument, toggleComposeMode, addTurnToDocument } from '$lib/stores/composeDocument';
   import EditableTurnContent from '$lib/components/EditableTurnContent.svelte';
   import ChartRenderer from '$lib/components/ChartRenderer.svelte';
   import DiffBlock from '$lib/components/DiffBlock.svelte';
@@ -386,6 +387,9 @@
                   content={turn.content}
                   streaming={turn.status === 'streaming'}
                   editable={turn.status === 'complete'}
+                  composeActive={turn.status === 'complete' && $composeDocument.active}
+                  alreadyAdded={$composeDocument.addedTaskIds.includes(provKey(turn))}
+                  onAddToDocument={() => addTurnToDocument(provKey(turn), turn.content)}
                 />
               {:else if turn.status === 'planning'}
                 <span class="placeholder-pulse">···</span>
@@ -522,6 +526,22 @@
           </div>
         {/if}
       </div>
+      <button
+        class="attach-btn"
+        class:attach-btn-active={$composeDocument.active}
+        on:click={toggleComposeMode}
+        aria-label={$composeDocument.active ? 'Close compose mode' : 'Open compose mode'}
+        title={$composeDocument.active ? 'Close compose mode' : 'Compose a document across turns'}
+        type="button"
+      >
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+          <line x1="16" y1="13" x2="8" y2="13"/>
+          <line x1="16" y1="17" x2="8" y2="17"/>
+          <line x1="10" y1="9" x2="8" y2="9"/>
+        </svg>
+      </button>
       <textarea
         bind:this={inputEl}
         bind:value={instruction}
@@ -900,6 +920,9 @@
   }
   .attach-btn:hover:not(:disabled) { color: var(--text-secondary); }
   .attach-btn:disabled { opacity: 0.4; }
+
+  .attach-btn-active { color: var(--accent); }
+  .attach-btn-active:hover:not(:disabled) { color: var(--accent); }
 
   .pin-btn-wrap { position: relative; flex-shrink: 0; }
 

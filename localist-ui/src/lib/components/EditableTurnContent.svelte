@@ -18,6 +18,9 @@
   export let content: string;
   export let streaming: boolean = false;
   export let editable: boolean = true;   // gate the edit toggle — false while streaming/planning
+  export let composeActive: boolean = false;   // Compose Mode is on — show the "Add to document" control
+  export let alreadyAdded: boolean = false;    // this turn has already been added to the compose draft
+  export let onAddToDocument: () => void = () => {};
 
   let editing = false;
   let draft = content;
@@ -145,20 +148,44 @@
       {/if}
     {/if}
   {:else}
-    {#if editable}
-      <button
-        class="turn-edit-toggle"
-        on:click={startEditing}
-        aria-label="Edit and save as file"
-        title="Edit and save as file"
-        type="button"
-      >
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-          <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-        </svg>
-      </button>
-    {/if}
+    <div class="turn-view-controls">
+      {#if composeActive}
+        <button
+          class="turn-add-doc-btn"
+          class:turn-add-doc-added={alreadyAdded}
+          on:click={onAddToDocument}
+          disabled={alreadyAdded}
+          aria-label={alreadyAdded ? 'Already added to document' : 'Add to document'}
+          title={alreadyAdded ? 'Added to document' : 'Add to document'}
+          type="button"
+        >
+          {#if alreadyAdded}
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="20 6 9 17 4 12"/>
+            </svg>
+          {:else}
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="12" y1="5" x2="12" y2="19"/>
+              <line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+          {/if}
+        </button>
+      {/if}
+      {#if editable}
+        <button
+          class="turn-edit-toggle"
+          on:click={startEditing}
+          aria-label="Edit and save as file"
+          title="Edit and save as file"
+          type="button"
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+          </svg>
+        </button>
+      {/if}
+    </div>
     <MarkdownRenderer {content} {streaming} />
   {/if}
 </div>
@@ -168,28 +195,76 @@
     position: relative;
   }
 
-  .turn-edit-toggle {
+  .turn-view-controls {
     position: absolute;
     top: 0;
     right: 0;
+    display: flex;
+    gap: var(--sp-1);
+  }
+
+  .turn-edit-toggle,
+  .turn-add-doc-btn {
     display: flex;
     align-items: center;
     justify-content: center;
     width: 22px;
     height: 22px;
     border-radius: var(--radius-sm);
-    background: var(--bg-panel);
+    /* bg-raised, not bg-panel: the bubble itself is bg-panel, so a bg-panel
+       button sitting on top of it was indistinguishable from the bubble
+       surface — only a 1px border separated them, easy to lose against
+       whatever text happens to sit underneath. The shadow adds a real
+       depth cue on top of the color difference, since a flat color alone
+       can still blend into text of a similar shade directly behind it. */
+    background: var(--bg-raised);
     border: 1px solid var(--border);
-    color: var(--text-tertiary);
+    box-shadow: var(--shadow-sm);
+    color: var(--text-secondary);
     opacity: 0;
-    transition: color var(--dur-fast) var(--ease), opacity var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
+    transition: color var(--dur-fast) var(--ease), opacity var(--dur-fast) var(--ease),
+      box-shadow var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
   }
 
-  :global(.turn:hover) .turn-edit-toggle {
+  :global(.turn:hover) .turn-edit-toggle,
+  :global(.turn:hover) .turn-add-doc-btn {
     opacity: 1;
   }
 
-  .turn-edit-toggle:hover { color: var(--text-secondary); background: var(--bg-active); }
+  /* Hover keeps the same opaque background (still var(--bg-raised), never
+     var(--bg-active)/var(--bg-hover) — those are translucent overlay tints
+     meant to sit on an already-transparent element elsewhere in the app;
+     used as this chip's *only* background, they let the text underneath
+     show back through on hover, which reads as "the shadow disappeared."
+     A stronger shadow + a lit border communicate hover instead, with the
+     surface staying fully opaque the whole time. */
+  .turn-edit-toggle:hover {
+    color: var(--text-primary);
+    box-shadow: var(--shadow-md);
+    border-color: var(--border-focus);
+  }
+  .turn-add-doc-btn:hover:not(:disabled) {
+    color: var(--text-primary);
+    box-shadow: var(--shadow-md);
+    border-color: var(--border-focus);
+  }
+
+  /* Same hover-gated opacity as the base state (not permanently visible) —
+     an always-on checkmark overlapping a short single-line turn's own last
+     word/line is a real, common overlap for terse answers, not just a
+     hover-only cosmetic tradeoff. Only the color/border read as "added"
+     once revealed. */
+  .turn-add-doc-added {
+    color: var(--success);
+    border-color: var(--success-dim);
+  }
+  /* Same opaque-background rule as above — border/shadow only, no
+     translucent background swap. */
+  .turn-add-doc-added:hover:not(:disabled) {
+    color: var(--success);
+    box-shadow: var(--shadow-md);
+    border-color: var(--success);
+  }
 
   .turn-edit-controls {
     position: absolute;

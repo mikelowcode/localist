@@ -928,3 +928,87 @@ after each verification round, leaving no leftover artifacts.
   from being in edit mode simultaneously. Not restricted, not tested; low risk given the single-user,
   one-conversation-at-a-time usage pattern, but worth a deliberate decision if it ever surfaces as a
   real point of confusion.
+
+### 7.23 Compose Mode: Multi-Turn Document Accumulation (2026-08-04)
+
+Michael asked to extend §7.22's per-turn editor into a "compose mode" — the assistant generates a long
+document across several chat turns, and the user assembles/edits the whole accumulated artifact as one
+document before saving. Scoped first, not built blind: an Explore-agent research pass confirmed no
+existing backend concept fits this (Slot 6A's `active_artifacts`, §9, is a same-turn RAG-source-path
+snapshot rebuilt every turn, not an accumulating document — repurposing it would break its actual
+semantics; `workflow_id`, §18.10, correlates steps within one tool dispatch, not across separate chat
+turns) and that `Turn`/`Task.metadata` was the only existing hook shaped right for a new
+turn-grouping concept. Two product decisions were put to Michael via `AskUserQuestion` before planning,
+since both meaningfully shaped the build: turns join the document via an explicit **manual "Add to
+document"** control per turn (not auto-capture-while-active, so incidental replies never land in the
+draft unasked), and the accumulating document lives in a **persistent side-by-side panel** (reusing
+`PreviewsPanel.svelte`/`previewsPanel.ts`'s collapsible-column mechanism, §7.14), not a bottom drawer.
+Built in three approved phases.
+
+**Realized scope: zero backend changes.** The entire feature is frontend-only — turn content
+concatenates client-side into a draft string, and saving reuses §7.22's exact `POST /files/generated` +
+`saveGeneratedFile()` path. No new endpoint, no new `chat_turns` column, no server-side document state.
+
+**Phase 1 — Panel shell.** New `stores/composeDocument.ts`: `{active, draft}`, scoped per
+`conversation_id` (mirrors `chatHistoryStore`'s reset-on-conversation-switch pattern in
+`conversation/[id]/+page.svelte`) and `localStorage`-persisted per conversation, so switching
+conversations swaps in that conversation's own draft and a reload doesn't lose an in-progress document.
+New `ComposeDocumentPanel.svelte` — structurally parallel to `PreviewsPanel.svelte` (same header/body
+shape, same `--previews-w` sizing) but **not** folded into it: a genuinely separate concern (an
+in-progress document vs. external live feeds), and unlike Previews' always-present collapsed-to-a-strip
+default, this panel is contextual — "off" means the `#app-shell` grid's new 4th column goes to `0px`,
+not a persistent discoverable strip, since there's nothing to keep visible across every route when no
+compose session exists. `+layout.svelte` grew a 4th `gridTemplateColumns` track
+(`$composeDocument.active ? 'var(--previews-w)' : '0px'`); `app.css`'s `#app-shell` initial rule updated
+to match. New composer-row toggle button in `ChatPanel.svelte` (document icon, next to attach/pin,
+highlighted `var(--accent)` while active). No route-gating — the panel deliberately stays open across
+navigation away from `/conversation` (e.g. to Settings) while a session is active, rather than forcing
+it closed, since the document isn't tied to `ChatPanel` being mounted.
+
+**Phase 2 — Turn wiring.** `composeDocument.ts` gained `addedTaskIds: string[]` and
+`addTurnToDocument(turnKey, content)` — idempotent per turn key (`ChatPanel.svelte`'s existing
+`provKey(turn)`, i.e. `task_id` falling back to `timestamp`), and critically **always appends to
+whatever the draft currently is**, never recomputed from the included-turns list — a prior hand-edit in
+the panel can never be silently clobbered by a later addition. This also means there's no structured
+"remove one turn's contribution" once added (a deliberate simplification, consistent with the manual-add
+decision): undoing means editing the draft text directly, the same capability the panel needs anyway.
+`EditableTurnContent.svelte` gained `composeActive`/`alreadyAdded`/`onAddToDocument` props — view mode
+shows a "+" control next to the existing pencil when compose mode is on, becoming a disabled green
+checkmark once that turn's been added.
+
+**Real bug caught by live verification, fixed before the phase shipped:** the checkmark was initially
+designed to stay permanently visible (not hover-gated like everything else in this corner), reasoned as
+an "at-a-glance record of what's already in the document." Playwright verification against a real short
+single-line answer ("The capital of France is Paris. (From my training)") showed the permanently-visible
+checkmark overlapping the bubble's own last word — a real, common case for terse answers, not an edge
+case. Fixed by making it hover-gated like the pencil toggle always was; only the resting color (green)
+reads as "added" once revealed via hover, same accepted hover-reveal tradeoff §7.22 already established
+for short content.
+
+**Phase 3 — Clear/reset and a styling pass.** `composeDocument.ts` gained `clearComposeDraft()`
+(resets both `draft` and `addedTaskIds`, keeps `active` — starts a fresh document in the same session
+rather than accumulating forever, e.g. after already saving one document). `ComposeDocumentPanel.svelte`
+gained a "Clear" link in the header (only shown once the draft has content) behind a two-step inline
+confirm banner — same destructive-action convention as Sidebar's file/conversation delete (§7.11),
+adapted to a banner rather than an in-row swap since the header has less room. Verified both dark and
+light themes (all colors are existing CSS custom properties, no new hardcoded values) and the two-panel
+case (Previews expanded alongside the Document panel at 1440px width) — chat column narrows but nothing
+overlaps or clips.
+
+**Verification, cumulative across all three phases.** `npm run check`: 0 errors, 0 warnings, at every
+step. Every functional pass live-verified against the real running dev server via Playwright (ad hoc in
+the scratchpad, per the §79/§80/§81 recipe): panel open/close, manual typing, save round-trip, reload
+persistence (both `active` and `draft` survive), two real chat turns added independently with correct
+separator formatting, idempotency (repeat-add is a no-op), hand-edit-after-add non-clobbering, confirm/
+cancel/clear, and the light-theme + dual-panel layout checks. Zero console/page errors at any pass. All
+test-created files deleted from `generated_files/` after each round; the directory's real pre-existing
+contents confirmed unchanged throughout.
+
+**Open items:**
+- No frontend automated test coverage (same precedent as §7.22/§20.9 — no test framework in this repo).
+- No structured way to remove a single already-added turn's contribution from the draft short of
+  editing the text by hand — an accepted simplification of the manual-add design, not an oversight, but
+  worth revisiting if it becomes a real friction point.
+- The Document panel has no route-gating — it stays mounted and visible while navigating away from the
+  conversation it belongs to. Intentional per Phase 1's reasoning, but not explicitly re-confirmed with
+  Michael as a final product decision.
