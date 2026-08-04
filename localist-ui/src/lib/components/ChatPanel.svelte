@@ -6,7 +6,7 @@
   import { currentConversationId, isFirstTurnOfConversation } from '$lib/stores/conversation';
   import { loadWikiFiles, wikiFiles, wikiLoading, wikiError } from '$lib/stores/files';
   import { assistantName } from '$lib/stores/assistantName';
-  import MarkdownRenderer from '$lib/components/MarkdownRenderer.svelte';
+  import EditableTurnContent from '$lib/components/EditableTurnContent.svelte';
   import ChartRenderer from '$lib/components/ChartRenderer.svelte';
   import DiffBlock from '$lib/components/DiffBlock.svelte';
   import { OCR_EXTENSIONS, extOf } from '$lib/utils/ocr';
@@ -382,9 +382,10 @@
               {/if}
 
               {#if turn.content}
-                <MarkdownRenderer
+                <EditableTurnContent
                   content={turn.content}
                   streaming={turn.status === 'streaming'}
+                  editable={turn.status === 'complete'}
                 />
               {:else if turn.status === 'planning'}
                 <span class="placeholder-pulse">···</span>

@@ -829,3 +829,102 @@ at §14.13). Live-verified end to end through the real running stack at each pas
 ordering and collapse/expand behavior confirmed visually by the user; the "Ask about this" flow confirmed
 via a direct `/task` call reproducing exactly what the button sends, both before the comment fix
 (fabricated paraphrase, now understood) and after (real comments, real usernames, grounded).
+
+### 7.22 Chat Turn "Save As": Direct-Write Generated-File Endpoint + In-Place Turn Editor (2026-08-03)
+
+Michael asked for every assistant chat turn to be saveable as a file into `generated_files/`, with a
+custom name, a `.md`/`.txt` choice, and the ability to edit the content before saving. Scoped and
+planned first (an Explore-agent research pass mapped `ChatPanel.svelte`'s per-turn rendering, the
+already-fully-built-but-write-only `generated_files/` read path, `mcp_server/file_ops.py`'s
+sandboxing/versioning, and confirmed no editable-text or per-message-toolbar precedent existed
+anywhere in the frontend), then built one approved phase at a time per Michael's established cadence.
+Two scoping decisions were resolved via `AskUserQuestion` before planning: editing is **export-only**
+(the draft never writes back to the live chat turn) and the file-type control is a fixed `.md`/`.txt`
+dropdown, not free-text extensions.
+
+**Phase 1 — Backend: `POST /files/generated`.** The direct-write counterpart to the model-driven
+`file_op write_file` MCP tool, for a user-triggered action rather than an agent tool call — no MCP
+round trip. Body: `{filename, extension: "txt"|"md", content}`. New `_sanitize_filename_stem()`
+(`main.py`) collapses arbitrary input to `[A-Za-z0-9_-]`, blocking path traversal (`../../etc/passwd`
+→ `etc-passwd`) and, by construction, ensuring the sanitized name never contains a space — which
+matters because the endpoint parses `file_ops.write_file()`'s human-readable return string (`"OK:
+wrote N characters to <name>"`) to learn the *actual* saved filename when a collision auto-versions it
+(`name_2.ext`, …), and a space in the name would make that parse ambiguous. Real correctness gap
+closed at startup, not just at the endpoint: `mcp_server/file_ops.py`'s sandbox root is resolved
+independently (`LOCALIST_MCP_PROJECT_ROOT`, read inside the standalone `localist-mcp` process) from
+`main.py`'s own `_state.generated_dir` (`LOCALIST_GENERATED_DIR`) — the two happen to coincide by
+default but aren't guaranteed to if configured differently. Since `main.py` now imports `file_ops`
+directly as a library (not over MCP) to reuse its sandboxing/never-overwrite logic, a one-line
+`file_ops.set_project_root(generated_dir)` call was added right after `_state.generated_dir` is
+resolved at startup — this only rebinds `file_ops`'s in-process module-global inside `main.py`'s own
+process, leaving the separate `localist-mcp` process's copy (and its own `LOCALIST_MCP_PROJECT_ROOT`
+resolution) untouched — guaranteeing the new endpoint always writes into the exact directory
+`GET /files/generated`/`/files/download`/`DELETE /files` already read from. 7 new tests
+(`tests/test_files_generated_endpoint.py`, fixture pattern mirrors §7.11's precedent): both
+extensions, collision auto-versioning, path-traversal sanitization, empty-content/empty-filename
+rejection, invalid-extension rejection. Full suite 1492 passed, 0 failed.
+
+**Phase 2 — Frontend, first cut: `SaveAsButton.svelte` (superseded within the same session, see
+below).** A small save icon overlaid top-right on a completed assistant bubble (hover-revealed),
+opening a floating popover with a textarea pre-filled from `turn.content`, a filename input, and the
+extension dropdown. `stores/files.ts` gained `saveGeneratedFile()`, mirroring `uploadFile()`'s
+POST-then-refresh-the-list pattern. Live-verified against the real running dev server (backend,
+`localist-mcp`, and frontend were all already up from a prior session) via a Playwright script —
+`chromium-cli` wasn't registered in this environment, so Playwright was installed ad hoc into the
+session's scratchpad directory only, the same recipe §79/§80 used, never touching the project's own
+`package.json`. Confirmed the full round trip: popover opens, content prefilled, save succeeds, file
+appears via `GET /files/generated`, no console errors.
+
+**Redesign — `EditableTurnContent.svelte` replaces the popover entirely.** Michael's live feedback
+after trying it: the popover's textarea was "not somewhere a user would want to draft their document
+edits" — too small, and structurally the wrong shape, since the original intent was editing the
+*actual chat turn paragraph* in place, with Save appearing top-right only once toggled into edit mode.
+Rebuilt as a single component now responsible for a turn's entire view↔edit lifecycle, replacing both
+`SaveAsButton.svelte` and the direct `<MarkdownRenderer>` call in `ChatPanel.svelte`: view mode renders
+the markdown as before, with a hover-revealed pencil toggle (`.turn-edit-toggle`, same top-right
+corner); clicking it swaps the rendered markdown for a full-width, auto-growing textarea (min 160px,
+grows with content to a 560px cap via a resize handler mirroring the composer's own
+`autoResizeTextarea()`, then becomes manually resizable/scrollable beyond that) with the filename input
+and extension dropdown directly beneath it, inline — not a second popup step. The pencil is replaced by
+a green checkmark (Save) and an X (Cancel) in the same corner only while editing. Editing remains
+export-only exactly as scoped — `draft` is local component state, never written to `chatHistoryStore`;
+Cancel discards it, and a completed Save shows an inline "Saved as `<name>`" confirmation with a Done
+button that returns to view mode, the live turn unchanged either way. A stale-error UX rough edge
+caught during this pass's own verification (a validation error like "Enter a file name" used to linger
+after the user started retyping) was fixed by clearing `error` on input to either the name field or the
+textarea.
+
+**Real CSS bug caught by Michael, not by the automated verification pass.** The first redesign
+verification only exercised a two-line response, which looked fine. A real long (6-paragraph) response
+came back looking "long and skinny vertical — a noticeable departure from the landscape orientated box
+it normally is." Root cause: `.bubble`/`.turn` are shrink-to-fit flex items with no explicit width
+(sized by content, up to a `max-width` cap) — `.turn-edit-textarea`'s `width: 100%` can't resolve
+against an undetermined ancestor width, so browsers fall back to the textarea's tiny default intrinsic
+column width (~20ch) in that ambiguous case; wrapping a long response into that narrow width then drove
+`scrollHeight` (and the JS-computed height, capped at 560px) far taller than the box was ever wide,
+producing exactly the observed skinny column. Fixed with an explicit `width: 600px; max-width: 100%;
+box-sizing: border-box` on the textarea instead of a percentage — a definite width gives shrink-to-fit
+ancestors a concrete value to size around, sidestepping the percentage-in-shrink-to-fit ambiguity
+entirely, while `max-width: 100%` keeps it responsive on narrower viewports. Re-verified against the
+same 6-paragraph response via Playwright bounding-box measurements: bubble width recovered from the
+collapsed narrow box to 634px (vs. 680px in plain view mode — a normal, minor difference, not a
+regression), textarea correctly capped at 560px tall with an internal scrollbar.
+
+**Verification.** `npm run check`: 0 errors, 0 warnings, throughout every iteration (initial popover,
+redesign, and the width fix). Every pass live-verified against the real running dev server via
+Playwright (installed ad hoc in the scratchpad, per the §79/§80 recipe) rather than mocked: hover
+reveal, in-place edit swap, content prefill, inline validation (including the stale-error fix),
+save-round-trip confirmed on disk through `GET /files/generated`, collision auto-versioning (`_2.md`)
+preserved from Phase 1, export-only behavior explicitly confirmed (the rendered turn is unchanged after
+an edit-then-cancel and after an edit-then-save), and the width-fix regression check on real long
+content. No console/page errors at any pass. All test-created files were deleted from `generated_files/`
+after each verification round, leaving no leftover artifacts.
+
+**Open items:**
+- No frontend automated test coverage for `EditableTurnContent.svelte`'s edit/save/cancel state
+  machine — no frontend test framework exists in this repo (same precedent as §20.9); verified only via
+  `svelte-check` plus live Playwright runs, not a checked-in regression suite.
+- Each turn's editor is fully self-contained local component state — nothing prevents multiple turns
+  from being in edit mode simultaneously. Not restricted, not tested; low risk given the single-user,
+  one-conversation-at-a-time usage pattern, but worth a deliberate decision if it ever surfaces as a
+  real point of confusion.

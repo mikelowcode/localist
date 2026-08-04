@@ -130,6 +130,7 @@ import logging
 import mimetypes
 import os
 import platform
+import re
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
@@ -157,6 +158,8 @@ import github_watch
 import hacker_news
 from mcp_server.ocr import get_upload_root as _ocr_upload_root
 from mcp_server.ocr import OCR_MIME_BY_EXTENSION as _OCR_MIME_BY_EXTENSION
+from mcp_server.file_ops import write_file as _write_generated_file
+from mcp_server.file_ops import set_project_root as _set_generated_file_root
 from mcp_tool_dispatcher import MCPToolDispatcher
 from memory_manager import MemoryManager, EpisodicMemoryWriter, EpisodicMemoryReader
 import news_brief
@@ -689,6 +692,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _state.schema_path   = schema_path
     _state.templates_dir = templates_dir
 
+    # file_ops resolves its own sandbox root independently (from
+    # LOCALIST_MCP_PROJECT_ROOT, for the standalone localist-mcp process) —
+    # sync its in-process copy to generated_dir so POST /files/generated
+    # below always writes into the exact directory GET /files/generated,
+    # /files/download, and DELETE /files already read from, even if the two
+    # env vars are configured to point elsewhere.
+    _set_generated_file_root(generated_dir)
+
     # -- Agents + Controller --------------------------------------------------
 
     logger.info(
@@ -939,6 +950,13 @@ class FileDeleteResponse(BaseModel):
     """Response body for DELETE /files."""
     path:    str
     deleted: bool
+
+
+class SaveGeneratedFileRequest(BaseModel):
+    """Request body for POST /files/generated — e.g. a chat turn's "Save as"."""
+    filename:  str
+    extension: Literal["txt", "md"]
+    content:   str
 
 
 class NewsPreferencesResponse(BaseModel):
@@ -1932,6 +1950,23 @@ def _file_entry(p: "Path", type: Literal["raw", "wiki", "generated"]) -> FileEnt
     )
 
 
+_FILENAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _sanitize_filename_stem(raw: str) -> str:
+    """
+    Turn arbitrary user input (e.g. a "Save as" filename field) into a safe
+    generated_files/ filename stem: whitespace and anything else collapses
+    to '-', repeats collapse, leading/trailing '-' are stripped, and the
+    result is capped at 150 chars. No spaces survive, which keeps
+    POST /files/generated's parse of file_ops.write_file()'s return string
+    (" ... to <name>") unambiguous even when the name was auto-versioned.
+    """
+    collapsed = _FILENAME_SANITIZE_RE.sub("-", raw.strip())
+    collapsed = re.sub(r"-{2,}", "-", collapsed).strip("-")
+    return collapsed[:150]
+
+
 @app.get(
     "/files/raw",
     response_model = FilesResponse,
@@ -2182,6 +2217,49 @@ async def post_file_upload(file: UploadFile = File(...)) -> FileEntry:
             )
 
     return _file_entry(dest, "raw")
+
+
+@app.post(
+    "/files/generated",
+    response_model = FileEntry,
+    summary        = "Save content as a new generated file",
+)
+async def post_file_generated(body: SaveGeneratedFileRequest) -> FileEntry:
+    """
+    Write user-supplied content (e.g. a "Save as" on an edited chat turn)
+    into generated_files/ as a new file — the direct-write counterpart to
+    the model-driven file_op write_file MCP tool, for actions the user
+    triggers themselves rather than the agent.
+
+    Reuses file_ops.write_file()'s sandboxing and never-overwrite/auto-
+    versioning behavior (name_2.ext ... name_10.ext) via the in-process
+    root synced to _state.generated_dir at startup, so the saved file
+    immediately shows up through the existing GET /files/generated,
+    /files/download, and DELETE /files endpoints.
+    """
+    if _state.generated_dir is None:
+        raise HTTPException(status_code=503, detail="generated_dir not configured.")
+
+    stem = _sanitize_filename_stem(body.filename)
+    if not stem:
+        raise HTTPException(
+            status_code=400,
+            detail="filename must contain at least one letter, digit, '-', or '_'.",
+        )
+    if not body.content.strip():
+        raise HTTPException(status_code=400, detail="content must not be empty.")
+
+    target_name = f"{stem}.{body.extension}"
+    try:
+        result = await asyncio.to_thread(_write_generated_file, target_name, body.content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # write_file() returns "OK: wrote N characters to <actual_name>" — the
+    # actual name may differ from target_name if it was auto-versioned
+    # because target_name already existed.
+    actual_name = result.rsplit(" ", 1)[-1]
+    return _file_entry(_state.generated_dir / actual_name, "generated")
 
 
 # ---------------------------------------------------------------------------

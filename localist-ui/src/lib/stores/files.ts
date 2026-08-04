@@ -187,6 +187,35 @@ export async function uploadFile(file: File): Promise<FileEntry> {
 }
 
 /**
+ * Save arbitrary content (e.g. an edited chat turn) to POST /api/files/generated.
+ *
+ * Never overwrites an existing file — the backend auto-versions on a name
+ * collision (name_2.ext, ...), so the returned FileEntry.filename may differ
+ * from the requested filename+extension. Refreshes the generated listing on
+ * success. Throws on failure.
+ */
+export async function saveGeneratedFile(
+  filename:  string,
+  extension: 'txt' | 'md',
+  content:   string,
+): Promise<FileEntry> {
+  const res = await fetch('/api/files/generated', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename, extension, content }),
+  });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail ?? `Save failed: HTTP ${res.status}`);
+  }
+
+  const entry: FileEntry = await res.json();
+  await loadGeneratedFiles();
+  return entry;
+}
+
+/**
  * Ingest a raw file via POST /api/task/stream.
  *
  * Streams SSE progress into the `ingest` store.
