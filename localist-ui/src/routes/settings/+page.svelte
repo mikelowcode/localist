@@ -10,6 +10,7 @@
     pinChatModel
   } from '$lib/stores/runtimeBackendSwitch';
   import { theme } from '$lib/stores/theme';
+  import { fontSize, FONT_SIZES } from '$lib/stores/fontSize';
   import { browser } from '$app/environment';
   import {
     retentionSettings,
@@ -380,6 +381,22 @@
         aria-label="Toggle light/dark theme"
         on:click={theme.toggle}
       ><span class="switch-knob" /></button>
+    </section>
+
+    <!-- Font size -->
+    <section class="settings-card">
+      <div class="card-title">Font Size</div>
+      <p class="card-desc">Scales text throughout the app. Some UI chrome and labels are a fixed size and won't change.</p>
+      <div class="segmented">
+        {#each FONT_SIZES as f}
+          <button
+            type="button"
+            class="seg-btn"
+            class:active={$fontSize === f.value}
+            on:click={() => fontSize.set(f.value)}
+          >{f.label}</button>
+        {/each}
+      </div>
     </section>
 
     <!-- Backend connection -->

@@ -8,6 +8,7 @@
   import ComposeDocumentPanel from '$lib/components/ComposeDocumentPanel.svelte';
   import { startHealthPolling, stopHealthPolling } from '$lib/stores/server';
   import { theme } from '$lib/stores/theme';
+  import { fontSize } from '$lib/stores/fontSize';
   import { sidebarWidth, sidebarCollapsed } from '$lib/stores/sidebar';
   import { previewsPanelCollapsed } from '$lib/stores/previewsPanel';
   import { composeDocument, composePanelWidth } from '$lib/stores/composeDocument';
@@ -31,9 +32,10 @@
   }
 
   onMount(() => {
-    // Apply saved theme
+    // Apply saved theme and font size
     if (browser) {
       document.documentElement.setAttribute('data-theme', $theme);
+      document.documentElement.setAttribute('data-font-size', $fontSize);
     }
     startHealthPolling();
     loadAssistantName();

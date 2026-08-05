@@ -107,6 +107,44 @@
   --text-muted:     #b4b4bc;
 }
 
+/* ── Font size overrides ───────────────────────────────────────
+   "md" is the default scale defined in :root above; these blocks
+   only need to override the other three presets. Known limitation:
+   only tokenized (var(--text-*)) declarations respond to this —
+   see docs/architecture note on font-size scoping. */
+:root[data-font-size="sm"] {
+  --text-xs:    10px;
+  --text-sm:    11px;
+  --text-base:  12px;
+  --text-md:    13px;
+  --text-lg:    15px;
+  --text-xl:    17px;
+  --text-2xl:   21px;
+  --text-3xl:   26px;
+}
+
+:root[data-font-size="lg"] {
+  --text-xs:    12px;
+  --text-sm:    15px;
+  --text-base:  16px;
+  --text-md:    17px;
+  --text-lg:    19px;
+  --text-xl:    22px;
+  --text-2xl:   27px;
+  --text-3xl:   34px;
+}
+
+:root[data-font-size="xl"] {
+  --text-xs:    14px;
+  --text-sm:    16px;
+  --text-base:  18px;
+  --text-md:    19px;
+  --text-lg:    21px;
+  --text-xl:    25px;
+  --text-2xl:   30px;
+  --text-3xl:   38px;
+}
+
 /* ── Reset ─────────────────────────────────────────────────── */
 *, *::before, *::after {
   box-sizing: border-box;
