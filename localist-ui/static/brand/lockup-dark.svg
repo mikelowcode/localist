@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 64">
+  <rect width="64" height="64" rx="14" fill="#111318"></rect>
+  <g transform="scale(0.5333)">
+    <path fill-rule="evenodd" clip-rule="evenodd" fill="#F5F4F0" d="
+      M 40.55,71.94
+      A 27.5,27.5 0 0 1 40.55,33.06
+      A 27.5,27.5 0 0 1 79.45,33.06
+      A 27.5,27.5 0 0 1 79.45,71.94
+      L 60,91.39
+      Z
+      M 60,58.5 A 8.5,8.5 0 1 0 60,41.5 A 8.5,8.5 0 1 0 60,58.5 Z
+    "></path>
+  </g>
+  <text x="80" y="40" font-family="Helvetica Neue, Arial, sans-serif" font-size="26" font-weight="700" letter-spacing="1" fill="#F5F4F0">LOCALIST</text>
+</svg>

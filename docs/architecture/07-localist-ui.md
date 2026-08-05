@@ -1026,7 +1026,8 @@ pattern (`runtimeBackendSwitch.ts`/§16.5), since font size is cosmetic/per-devi
 server-side behavioral implication (that split — `.env` for runtime infra, SQLite `*_settings` tables for
 retention/assistant-name, `localStorage` for theme/streaming/episodic-approval/backend-url — was
 confirmed against the actual current code before picking, not assumed). New `stores/fontSize.ts`:
-`localStorage['lora-font-size']` + a `writable` store, mirrored onto `document.documentElement`'s
+`localStorage['localist-font-size']` (renamed from `lora-font-size`, see §7.25) + a `writable` store,
+mirrored onto `document.documentElement`'s
 `data-font-size` attribute (parallel to `data-theme`) both on `set()` and again in `+layout.svelte`'s
 `onMount` for post-hydration correctness. `app.css` gained three `:root[data-font-size="sm|lg|xl"]`
 override blocks (sibling to the existing `:root[data-theme="light"]` block) remapping the eight
@@ -1063,3 +1064,57 @@ declarations are explicitly out of scope — the former is a deliberate fixed an
 Estimated ~80 mechanical edits across ~15 component files plus the 3 new token rows. **Deferred at
 Michael's request** (2026-08-05) — no code changes made; this section exists so the mapping table and
 the "why not just remap onto existing tokens" reasoning don't have to be re-derived if picked up later.
+
+### 7.25 New Logo (Place-Marker Mark), Sidebar Nav-Icon Cleanup, and Remaining "LORA" → "Localist" Text (2026-08-05)
+
+Michael supplied a new logo kit (monochrome place-marker mark, dark tile `#111318` / mark `#F5F4F0`;
+`icon.svg`, `logomark-tile.svg`, `lockup-light.svg`, `lockup-dark.svg` + kit `README.md`) and asked to
+scope its implementation. Auditing first, rather than assuming prior branding existed to replace, found
+two placeholders instead of real branding: `app.html`'s `<link rel="icon" href="%sveltekit.assets%/
+favicon.png">` was a dead link (`localist-ui` had no `static/` directory at all — 404 in both dev and
+prod), and `Sidebar.svelte`'s wordmark rendered `<span class="brand-mark">L</span>` with **no CSS rule
+for `.brand-mark` anywhere in the file** — an unstyled bare letter, not a mark.
+
+**Assets.** New `localist-ui/static/brand/` holds the kit verbatim (all four SVGs + README) as the
+canonical, servable copy.
+
+**Favicon.** `app.html`'s dead link replaced with `<link rel="icon" type="image/svg+xml"
+href="%sveltekit.assets%/brand/logomark-tile.svg">` plus a matching `apple-touch-icon` —
+`logomark-tile.svg` was picked over `icon.svg` specifically because it's self-contained (tile baked
+in), unlike `icon.svg`'s `fill="currentColor"` which needs a CSS color context a favicon `<link>`
+doesn't provide.
+
+**Sidebar mark.** `icon.svg`'s path data is inlined directly as markup in `Sidebar.svelte` (not
+imported — `static/` isn't part of Vite's module graph, so a `?raw` import isn't available for it),
+`fill="currentColor"`, replacing the bare `L`. The previously-nonexistent `.brand-mark` CSS rule was
+added (20×20px, `flex-shrink: 0`, `color: var(--text-primary)`) — it now actually tracks both themes
+automatically, the same pattern the kit's own README documents.
+
+**Nav-icon-sq removal.** Follow-up ask: the five single-bold-letter nav badges (`C`/`M`/`E`/`F`/`S` next
+to Chat/Memory/Episodes/Files/Settings) read as redundant against the adjacent text label and clashed
+with the new minimalist mark. Removed all five `<span class="nav-icon-sq">` markup instances, the
+now-orphaned `.nav-link.active .nav-icon-sq` override in `Sidebar.svelte`, and the base `.nav-icon-sq`
+rule in `app.css` (confirmed unused anywhere else in the frontend before deleting).
+
+**Remaining "LORA" text.** `app.html`'s `<title>`/meta description were the last user-visible "LORA"
+strings in the UI — every per-route `<title>` (`Conversation — Localist`, `Settings — Localist`, etc.)
+already said "Localist". Updated to `<title>Localist</title>` /
+`"Localist — a local-first, agentic general assistant"`.
+
+**`lora-*` → `localist-*` localStorage key rename.** At Michael's explicit request (single-user, an
+in-place preferences reset on next load was an accepted tradeoff, not a bug) — every remaining
+`lora-*` localStorage key was renamed to `localist-*`: `theme.ts` (`lora-theme`), `sidebar.ts`
+(`lora-sidebar-width`/`lora-sidebar-collapsed`), `fontSize.ts` (`lora-font-size`, §7.24),
+`composeDocument.ts` (`lora-compose-doc-` prefix, `lora-compose-panel-width`, §7.23),
+`previewBlocks.ts` (`lora-preview-blocks-collapsed`, §7.21), `previewsPanel.ts`
+(`lora-previews-panel-collapsed`, §7.14), `model.ts` (`lora-runtime-backend`), and
+`settings/+page.svelte` (`lora-backend-url`, `lora-streaming`, `lora-episodic-approval`) — 8 files, 17
+call sites, confirmed via full-repo grep both before (to enumerate) and after (to verify zero `lora-`
+keys remained).
+
+**Verification.** `svelte-check`: 0 errors/warnings after each step. Live-verified by Michael directly
+against the running dev server: favicon renders correctly (confirmed via the served HTML's `<link>`
+tags, not just file presence), sidebar mark renders correctly in both themes, nav spacing/alignment
+holds with the letter badges gone, and — after a hard refresh — all settings (theme, sidebar
+width/collapsed, font size) cleanly reset to defaults under the new key names with no leftover stale
+values or console errors.

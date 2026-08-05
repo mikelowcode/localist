@@ -100,12 +100,12 @@
 
   // Initialize from store
   $: if (browser) {
-    backendUrl = localStorage.getItem('lora-backend-url') ?? 'http://127.0.0.1:8000';
+    backendUrl = localStorage.getItem('localist-backend-url') ?? 'http://127.0.0.1:8000';
     chatModel  = $modelConfig.chat_model;
   }
 
   function saveBackendUrl() {
-    if (browser) localStorage.setItem('lora-backend-url', backendUrl);
+    if (browser) localStorage.setItem('localist-backend-url', backendUrl);
   }
 
   // The backend whose models the Chat Model dropdown below is scoped to.
@@ -166,18 +166,18 @@
   let episodicApproval = false;
 
   $: if (browser) {
-    streaming = localStorage.getItem('lora-streaming') !== '0';
-    episodicApproval = localStorage.getItem('lora-episodic-approval') === '1';
+    streaming = localStorage.getItem('localist-streaming') !== '0';
+    episodicApproval = localStorage.getItem('localist-episodic-approval') === '1';
   }
 
   function toggleStreaming() {
     streaming = !streaming;
-    if (browser) localStorage.setItem('lora-streaming', streaming ? '1' : '0');
+    if (browser) localStorage.setItem('localist-streaming', streaming ? '1' : '0');
   }
 
   function toggleEpisodicApproval() {
     episodicApproval = !episodicApproval;
-    if (browser) localStorage.setItem('lora-episodic-approval', episodicApproval ? '1' : '0');
+    if (browser) localStorage.setItem('localist-episodic-approval', episodicApproval ? '1' : '0');
   }
 
   // Daily News Brief preferences (docs/daily-news-brief-plan.md §5) — local

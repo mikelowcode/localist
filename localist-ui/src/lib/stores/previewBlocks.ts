@@ -20,7 +20,7 @@ import { browser } from '$app/environment';
 
 export type PreviewBlockKey = 'news' | 'github' | 'hackerNews';
 
-const STORAGE_KEY = 'lora-preview-blocks-collapsed';
+const STORAGE_KEY = 'localist-preview-blocks-collapsed';
 
 // Defaults to all expanded — collapsing a box is an opt-in decluttering
 // action, not the default state (contrast previewsPanel.ts, whose default

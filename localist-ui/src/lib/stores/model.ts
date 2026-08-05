@@ -8,7 +8,7 @@ export interface ModelState {
   backend: string;
 }
 
-const BACKEND_KEY = 'lora-runtime-backend';
+const BACKEND_KEY = 'localist-runtime-backend';
 
 export const RUNTIME_BACKENDS = ['omlx', 'ollama', 'foundry'] as const;
 export type RuntimeBackend = (typeof RUNTIME_BACKENDS)[number];

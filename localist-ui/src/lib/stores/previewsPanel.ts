@@ -14,7 +14,7 @@
 import { writable } from 'svelte/store';
 import { browser } from '$app/environment';
 
-const COLLAPSED_KEY = 'lora-previews-panel-collapsed';
+const COLLAPSED_KEY = 'localist-previews-panel-collapsed';
 
 // Defaults to collapsed — this is a new, low-traffic panel and shouldn't
 // eat horizontal space for existing users until they opt in by expanding it.

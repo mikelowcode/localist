@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
+  <rect width="120" height="120" rx="26" fill="#111318"></rect>
+  <path fill-rule="evenodd" clip-rule="evenodd" fill="#F5F4F0" d="
+    M 40.55,71.94
+    A 27.5,27.5 0 0 1 40.55,33.06
+    A 27.5,27.5 0 0 1 79.45,33.06
+    A 27.5,27.5 0 0 1 79.45,71.94
+    L 60,91.39
+    Z
+    M 60,58.5 A 8.5,8.5 0 1 0 60,41.5 A 8.5,8.5 0 1 0 60,58.5 Z
+  "></path>
+</svg>

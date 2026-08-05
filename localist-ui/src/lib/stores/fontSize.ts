@@ -11,7 +11,7 @@ export const FONT_SIZES: { value: FontSize; label: string }[] = [
 ];
 
 function createFontSizeStore() {
-  const stored = browser ? (localStorage.getItem('lora-font-size') as FontSize | null) : null;
+  const stored = browser ? (localStorage.getItem('localist-font-size') as FontSize | null) : null;
   const initial: FontSize = stored ?? 'md';
 
   const { subscribe, set } = writable<FontSize>(initial);
@@ -20,7 +20,7 @@ function createFontSizeStore() {
     subscribe,
     set: (size: FontSize) => {
       if (browser) {
-        localStorage.setItem('lora-font-size', size);
+        localStorage.setItem('localist-font-size', size);
         document.documentElement.setAttribute('data-font-size', size);
       }
       set(size);

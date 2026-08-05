@@ -28,7 +28,7 @@ export interface ComposeState {
 }
 
 const EMPTY_STATE: ComposeState = { active: false, draft: '', addedTaskIds: [] };
-const STORAGE_PREFIX = 'lora-compose-doc-';
+const STORAGE_PREFIX = 'localist-compose-doc-';
 
 function storageKey(conversationId: string): string {
   return STORAGE_PREFIX + conversationId;
@@ -112,7 +112,7 @@ export function clearComposeDraft(): void {
 // pattern reused in ComposeDocumentPanel.svelte, mirrored from
 // Sidebar.svelte's own divider).
 
-const WIDTH_KEY = 'lora-compose-panel-width';
+const WIDTH_KEY = 'localist-compose-panel-width';
 const DEFAULT_WIDTH = 320;   // matches --previews-w, the panel's prior fixed width
 export const COMPOSE_MIN_WIDTH = 280;
 export const COMPOSE_MAX_WIDTH = 800;

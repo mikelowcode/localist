@@ -307,7 +307,17 @@
 >
   <!-- Wordmark -->
   <div class="wordmark">
-    <span class="brand-mark">L</span>
+    <svg class="brand-mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path fill-rule="evenodd" clip-rule="evenodd" fill="currentColor" d="
+        M 8.111,14.389
+        A 5.5,5.5 0 0 1 8.111,6.611
+        A 5.5,5.5 0 0 1 15.889,6.611
+        A 5.5,5.5 0 0 1 15.889,14.389
+        L 12,18.278
+        Z
+        M 12,11.7 A 1.7,1.7 0 1 0 12,8.3 A 1.7,1.7 0 1 0 12,11.7 Z
+      "></path>
+    </svg>
     <span class="wordmark-text">LOCALIST</span>
   </div>
 
@@ -324,7 +334,6 @@
           aria-expanded={chatHistoryExpanded}
           on:click={handleChatNavClick}
         >
-          <span class="nav-icon-sq">C</span>
           <span class="nav-label">Chat</span>
           <span class="nav-chevron" aria-hidden="true">{chatHistoryExpanded ? '⌃' : '⌄'}</span>
         </button>
@@ -408,7 +417,6 @@
           class:active={active.startsWith('/memory')}
           aria-current={active.startsWith('/memory') ? 'page' : undefined}
         >
-          <span class="nav-icon-sq">M</span>
           <span class="nav-label">Memory</span>
           {#if $pendingCount > 0}
             <span class="badge badge-warning nav-badge">{$pendingCount}</span>
@@ -424,7 +432,6 @@
           class:active={active.startsWith('/episodes')}
           aria-current={active.startsWith('/episodes') ? 'page' : undefined}
         >
-          <span class="nav-icon-sq">E</span>
           <span class="nav-label">Episodes</span>
         </a>
       </li>
@@ -439,7 +446,6 @@
           aria-expanded={filesNavExpanded}
           on:click={handleFilesNavClick}
         >
-          <span class="nav-icon-sq">F</span>
           <span class="nav-label">Files</span>
           <span class="nav-chevron" aria-hidden="true">{filesNavExpanded ? '⌃' : '⌄'}</span>
         </button>
@@ -568,7 +574,6 @@
           class:active={active.startsWith('/settings')}
           aria-current={active.startsWith('/settings') ? 'page' : undefined}
         >
-          <span class="nav-icon-sq">S</span>
           <span class="nav-label">Settings</span>
         </a>
       </li>
@@ -637,6 +642,13 @@
     white-space: nowrap;
   }
 
+  .brand-mark {
+    width: 20px;
+    height: 20px;
+    flex-shrink: 0;
+    color: var(--text-primary);
+  }
+
   .wordmark-text {
     font-size: 12px;
     font-weight: 600;
@@ -691,11 +703,6 @@
     color: var(--accent);
     background: var(--accent-glow);
     font-weight: 500;
-  }
-
-  .nav-link.active .nav-icon-sq {
-    background: var(--accent);
-    color: #fff;
   }
 
   .nav-label { flex: 1; }

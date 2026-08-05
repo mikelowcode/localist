@@ -4,7 +4,7 @@ import { browser } from '$app/environment';
 export type Theme = 'dark' | 'light';
 
 function createThemeStore() {
-  const stored = browser ? (localStorage.getItem('lora-theme') as Theme | null) : null;
+  const stored = browser ? (localStorage.getItem('localist-theme') as Theme | null) : null;
   const initial: Theme = stored ?? 'dark';
 
   const { subscribe, set, update } = writable<Theme>(initial);
@@ -13,7 +13,7 @@ function createThemeStore() {
     subscribe,
     set: (theme: Theme) => {
       if (browser) {
-        localStorage.setItem('lora-theme', theme);
+        localStorage.setItem('localist-theme', theme);
         document.documentElement.setAttribute('data-theme', theme);
       }
       set(theme);
@@ -22,7 +22,7 @@ function createThemeStore() {
       update((current) => {
         const next: Theme = current === 'dark' ? 'light' : 'dark';
         if (browser) {
-          localStorage.setItem('lora-theme', next);
+          localStorage.setItem('localist-theme', next);
           document.documentElement.setAttribute('data-theme', next);
         }
         return next;

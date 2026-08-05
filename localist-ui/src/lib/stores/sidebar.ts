@@ -10,8 +10,8 @@
 import { writable } from 'svelte/store';
 import { browser } from '$app/environment';
 
-const WIDTH_KEY = 'lora-sidebar-width';
-const COLLAPSED_KEY = 'lora-sidebar-collapsed';
+const WIDTH_KEY = 'localist-sidebar-width';
+const COLLAPSED_KEY = 'localist-sidebar-collapsed';
 
 const DEFAULT_WIDTH = 236;
 export const MIN_WIDTH = 180;

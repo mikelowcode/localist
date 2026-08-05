@@ -513,18 +513,3 @@ input::placeholder, textarea::placeholder {
   white-space: nowrap;
 }
 
-/* ── Nav icon square (20×20, single bold mono letter) ───────────────────── */
-.nav-icon-sq {
-  width: 20px;
-  height: 20px;
-  border-radius: 6px;
-  background: var(--bg-active);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 700;
-  flex-shrink: 0;
-  color: inherit;
-}
