@@ -1012,3 +1012,54 @@ contents confirmed unchanged throughout.
 - The Document panel has no route-gating — it stays mounted and visible while navigating away from the
   conversation it belongs to. Intentional per Phase 1's reasoning, but not explicitly re-confirmed with
   Michael as a final product decision.
+
+### 7.24 Font Size Accessibility Setting (2026-08-05)
+
+First accessibility-scoped feature (scoped as a standalone control, not the start of a broader
+accessibility initiative — the broader-push option was explicitly declined via `AskUserQuestion`). A new
+Settings card, "Font Size," offering four presets (Small/Medium/Large/X-Large) as a segmented control,
+placed directly under the existing Theme toggle.
+
+**Realized scope: zero backend changes**, purely client-side — cloned `stores/theme.ts`'s exact pattern
+rather than the SQLite-singleton-table pattern (`retentionSettings.ts`/§20.10) or the `.env`-persisted
+pattern (`runtimeBackendSwitch.ts`/§16.5), since font size is cosmetic/per-device rendering with no
+server-side behavioral implication (that split — `.env` for runtime infra, SQLite `*_settings` tables for
+retention/assistant-name, `localStorage` for theme/streaming/episodic-approval/backend-url — was
+confirmed against the actual current code before picking, not assumed). New `stores/fontSize.ts`:
+`localStorage['lora-font-size']` + a `writable` store, mirrored onto `document.documentElement`'s
+`data-font-size` attribute (parallel to `data-theme`) both on `set()` and again in `+layout.svelte`'s
+`onMount` for post-hydration correctness. `app.css` gained three `:root[data-font-size="sm|lg|xl"]`
+override blocks (sibling to the existing `:root[data-theme="light"]` block) remapping the eight
+`--text-*` typography tokens; `md` is the pre-existing default scale, untouched. `svelte-check`: 0
+errors/warnings. Live-verified by Michael directly against the running dev server (segmented-control
+active-state highlighting and no overflow/clipping at every preset, including X-Large).
+
+**Known limitation, scoped and accepted up front, not discovered after the fact:** only 86 of the
+frontend's 169 total `font-size` declarations use `var(--text-*)` tokens — the other 81 are hardcoded
+px literals in component-local `<style>` blocks (heaviest in `Sidebar.svelte`, `ChatPanel.svelte`,
+`PreviewsPanel.svelte`, `ComposeDocumentPanel.svelte`, `EpisodesPanel.svelte`, `settings/+page.svelte`).
+This setting scales prose/headings/primary copy; sidebar labels and a good deal of chat/preview-panel
+meta text stay fixed size. Michael explicitly accepted this gap rather than requesting the wider
+migration in the same pass.
+
+**Proposed future design (scoped, not built) — hardcoded-`font-size` token migration.** The 81 literal
+values don't land on the 8 existing tokens (`xs:11 / sm:13 / base:14 / md:15 / lg:17 / xl:20 / 2xl:24 /
+3xl:30`), so a naive nearest-token remap would visibly shift sizes even at the Medium default. Proposed
+fix: add three new intermediate tokens sized to exactly match today's most common literals (zero visual
+change at Medium), each gaining its own row in the three `sm`/`lg`/`xl` override blocks so it actually
+scales:
+
+| New token | Medium (= today's literal) | Absorbs |
+|---|---|---|
+| `--text-3xs` | 10px | 9.5px, 10px, 10.5px (13 call sites) |
+| `--text-2sm` | 12px | 12px, 12.5px (15 call sites) |
+| `--text-md-plus` | 16px | 16px (1 call site, `ComposeDocumentPanel.svelte`) |
+
+The remaining literals (11/11.5 → `xs`, 13/13.5 → `sm`, 14 → `base`, 15 → `md`) already land on an
+existing token within ≤0.5px, an accepted sub-pixel rounding tolerance. `html`'s root `font-size: 16px`
+(the `rem` anchor, `app.css:157` at the time of this scoping) and the handful of `em`-relative
+declarations are explicitly out of scope — the former is a deliberate fixed anchor independent of the
+`--text-*` scale, the latter already scale proportionally with whatever token their ancestor uses.
+Estimated ~80 mechanical edits across ~15 component files plus the 3 new token rows. **Deferred at
+Michael's request** (2026-08-05) — no code changes made; this section exists so the mapping table and
+the "why not just remap onto existing tokens" reasoning don't have to be re-derived if picked up later.
