@@ -210,6 +210,7 @@
 
     submitting = true;
     instruction = '';
+    await tick();
     autoResizeTextarea();
 
     const task_id = crypto.randomUUID();
