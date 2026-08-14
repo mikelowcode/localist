@@ -1257,7 +1257,7 @@ async def post_task(request: TaskRequest) -> TaskResponse:
     task_dict = {
         "task_id":     request.task_id,
         "instruction": request.instruction,
-        "context":     _enrich_context(request.context),
+        "context":     {**_enrich_context(request.context), "conversation_id": request.conversation_id},
         "metadata":    request.metadata,
     }
 
@@ -1315,7 +1315,7 @@ async def post_task_stream(request: TaskRequest) -> StreamingResponse:
     task_dict = {
         "task_id":     request.task_id,
         "instruction": request.instruction,
-        "context":     _enrich_context(request.context),
+        "context":     {**_enrich_context(request.context), "conversation_id": request.conversation_id},
         "metadata":    request.metadata,
     }
 

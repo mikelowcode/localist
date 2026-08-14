@@ -332,12 +332,38 @@ distinct from `tasks.ts`'s `SESSION_ID` (see below):
 **`tasks.ts`'s `submitTask()`**, extended with two new trailing optional
 params, `conversation_id?: string` and `conversation_title?: string`,
 both passed straight through in the `POST /task/stream` request body.
-This is separate from, and does not touch, the pre-existing
-`SESSION_ID` constant (`tasks.ts:53`) — `SESSION_ID` is a page-load-scoped
-id used for backend `conversation_log` working-memory grouping (§12.2);
-`conversation_id` is the durable, user-facing chat-thread identifier
-persisted across reloads. The two must not be conflated: one resets on
-every full page reload by design, the other explicitly does not.
+This is separate from the pre-existing `SESSION_ID` constant
+(`tasks.ts:53`) — `SESSION_ID` is a page-load-scoped id, `conversation_id`
+is the durable, user-facing chat-thread identifier persisted across
+reloads and rotated by "New chat".
+
+**Update 2026-08-14 — `_memory_key()` now prefers `conversation_id`
+(fixes stale context on "New chat").** Originally, backend
+`conversation_log` working-memory grouping (§12.2, `ControllerAgent.
+_memory_key()` in `controller_agent.py`) keyed off `session_id` only,
+with the framing above ("the two must not be conflated... one resets on
+every full page reload by design, the other explicitly does not") taken
+to mean working memory should stay tied to the browser tab's lifetime.
+In practice this meant clicking "+ New chat" — a client-side SPA
+navigation that rotates `conversation_id` but leaves `SESSION_ID`
+untouched — left the model still reading turns from the just-abandoned
+conversation, even though the visible transcript (`chat_turns`, correctly
+`conversation_id`-scoped) looked empty. Nothing in this section actually
+specified that starting a new chat should reset working memory; the
+`SESSION_ID`/`conversation_id` split predates "New chat" existing at all
+(§7.8, 2026-06-29) and was never revisited when `conversation_id` shipped.
+
+Fixed by merging `conversation_id` into `task.context` at both
+`task_dict` construction sites in `main.py` (`post_task()`,
+`post_task_stream()`) and changing `_memory_key()`'s precedence to
+`conversation_id` → `session_id` → `task_id`. Working-memory continuity
+is now scoped to the conversation the user is looking at; `session_id`
+remains a fallback for non-conversation callers (e.g. none currently
+send `conversation_id` without also being conversation turns), and
+`task_id` remains the fallback for the one-shot ingest path, which
+supplies neither. See `backend/tests/test_controller_phase4.py`,
+`TestMemoryKey`, for the regression coverage (in particular
+`test_new_conversation_id_in_same_session_is_isolated`).
 
 **`src/routes/history/+page.svelte` — retired 2026-07-21, see §20.** Was
 unlinked from nav since the 2026-07-02 merge above; deleted outright once

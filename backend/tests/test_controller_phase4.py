@@ -2168,23 +2168,32 @@ class TestLoadUserProfileWikiDoc:
 
 
 # ---------------------------------------------------------------------------
-# _memory_key() and session_id cross-turn working memory
+# _memory_key() and conversation_id/session_id cross-turn working memory
 # ---------------------------------------------------------------------------
 
 class TestMemoryKey:
 
-    def test_prefers_session_id_when_present(self):
-        """session_id in context takes precedence over task_id."""
+    def test_prefers_conversation_id_over_session_id(self):
+        """conversation_id takes precedence over session_id and task_id."""
+        task = Task(
+            task_id="xyz",
+            instruction="hi",
+            context={"conversation_id": "conv-1", "session_id": "abc"},
+        )
+        assert _memory_key(task) == "conv-1"
+
+    def test_falls_back_to_session_id_when_no_conversation_id(self):
+        """session_id in context is used when conversation_id is absent."""
         task = Task(task_id="xyz", instruction="hi", context={"session_id": "abc"})
         assert _memory_key(task) == "abc"
 
     def test_falls_back_to_task_id_when_absent(self):
-        """Callers without session_id (e.g. ingest path) keep today's behavior."""
+        """Callers without conversation_id/session_id (e.g. ingest path) keep today's behavior."""
         task = Task(task_id="xyz", instruction="hi", context={})
         assert _memory_key(task) == "xyz"
 
-    def test_same_session_id_shares_working_memory(self, db_path: Path):
-        """Two handle_task() calls with the same session_id accumulate in one log."""
+    def test_same_conversation_id_shares_working_memory(self, db_path: Path):
+        """Two handle_task() calls with the same conversation_id accumulate in one log."""
         mm   = MemoryManager(db_path=db_path)
         rt   = make_runtime()
         conv = make_conv_agent("Answer.")
@@ -2193,21 +2202,46 @@ class TestMemoryKey:
         ctrl.handle_task({
             "task_id":     "task-1",
             "instruction": "First question",
-            "context":     {"session_id": "test-session"},
+            "context":     {"conversation_id": "conv-shared", "session_id": "tab-session"},
         })
         ctrl.handle_task({
             "task_id":     "task-2",
             "instruction": "Second question",
-            "context":     {"session_id": "test-session"},
+            "context":     {"conversation_id": "conv-shared", "session_id": "tab-session"},
         })
 
-        entries = mm.get_context_window(task_id="test-session", limit=20)
+        entries = mm.get_context_window(task_id="conv-shared", limit=20)
         user_instructions = [e["content"] for e in entries if e["role"] == "user"]
         assert "First question" in user_instructions
         assert "Second question" in user_instructions
 
+    def test_new_conversation_id_in_same_session_is_isolated(self, db_path: Path):
+        """Clicking 'New chat' (new conversation_id, same page-load session_id)
+        must not leak the prior conversation's turns into working memory."""
+        mm   = MemoryManager(db_path=db_path)
+        rt   = make_runtime()
+        conv = make_conv_agent("Answer.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        ctrl.handle_task({
+            "task_id":     "task-1",
+            "instruction": "Old conversation question",
+            "context":     {"conversation_id": "conv-old", "session_id": "tab-session"},
+        })
+        ctrl.handle_task({
+            "task_id":     "task-2",
+            "instruction": "New conversation question",
+            "context":     {"conversation_id": "conv-new", "session_id": "tab-session"},
+        })
+
+        entries_new = mm.get_context_window(task_id="conv-new", limit=20)
+        contents_new = [e["content"] for e in entries_new]
+
+        assert "New conversation question" in contents_new
+        assert "Old conversation question" not in contents_new
+
     def test_different_task_ids_without_session_are_isolated(self, db_path: Path):
-        """Callers without session_id keep isolated per-request memory."""
+        """Callers without conversation_id/session_id keep isolated per-request memory."""
         mm   = MemoryManager(db_path=db_path)
         rt   = make_runtime()
         conv = make_conv_agent("Answer.")

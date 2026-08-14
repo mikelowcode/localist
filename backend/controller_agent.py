@@ -252,13 +252,18 @@ class RuntimeClient(Protocol):
 def _memory_key(task: Task) -> str:
     """
     The key used to group conversation_log entries for working-memory
-    continuity. Prefers a client-supplied session_id (set once per page
-    load by the frontend) so multiple turns in one conversation share
-    working memory. Falls back to task.task_id for any caller that
-    doesn't supply session_id (e.g. the one-shot ingest path), matching
-    today's behavior for that path exactly.
+    continuity. Prefers a client-supplied conversation_id (rotated by the
+    frontend's "New chat" action) so working memory resets when the user
+    starts a new chat, not just on a full page reload. Falls back to
+    session_id (set once per page load) for callers that supply it
+    without a conversation_id, then to task.task_id for any caller that
+    supplies neither (e.g. the one-shot ingest path).
     """
-    return task.context.get("session_id") or task.task_id
+    return (
+        task.context.get("conversation_id")
+        or task.context.get("session_id")
+        or task.task_id
+    )
 
 
 # ---------------------------------------------------------------------------
