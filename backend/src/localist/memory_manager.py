@@ -5458,6 +5458,46 @@ _MAX_TOKENS_PER_BULLET = 20
 _MAX_BULLET_CHARS = _MAX_TOKENS_PER_BULLET * _CHARS_PER_TOKEN  # 80 chars
 
 
+def select_top_episodes(
+    episodes:       list["EpisodeRecord"],
+    max_bullets:    int   = 5,
+    min_confidence: float = 0.7,
+) -> list["EpisodeRecord"]:
+    """
+    Filter, rank, and cap `episodes` per the confidence>=0.7 / max-5-bullet
+    contract (§2.7 of LOCALIST-Architecture.md) — the selection half of
+    format_episodic_summary(), extracted so every caller that needs the
+    actual EpisodeRecord objects going into the prompt (not just the
+    formatted text block) applies the identical filter/sort/cap, not a
+    hand-rolled partial reimplementation.
+
+    Real bug this closes (found live-testing keyword-only/BM25 retrieval,
+    2026-09-06): controller_agent.py's episodic-bullet-building loop
+    duplicated only the confidence/status filter below, never the sort-
+    then-cap-at-max_bullets step — so up to 10 records (5 from by_recency()
+    + 5 from by_similarity(), sometimes more via graph-neighbor expansion)
+    reached the prompt while format_episodic_summary()'s own 5-bullet
+    output was computed correctly but only ever used as a truthiness gate,
+    its actual capped/sorted result discarded.
+
+    Only `active` episodes at or above `min_confidence` are eligible,
+    sorted by type priority (_EPISODE_TYPE_PRIORITY — correction first,
+    task_completion last) then confidence descending, capped at
+    `max_bullets`. Returns [] if nothing survives filtering.
+    """
+    eligible = [
+        ep for ep in episodes
+        if ep.status == "active" and ep.confidence >= min_confidence
+    ]
+    eligible.sort(
+        key=lambda ep: (
+            _EPISODE_TYPE_PRIORITY.get(ep.episode_type, 99),
+            -ep.confidence,
+        )
+    )
+    return eligible[:max_bullets]
+
+
 def format_episodic_summary(
     episodes:          list["EpisodeRecord"],
     max_bullets:       int   = 5,
@@ -5509,28 +5549,10 @@ def format_episodic_summary(
     str
         The formatted block, or "" if no eligible episodes exist.
     """
-    # Step 1: filter — active status and confidence threshold
-    eligible = [
-        ep for ep in episodes
-        if ep.status == "active" and ep.confidence >= min_confidence
-    ]
-
-    if not eligible:
+    top = select_top_episodes(episodes, max_bullets=max_bullets, min_confidence=min_confidence)
+    if not top:
         return ""
 
-    # Step 2: sort — type priority ASC (lower = higher priority),
-    #                confidence DESC as tiebreaker
-    eligible.sort(
-        key=lambda ep: (
-            _EPISODE_TYPE_PRIORITY.get(ep.episode_type, 99),
-            -ep.confidence,
-        )
-    )
-
-    # Step 3: cap at max_bullets
-    top = eligible[:max_bullets]
-
-    # Step 4: format each bullet
     lines = ["[EPISODIC MEMORY]"]
     for ep in top:
         content = ep.content

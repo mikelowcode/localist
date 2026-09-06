@@ -910,6 +910,48 @@ class TestEpisodicRetrievalPath:
         routing = conv._received[0].context["_routing"]
         assert routing["fetch_episodic"] is True
 
+    def test_more_than_five_eligible_records_still_cap_at_five_bullets(self, db_path, mm):
+        """
+        Regression test for a real bug found live-testing keyword-only/BM25
+        retrieval (2026-09-06): by_recency() (up to 5) merged with
+        by_similarity() (up to 5, deduped) can hand _execute_plan up to 10
+        eligible records, but only 5 should ever reach the prompt — the
+        documented "max-5-bullet formatting contract" (controller_agent.py
+        Step 5 comment, format_episodic_summary() §2.7). The bullet-building
+        loop used to re-filter `records` from scratch (confidence/status
+        only) without the sort-then-cap-at-5 step format_episodic_summary()
+        itself applies, so all 10 leaked through uncapped.
+        """
+        def _record(id_, content):
+            return EpisodeRecord(
+                id=id_, episode_type="project_fact", subject="s", content=content,
+                confidence=0.9, source="model_extracted", task_id=None,
+                conversation_id=None, project_context="general", status="active",
+                created_at=time.time(), last_accessed=None,
+            )
+
+        recency_records    = [_record(i, f"recency fact {i}") for i in range(1, 6)]
+        similarity_records = [_record(i, f"similarity fact {i}") for i in range(6, 11)]
+
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = RoutingPlan(agent="conversational_agent", fetch_episodic=False, fetch_rag=False, priority=6)
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch.object(EpisodicMemoryReader, "by_recency", return_value=recency_records), \
+             patch.object(EpisodicMemoryReader, "by_similarity", return_value=similarity_records):
+            ctrl.handle_task({"instruction": "tell me about the project"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        bullet_lines = [
+            line for line in prompt.splitlines()
+            if line.startswith("- ") and ("recency fact" in line or "similarity fact" in line)
+        ]
+        assert len(bullet_lines) == 5, (
+            f"expected exactly 5 injected bullets, got {len(bullet_lines)}: {bullet_lines}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Recency cache (by_recency() cached per project_context, invalidated on write)

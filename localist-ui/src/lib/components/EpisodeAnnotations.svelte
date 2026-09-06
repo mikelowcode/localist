@@ -39,8 +39,13 @@
     if (!content) return;
     loading = true;
     try {
+      // No `limit` param -- defer to the endpoint's own default (5,
+      // main.py's get_related_episodes()) rather than duplicating that
+      // number here. Previously hardcoded to 10 for no documented reason,
+      // which is what a user saw as "10 related memories" for a turn
+      // (2026-09-06) -- the endpoint's actual intended cap is 5.
       const res = await fetch(
-        apiUrl(`/api/memory/episodes/related?${new URLSearchParams({ content, task_id: taskId, limit: '10' })}`)
+        apiUrl(`/api/memory/episodes/related?${new URLSearchParams({ content, task_id: taskId })}`)
       );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: { episodes: RelatedEpisode[] } = await res.json();

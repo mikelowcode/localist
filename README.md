@@ -2,7 +2,7 @@
 
 A local-first, agentic general assistant built primarily for macOS Apple Silicon. Persistent memory across sessions, live web search/fetch, indexed document search, and a deterministic priority-based router — no inference spent deciding how to route a query.
 
-Inference-engine-agnostic: ships with oMLX, Ollama (including Ollama Cloud models), and Azure AI Foundry, swappable via one config variable or live at runtime with no restart. Embeddings always run locally regardless of chat backend — via MLX EmbeddingGemma (Apple Silicon only) or, with the Ollama backend, via any locally-served Ollama embedding model (e.g. `nomic-embed-text`), which also makes the framework usable on non-Apple-Silicon hardware.
+Inference-engine-agnostic: ships with oMLX, Ollama (including Ollama Cloud models), and Azure AI Foundry, swappable via one config variable or live at runtime with no restart. Embeddings, when configured, always run locally — via any locally-served Ollama embedding model (e.g. `nomic-embed-text`), live-switchable from Settings with no restart. With no embedding model configured, the framework runs zero-config on keyword (BM25) retrieval instead — real semantic-gating signal, not a degraded no-op, across every platform.
 
 See `PRIVACY.md` for what stays local, what can leave your machine and when, and what a fresh clone actually contains; `THIRD_PARTY_LICENSES.md` for the dependency/model-weight license audit.
 
@@ -45,7 +45,7 @@ reached via `MCPToolDispatcher`'s normal chat-turn dispatch; see Attachments bel
 
 - Python 3.13, Node.js
 - One runtime backend: oMLX (chat model on :8000, macOS Apple Silicon only), [Ollama](https://ollama.com) (local or Ollama Cloud, :11434, any OS), or Azure AI Foundry
-- MLX EmbeddingGemma (the local embedding model, opt-in) requires Apple Silicon and the `[mlx]` extra; on other platforms, set `LOCALIST_EMBEDDING_MODEL` to an Ollama-served embedding model instead (or fall back to keyword-only retrieval)
+- Local embeddings (optional, any OS): set `LOCALIST_EMBEDDING_MODEL` to any embedding model already pulled in your Ollama daemon (e.g. `nomic-embed-text`) — no separate extra or download to install. Without it, retrieval runs keyword-only (BM25), automatically, with no configuration at all
 - OCR'd PDF chat uploads (see Attachments below) require macOS on Apple Silicon (Apple Vision framework + PyMuPDF); on other platforms those uploads are cleanly rejected with an explanatory error, everything else in the app is unaffected. Image uploads work everywhere: Apple Silicon uses Vision framework, other platforms fall back to a configured Ollama vision-capable chat model (`LOCALIST_OLLAMA_VISION_MODEL`)
 
 ## Installation
@@ -54,17 +54,25 @@ reached via `MCPToolDispatcher`'s normal chat-turn dispatch; see Attachments bel
 cd backend
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[mlx,ocr,chart,dev]"   # Apple Silicon: full local stack (MLX embeddings, OCR, chart tool)
-# pip install -e ".[dev]"               # any OS: base install — Ollama/Foundry, keyword-only retrieval
+pip install -e ".[ocr,chart,dev]"   # Apple Silicon: full local stack (OCR, chart tool)
+# pip install -e ".[dev]"           # any OS: base install — Ollama/Foundry, keyword-only retrieval
 ```
 
-`[mlx]` and `[ocr]` are Apple-Silicon-only (platform markers make them a no-op elsewhere); `[chart]`
-is cross-platform. See `THIRD_PARTY_LICENSES.md` — both `[mlx]` and `[ocr]` pull in copyleft
-dependencies (GPLv3, AGPL-3.0 respectively).
+`[ocr]` is Apple-Silicon-only (a platform marker makes it a no-op elsewhere); `[chart]` is
+cross-platform. See `THIRD_PARTY_LICENSES.md` — `[ocr]` pulls in a copyleft dependency
+(AGPL-3.0).
 
-The local embedding model is opt-in, not automatic — `LOCALIST_EMBEDDING_ENGINE_ENABLED` defaults to `false`, so a fresh install runs in keyword-only retrieval mode with zero download. `./start_localist.sh` asks once, interactively, on first run (only when `.env` doesn't already set the key, this is Apple Silicon, and the `[mlx]` extra looks installed) whether to enable it; answering yes downloads `mlx-community/embeddinggemma-300m-4bit` (~400MB, one-time, needs internet access) on the next backend startup. Set `LOCALIST_EMBEDDING_ENGINE_ENABLED=true` in `backend/.env` yourself to skip that prompt. Without it (or on non-Apple-Silicon hardware, where it can't run at all), episodic memory and RAG retrieval still work in keyword-only mode, or via an Ollama-served embedding model instead (see `LOCALIST_EMBEDDING_MODEL` below).
+Embeddings need no separate extra or download at all — there is no bundled local embedding model.
+Two supported configurations, either usable on any platform:
 
-Localist's own code is MIT-licensed (see `LICENSE`), but this downloaded model is not — EmbeddingGemma is built on Google's Gemma and distributed under the [Gemma Terms of Use](https://ai.google.dev/gemma/terms), not MIT. See `THIRD_PARTY_LICENSES.md` for the full dependency and model-weight license audit.
+- **Ollama-served embeddings**: set `LOCALIST_EMBEDDING_MODEL` to any embedding model already
+  pulled in your Ollama daemon (e.g. `nomic-embed-text`) — see the Configuration table below, or
+  switch it live from the Settings UI with no restart.
+- **Keyword-only (BM25) retrieval**: the zero-config default when no embedding model is set.
+  Episodic memory and RAG retrieval both fall back to hand-rolled Okapi BM25 keyword scoring, and
+  semantic-gating (search-intent classification, episodic-relevance detection) resolves to its own
+  BM25-calibrated fallback thresholds rather than being silently disabled — this is a fully
+  supported mode, not a degraded stopgap.
 
 ## Running
 
@@ -77,10 +85,11 @@ Localist's own code is MIT-licensed (see `LICENSE`), but this downloaded model i
 
 ### Native macOS app (optional)
 
-`./start_localist.sh` runs from source and is the recommended way to use every feature (MLX
-embeddings, Vision/PyMuPDF OCR). A native `Localist.app` is also buildable — a Tauri shell that
-spawns two PyInstaller-frozen, base-only builds of the backend and localist-mcp (no MLX/Vision/
-PyMuPDF bundled, so those platform-gated features aren't available from the packaged app). See
+`./start_localist.sh` runs from source and is the recommended way to use every feature, including
+local OCR (Vision/PyMuPDF, Apple Silicon only). A native `Localist.app` is also buildable — a Tauri
+shell that spawns two PyInstaller-frozen, base-only builds of the backend and localist-mcp (no
+Vision/PyMuPDF bundled, so OCR isn't available from the packaged app — Ollama-served embeddings and
+keyword-only retrieval are unaffected either way, on both source and packaged installs). See
 `backend/packaging/README.md` (build the two frozen services) then `localist-ui/src-tauri/README.md`
 (build the `.app`). No first-run config UX or code signing yet — a fresh build defaults to the
 unreachable `foundry` runtime backend, same as an unconfigured source install.
@@ -94,7 +103,7 @@ Copy `backend/.env.example` to `backend/.env`. Only an API key for the active `w
 | `LOCALIST_RUNTIME_BACKEND` | `foundry` | `foundry`, `omlx`, or `ollama` — also swappable live at runtime, see below |
 | `LOCALIST_CHAT_MODEL` | *(none)* | Chat model ID override — wins over any per-backend pin below; required for `ollama` if no pin is set either (fails fast at startup if unset) |
 | `LOCALIST_CHAT_MODEL_OLLAMA` / `_OMLX` / `_FOUNDRY` | *(none)* | Per-backend chat model pin, used when `LOCALIST_CHAT_MODEL` is unset — lets each backend remember its own model choice independently, including across a live runtime-backend switch |
-| `LOCALIST_EMBEDDING_MODEL` | *(none)* | Embedding model ID for the active backend (`foundry`/`ollama`); if set and found, takes precedence over MLX EmbeddingGemma |
+| `LOCALIST_EMBEDDING_MODEL` | *(none)* | Embedding model ID for the active backend (`foundry`/`ollama`); if set and found, this is used instead of the zero-config keyword-only (BM25) retrieval default |
 | `SEARCH_PROVIDER` | `langsearch` | `web_search` provider: `langsearch` or `brave` |
 | `LANGSEARCH_API_KEY` | *(none)* | Required when `SEARCH_PROVIDER=langsearch`; without it, `web_search` fails and falls back to corpus |
 | `BRAVE_API_KEY` | *(none)* | Required when `SEARCH_PROVIDER=brave`; without it, `web_search` fails and falls back to corpus |

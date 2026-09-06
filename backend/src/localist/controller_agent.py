@@ -54,6 +54,7 @@ from .memory_manager import (
     EpisodicMemoryWriter,
     EpisodicMemoryReader,
     format_episodic_summary,
+    select_top_episodes,
     EpisodeRecord,
     _cosine_similarity,
 )
@@ -1767,13 +1768,20 @@ class ControllerAgent:
 
                 summary = format_episodic_summary(records)
                 if summary:
-                    for record in records:
-                        if record.confidence >= 0.7 and record.status == "active":
-                            episodic_bullets.append(EpisodeBullet(
-                                content      = record.content,
-                                episode_type = record.episode_type,
-                                confidence   = record.confidence,
-                            ))
+                    # select_top_episodes() applies the SAME filter/sort/
+                    # cap-at-5 contract format_episodic_summary() used to
+                    # compute `summary` above -- previously this loop
+                    # re-filtered `records` from scratch (confidence/status
+                    # only, no sort or cap), so up to 10 records (5 from
+                    # by_recency() + 5 from by_similarity(), more with graph
+                    # expansion) reached the prompt instead of the intended
+                    # top 5. See select_top_episodes()'s docstring.
+                    for record in select_top_episodes(records):
+                        episodic_bullets.append(EpisodeBullet(
+                            content      = record.content,
+                            episode_type = record.episode_type,
+                            confidence   = record.confidence,
+                        ))
                     self._planner.mark_episodic_injected()
                     logger.info(
                         "_execute_plan: episodic retrieval complete — "
