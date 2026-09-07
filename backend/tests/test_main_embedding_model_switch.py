@@ -82,13 +82,11 @@ def client(tmp_path, monkeypatch):
     prev_controller        = main._state.controller
     prev_memory            = main._state.memory_manager
     prev_templates         = main._state.templates_dir
-    prev_embedding_engine  = main._state.embedding_engine
     prev_active_model_name = main._state.active_embedding_model_name
 
     main._state.settings          = _settings()
     main._state.memory_manager    = MemoryManager(db_path=tmp_path / "main_embedding_switch.db")
     main._state.templates_dir     = tmp_path  # no warmup_fixture.md here — run_cache_warmup no-ops safely
-    main._state.embedding_engine  = None
 
     initial_runtime = MagicMock(name="initial-runtime")
     main._state.runtime    = initial_runtime
@@ -103,7 +101,6 @@ def client(tmp_path, monkeypatch):
     main._state.controller                = prev_controller
     main._state.memory_manager            = prev_memory
     main._state.templates_dir             = prev_templates
-    main._state.embedding_engine          = prev_embedding_engine
     main._state.active_embedding_model_name = prev_active_model_name
 
 
@@ -194,35 +191,6 @@ class TestSuccessfulSwitch:
 
         assert "LOCALIST_EMBEDDING_MODEL=nomic-embed-text" in env_path.read_text()
 
-    def test_setting_a_model_ignores_a_stale_embedding_engine_for_naming(
-        self, client, monkeypatch, tmp_path,
-    ):
-        """
-        _state.embedding_engine can be non-None left over from startup (tier
-        2 engaged then, before this endpoint was ever called) even while
-        setting a tier-1 model now — _derive_active_embedding_model_name()
-        must not consult it once tier 1 is what's actually wired to
-        embed_fn, or the Planner's tuned-threshold guard (§16.4) would
-        compare against the wrong model name and silently pass a real
-        mismatch.
-        """
-        test_client, _initial_runtime = client
-        fake_engine = MagicMock(name="fake-embedding-engine")
-        fake_engine.available = True
-        fake_engine.model_path = "mlx-community/embeddinggemma-300m-4bit"
-        main._state.embedding_engine = fake_engine
-
-        monkeypatch.setattr(
-            main, "create_runtime",
-            _fake_create_runtime(embed_model_found=True, models=["nomic-embed-text"]),
-        )
-
-        resp = test_client.post("/settings/embedding-model", json={"model": "nomic-embed-text"})
-
-        assert resp.status_code == 200
-        assert main._state.memory_manager.embed_fn is main._state.runtime.embed
-        assert main._state.active_embedding_model_name == "nomic-embed-text"
-
     def test_clearing_the_model_disables_embed_fn(self, client, monkeypatch, tmp_path):
         test_client, _initial_runtime = client
         env_path = tmp_path / ".env"
@@ -245,42 +213,6 @@ class TestSuccessfulSwitch:
         assert main._state.memory_manager.embed_fn is None
         assert main._state.active_embedding_model_name is None
         assert "LOCALIST_EMBEDDING_MODEL=\n" in env_path.read_text()
-
-    def test_clearing_falls_back_to_already_loaded_embedding_engine(self, client, monkeypatch, tmp_path):
-        """
-        The desktop-build (base-only PyInstaller freeze) case has no
-        EmbeddingEngine to fall back to (_state.embedding_engine stays None,
-        covered by test_clearing_the_model_disables_embed_fn above). On the
-        full dev build, an EmbeddingEngine may already be loaded from
-        startup (tier 2 engaged because LOCALIST_EMBEDDING_MODEL was unset
-        then) — clearing a tier-1 override must fall back to that already-
-        loaded instance, not drop straight to keyword-only and silently lose
-        working embeddings that were available the whole time.
-        """
-        test_client, _initial_runtime = client
-        env_path = tmp_path / ".env"
-        env_path.write_text("LOCALIST_RUNTIME_BACKEND=ollama\nLOCALIST_EMBEDDING_MODEL=nomic-embed-text\n")
-        main._state.settings.embedding_model = "nomic-embed-text"
-
-        fake_engine = MagicMock(name="fake-embedding-engine")
-        fake_engine.available = True
-        fake_engine.model_path = "mlx-community/embeddinggemma-300m-4bit"
-        main._state.embedding_engine = fake_engine
-
-        monkeypatch.setattr(
-            main, "create_runtime",
-            _fake_create_runtime(embed_model_found=False, models=["nomic-embed-text"]),
-        )
-
-        resp = test_client.post("/settings/embedding-model", json={"model": ""})
-
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["active"] is True  # embed_fn is set, just to the EmbeddingEngine now
-
-        assert main._state.settings.embedding_model == ""
-        assert main._state.memory_manager.embed_fn is fake_engine.embed
-        assert main._state.active_embedding_model_name == "mlx-community/embeddinggemma-300m-4bit"
 
     def test_write_env_failure_reports_persisted_false_but_keeps_live_swap(
         self, client, monkeypatch, tmp_path,
@@ -414,24 +346,6 @@ class TestAutomaticFirstTimeCalibration:
         assert resp.json()["calibration"] is None
         fake_calibrate.assert_not_called()
 
-    def test_tuned_model_never_triggers_calibration(self, client, monkeypatch, tmp_path):
-        from localist.planner import _TUNED_EMBEDDING_MODEL
-
-        test_client, _initial_runtime = client
-        monkeypatch.setattr(
-            main, "create_runtime",
-            _fake_create_runtime(embed_model_found=True, models=[_TUNED_EMBEDDING_MODEL]),
-        )
-        fake_calibrate = MagicMock(side_effect=AssertionError("must not calibrate the tuned model"))
-        monkeypatch.setattr(main, "calibrate_thresholds", fake_calibrate)
-
-        resp = test_client.post("/settings/embedding-model", json={"model": _TUNED_EMBEDDING_MODEL})
-
-        assert resp.status_code == 200
-        assert resp.json()["calibration"] is None
-        fake_calibrate.assert_not_called()
-        assert main._state.memory_manager.embed_fn is main._state.runtime.embed
-
 
 class TestReembedRecalibration:
     """
@@ -508,7 +422,7 @@ class TestReembedRecalibration:
         # not just on next restart.
         assert main._state.controller is not controller_after_switch
 
-    def test_reembed_does_not_recalibrate_for_tuned_model(self, client, monkeypatch, tmp_path):
+    def test_reembed_does_not_recalibrate_with_no_active_embedding_model(self, client, monkeypatch, tmp_path):
         # Default fixture state: no embedding model switch has happened, so
         # _state.active_embedding_model_name is whatever the fixture leaves
         # it as (None) — nothing to recalibrate, and no embed_fn configured

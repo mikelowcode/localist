@@ -34,7 +34,7 @@ class TestReembedChatTurnsEndpoint:
         embed_fn = _embed_fn()
         mm = MemoryManager(
             db_path=tmp_path / "reembed.db", embed_fn=embed_fn,
-            embedding_model_name="mlx-community/embeddinggemma-300m-4bit",
+            embedding_model_name="some-embedding-model:latest",
         )
         mm.add_chat_turn(task_id="t1", role="user", content="alpha", conversation_id="c1")
         mm.add_chat_turn(task_id="t2", role="user", content="beta", conversation_id="c1")
@@ -46,7 +46,7 @@ class TestReembedChatTurnsEndpoint:
         assert resp.json() == {
             "reembedded": 2,
             "total": 2,
-            "model": "mlx-community/embeddinggemma-300m-4bit",
+            "model": "some-embedding-model:latest",
         }
 
     def test_returns_503_when_memory_manager_not_initialised(self, client):
@@ -71,7 +71,7 @@ class TestMemoryStatsChatTurnsStale:
         test_client, tmp_path = client
         mm = MemoryManager(
             db_path=tmp_path / "stats.db", embed_fn=_embed_fn(),
-            embedding_model_name="mlx-community/embeddinggemma-300m-4bit",
+            embedding_model_name="some-embedding-model:latest",
         )
         main._state.memory_manager = mm
 
@@ -84,7 +84,7 @@ class TestMemoryStatsChatTurnsStale:
         test_client, tmp_path = client
         mm = MemoryManager(
             db_path=tmp_path / "stats.db", embed_fn=_embed_fn(),
-            embedding_model_name="mlx-community/embeddinggemma-300m-4bit",
+            embedding_model_name="some-embedding-model:latest",
         )
         mm._chat_turns_stale = True
         main._state.memory_manager = mm
@@ -97,7 +97,7 @@ class TestMemoryStatsChatTurnsStale:
         test_client, tmp_path = client
         mm = MemoryManager(
             db_path=tmp_path / "stats.db", embed_fn=_embed_fn(),
-            embedding_model_name="mlx-community/embeddinggemma-300m-4bit",
+            embedding_model_name="some-embedding-model:latest",
         )
         mm.add_chat_turn(task_id="t", role="user", content="hi", conversation_id="c")
         mm._chat_turns_stale = True
@@ -130,7 +130,7 @@ class TestChatHistorySemanticMode:
         ))
         mm = MemoryManager(
             db_path=tmp_path / "semantic.db", embed_fn=embed_fn,
-            embedding_model_name="mlx-community/embeddinggemma-300m-4bit",
+            embedding_model_name="some-embedding-model:latest",
         )
         mm.add_chat_turn(task_id="t1", role="user", content="zebra facts", conversation_id="c")
         mm.add_chat_turn(task_id="t2", role="user", content="unrelated content", conversation_id="c")

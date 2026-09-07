@@ -391,7 +391,7 @@ _HACKER_NEWS_KEYWORDS: frozenset[str] = frozenset({
 })
 
 # Priority 3 — explicit-date web search signal, independent of both
-# _WEB_SEARCH_KEYWORDS and _SEMANTIC_GATE_THRESHOLDS. A query that names a
+# _WEB_SEARCH_KEYWORDS and the semantic gates below. A query that names a
 # specific calendar date (month + year, with or without a day) is a
 # qualitatively different signal from the fuzzy semantic gates below: the
 # model structurally cannot verify a specific date from training alone, so
@@ -589,9 +589,9 @@ _SEARCH_INTENT_TEMPLATES: dict[str, tuple[str, ...]] = {
     # so it can carry its own threshold and be tuned independently, same
     # reasoning that already separates explicit_search_action (0.72) from
     # lookup_request (0.60). Only ever decides web_search -> research
-    # upgrade in _priority3_tool (see _RESEARCH_INTENT_THRESHOLD below) —
-    # never gates whether a tool fires at all, so it is intentionally not
-    # part of _SEMANTIC_GATE_THRESHOLDS.
+    # upgrade in _priority3_tool — never gates whether a tool fires at
+    # all, so it is intentionally scored/thresholded independently of the
+    # explicit_search_action/lookup_request gates.
     #
     # v2 (2026-07-16): every template anchors on an explicit lookup/search
     # verb + a concrete object, replacing v1's bare interrogative forms
@@ -687,8 +687,6 @@ _ALL_SEARCH_NEGATIVE_FILTERS: frozenset[str] = _SEARCH_NEGATIVE_FILTER | _RESEAR
 _CORPUS_SCORE_THRESHOLD: float = 0.55
 
 # Slot [Fix 1] — semantic search-intent gating thresholds.
-# Derived from Diagnostic 2's live-backend score table (18 real
-# utterances against mlx-community/embeddinggemma-300m-4bit).
 # knowledge_request_open and freshness_request are deliberately
 # excluded from gating — see Diagnostic 2 findings: a non-search
 # utterance ("Explain this code to me.") scored 0.795 on
@@ -699,40 +697,12 @@ _CORPUS_SCORE_THRESHOLD: float = 0.55
 # stress-tested. Both groups remain computed and logged for future
 # tuning but must never gate tools_to_call until separately re-evaluated.
 #
-# 2026-06-25 update A (§8.8 Open Item 11): lookup_request templates expanded
-# from 5 to 9. The original 5 were bare imperatives with vague pronoun
-# objects ("look up this", "look that up", etc.); they did not represent
-# the "Can/Could you + look up/look into + [specific object]" question-form
-# frame. Three live utterances using that frame scored 0.593, 0.598, and
-# 0.598 on lookup_request — consistently below the 0.65 gate — causing
-# gate_fired=False and no web_search dispatch. Four new templates appended:
-# "can you look up", "can you look that up for me", "could you look up",
-# "can you look into this for me". This was a template-coverage fix, not a
-# threshold adjustment; the 0.65 threshold was deliberately left unchanged.
-#
-# 2026-06-25 update B (§10.4 Open Item 3 revisit, §8.8 Open Item 11):
-# lookup_request threshold lowered from 0.65 to 0.60. Live re-verification
-# after update A showed the same three utterances scored 0.608, 0.621, and
-# 0.617 — a real, consistent improvement (+0.015 to +0.023) but still below
-# the 0.65 gate. Template coverage alone cannot close this remaining gap for
-# this phrasing family at this scale of addition. The 0.03–0.04 shortfall
-# across all three utterances matches Open Item 3's stated revisit criterion
-# ("if live false negatives are observed"). explicit_search_action (0.68) is
-# NOT changed. Known risk: the original 18-utterance diagnostic pass did not
-# retain per-utterance scores for lookup_request's adversarial negatives, so
-# the margin to the new 0.60 line is unknown. Accepted and named risk — any
-# live false positive on lookup_request is the trigger to revisit this value.
-_SEMANTIC_GATE_THRESHOLDS: dict[str, float] = {
-    # 2026-06-28: raised from 0.68 → 0.72 per
-    # diagnostics/reports/explicit_search_action_margin_assessment_2026-06-28.md.
-    # The single template "go look it up" (bare verb "look") collided with "look at"/
-    # "look into" phrasing in 2 adversarial negatives at ESA 0.69–0.70. Zero cost to
-    # true positives: Cat C max ESA score = 0.58, well under either threshold.
-    # Per Michael's decision: shipping to observe live behavior for several days before
-    # treating as final — not a permanently closed item.
-    "explicit_search_action": 0.72,
-    "lookup_request": 0.60,
-}
+# explicit_search_action and lookup_request no longer have a bare-constant
+# "tuned" tier here — see _VALIDATED_MODEL_THRESHOLDS / _LEXICAL_FALLBACK_
+# THRESHOLDS below and resolve_gate_tiers() for the current per-gate,
+# per-model resolution. (Historical note: this project ran a hand-tuned
+# threshold tier against mlx-community/embeddinggemma-300m-4bit before that
+# model was retired 2026-09 — see sessions-log.md for that history.)
 
 
 # ---------------------------------------------------------------------------
@@ -745,7 +715,7 @@ _SEMANTIC_GATE_THRESHOLDS: dict[str, float] = {
 # semantic fallback, structurally mirroring _semantic_search_intent()'s
 # pattern (own template set, precomputed embeddings, tuned threshold) — but
 # deliberately kept as its OWN separate mechanism, not folded into
-# _SEARCH_INTENT_TEMPLATES / _SEMANTIC_GATE_THRESHOLDS above. Those carry
+# _SEARCH_INTENT_TEMPLATES above. Those carry
 # _ALL_SEARCH_NEGATIVE_FILTERS / _resolve_negative_filter_conflict, which
 # are search-intent-specific collision handling with nothing to do with
 # episodic relevance — reusing that path risked an unrelated P3 filter
@@ -774,33 +744,6 @@ _EPISODIC_RELEVANCE_TEMPLATES: tuple[str, ...] = (
     "help me get ready for my appointment",
     "what did we decide about this before",
 )
-_EPISODIC_RELEVANCE_THRESHOLD: float = 0.70
-
-
-# ---------------------------------------------------------------------------
-# Tuned-embedding-model guard
-#
-# Every threshold above (_SEMANTIC_GATE_THRESHOLDS, and _RESEARCH_INTENT_
-# THRESHOLD further below) and both negative-filter substring pre-filters
-# (_SEARCH_NEGATIVE_FILTER, _RESEARCH_NEGATIVE_FILTER) were tuned against
-# cosine scores produced by this specific embedding model. Cosine similarity
-# is not portable across embedding models — the same utterance pair can
-# score very differently under a different model's geometry, which silently
-# flips gate_fired without raising anything. Confirmed live 2026-07-16: the
-# identical lookup_request utterance scored 0.7119 under
-# mlx-community/embeddinggemma-300m-4bit vs 0.578 under nomic-embed-text —
-# enough to cross the 0.60 lookup_request gate one way and not the other.
-#
-# Measured against (all assumed this exact model):
-#   - the lookup_request / explicit_search_action threshold history in the
-#     comments above (2026-06-25 update A/B, 2026-06-28 ESA raise)
-#   - diagnostics/reports/research_intent_threshold_assessment_2026-07-16.md
-#   - diagnostics/reports/research_intent_threshold_assessment_2026-07-16-v2.md
-#   - diagnostics/reports/negative_filter_tiebreak_assessment_2026-07-16.md
-#
-# See Planner.__init__ / _semantic_search_intent() for the runtime guard this
-# constant backs, and docs/architecture/16-runtime-backend-layer.md §16.4.
-_TUNED_EMBEDDING_MODEL: str = "mlx-community/embeddinggemma-300m-4bit"
 
 # Canonical names of the four semantic gates, shared by _VALIDATED_MODEL_
 # THRESHOLDS, MemoryManager's embedding_model_thresholds table, and
@@ -811,20 +754,23 @@ _GATE_NAMES: tuple[str, ...] = (
 )
 
 # ---------------------------------------------------------------------------
-# Per-model validated thresholds — an escape hatch from the all-or-nothing
-# _TUNED_EMBEDDING_MODEL guard above, added 2026-09-05 (docs/architecture/
-# 16-runtime-backend-layer.md §16.15) after a live report that switching the
-# desktop build's embedding source to nomic-embed-text (the only local
-# embedding path available there — no MLX in the packaged build) silently
+# Per-model validated thresholds — the highest-trust threshold tier, added
+# 2026-09-05 (docs/architecture/16-runtime-backend-layer.md §16.15) after a
+# live report that switching the desktop build's embedding source to
+# nomic-embed-text (the only local embedding path available there) silently
 # disabled episodic-relevance/search-intent semantic gating entirely,
 # missing a known-relevant "user owns an Xbox" memory on an Xbox-related
-# question.
+# question. Cosine similarity is not portable across embedding models — the
+# same utterance pair can score very differently under a different model's
+# geometry — so a model's thresholds are only ever read from here (or from
+# the lower tiers below) when that exact model has its own measured entry;
+# there is no longer a global default tier.
 #
 # Fails closed, same posture as context_profile.py's _VALIDATED_LOCAL_TIERS:
 # only a model with its own entry here, measured against these exact
 # template sets via diagnostics/nomic_embed_text_threshold_probe.py, gets a
-# threshold set from THIS dict. A non-tuned model with no entry here no
-# longer falls straight through to full gating disablement, though — see
+# threshold set from THIS dict. A model with no entry here no longer falls
+# straight through to full gating disablement, though — see
 # PLAN_semantic_gating_calibration.md: Planner.__init__ next checks a
 # persisted, in-app-measured threshold set (MemoryManager.
 # embedding_model_thresholds, surfaced via the calibrated_thresholds
@@ -844,7 +790,7 @@ _GATE_NAMES: tuple[str, ...] = (
 #   - lookup_request=0.62: preserves 3/3 Cat-C true positives at a cost of
 #     4/17 Cat-A/D false positives — the same "can/could/would you + [verb]"
 #     modal-question collision already known and accepted for the tuned
-#     model's own 0.60 (see _SEMANTIC_GATE_THRESHOLDS comment above), just a
+#     lookup_request's own 0.60 value elsewhere in this file, just a
 #     larger residual under this model's geometry.
 #   - explicit_search_action=0.68: no real ESA-positive battery exists in
 #     the probe (a gap inherited from the original tuning diagnostics, which
@@ -905,7 +851,7 @@ _VALIDATED_MODEL_THRESHOLDS: dict[str, dict[str, float]] = {
 # BM25 scores are unbounded (bm25.py's module docstring), so these numbers
 # have no relationship to the 0-1 cosine-similarity scale used everywhere
 # else in this file — never compare a BM25 score against a value from
-# _SEMANTIC_GATE_THRESHOLDS/_VALIDATED_MODEL_THRESHOLDS or vice versa.
+# _VALIDATED_MODEL_THRESHOLDS or vice versa.
 _LEXICAL_FALLBACK_THRESHOLDS: dict[str, float] = {
     "explicit_search_action": 2.833302343894667,
     "lookup_request":         2.5611057478287096,
@@ -928,21 +874,12 @@ _LEXICAL_FALLBACK_THRESHOLDS: dict[str, float] = {
 # ---------------------------------------------------------------------------
 _RESEARCH_LOOP_ENV_VAR: str = "LOCALIST_RESEARCH_LOOP_ENABLED"
 
-# Picked from the v2 diagnostic trade-off table
-# (diagnostics/reports/research_intent_threshold_assessment_2026-07-16-v2.md):
-# 9/10 true positives survive (only "What's the going rate for a plumber in
-# this area?", itself a marginal non-brand-specific phrasing, drops out),
-# and only 2/16 FP-pool items leak — both Category L generic lookups that
-# already trigger web_search via lookup_request regardless, so a false
-# positive here just burns extra bounded loop iterations rather than
-# producing a wrong answer. That asymmetry (false positive = wasted
-# latency, capped by _MAX_RESEARCH_ITERATIONS; false negative = today's
-# existing plain-web_search behavior, not broken) is why full T/FP
-# separation wasn't chased further. No threshold in the scanned range
-# achieved full separation — see the report for the complete trade-off.
-# Revisit directly if 0.65 turns out wrong against live usage, same as how
-# lookup_request's threshold was revised from 0.65 to 0.60.
-_RESEARCH_INTENT_THRESHOLD: float = 0.65
+# research_intent's own threshold now lives in _VALIDATED_MODEL_THRESHOLDS /
+# _LEXICAL_FALLBACK_THRESHOLDS like the other three gates — see
+# resolve_gate_tiers() and Planner.__init__ for the per-model, per-gate
+# resolution. (Historical note: the original 0.65 value was picked from
+# diagnostics/reports/research_intent_threshold_assessment_2026-07-16-v2.md
+# against the now-retired tuned model.)
 
 
 # ---------------------------------------------------------------------------
@@ -1172,10 +1109,10 @@ def resolve_gate_tiers(
     calibrated_thresholds: dict[str, float] | None = None,
 ) -> dict[str, str]:
     """
-    Pure per-gate trust-tier resolution — tuned model -> _VALIDATED_MODEL_
-    THRESHOLDS -> calibrated_thresholds -> _LEXICAL_FALLBACK_THRESHOLDS ->
-    disabled. Returns all four _GATE_NAMES as keys, each mapped to "tuned" /
-    "validated" / "auto-calibrated" / "lexical-fallback" / "disabled".
+    Pure per-gate trust-tier resolution — _VALIDATED_MODEL_THRESHOLDS ->
+    calibrated_thresholds -> _LEXICAL_FALLBACK_THRESHOLDS -> disabled.
+    Returns all four _GATE_NAMES as keys, each mapped to "validated" /
+    "auto-calibrated" / "lexical-fallback" / "disabled".
 
     Extracted so GET /health can show the same per-gate trust badges
     Planner.__init__ resolves internally, without constructing a full
@@ -1183,20 +1120,13 @@ def resolve_gate_tiers(
     check that only needs the tier labels, not the actual threshold
     values). Planner.__init__ calls this too, so the two can never drift.
 
-    embedding_model_name=None is treated the same as the tuned model here
-    (both get "tuned") purely as a labeling convenience — in production,
-    None only ever occurs when embed_fn is also None (true keyword-only),
-    so a "tuned" cosine-scale threshold value is inert either way (nothing
-    ever scores against it without embed_fn). The runtime decision of
-    whether a gate actually needs the lexical/BM25 path is made
-    separately, in Planner._lexical_fallback_active(), which checks
-    `self._embed_fn is None` directly rather than relying on this tier
-    label — so a genuinely embedding-less session still gets real lexical
-    signal despite this function reporting "tuned" for it.
+    embedding_model_name=None (true keyword-only — embed_fn is also None
+    in that case) has no entry in _VALIDATED_MODEL_THRESHOLDS or any
+    calibrated_thresholds, so it flows through the same per-gate loop as
+    any other unrecognized model and naturally resolves to
+    "lexical-fallback" for all four gates (since _LEXICAL_FALLBACK_
+    THRESHOLDS covers all four) — no special-casing needed.
     """
-    if embedding_model_name is None or embedding_model_name == _TUNED_EMBEDDING_MODEL:
-        return {name: "tuned" for name in _GATE_NAMES}
-
     validated  = _VALIDATED_MODEL_THRESHOLDS.get(embedding_model_name, {}) if embedding_model_name else {}
     calibrated = calibrated_thresholds or {}
     tiers: dict[str, str] = {}
@@ -1259,19 +1189,19 @@ class Planner:
         Optional MemoryManager. Required for Priority 4 corpus scoring.
         When absent, Priority 4 is skipped (no corpus to query).
     embedding_model_name :
-        Name of the embedding model actually producing embed_fn's vectors
-        (e.g. "mlx-community/embeddinggemma-300m-4bit"), or None when no
-        embedding source is configured at all (keyword-only mode — embed_fn
-        is also None in that case, so semantic scoring is already
-        short-circuited). When set and it does not match
-        _TUNED_EMBEDDING_MODEL, each of the four semantic gates (_GATE_NAMES)
-        is resolved independently: that model's own validated threshold
-        (_VALIDATED_MODEL_THRESHOLDS) if one exists, else its persisted
-        calibrated threshold (calibrated_thresholds, below) if one exists,
-        else that gate is disabled — see the module-level comments above
-        _TUNED_EMBEDDING_MODEL and _VALIDATED_MODEL_THRESHOLDS for why
-        cosine-similarity thresholds don't transfer across embedding models
-        without being independently measured.
+        Name of the embedding model actually producing embed_fn's vectors,
+        or None when no embedding source is configured at all (keyword-only
+        mode — embed_fn is also None in that case, so semantic scoring is
+        already short-circuited). Each of the four semantic gates
+        (_GATE_NAMES) is resolved independently: that model's own validated
+        threshold (_VALIDATED_MODEL_THRESHOLDS) if one exists, else its
+        persisted calibrated threshold (calibrated_thresholds, below) if one
+        exists, else the model-independent lexical/BM25 fallback threshold
+        (_LEXICAL_FALLBACK_THRESHOLDS) if one exists, else that gate is
+        disabled — see the module-level comments above
+        _VALIDATED_MODEL_THRESHOLDS for why cosine-similarity thresholds
+        don't transfer across embedding models without being independently
+        measured.
     calibrated_thresholds :
         Live-calibration results for `embedding_model_name`, as returned by
         MemoryManager.get_calibrated_thresholds() — a partial dict (any
@@ -1280,8 +1210,7 @@ class Planner:
         table (schema v17, PLAN_semantic_gating_calibration.md). Lower trust
         than _VALIDATED_MODEL_THRESHOLDS (auto-measured, never human-
         reviewed) — only consulted per gate when that gate has no entry in
-        _VALIDATED_MODEL_THRESHOLDS. Ignored entirely when embedding_model_name
-        matches _TUNED_EMBEDDING_MODEL or is None.
+        _VALIDATED_MODEL_THRESHOLDS.
     """
 
     # Class-level aliases so callers can access via instance (e.g. p._WEB_SEARCH_KEYWORDS)
@@ -1308,80 +1237,73 @@ class Planner:
         self._embed_fn       = embed_fn
 
         # Guard against silently-invalid semantic gating (docs/architecture/
-        # 16-runtime-backend-layer.md §16.4): every threshold in this file
-        # was tuned against _TUNED_EMBEDDING_MODEL's cosine geometry. A
-        # different active embedding model means those thresholds have no
-        # validated meaning, so gating is disabled rather than left to
-        # silently over/under-fire. None (no embedding source configured at
-        # all) is not a mismatch — embed_fn is already None in that case,
-        # which already short-circuits semantic scoring.
+        # 16-runtime-backend-layer.md §16.4): cosine-similarity thresholds
+        # don't transfer across embedding models, so a gate only ever scores
+        # against a threshold that was actually measured for the active
+        # model — validated, then auto-calibrated, then the model-
+        # independent lexical/BM25 fallback, else disabled. None (no
+        # embedding source configured at all) has no validated/calibrated
+        # entry for any gate, so it resolves the same way any other
+        # unmeasured model would — see resolve_gate_tiers().
         self._embedding_model_name  = embedding_model_name
-        # Defaults: the tuned model's own thresholds. Overwritten below only
-        # when a different, non-tuned model is active — see
-        # _VALIDATED_MODEL_THRESHOLDS above.
-        self._semantic_gate_thresholds:     dict[str, float] = dict(_SEMANTIC_GATE_THRESHOLDS)
-        self._research_intent_threshold:    float | None = _RESEARCH_INTENT_THRESHOLD
-        self._episodic_relevance_threshold: float | None = _EPISODIC_RELEVANCE_THRESHOLD
+        # Defaults: no gate cosine-scored until resolved below.
+        self._semantic_gate_thresholds:     dict[str, float] = {}
+        self._research_intent_threshold:    float | None = None
+        self._episodic_relevance_threshold: float | None = None
 
-        # Per-gate provenance ("tuned" / "validated" / "auto-calibrated" /
-        # "disabled") — a model can be "validated" for one gate, "auto-
-        # calibrated" for another, and "disabled" for a third; this is NOT
-        # an all-or-nothing decision for the model as a whole. Shared with
-        # GET /health's trust badges via resolve_gate_tiers() so the two can
-        # never disagree about which tier is actually active.
+        # Per-gate provenance ("validated" / "auto-calibrated" /
+        # "lexical-fallback" / "disabled") — a model can be "validated" for
+        # one gate, "auto-calibrated" for another, and "disabled" for a
+        # third; this is NOT an all-or-nothing decision for the model as a
+        # whole. Shared with GET /health's trust badges via
+        # resolve_gate_tiers() so the two can never disagree about which
+        # tier is actually active.
         self._gate_tier: dict[str, str] = resolve_gate_tiers(embedding_model_name, calibrated_thresholds)
 
-        if embedding_model_name is not None and embedding_model_name != _TUNED_EMBEDDING_MODEL:
-            validated  = _VALIDATED_MODEL_THRESHOLDS.get(embedding_model_name, {})
-            calibrated = calibrated_thresholds or {}
-            # Only tuned/validated/auto-calibrated gates get a cosine-scale
-            # threshold here -- a "lexical-fallback" gate is scored
-            # separately, via BM25 (_lexical_search_intent_scores() /
-            # _lexical_episodic_relevance(), against _LEXICAL_FALLBACK_
-            # THRESHOLDS below), an entirely different, unbounded scale
-            # that must never be compared against a cosine score. Mixing
-            # the two into one dict here would silently make a lexical-
-            # fallback gate's threshold value unreachable by cosine scores
-            # (which never exceed 1.0) without ever raising an error.
-            resolved: dict[str, float] = {
-                name: (validated[name] if name in validated else calibrated[name])
-                for name in _GATE_NAMES
-                if self._gate_tier[name] in ("validated", "auto-calibrated")
-            }
+        validated  = _VALIDATED_MODEL_THRESHOLDS.get(embedding_model_name, {}) if embedding_model_name else {}
+        calibrated = calibrated_thresholds or {}
+        # Only validated/auto-calibrated gates get a cosine-scale threshold
+        # here -- a "lexical-fallback" gate is scored separately, via BM25
+        # (_lexical_search_intent_scores() / _lexical_episodic_relevance(),
+        # against _LEXICAL_FALLBACK_THRESHOLDS below), an entirely different,
+        # unbounded scale that must never be compared against a cosine
+        # score. Mixing the two into one dict here would silently make a
+        # lexical-fallback gate's threshold value unreachable by cosine
+        # scores (which never exceed 1.0) without ever raising an error.
+        resolved: dict[str, float] = {
+            name: (validated[name] if name in validated else calibrated[name])
+            for name in _GATE_NAMES
+            if self._gate_tier[name] in ("validated", "auto-calibrated")
+        }
 
-            self._semantic_gate_thresholds = {
-                name: resolved[name]
-                for name in ("explicit_search_action", "lookup_request")
-                if name in resolved
-            }
-            self._research_intent_threshold    = resolved.get("research_intent")
-            self._episodic_relevance_threshold = resolved.get("episodic_relevance")
+        self._semantic_gate_thresholds = {
+            name: resolved[name]
+            for name in ("explicit_search_action", "lookup_request")
+            if name in resolved
+        }
+        self._research_intent_threshold    = resolved.get("research_intent")
+        self._episodic_relevance_threshold = resolved.get("episodic_relevance")
 
-            cosine_enabled  = sorted(resolved)
-            lexical_enabled = [name for name in _GATE_NAMES if self._gate_tier[name] == "lexical-fallback"]
-            disabled        = [name for name in _GATE_NAMES if self._gate_tier[name] == "disabled"]
-            if cosine_enabled or lexical_enabled:
-                logger.info(
-                    "Planner: active embedding model %r does not match the tuned "
-                    "model (%r) — per-gate threshold resolution: cosine=%s "
-                    "lexical-fallback=%s disabled=%s.",
-                    embedding_model_name, _TUNED_EMBEDDING_MODEL,
-                    {name: (resolved[name], self._gate_tier[name]) for name in cosine_enabled},
-                    lexical_enabled or "none",
-                    disabled or "none",
-                )
-            else:
-                logger.warning(
-                    "Planner: active embedding model %r does not match the model "
-                    "semantic-gating thresholds were tuned against (%r), and has "
-                    "neither a validated, auto-calibrated, nor lexical-fallback "
-                    "threshold for any of the four semantic gates — disabling "
-                    "semantic gating entirely for this session. The thresholds in "
-                    "_SEMANTIC_GATE_THRESHOLDS / _RESEARCH_INTENT_THRESHOLD / "
-                    "_EPISODIC_RELEVANCE_THRESHOLD have no validated meaning "
-                    "against embeddings from a different, unmeasured model.",
-                    embedding_model_name, _TUNED_EMBEDDING_MODEL,
-                )
+        cosine_enabled  = sorted(resolved)
+        lexical_enabled = [name for name in _GATE_NAMES if self._gate_tier[name] == "lexical-fallback"]
+        disabled        = [name for name in _GATE_NAMES if self._gate_tier[name] == "disabled"]
+        if cosine_enabled or lexical_enabled:
+            logger.info(
+                "Planner: active embedding model %r — per-gate threshold "
+                "resolution: cosine=%s lexical-fallback=%s disabled=%s.",
+                embedding_model_name,
+                {name: (resolved[name], self._gate_tier[name]) for name in cosine_enabled},
+                lexical_enabled or "none",
+                disabled or "none",
+            )
+        else:
+            logger.warning(
+                "Planner: active embedding model %r has neither a validated, "
+                "auto-calibrated, nor lexical-fallback threshold for any of "
+                "the four semantic gates — disabling semantic gating "
+                "entirely for this session.",
+                embedding_model_name,
+            )
 
         # Session state for Priority 5 caching (§4.3)
         # _episodic_injected: True once episodic bullets have been injected
@@ -1974,14 +1896,16 @@ class Planner:
         for this turn.
 
         True in either of two cases: (a) this gate's own resolved tier is
-        "lexical-fallback" — a real, named, non-tuned embedding model with
-        no validated/auto-calibrated threshold for THIS gate specifically
-        (see resolve_gate_tiers()), even if embed_fn works fine for other
-        gates; or (b) there's no embed_fn at all — true keyword-only,
-        where resolve_gate_tiers() reports "tuned" purely for labeling
-        convenience (see its docstring) since cosine scoring can never run
+        "lexical-fallback" — a real, named embedding model with no
+        validated/auto-calibrated threshold for THIS gate specifically (see
+        resolve_gate_tiers()), even if embed_fn works fine for other gates;
+        or (b) there's no embed_fn at all — true keyword-only, where
+        resolve_gate_tiers() also naturally reports "lexical-fallback" for
+        every gate (no model name to look up in _VALIDATED_MODEL_THRESHOLDS
+        or calibrated_thresholds) since cosine scoring can never run
         either way. Checking embed_fn directly, not just the tier label,
-        is what makes case (b) work: covers the full motivation in
+        is what makes case (b) robust even if that resolution ever changes:
+        covers the full motivation in
         PLAN_semantic_gating_calibration.md §9, including a true
         zero-config keyword-only install, not only a model with a
         gate-specific calibration gap.
@@ -2199,7 +2123,7 @@ class Planner:
         Match condition: web search keyword, explicit-date pattern, semantic
         search-intent gate, chart keyword, OR file operation keyword present
         in lowercased instruction — see _WEB_SEARCH_KEYWORDS,
-        _has_explicit_date(), _SEMANTIC_GATE_THRESHOLDS, and _CHART_KEYWORDS
+        _has_explicit_date(), the semantic gate thresholds, and _CHART_KEYWORDS
         respectively; any one alone is sufficient.
 
         Populates tools_to_call with "web_search", "chart", and/or "file_op"
@@ -2292,7 +2216,7 @@ class Planner:
         # web_search already fired for some other reason — it is not itself
         # a gate on whether a tool fires at all (see the module-level note
         # above _RESEARCH_LOOP_ENV_VAR), which is why it lives outside
-        # _SEMANTIC_GATE_THRESHOLDS rather than as an entry in it.
+        # its own threshold tier rather than as part of the other gates.
         if (
             "web_search" in tools
             and semantic_result is not None

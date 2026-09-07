@@ -33,13 +33,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Local embedding inference (EmbeddingGemma via MLX). Apple Silicon only —
-# see backend/src/localist/embedding_engine.py's is_apple_silicon gate.
-# mlx-embeddings is GPLv3 (see THIRD_PARTY_LICENSES.md) — kept as a
-# separately-installed, non-bundled optional extra.
-mlx = [
-    "mlx-embeddings>=0.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
-]
 # Local OCR service (ocr_extract MCP tool) — Apple Vision framework for
 # images, PyMuPDF for PDFs. Apple Silicon only — see
 # backend/src/localist/mcp_server/ocr.py's is_apple_silicon() gate. PyMuPDF

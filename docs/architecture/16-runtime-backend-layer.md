@@ -222,7 +222,8 @@ particular spans model sizes from tiny local quantizations to 700B-parameter clo
 is no safe default to assume. Live-verified 2026-07-14: unsetting `LOCALIST_CHAT_MODEL` produces a
 clean startup crash with the expected `ValueError` message; restoring it produces normal startup.
 
-**Embedding source precedence (all backends):**
+**Embedding source precedence (all backends) — current as of the 2026-09 MLX retirement, see
+§16.18:**
 
 At startup, `lifespan()` in `main.py` selects an embedding source via
 `_configure_embedding_source(settings, runtime, health)` (extracted 2026-07-14 into a standalone,
@@ -237,29 +238,12 @@ unit-testable function — see Testing note below) in this order:
    is active, even though `OMLXRuntimeClient.embed()` itself supports a configurable
    `embedding_model` when constructed directly. Closing this gap is a follow-up, not part of this
    change.
-2. **`EmbeddingEngine` (MLX-LM, standalone)** — used only when tier 1 isn't active, AND only on
-   Apple Silicon. Gated behind
-   `is_apple_silicon = platform.system() == "Darwin" and platform.machine() in ("arm64", "aarch64")`,
-   added 2026-07-14, since `mlx_lm` cannot run on Intel Mac, Windows, or Linux. On non-Apple-Silicon
-   hosts with this tier otherwise eligible, the load attempt is skipped entirely (no
-   `EmbeddingEngine()` construction, no import attempt) and an INFO-level log line fires — distinct
-   from the WARNING-level "failed to load" message used when an actual load attempt fails, so the
-   two situations ("this platform can't run this by design" vs. "this platform can but something
-   went wrong") are distinguishable in logs.
-3. **Keyword-only** — universal fallback when neither of the above is available.
+2. **Keyword-only** — universal fallback when tier 1 isn't available. The true zero-config default
+   on every platform.
 
-**Updated 2026-08-30 (OSS packaging pass):** tier 2's gate,
-`Settings.embedding_engine_enabled` (`LOCALIST_EMBEDDING_ENGINE_ENABLED`),
-now defaults to `False` — previously `True`, meaning a fresh install used to
-attempt the ~400MB EmbeddingGemma download silently on first startup
-whenever Apple Silicon was detected. Keyword-only (tier 3) is now the true
-zero-config default on every platform; enabling tier 2 is an explicit
-opt-in, offered interactively by `start_localist.sh` on first run (only
-when `.env` doesn't already set the key, this is Apple Silicon, and the
-`localist[mlx]` extra — see `backend/pyproject.toml` — looks installed).
-The precedence order and `_configure_embedding_source()`'s branch logic
-above are unchanged; only the default value feeding into branch 2's
-condition moved.
+(Historical note: a third tier, `EmbeddingEngine` — a standalone, Apple-Silicon-only local MLX
+EmbeddingGemma path — sat between these two from 2026-07-14 until it was retired 2026-09; see
+§16.18 for what was removed and why.)
 
 `GET /health`'s `embed_model_found` field mirrors this same precedence (fixed 2026-07-14 —
 previously hardcoded to check `EmbeddingEngine` only, which misreported `false` whenever tier 1 was
@@ -267,13 +251,10 @@ actually active).
 
 **Testing note:** the project's test suite convention (established in
 `test_main_memory_episodes.py`) is to never trigger the real FastAPI `lifespan()` in tests — tests
-swap `AppState` fields directly instead. The four-branch embedding-source selection was therefore
-extracted out of `lifespan()`'s inline body into `_configure_embedding_source()` specifically to
-make it unit-testable without violating that convention. `tests/test_main_embedding_source_selection.py`
-covers all four branches, including the Apple-Silicon skip branch under mocked
-`platform.system()`/`platform.machine()` calls (Linux/x86_64, Windows/AMD64) — this is
-mocked/forced-condition testing, not real cross-platform execution; no non-Darwin hardware was
-available to verify the skip branch by actually running on it.
+swap `AppState` fields directly instead. The embedding-source selection was therefore extracted out
+of `lifespan()`'s inline body into `_configure_embedding_source()` specifically to make it
+unit-testable without violating that convention. `tests/test_main_embedding_source_selection.py`
+covers both branches.
 
 **Verified configuration (2026-07-14, fully live end-to-end):** cloud chat model
 (`gemma4:31b-cloud`, proxied through ollama.com — never resident locally) + local embedding model
@@ -304,20 +285,20 @@ platform-gating change (+7 new tests).
   portable across embedding models' geometries; a threshold tuned on one model's score distribution
   has no guaranteed meaning on another's.
 
-  **Fixed on the Planner side (2026-07-16).** `planner.py` now declares `_TUNED_EMBEDDING_MODEL =
-  "mlx-community/embeddinggemma-300m-4bit"`. `Planner.__init__` takes an `embedding_model_name`
-  parameter; when it's set and doesn't match `_TUNED_EMBEDDING_MODEL`, semantic search-intent gating
-  (`_semantic_search_intent()`, backing `explicit_search_action` / `lookup_request` /
-  `research_intent`) is disabled for that Planner instance — a startup-time guard rather than a
-  silent runtime degradation, with a `logger.warning` naming both models. `main.py` derives this name
-  via the new `_derive_active_embedding_model_name()` (mirroring `_configure_embedding_source()`'s
-  own three-tier precedence), stores it on `_state.active_embedding_model_name`, and threads it
-  through `_build_controller()` into `ControllerAgent` at every construction site — startup
-  (`lifespan()`) and both live-switch endpoints (`/settings/runtime-backend`,
+  **Fixed on the Planner side (2026-07-16; superseded 2026-09, see §16.18).** `planner.py`
+  originally declared `_TUNED_EMBEDDING_MODEL = "mlx-community/embeddinggemma-300m-4bit"` and
+  disabled semantic search-intent gating outright for any other model. §16.18's retirement replaced
+  this all-or-nothing guard with the per-gate tiered resolution described in §16.15/§16.17
+  (`resolve_gate_tiers()`: validated → auto-calibrated → lexical-fallback → disabled) — there is no
+  longer a single "tuned" model constant. `main.py` still derives the active model name via
+  `_derive_active_embedding_model_name()` (mirroring `_configure_embedding_source()`'s own
+  precedence), stores it on `_state.active_embedding_model_name`, and threads it through
+  `_build_controller()` into `ControllerAgent` at every construction site — startup (`lifespan()`)
+  and both live-switch endpoints (`/settings/runtime-backend`,
   `/settings/runtime-backend/{backend}/chat-model`), read fresh from `_state` at request time rather
   than captured once. `embedding_model_name=None` (keyword-only mode, no embedding source
-  configured) is not treated as a mismatch — `embed_fn` is already `None` in that case, which already
-  short-circuits semantic scoring.
+  configured) now resolves through the same per-gate loop as any other unrecognized model, landing
+  on the model-independent lexical/BM25 fallback tier for all four gates.
 
   **Fixed on the MemoryManager side too (2026-07-16).** A new `embedding_provenance` table
   (`store TEXT PRIMARY KEY` — `'corpus'` | `'episodes'` — `model TEXT NOT NULL`, schema v8) records
@@ -1304,3 +1285,83 @@ have been silently broken by real BM25 scoring against the literal instruction t
 - `_VALIDATED_MODEL_THRESHOLDS`'s own addition (§16.15's cross-reference, `nomic-embed-text:latest`)
   was never actually documented in this file under its own section — a pre-existing doc gap noticed
   while writing this entry, not fixed here (out of scope for this pass).
+
+### §16.18 — MLX EmbeddingGemma retired: `EmbeddingEngine` and the "tuned" gate tier removed (2026-09-06)
+
+Followed through on a decision already reflected in `README.md` from a prior session (embeddings
+documented as "Ollama-served, or zero-config BM25 keyword-only" — no MLX option): removed
+`EmbeddingEngine` (`backend/src/localist/embedding_engine.py`, the standalone MLX-LM/EmbeddingGemma
+wrapper) both as a packaging dependency (`backend/pyproject.toml`'s `[mlx]` extra) and as a
+user-facing embedding option (`Settings.embedding_engine_enabled` /
+`LOCALIST_EMBEDDING_ENGINE_ENABLED`). See `PLAN_retire_mlx_embeddinggemma.md` (repo root) for the
+full inventory this pass worked from.
+
+**Why this was more than a routine dependency removal:** `planner.py`'s entire hand-tuned
+semantic-gating threshold system (`_SEMANTIC_GATE_THRESHOLDS`, `_RESEARCH_INTENT_THRESHOLD`,
+`_EPISODIC_RELEVANCE_THRESHOLD`, and the `_TUNED_EMBEDDING_MODEL`-keyed "tuned" tier described in
+§16.4/§16.15/§16.17 above) was calibrated specifically against
+`mlx-community/embeddinggemma-300m-4bit`. Deleting model support without deciding what replaced
+that tier would have left dead, unreachable code and stale threshold constants tied to a model no
+longer in the codebase.
+
+**Decision: collapsed 5 tiers to 4, no new pinned "tuned" model.** The prior resolution order —
+tuned → validated → auto-calibrated → lexical-fallback → disabled — is now **validated →
+auto-calibrated → lexical-fallback → disabled**. `_VALIDATED_MODEL_THRESHOLDS`'s existing
+`nomic-embed-text:latest` entry (§16.15, same hand-reviewed rigor "tuned" ever had, just added via
+the newer per-model dict shape) becomes the top tier as-is — no new diagnostic work was needed.
+`resolve_gate_tiers()`'s old `embedding_model_name is None or embedding_model_name ==
+_TUNED_EMBEDDING_MODEL: return "tuned"` special case is gone; `None` (true keyword-only) now flows
+through the same general per-gate loop as any other unrecognized model, landing on
+"lexical-fallback" for all four gates since `_LEXICAL_FALLBACK_THRESHOLDS` (§16.17) covers all of
+them. Rejected alternative: promoting a new model into a renamed `_TUNED_EMBEDDING_MODEL` constant —
+would have required fresh diagnostic work for no material trust improvement over the existing
+validated-tier shape, and reintroduced the "assume one canonical model" framing this multi-session
+project was deliberately moving away from.
+
+**A real bug fix, not just a refactor:** before this change, a true keyword-only session was
+labeled `"tuned"` by `resolve_gate_tiers()`, which the Settings UI's trust-badge logic rendered as a
+green "hand-validated" badge — actively misleading, since no cosine scoring ever ran in that case.
+It now correctly shows "keyword fallback."
+
+**What changed, by file:**
+- `planner.py` — deleted `_TUNED_EMBEDDING_MODEL`, `_SEMANTIC_GATE_THRESHOLDS`,
+  `_RESEARCH_INTENT_THRESHOLD`, `_EPISODIC_RELEVANCE_THRESHOLD` and their tuned-tier-specific
+  comment blocks; `resolve_gate_tiers()` and `Planner.__init__`'s per-gate resolution now run
+  unconditionally (no more "only if not the tuned model" branch), defaulting to empty/`None`
+  thresholds rather than tuned-tier constants.
+- `main.py` — removed the `EmbeddingEngine` import, `Settings.embedding_engine_enabled`,
+  `AppState.embedding_engine`; `_configure_embedding_source()` and
+  `_derive_active_embedding_model_name()` collapsed from three tiers to two (runtime-backend embed /
+  keyword-only); `GET /health` and `POST /settings/embedding-model` simplified to match — clearing
+  the runtime-backend embedding model now drops straight to keyword-only, no second tier to fall
+  back to.
+- Deleted `embedding_engine.py`, plus the standalone `backfill_embeddings.py` /
+  `backfill_episode_embeddings.py` scripts (found during the sweep, not in the original inventory —
+  both imported `embedding_engine` directly and had no purpose left once it was gone).
+- `backend/pyproject.toml` — removed the `[mlx]` extra.
+- `start_localist.sh` — removed the first-run EmbeddingGemma-download prompt block.
+- `localist-ui/src/routes/settings/+page.svelte` — the Embedding Model card's hardcoded
+  `mlx-community/embeddinggemma-300m-4bit` status string now reports whichever model is actually
+  active (`$health.active_embedding_model_name`); nearby copy referencing MLX/EmbeddingEngine as an
+  alternative reworded.
+- Tests: `test_planner_phase3.py` (`TestTunedEmbeddingModelGuard` replaced with a smaller
+  `TestNoneModelNameFallsToLexical`; ~10 tests updated to pass an explicit
+  `embedding_model_name="nomic-embed-text:latest"` now that an unset model name no longer gets
+  tuned-tier cosine defaults); `test_main_embedding_source_selection.py` (full rewrite for the
+  two-tier shape); `test_main_embedding_model_switch.py` and `test_main_health_gate_tiers.py`
+  (dropped tuned/`EmbeddingEngine`-fallback-specific cases); `test_embedding_provenance.py` /
+  `test_chat_turns_semantic_search.py` / `test_main_chat_turns_semantic_endpoint.py` /
+  `test_main_memory_reembed.py` (repointed hardcoded `embeddinggemma` fixture strings at a neutral
+  model name — fixture data only, no tier-specific behavior involved).
+- `THIRD_PARTY_LICENSES.md` — removed the `mlx-embeddings` (GPLv3) dependency row and the
+  EmbeddingGemma model-weights section; noted the remaining `mlx`/`mlx-lm`/etc. rows in the full
+  package table are incidental to the dev venv (pulled in by other local tooling), not a declared
+  dependency of this repo.
+- `CLAUDE.md` — setup command drops `[mlx]`; embedding precedence description updated to two-tier.
+
+**Not touched (explicitly out of scope, low priority):** `test_build_graph.py` / `test_wiki_doc.py`
+still contain EmbeddingGemma mentions inside *sample wiki-page fixture content* (parsing test
+fixtures, not functional assertions) — left as-is per the original plan's own priority call.
+
+**Test suite:** full backend suite 1599 passed / 0 failed after this pass; frontend
+`svelte-check` 0 errors / 0 warnings.

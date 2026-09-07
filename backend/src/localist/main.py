@@ -105,22 +105,8 @@ can be overridden via environment variables or a .env file:
                                        Defaults to <project_root>/localist_memory.db
   LOCALIST_EMBEDDING_MODEL             Runtime-backend embedding model ID (foundry/ollama
                                        only; omlx does not yet wire this through). Empty
-                                       string (default) = not configured, falls back to
-                                       EmbeddingEngine.
-  LOCALIST_EMBEDDING_ENGINE_ENABLED    Load the standalone MLX-LM EmbeddingEngine at
-                                       startup (bool, default False as of the OSS
-                                       packaging pass — opt-in, not silent-by-default;
-                                       see backend/pyproject.toml's [mlx] extra and
-                                       start_localist.sh's first-run prompt). Set True
-                                       to download (~400MB, first run only) and load
-                                       the model; leave False/unset to run in
-                                       keyword-only mode. Ignored when
-                                       LOCALIST_EMBEDDING_MODEL is set and found by the
-                                       active runtime backend — the runtime backend's
-                                       own embed() is used instead. Also a no-op on
-                                       non-Apple-Silicon platforms regardless of its
-                                       value, since EmbeddingEngine's mlx_lm dependency
-                                       only runs on Apple Silicon.
+                                       string (default) = not configured, MemoryManager
+                                       runs in keyword-only (BM25) retrieval mode.
 """
 
 from __future__ import annotations
@@ -161,7 +147,6 @@ from .build_graph import build_graph
 from .context_profile import check_local_ram_headroom, profile_for
 from .controller_agent import ControllerAgent, TaskStatus, _MEMORY_MD_PATH
 from .conversational_agent import ConversationalAgent
-from .embedding_engine import EmbeddingEngine
 from . import github_watch
 from . import hacker_news
 from .mcp_server.ocr import get_upload_root as _ocr_upload_root
@@ -171,7 +156,7 @@ from .mcp_server.file_ops import set_project_root as _set_generated_file_root
 from .mcp_tool_dispatcher import MCPToolDispatcher
 from .memory_manager import MemoryManager, EpisodicMemoryWriter, EpisodicMemoryReader
 from . import news_brief
-from .planner import _TUNED_EMBEDDING_MODEL, _VALIDATED_MODEL_THRESHOLDS, resolve_gate_tiers
+from .planner import _VALIDATED_MODEL_THRESHOLDS, resolve_gate_tiers
 from .runtime_factory import available_backends, create_runtime
 from .threshold_calibration import calibrate_thresholds, CalibrationResult
 from . import session_files
@@ -194,9 +179,9 @@ class Settings(BaseSettings):
     # Runtime backend selection
     runtime_backend: str = "foundry"
 
-    # Model ID — chat only; embeddings are handled by EmbeddingEngine (MLX-LM)
-    # unless embedding_model below is set and found by the active runtime
-    # backend, in which case the runtime backend's own embed() is used instead.
+    # Model ID — chat only. Embeddings are handled separately (see
+    # embedding_model below); when embedding_model is unset or not found by
+    # the active runtime backend, MemoryManager runs keyword-only (BM25).
     chat_model:       str | None = None
 
     # Per-backend chat-model pins (LOCALIST_CHAT_MODEL_OMLX / _OLLAMA / _FOUNDRY).
@@ -208,7 +193,7 @@ class Settings(BaseSettings):
     chat_model_foundry: str | None = None
 
     # Runtime-backend embedding model ID (foundry/ollama only; empty string =
-    # not configured, falls back to EmbeddingEngine).
+    # not configured, MemoryManager runs keyword-only (BM25)).
     embedding_model:  str = ""
 
     # Foundry network (foundry backend only)
@@ -233,13 +218,6 @@ class Settings(BaseSettings):
 
     # MemoryManager
     memory_db:                str | None = None   # None → <project_root>/localist_memory.db
-
-    # EmbeddingEngine — standalone MLX-LM embedding, backend-agnostic.
-    # Opt-in (default False) — set True to download (~400MB, first run only)
-    # and load the model; unset/False runs MemoryManager in keyword-only
-    # mode. See start_localist.sh's first-run prompt, which offers to set
-    # this explicitly instead of leaving it to this silent default.
-    embedding_engine_enabled: bool = False
 
     # Agent behaviour
     auto_apply:      bool = False
@@ -267,12 +245,12 @@ class AppState:
         self.controller:        ControllerAgent   | None = None
         self.wiki_agent:        WikiAgent         | None = None
         self.memory_manager:    MemoryManager     | None = None
-        self.embedding_engine:  EmbeddingEngine   | None = None
         self.settings:          Settings          | None = None
         # Name of the embedding model actually backing embed_fn, resolved by
         # _derive_active_embedding_model_name() alongside _configure_embedding_
-        # source() — see planner.py's _TUNED_EMBEDDING_MODEL guard. None means
-        # keyword-only mode (no embedding source at all).
+        # source() — see planner.py's per-gate threshold resolution
+        # (resolve_gate_tiers()). None means keyword-only mode (no embedding
+        # source at all).
         self.active_embedding_model_name: str | None = None
         # Resolved at startup by lifespan()
         self.wiki_dir:          Path | None = None
@@ -293,95 +271,57 @@ def _configure_embedding_source(
     settings: Settings,
     runtime:  BaseRuntimeClient,
     health:   dict,
-) -> tuple[Any, EmbeddingEngine | None]:
+) -> Any:
     """
-    Decide and construct which embedding source lifespan() should use, in
-    three-tier precedence order:
+    Decide which embedding source lifespan() should use, in two-tier
+    precedence order:
 
       1. The active runtime backend's own embed() — used when
          settings.embedding_model is set AND health["embed_model_found"]
          (from the health check already run in lifespan()) is truthy.
          Platform-agnostic.
-      2. EmbeddingEngine (standalone MLX-LM) — attempted only when enabled
-         AND this platform is Apple Silicon, since mlx_lm cannot run
-         elsewhere.
-      3. Neither — MemoryManager falls back to keyword-only retrieval.
-
-    Tiers 1 and 2 are mutually exclusive: loading both would hold two
-    embedding models in memory for no benefit.
+      2. Neither — MemoryManager falls back to keyword-only (BM25)
+         retrieval.
 
     Returns
     -------
-    tuple[Callable | None, EmbeddingEngine | None]
-        (embed_fn, embedding_engine). embedding_engine is the constructed
-        EmbeddingEngine instance whenever tier 2 was attempted (whether or
-        not it ended up available), so the caller can stash it on app
-        state; otherwise None.
+    Callable | None
+        embed_fn, or None for keyword-only mode.
 
     This is a standalone function (not inlined in lifespan()) purely so the
     branch selection can be unit-tested without running the full startup
     sequence (real runtime construction, directory indexing, graph build,
     etc.) — lifespan() itself is not exercised by the test suite.
     """
-    is_apple_silicon = platform.system() == "Darwin" and platform.machine() in ("arm64", "aarch64")
-
     if settings.embedding_model and health.get("embed_model_found"):
         logger.info(
-            "Runtime-backend embeddings ready — backend=%s model=%s. "
-            "EmbeddingEngine will not be loaded.",
+            "Runtime-backend embeddings ready — backend=%s model=%s.",
             settings.runtime_backend.upper(), settings.embedding_model,
         )
-        return runtime.embed, None
-
-    if settings.embedding_engine_enabled and is_apple_silicon:
-        embedding_engine = EmbeddingEngine()
-        if embedding_engine.available:
-            logger.info("EmbeddingEngine ready — embeddings enabled.")
-            return embedding_engine.embed, embedding_engine
-        logger.warning(
-            "EmbeddingEngine failed to load — MemoryManager will run "
-            "in keyword-only mode.  Install mlx-lm and retry."
-        )
-        return None, embedding_engine
-
-    if settings.embedding_engine_enabled and not is_apple_silicon:
-        logger.info(
-            "EmbeddingEngine skipped — mlx_lm requires Apple Silicon, this platform "
-            "is %s/%s. MemoryManager will run in keyword-only mode.",
-            platform.system(), platform.machine(),
-        )
-        return None, None
+        return runtime.embed
 
     logger.info(
-        "EmbeddingEngine disabled (LOCALIST_EMBEDDING_ENGINE_ENABLED=false) — "
-        "MemoryManager will run in keyword-only mode."
+        "No embedding model configured or found — MemoryManager will run "
+        "in keyword-only mode."
     )
-    return None, None
+    return None
 
 
 def _derive_active_embedding_model_name(
-    settings:         Settings,
-    embed_fn:         Any,
-    embedding_engine: EmbeddingEngine | None,
+    settings: Settings,
+    embed_fn: Any,
 ) -> str | None:
     """
     Name the embedding model actually backing `embed_fn`, mirroring
-    _configure_embedding_source()'s three-tier precedence:
+    _configure_embedding_source()'s two-tier precedence:
 
-      1. Runtime-backend embed (embedding_engine is None, embed_fn is not)
-         -> settings.embedding_model.
-      2. EmbeddingEngine (embedding_engine is not None) -> its model_path,
-         but only if it loaded successfully (embedding_engine.available);
-         a construction attempt that failed to load names no model.
-      3. Keyword-only (embed_fn is None, embedding_engine is None) -> None.
+      1. Runtime-backend embed (embed_fn is not None) -> settings.embedding_model.
+      2. Keyword-only (embed_fn is None) -> None.
 
-    Consumed by Planner's _TUNED_EMBEDDING_MODEL guard (docs/architecture/
-    16-runtime-backend-layer.md §16.4) so a mismatched embedding model
-    disables semantic gating instead of silently producing thresholds with
-    no validated meaning.
+    Consumed by Planner's per-gate threshold resolution (resolve_gate_tiers())
+    so a mismatched or absent embedding model disables semantic gating
+    instead of silently producing thresholds with no validated meaning.
     """
-    if embedding_engine is not None:
-        return embedding_engine.model_path if embedding_engine.available else None
     if embed_fn is not None:
         return settings.embedding_model
     return None
@@ -647,14 +587,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     templates_dir = _resolve_configured_path(settings.templates_dir, resource_root, "templates")
 
     # -- Embedding source selection -------------------------------------------
-    # See _configure_embedding_source() for the three-tier precedence rules
-    # (runtime-backend embed / EmbeddingEngine-if-Apple-Silicon / keyword-only).
+    # See _configure_embedding_source() for the two-tier precedence rules
+    # (runtime-backend embed / keyword-only).
 
-    embed_fn, embedding_engine = _configure_embedding_source(settings, runtime, health)
-    if embedding_engine is not None:
-        _state.embedding_engine = embedding_engine
+    embed_fn = _configure_embedding_source(settings, runtime, health)
     _state.active_embedding_model_name = _derive_active_embedding_model_name(
-        settings, embed_fn, embedding_engine,
+        settings, embed_fn,
     )
 
     memory_manager = MemoryManager(
@@ -855,15 +793,15 @@ class HealthResponse(BaseModel):
     embedding_model:   str        = ""
     error:             str | None = None
     # active_embedding_model_name / gate_tiers (PLAN_semantic_gating_
-    # calibration.md §6): the RESOLVED model name Planner actually compares
-    # against _TUNED_EMBEDDING_MODEL (_state.active_embedding_model_name),
-    # not the raw `embedding_model` setting above — those can differ (e.g.
-    # EmbeddingEngine fallback naming, see _derive_active_embedding_model_
-    # name()). gate_tiers gives the Settings UI a per-gate trust badge
-    # ("tuned"/"validated"/"auto-calibrated"/"disabled") on every page
-    # load/poll, not just transiently after a switch or reembed response —
-    # computed via resolve_gate_tiers(), the same function Planner.__init__
-    # uses, so the two can never disagree.
+    # calibration.md §6): the RESOLVED model name Planner actually uses for
+    # per-gate threshold resolution (_state.active_embedding_model_name),
+    # not the raw `embedding_model` setting above — see
+    # _derive_active_embedding_model_name(). gate_tiers gives the Settings
+    # UI a per-gate trust badge ("validated"/"auto-calibrated"/
+    # "lexical-fallback"/"disabled") on every page load/poll, not just
+    # transiently after a switch or reembed response — computed via
+    # resolve_gate_tiers(), the same function Planner.__init__ uses, so the
+    # two can never disagree.
     active_embedding_model_name: str | None = None
     gate_tiers: dict[str, str] = Field(default_factory=dict)
 
@@ -922,8 +860,7 @@ class ChatModelPinResponse(BaseModel):
 class EmbeddingModelRequest(BaseModel):
     """
     Payload accepted by POST /settings/embedding-model. An empty model
-    clears the runtime-backend embedding tier (falls back to EmbeddingEngine
-    if enabled/available, else keyword-only).
+    clears the runtime-backend embedding tier (falls back to keyword-only).
     """
     model: str = ""
 
@@ -994,8 +931,8 @@ def _needs_first_time_calibration(memory_manager: MemoryManager, embedding_model
     (_VALIDATED_MODEL_THRESHOLDS) nor an existing persisted calibration row
     — the trigger condition for POST /settings/embedding-model's automatic,
     zero-extra-clicks first-time calibration (PLAN_semantic_gating_
-    calibration.md §5). False for the tuned model (needs no calibration at
-    all) and for None (keyword-only — nothing to calibrate).
+    calibration.md §5). False for None (keyword-only — nothing to
+    calibrate).
 
     Deliberately does NOT re-trigger for a model calibrated before, even if
     every gate came back degenerate that time — get_calibrated_thresholds()
@@ -1003,7 +940,7 @@ def _needs_first_time_calibration(memory_manager: MemoryManager, embedding_model
     distinct from None ("never attempted"). Re-attempting a fully-degenerate
     model is what the manual "Re-embed Corpus Now" re-trigger is for.
     """
-    if embedding_model_name is None or embedding_model_name == _TUNED_EMBEDDING_MODEL:
+    if embedding_model_name is None:
         return False
     if embedding_model_name in _VALIDATED_MODEL_THRESHOLDS:
         return False
@@ -1579,17 +1516,13 @@ async def get_health() -> HealthResponse:
     raw: dict[str, Any] = await asyncio.to_thread(runtime.health_check)
 
     # Mirrors the embed_fn precedence lifespan() establishes at startup: the
-    # runtime backend's own embed() wins when an embedding_model is configured
-    # and the health check confirms it's actually present, since in that case
-    # lifespan() never loads EmbeddingEngine at all (_state.embedding_engine
-    # stays None). Only fall back to EmbeddingEngine's own availability when
-    # the runtime-backend path isn't the one actually wired to MemoryManager.
+    # runtime backend's own embed() is the only embedding source — active
+    # when an embedding_model is configured and the health check confirms
+    # it's actually present, else MemoryManager runs keyword-only.
     settings = _state.settings
-    if settings is not None and settings.embedding_model and raw.get("embed_model_found"):
-        embed_available = True
-    else:
-        embedding_engine = _state.embedding_engine
-        embed_available  = embedding_engine is not None and embedding_engine.available
+    embed_available = bool(
+        settings is not None and settings.embedding_model and raw.get("embed_model_found")
+    )
 
     active_embedding_model_name = _state.active_embedding_model_name
     calibrated_thresholds = _derive_calibrated_thresholds(_state.memory_manager, active_embedding_model_name)
@@ -1873,11 +1806,10 @@ async def set_embedding_model(request: EmbeddingModelRequest) -> EmbeddingModelR
     """
     Configure MemoryManager's embedding source to use the active runtime
     backend's embed() with `model` — tier 1 of _configure_embedding_source()'s
-    three-tier precedence (docs/architecture/16-runtime-backend-layer.md
+    two-tier precedence (docs/architecture/16-runtime-backend-layer.md
     §16.4). An empty model clears the runtime-backend embedding tier,
-    falling back to EmbeddingEngine (if enabled and available) or
-    keyword-only — mirrors what an unset LOCALIST_EMBEDDING_MODEL does at
-    startup; it does not attempt to newly load EmbeddingEngine live.
+    falling back to keyword-only — mirrors what an unset
+    LOCALIST_EMBEDDING_MODEL does at startup.
 
     oMLX is rejected up front — runtime_factory._make_omlx() hardcodes
     embedding_model="" regardless of what's requested here (a known,
@@ -1932,35 +1864,12 @@ async def set_embedding_model(request: EmbeddingModelRequest) -> EmbeddingModelR
             )
 
         settings.embedding_model = model
-        if model:
-            # Tier 1 (runtime-backend embed) engaged — mutually exclusive with
-            # tier 2 (_configure_embedding_source()'s own invariant), so an
-            # EmbeddingEngine left over from startup must not be consulted for
-            # naming here even though _state.embedding_engine itself is left
-            # untouched (still holds whatever lifespan() constructed, in case
-            # this model is cleared later).
-            embed_fn = candidate_runtime.embed
-            embedding_engine_for_name = None
-        else:
-            # Clearing tier 1 falls back to tier 2 (EmbeddingEngine) if it was
-            # already loaded and available at startup, exactly like an unset
-            # LOCALIST_EMBEDDING_MODEL would at boot — not straight to
-            # keyword-only, which would silently disable working embeddings.
-            embedding_engine = _state.embedding_engine
-            embed_fn = (
-                embedding_engine.embed
-                if embedding_engine is not None and embedding_engine.available
-                else None
-            )
-            embedding_engine_for_name = embedding_engine
+        # Tier 1 (runtime-backend embed) engaged only when a model is given;
+        # clearing it drops straight to keyword-only — no second embedding
+        # tier left to fall back to.
+        embed_fn = candidate_runtime.embed if model else None
 
-        embedding_model_name = _derive_active_embedding_model_name(
-            settings, embed_fn, embedding_engine_for_name,
-        )
-        # Pass the *derived* name, not the raw `model` string — when clearing
-        # falls back to tier 2 above, the vectors are actually produced by
-        # embedding_engine.model_path, not None; provenance checking against
-        # the wrong (or a missing) name would silently skip a real mismatch.
+        embedding_model_name = _derive_active_embedding_model_name(settings, embed_fn)
         memory_manager.set_embedding_source(embed_fn, embedding_model_name)
         _state.active_embedding_model_name = embedding_model_name
 
@@ -2100,7 +2009,7 @@ async def reembed_corpus() -> ReembedCorpusResponse:
 
     calibration: CalibrationResponse | None = None
     embedding_model_name = _state.active_embedding_model_name
-    if embedding_model_name is not None and embedding_model_name != _TUNED_EMBEDDING_MODEL:
+    if embedding_model_name is not None:
         async with _runtime_switch_lock:
             calibration_result = await asyncio.to_thread(
                 _calibrate_and_persist, mm, embedding_model_name, mm.embed_fn,

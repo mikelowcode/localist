@@ -27,7 +27,7 @@ from localist.memory_manager import (
 )
 
 
-_TUNED = "mlx-community/embeddinggemma-300m-4bit"
+_MODEL_A = "some-embedding-model:latest"
 _OTHER = "nomic-embed-text"
 
 
@@ -236,7 +236,7 @@ class TestAddChatTurnEmbedding:
     def test_embeds_content_when_embed_fn_configured(self, tmp_path):
         embed_fn = _stub_embed_fn(0.5)
         mm = MemoryManager(
-            db_path=tmp_path / "embed.db", embed_fn=embed_fn, embedding_model_name=_TUNED,
+            db_path=tmp_path / "embed.db", embed_fn=embed_fn, embedding_model_name=_MODEL_A,
         )
         mm.add_chat_turn(task_id="t", role="user", content="hello world", conversation_id="c")
 
@@ -260,7 +260,7 @@ class TestAddChatTurnEmbedding:
     def test_content_truncated_to_500_chars_before_embedding(self, tmp_path):
         embed_fn = _stub_embed_fn()
         mm = MemoryManager(
-            db_path=tmp_path / "trunc.db", embed_fn=embed_fn, embedding_model_name=_TUNED,
+            db_path=tmp_path / "trunc.db", embed_fn=embed_fn, embedding_model_name=_MODEL_A,
         )
         long_content = "x" * 600
         mm.add_chat_turn(task_id="t", role="user", content=long_content, conversation_id="c")
@@ -270,7 +270,7 @@ class TestAddChatTurnEmbedding:
     def test_embed_failure_leaves_null_embedding_write_still_succeeds(self, tmp_path):
         embed_fn = MagicMock(side_effect=RuntimeError("boom"))
         mm = MemoryManager(
-            db_path=tmp_path / "fail.db", embed_fn=embed_fn, embedding_model_name=_TUNED,
+            db_path=tmp_path / "fail.db", embed_fn=embed_fn, embedding_model_name=_MODEL_A,
         )
         mm.add_chat_turn(task_id="t", role="user", content="hello", conversation_id="c")
 
@@ -283,13 +283,13 @@ class TestAddChatTurnEmbedding:
     def test_first_embedded_write_seeds_chat_turns_provenance(self, tmp_path):
         embed_fn = _stub_embed_fn()
         mm = MemoryManager(
-            db_path=tmp_path / "seed.db", embed_fn=embed_fn, embedding_model_name=_TUNED,
+            db_path=tmp_path / "seed.db", embed_fn=embed_fn, embedding_model_name=_MODEL_A,
         )
         assert _get_provenance(mm._db_path, "chat_turns") is None
 
         mm.add_chat_turn(task_id="t", role="user", content="hello", conversation_id="c")
 
-        assert _get_provenance(mm._db_path, "chat_turns") == _TUNED
+        assert _get_provenance(mm._db_path, "chat_turns") == _MODEL_A
 
     def test_no_embed_fn_row_shape_unchanged_no_score_key(self, tmp_path):
         """Regression guard: keyword-mode callers must not see a new
@@ -315,13 +315,13 @@ class TestChatTurnsProvenanceMismatch:
 
         with caplog.at_level(logging.WARNING, logger="localist.memory_manager"):
             mm = MemoryManager(
-                db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_TUNED,
+                db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_MODEL_A,
             )
 
         assert mm._chat_turns_stale is True
         assert "chat_turns embeddings were produced by" in caplog.text
         assert _OTHER in caplog.text
-        assert _TUNED in caplog.text
+        assert _MODEL_A in caplog.text
         # Provenance still describes what's on disk until reembed_chat_turns() runs.
         assert _get_provenance(path, "chat_turns") == _OTHER
 
@@ -332,7 +332,7 @@ class TestChatTurnsProvenanceMismatch:
         _set_provenance(path, "chat_turns", _OTHER)
 
         embed_fn = _stub_embed_fn()
-        MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_TUNED)
+        MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_MODEL_A)
 
         embed_fn.assert_not_called()
 
@@ -344,10 +344,10 @@ class TestChatTurnsProvenanceMismatch:
 
         with caplog.at_level(logging.WARNING, logger="localist.memory_manager"):
             mm = MemoryManager(
-                db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_TUNED,
+                db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_MODEL_A,
             )
 
-        assert _get_provenance(path, "chat_turns") == _TUNED
+        assert _get_provenance(path, "chat_turns") == _MODEL_A
         assert mm._chat_turns_stale is False
         assert caplog.text == ""
 
@@ -358,7 +358,7 @@ class TestChatTurnsProvenanceMismatch:
         _set_provenance(path, "chat_turns", _OTHER)
 
         embed_fn = _stub_embed_fn()
-        mm = MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_TUNED)
+        mm = MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_MODEL_A)
         assert mm._chat_turns_stale is True
         embed_fn.reset_mock()
 
@@ -384,14 +384,14 @@ class TestReembedChatTurns:
         _set_provenance(path, "chat_turns", _OTHER)
 
         embed_fn = _stub_embed_fn(0.42)
-        mm = MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_TUNED)
+        mm = MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_MODEL_A)
         assert mm._chat_turns_stale is True
 
         result = mm.reembed_chat_turns()
 
-        assert result == {"reembedded": 2, "total": 2, "model": _TUNED}
+        assert result == {"reembedded": 2, "total": 2, "model": _MODEL_A}
         assert mm._chat_turns_stale is False
-        assert _get_provenance(path, "chat_turns") == _TUNED
+        assert _get_provenance(path, "chat_turns") == _MODEL_A
 
         conn = sqlite3.connect(str(path))
         blobs = [row[0] for row in conn.execute("SELECT embedding FROM chat_turns").fetchall()]
@@ -407,7 +407,7 @@ class TestReembedChatTurns:
     def test_idempotent_when_not_stale(self, tmp_path):
         embed_fn = _stub_embed_fn(0.7)
         mm = MemoryManager(
-            db_path=tmp_path / "fresh.db", embed_fn=embed_fn, embedding_model_name=_TUNED,
+            db_path=tmp_path / "fresh.db", embed_fn=embed_fn, embedding_model_name=_MODEL_A,
         )
         mm.add_chat_turn(task_id="t", role="user", content="hi", conversation_id="c")
         assert mm._chat_turns_stale is False
@@ -445,7 +445,7 @@ class TestGetChatTurnsSemantic:
     @pytest.fixture()
     def mm(self, tmp_path, embed_fn) -> MemoryManager:
         return MemoryManager(
-            db_path=tmp_path / "semantic.db", embed_fn=embed_fn, embedding_model_name=_TUNED,
+            db_path=tmp_path / "semantic.db", embed_fn=embed_fn, embedding_model_name=_MODEL_A,
         )
 
     def test_semantic_mode_ranks_by_cosine_similarity(self, mm):

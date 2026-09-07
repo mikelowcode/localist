@@ -17,15 +17,15 @@ variable); embeddings always run locally regardless of the active chat backend.
 cd backend
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[mlx,ocr,chart,dev]"   # Apple Silicon: full local stack
+pip install -e ".[ocr,chart,dev]"       # Apple Silicon: full local stack
 # pip install -e ".[dev]"               # any OS: base install, Ollama/Foundry only
 ```
 `backend/pyproject.toml` is the dependency source of truth (`src/localist/` layout, installed
-editable). Base install is cross-platform with no MLX/Vision/PyMuPDF; `[mlx]` (local embeddings)
-and `[ocr]` (local OCR — Apple Vision + PyMuPDF) are both Apple-Silicon-only extras, gated by
-`platform_machine == 'arm64'` markers matching each feature's own runtime gate; `[chart]`
-(matplotlib, for `generate_chart`) is cross-platform. See `THIRD_PARTY_LICENSES.md` for why `[mlx]`
-and `[ocr]` pull in copyleft dependencies (GPLv3, AGPL-3.0 respectively).
+editable). Base install is cross-platform with no Vision/PyMuPDF; `[ocr]` (local OCR — Apple
+Vision + PyMuPDF) is an Apple-Silicon-only extra, gated by a `platform_machine == 'arm64'` marker
+matching its own runtime gate; `[chart]` (matplotlib, for `generate_chart`) is cross-platform. See
+`THIRD_PARTY_LICENSES.md` for why `[ocr]` pulls in a copyleft dependency (AGPL-3.0). There is no
+local embedding extra — embeddings are either Ollama-served or keyword-only (BM25); see below.
 
 Copy `backend/.env.example` to `backend/.env`. Only `LANGSEARCH_API_KEY` is required for full
 functionality (`web_search`); everything else has a working default.
@@ -84,14 +84,13 @@ All inference goes through a `BaseRuntimeClient`-conforming runtime selected at 
 active at startup is still the one active when a request is handled; always resolve it from
 `_state.runtime` at request time, never capture it once and hold onto it. The Settings UI's Runtime
 Backend control is wired to this endpoint (§7.10, §16.6) — a live switch there is a real,
-confirm-gated action, not a display preference. Vector embeddings, when enabled, run locally via
-`EmbeddingEngine` (`mlx-community/embeddinggemma-300m-4bit`, 768-dim) — but `EmbeddingEngine` is
-opt-in (`LOCALIST_EMBEDDING_ENGINE_ENABLED`, default `false` as of the OSS packaging pass; see
-`backend/pyproject.toml`'s `[mlx]` extra and `start_localist.sh`'s first-run prompt), not the
-silent default it once was. Three-tier precedence (§16.4): a runtime-backend embed source, if
-configured and active, wins over `EmbeddingEngine`; `EmbeddingEngine`, if enabled and available,
-wins over the true zero-config default — keyword-only (BM25) retrieval. Independent of the chat
-backend only in the keyword-only/EmbeddingEngine case, not universally.
+confirm-gated action, not a display preference. There is no local embedding model in this repo —
+vector embeddings, when configured, come from the active runtime backend's own `embed()`
+(`LOCALIST_EMBEDDING_MODEL`, Ollama/Foundry only; oMLX does not yet wire this through). Two-tier
+precedence (§16.4): a runtime-backend embed source, if configured and found by the active backend,
+is used; otherwise MemoryManager runs the true zero-config default — keyword-only (BM25) retrieval.
+(Historical note: a local MLX EmbeddingGemma path, `EmbeddingEngine`, existed as a third,
+independent-of-chat-backend tier until it was retired 2026-09 — see §16.18.)
 
 `MemoryManager` is the SQLite-backed store (WAL mode) for two independent memory types:
 **episodic memory** (typed, sparse facts — preferences, corrections, decisions — extracted

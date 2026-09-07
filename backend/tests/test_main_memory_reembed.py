@@ -34,7 +34,7 @@ class TestReembedEndpoint:
         embed_fn = _embed_fn()
         mm = MemoryManager(
             db_path=tmp_path / "reembed.db", embed_fn=embed_fn,
-            embedding_model_name="mlx-community/embeddinggemma-300m-4bit",
+            embedding_model_name="some-embedding-model:latest",
         )
         mm.index_document(path=tmp_path / "a.md", doc_type="wiki", content="alpha", embed=True)
         mm.index_document(path=tmp_path / "b.md", doc_type="wiki", content="beta", embed=True)
@@ -47,7 +47,7 @@ class TestReembedEndpoint:
         assert body == {
             "reembedded": 2,
             "total": 2,
-            "model": "mlx-community/embeddinggemma-300m-4bit",
+            "model": "some-embedding-model:latest",
             "calibration": None,
         }
 
@@ -78,7 +78,7 @@ class TestMemoryStatsCorpusStale:
         embed_fn = _embed_fn()
         mm = MemoryManager(
             db_path=tmp_path / "stats.db", embed_fn=embed_fn,
-            embedding_model_name="mlx-community/embeddinggemma-300m-4bit",
+            embedding_model_name="some-embedding-model:latest",
         )
         main._state.memory_manager = mm
 
@@ -92,7 +92,7 @@ class TestMemoryStatsCorpusStale:
         embed_fn = _embed_fn()
         mm = MemoryManager(
             db_path=tmp_path / "stats.db", embed_fn=embed_fn,
-            embedding_model_name="mlx-community/embeddinggemma-300m-4bit",
+            embedding_model_name="some-embedding-model:latest",
         )
         mm._corpus_stale = True
         main._state.memory_manager = mm
@@ -107,7 +107,7 @@ class TestMemoryStatsCorpusStale:
         embed_fn = _embed_fn()
         mm = MemoryManager(
             db_path=tmp_path / "stats.db", embed_fn=embed_fn,
-            embedding_model_name="mlx-community/embeddinggemma-300m-4bit",
+            embedding_model_name="some-embedding-model:latest",
         )
         mm.index_document(path=tmp_path / "a.md", doc_type="wiki", content="alpha", embed=True)
         mm._corpus_stale = True

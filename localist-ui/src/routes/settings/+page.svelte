@@ -224,7 +224,7 @@
     if (body) {
       embeddingModelResult = (value
         ? `Embedding model set to ${value}.`
-        : 'Embedding model cleared — back to keyword-only (or EmbeddingEngine, if enabled).')
+        : 'Embedding model cleared — back to keyword-only.')
         + formatCalibrationSummary(body.calibration);
       await checkHealth();
       await loadMemoryStats();
@@ -552,8 +552,8 @@
           </select>
           <p class="field-hint">
             Routes local embeddings through Ollama's <code>/api/embed</code> via
-            <code>POST /settings/embedding-model</code> — the desktop-build-friendly
-            alternative to MLX EmbeddingEngine, which the packaged app doesn't bundle.
+            <code>POST /settings/embedding-model</code> — the only local embedding
+            source; leave it unset to run in keyword-only (BM25) mode instead.
             Applies immediately; switching models flags the wiki/raw corpus and chat
             history stale for re-embedding (see the Corpus Embeddings card above) —
             episodic memory re-embeds itself automatically. Switching to a new model
@@ -680,7 +680,7 @@
               class:badge-success={$health.embed_model_found}
               class:badge-warning={!$health.embed_model_found}
               title={$health.embed_model_found
-                ? 'Cosine-similarity retrieval active (mlx-community/embeddinggemma-300m-4bit).'
+                ? `Cosine-similarity retrieval active (${$health.active_embedding_model_name ?? $health.embedding_model}).`
                 : 'Running in keyword-only fallback — check backend logs for the load error.'}
             >
               {$health.embed_model_found ? 'ready' : 'keyword-only fallback'}

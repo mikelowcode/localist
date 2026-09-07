@@ -1438,7 +1438,7 @@ class TestSemanticSearchIntent:
 
         embed_fn = MagicMock(return_value=fixed_vec)
         runtime = make_runtime()
-        p = Planner(runtime=runtime, embed_fn=embed_fn)
+        p = Planner(runtime=runtime, embed_fn=embed_fn, embedding_model_name="nomic-embed-text:latest")
         embed_fn.reset_mock()
         embed_fn.return_value = orthogonal_vec
 
@@ -1458,7 +1458,7 @@ class TestSemanticSearchIntent:
         fixed_vec = _unit_vector(4)
         embed_fn = MagicMock(return_value=fixed_vec)    # same vector everywhere -> cosine 1.0
         runtime = make_runtime()                         # infer() returns "no" by default
-        p = Planner(runtime=runtime, embed_fn=embed_fn)
+        p = Planner(runtime=runtime, embed_fn=embed_fn, embedding_model_name="nomic-embed-text:latest")
 
         result = p._semantic_search_intent("did you search for that already?")
         assert result is None
@@ -1473,7 +1473,7 @@ class TestSemanticSearchIntent:
         fixed_vec = _unit_vector(4)
         embed_fn = MagicMock(return_value=fixed_vec)
         runtime = make_runtime(infer_return="lookup")
-        p = Planner(runtime=runtime, embed_fn=embed_fn)
+        p = Planner(runtime=runtime, embed_fn=embed_fn, embedding_model_name="nomic-embed-text:latest")
 
         result = p._semantic_search_intent("did you search for that already?")
         assert result is not None
@@ -1489,7 +1489,7 @@ class TestSemanticSearchIntent:
         from localist.planner import _SEARCH_INTENT_TEMPLATES
         fixed_vec = _unit_vector(8)
         embed_fn = MagicMock(return_value=fixed_vec)
-        p = Planner(runtime=make_runtime(), embed_fn=embed_fn)
+        p = Planner(runtime=make_runtime(), embed_fn=embed_fn, embedding_model_name="nomic-embed-text:latest")
 
         embed_fn.reset_mock()
         result = p._semantic_search_intent("why don't you do a web search for APC")
@@ -1552,7 +1552,7 @@ class TestEpisodicSemanticRelevance:
     def test_returns_high_score_for_matching_vector(self):
         fixed_vec = _unit_vector(8)
         embed_fn = MagicMock(return_value=fixed_vec)
-        p = Planner(runtime=make_runtime(), embed_fn=embed_fn)
+        p = Planner(runtime=make_runtime(), embed_fn=embed_fn, embedding_model_name="nomic-embed-text:latest")
 
         score = p._episodic_semantic_relevance("anything at all")
         assert score is not None
@@ -1563,7 +1563,7 @@ class TestEpisodicSemanticRelevance:
         orthogonal_vec = [0.5, 0.5, -0.5, -0.5]          # cosine(fixed, orthogonal) == 0
 
         embed_fn = MagicMock(return_value=fixed_vec)
-        p = Planner(runtime=make_runtime(), embed_fn=embed_fn)
+        p = Planner(runtime=make_runtime(), embed_fn=embed_fn, embedding_model_name="nomic-embed-text:latest")
         embed_fn.return_value = orthogonal_vec
 
         score = p._episodic_semantic_relevance("totally unrelated text")
@@ -1643,70 +1643,32 @@ class TestEpisodicSemanticRelevance:
         assert plan.fetch_episodic is True
 
 
-class TestTunedEmbeddingModelGuard:
+class TestNoneModelNameFallsToLexical:
     """
-    Unit tests for the _TUNED_EMBEDDING_MODEL guard (docs/architecture/
-    16-runtime-backend-layer.md §16.4): semantic search-intent gating is
-    disabled whenever the active embedding model doesn't match the model
-    every _SEMANTIC_GATE_THRESHOLDS / _RESEARCH_INTENT_THRESHOLD value was
-    tuned against, confirmed live 2026-07-16 (lookup_request scored 0.7119
-    under mlx-community/embeddinggemma-300m-4bit vs 0.578 under
-    nomic-embed-text for the identical utterance).
+    embedding_model_name=None (true keyword-only / no embedding source
+    configured) has no entry in _VALIDATED_MODEL_THRESHOLDS or
+    calibrated_thresholds, so it resolves through the same general per-gate
+    loop as any other unrecognized model — landing on "lexical-fallback"
+    for all four gates, same as a real, named model with no validated/
+    calibrated entry (see TestValidatedModelThresholds.
+    test_unvalidated_mismatched_model_falls_to_lexical_not_disabled). No
+    special-cased "tuned" tier exists any more (retired alongside MLX
+    EmbeddingGemma, 2026-09).
     """
 
-    def _matching_vec_planner(self, **kwargs) -> "Planner":
-        """Planner whose embed_fn returns the identical vector everywhere —
-        every template group scores ~1.0, clearing every gate threshold —
-        so any None result can only be attributed to the guard, not to a
-        genuinely low score."""
+    def test_none_model_name_resolves_to_lexical_fallback_no_warning(self, caplog):
         fixed_vec = _unit_vector(8)
         embed_fn = MagicMock(return_value=fixed_vec)
-        return Planner(runtime=make_runtime(), embed_fn=embed_fn, **kwargs)
 
-    def test_mismatched_model_disables_semantic_gating(self, caplog):
-        # "nomic-embed-text" (no ":latest") has no _VALIDATED_MODEL_
-        # THRESHOLDS/persisted-calibration entry, so cosine scoring is
-        # unavailable for every gate here -- but every gate now resolves to
-        # "lexical-fallback" rather than "disabled"
-        # (PLAN_semantic_gating_calibration.md §9), since
-        # _LEXICAL_FALLBACK_THRESHOLDS covers all four. The cosine-specific
-        # method still correctly returns None (no cosine threshold was
-        # ever assigned for a lexical-fallback gate).
-        with caplog.at_level(logging.INFO, logger="localist.planner"):
-            p = self._matching_vec_planner(embedding_model_name="nomic-embed-text")
+        with caplog.at_level(logging.WARNING, logger="localist.planner"):
+            p = Planner(runtime=make_runtime(), embed_fn=embed_fn, embedding_model_name=None)
 
         assert all(tier == "lexical-fallback" for tier in p._gate_tier.values())
-        assert "per-gate threshold resolution" in caplog.text
-        assert "nomic-embed-text" in caplog.text
+        assert caplog.text == ""
 
+        # Cosine-specific scoring correctly finds nothing to score against.
         result = p._semantic_search_intent("why don't you do a web search for APC")
         assert result is None
-
-    def test_matching_model_name_unaffected(self, caplog):
-        from localist.planner import _TUNED_EMBEDDING_MODEL
-
-        with caplog.at_level(logging.WARNING, logger="localist.planner"):
-            p = self._matching_vec_planner(embedding_model_name=_TUNED_EMBEDDING_MODEL)
-
-        assert all(tier == "tuned" for tier in p._gate_tier.values())
-        assert caplog.text == ""
-
-        result = p._semantic_search_intent("why don't you do a web search for APC")
-        assert result is not None
-        best_group, best_score, all_scores = result
-        assert abs(best_score - 1.0) < 1e-6
-
-    def test_none_model_name_unaffected_no_warning(self, caplog):
-        """embedding_model_name=None (keyword-only / no embedding source
-        configured) is not a mismatch — no warning, gating untouched."""
-        with caplog.at_level(logging.WARNING, logger="localist.planner"):
-            p = self._matching_vec_planner(embedding_model_name=None)
-
-        assert all(tier == "tuned" for tier in p._gate_tier.values())
-        assert caplog.text == ""
-
-        result = p._semantic_search_intent("why don't you do a web search for APC")
-        assert result is not None
 
 
 class TestValidatedModelThresholds:
@@ -1731,8 +1693,8 @@ class TestValidatedModelThresholds:
         assert "per-gate threshold resolution" in caplog.text
         assert "nomic-embed-text:latest" in caplog.text
 
-    def test_validated_model_uses_its_own_thresholds_not_the_tuned_models(self):
-        from localist.planner import _VALIDATED_MODEL_THRESHOLDS, _SEMANTIC_GATE_THRESHOLDS
+    def test_validated_model_uses_its_own_thresholds(self):
+        from localist.planner import _VALIDATED_MODEL_THRESHOLDS
 
         p = self._matching_vec_planner(embedding_model_name="nomic-embed-text:latest")
         validated = _VALIDATED_MODEL_THRESHOLDS["nomic-embed-text:latest"]
@@ -1743,10 +1705,6 @@ class TestValidatedModelThresholds:
         }
         assert p._research_intent_threshold == validated["research_intent"]
         assert p._episodic_relevance_threshold == validated["episodic_relevance"]
-        # Sanity: this model's values are genuinely different from the tuned
-        # model's own — otherwise this test wouldn't distinguish "uses its
-        # own set" from "coincidentally matches the default".
-        assert validated["lookup_request"] != _SEMANTIC_GATE_THRESHOLDS["lookup_request"]
 
     def test_validated_model_still_gates_via_its_own_threshold(self):
         # A score that clears the tuned model's lookup_request threshold
@@ -1884,19 +1842,6 @@ class TestCalibratedModelThresholds:
             _VALIDATED_MODEL_THRESHOLDS["nomic-embed-text:latest"]["lookup_request"]
         )
 
-    def test_calibrated_thresholds_ignored_for_tuned_model(self):
-        # A stray calibrated_thresholds value must never leak in when the
-        # active model IS the tuned model — that tier only ever applies to
-        # non-tuned models.
-        from localist.planner import _TUNED_EMBEDDING_MODEL, _SEMANTIC_GATE_THRESHOLDS
-
-        p = self._matching_vec_planner(
-            embedding_model_name=_TUNED_EMBEDDING_MODEL,
-            calibrated_thresholds={"lookup_request": 0.01},
-        )
-        assert all(tier == "tuned" for tier in p._gate_tier.values())
-        assert p._semantic_gate_thresholds["lookup_request"] == _SEMANTIC_GATE_THRESHOLDS["lookup_request"]
-
 
 class TestLexicalFallbackTier:
     """
@@ -2011,7 +1956,7 @@ class TestSemanticSearchIntentDiag2:
         }
 
         fixed_vec = _unit_vector(8)
-        p = Planner(runtime=make_runtime(), embed_fn=MagicMock(return_value=fixed_vec))
+        p = Planner(runtime=make_runtime(), embed_fn=MagicMock(return_value=fixed_vec), embedding_model_name="nomic-embed-text:latest")
         result = p._semantic_search_intent("find out about this topic online")
         assert result is not None
         _, _, all_scores = result
@@ -2035,7 +1980,7 @@ class TestSemanticSearchIntentDiag2:
 
         # Build a planner with any embed_fn to get past __init__ validation.
         fixed_vec = _unit_vector(8)
-        p = Planner(runtime=make_runtime(), embed_fn=MagicMock(return_value=fixed_vec))
+        p = Planner(runtime=make_runtime(), embed_fn=MagicMock(return_value=fixed_vec), embedding_model_name="nomic-embed-text:latest")
 
         # Manually install two distinct group vectors:
         # group A ("explicit_search_action") gets [1, 0, 0, 0]
@@ -2098,6 +2043,17 @@ def _planner_with_mocked_semantic(all_scores: dict[str, float]) -> "Planner":
     signal source that would defeat this helper's whole point (testing the
     mocked cosine gate boundary in isolation, with nothing else able to
     fire).
+
+    Threshold resolution normally comes entirely from embedding_model_name
+    (via resolve_gate_tiers()/_VALIDATED_MODEL_THRESHOLDS) — with no model
+    configured, this Planner would otherwise resolve every gate to
+    "lexical-fallback" and carry no cosine thresholds at all. This helper
+    overrides _semantic_gate_thresholds directly afterward so the
+    gate-boundary tests below can exercise fixed, known threshold values
+    (0.72 / 0.60 — the historical explicit_search_action/lookup_request
+    values, picked as stand-ins here purely for a stable test fixture, not
+    because any live model is calibrated to them) independent of which
+    model happens to be configured in production.
     """
     p = Planner(runtime=make_runtime())
     best_group = max(all_scores, key=lambda g: all_scores[g])
@@ -2106,6 +2062,7 @@ def _planner_with_mocked_semantic(all_scores: dict[str, float]) -> "Planner":
         return_value=(best_group, best_score, all_scores)
     )
     p._lexical_fallback_active = MagicMock(return_value=False)
+    p._semantic_gate_thresholds = {"explicit_search_action": 0.72, "lookup_request": 0.60}
     return p
 
 
@@ -2289,18 +2246,6 @@ class TestPriority3SemanticGating:
             "find out about this",
         ):
             assert expected in templates, f"Original template missing or edited: {expected!r}"
-
-    def test_semantic_gate_thresholds_current_values(self):
-        """Regression lock: _SEMANTIC_GATE_THRESHOLDS must match current calibrated values.
-        lookup_request lowered 0.65 → 0.60 on 2026-06-25 (§10.4 Open Item 3 revisit).
-        explicit_search_action raised 0.68 → 0.72 on 2026-06-28 per
-        explicit_search_action_margin_assessment_2026-06-28.md (pass→fail change:
-        old assertion was 0.68; updated to 0.72 after the threshold raise)."""
-        from localist.planner import _SEMANTIC_GATE_THRESHOLDS
-        assert _SEMANTIC_GATE_THRESHOLDS == {
-            "explicit_search_action": 0.72,
-            "lookup_request": 0.60,
-        }
 
     def test_lookup_request_score_at_new_threshold_fires_gate(self):
         """lookup_request at 0.605 (≥ 0.60) must fire the gate → web_search added."""
@@ -2536,7 +2481,7 @@ class TestIdentityCapabilityNegativeFilter:
         """Return a Planner with a stub embed_fn so _semantic_search_intent is reachable."""
         fixed_vec = _unit_vector(8)
         spy = MagicMock(return_value=fixed_vec)
-        p = Planner(runtime=make_runtime(), embed_fn=spy)
+        p = Planner(runtime=make_runtime(), embed_fn=spy, embedding_model_name="nomic-embed-text:latest")
         spy.reset_mock()
         return p
 
@@ -2635,7 +2580,7 @@ class TestGreetingFalsePositiveFilter:
         """Planner with a stub embed_fn; spy reset after __init__ template pre-embedding."""
         fixed_vec = _unit_vector(8)
         spy = MagicMock(return_value=fixed_vec)
-        p = Planner(runtime=make_runtime(), embed_fn=spy)
+        p = Planner(runtime=make_runtime(), embed_fn=spy, embedding_model_name="nomic-embed-text:latest")
         spy.reset_mock()
         return p
 
@@ -2686,7 +2631,7 @@ class TestGreetingFalsePositiveFilter:
         """
         spy = MagicMock(return_value=_unit_vector(8))
         runtime = make_runtime()
-        p = Planner(runtime=runtime, embed_fn=spy)
+        p = Planner(runtime=runtime, embed_fn=spy, embedding_model_name="nomic-embed-text:latest")
         spy.reset_mock()
 
         result = p._semantic_search_intent("hey lora!")

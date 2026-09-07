@@ -2,7 +2,7 @@
 Embedding-provenance tracking for MemoryManager's corpus (document_index)
 and episodes stores — the confirmed follow-up named in docs/architecture/
 16-runtime-backend-layer.md §16.4, applying the same detect-and-fail-safe
-pattern shipped for Planner (_TUNED_EMBEDDING_MODEL / _semantic_gating_disabled)
+pattern shipped for Planner (resolve_gate_tiers() / _semantic_gating_disabled)
 to stored vectors instead of threshold constants.
 
 Split (decided): episodes auto-re-embeds in place on a detected mismatch
@@ -34,7 +34,7 @@ from localist.memory_manager import (
 )
 
 
-_TUNED = "mlx-community/embeddinggemma-300m-4bit"
+_MODEL_A = "some-embedding-model:latest"
 _OTHER = "nomic-embed-text"
 
 
@@ -124,7 +124,7 @@ class TestFreshDatabaseNoProvenance:
     def test_no_provenance_row_created_when_no_data_exists(self, tmp_path, caplog):
         path = tmp_path / "fresh.db"
         with caplog.at_level(logging.WARNING, logger="localist.memory_manager"):
-            MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_TUNED)
+            MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_MODEL_A)
 
         assert _get_provenance(path, "corpus") is None
         assert _get_provenance(path, "episodes") is None
@@ -133,7 +133,7 @@ class TestFreshDatabaseNoProvenance:
     def test_first_index_document_call_seeds_corpus_provenance(self, tmp_path, caplog):
         path = tmp_path / "fresh.db"
         embed_fn = _stub_embed_fn()
-        mm = MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_TUNED)
+        mm = MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_MODEL_A)
         assert _get_provenance(path, "corpus") is None
 
         with caplog.at_level(logging.WARNING, logger="localist.memory_manager"):
@@ -141,7 +141,7 @@ class TestFreshDatabaseNoProvenance:
                 path=tmp_path / "doc.md", doc_type="wiki", content="hello world", embed=True,
             )
 
-        assert _get_provenance(path, "corpus") == _TUNED
+        assert _get_provenance(path, "corpus") == _MODEL_A
         assert mm._corpus_stale is False
         assert caplog.text == ""
 
@@ -159,10 +159,10 @@ class TestMigrationSeeding:
 
         with caplog.at_level(logging.WARNING, logger="localist.memory_manager"):
             mm = MemoryManager(
-                db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_TUNED,
+                db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_MODEL_A,
             )
 
-        assert _get_provenance(path, "corpus") == _TUNED
+        assert _get_provenance(path, "corpus") == _MODEL_A
         assert mm._corpus_stale is False
         assert caplog.text == ""
 
@@ -174,9 +174,9 @@ class TestMigrationSeeding:
 
         embed_fn = _stub_embed_fn()
         with caplog.at_level(logging.WARNING, logger="localist.memory_manager"):
-            MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_TUNED)
+            MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_MODEL_A)
 
-        assert _get_provenance(path, "episodes") == _TUNED
+        assert _get_provenance(path, "episodes") == _MODEL_A
         assert caplog.text == ""
         # Seeded, not re-embedded — no model call for the pre-existing row.
         embed_fn.assert_not_called()
@@ -188,7 +188,7 @@ class TestMigrationSeeding:
         _build_schema(path)
         _insert_document(path, name="unembedded-doc", embedded=False)
 
-        MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_TUNED)
+        MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_MODEL_A)
 
         assert _get_provenance(path, "corpus") is None
 
@@ -211,7 +211,7 @@ class TestMissingProvenanceTableSelfHeals:
         conn.commit()
         conn.close()
 
-        mm = MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_TUNED)
+        mm = MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_MODEL_A)
 
         conn = sqlite3.connect(str(path))
         assert conn.execute(
@@ -233,9 +233,9 @@ class TestMissingProvenanceTableSelfHeals:
         conn.commit()
         conn.close()
 
-        MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_TUNED)
+        MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_MODEL_A)
 
-        assert _get_provenance(path, "corpus") == _TUNED
+        assert _get_provenance(path, "corpus") == _MODEL_A
 
 
 # ---------------------------------------------------------------------------
@@ -251,13 +251,13 @@ class TestGenuineCorpusMismatch:
 
         with caplog.at_level(logging.WARNING, logger="localist.memory_manager"):
             mm = MemoryManager(
-                db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_TUNED,
+                db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_MODEL_A,
             )
 
         assert mm._corpus_stale is True
         assert "corpus embeddings were produced by" in caplog.text
         assert _OTHER in caplog.text
-        assert _TUNED in caplog.text
+        assert _MODEL_A in caplog.text
         # Provenance is left recording the OLD model — it still describes
         # what's actually on disk until reembed_corpus() runs.
         assert _get_provenance(path, "corpus") == _OTHER
@@ -270,7 +270,7 @@ class TestGenuineCorpusMismatch:
         _set_cache_row_valid(path)
         assert _cache_valid_count(path) == 1
 
-        MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_TUNED)
+        MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_MODEL_A)
 
         assert _cache_valid_count(path) == 0
 
@@ -281,7 +281,7 @@ class TestGenuineCorpusMismatch:
         _set_provenance(path, "corpus", _OTHER)
 
         embed_fn = _stub_embed_fn()
-        mm = MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_TUNED)
+        mm = MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_MODEL_A)
         assert mm._corpus_stale is True
         embed_fn.reset_mock()
 
@@ -308,14 +308,14 @@ class TestGenuineEpisodesMismatch:
 
         embed_fn = _stub_embed_fn(vector_value=0.9)
         with caplog.at_level(logging.WARNING, logger="localist.memory_manager"):
-            MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_TUNED)
+            MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_MODEL_A)
 
         assert "episodes embeddings were produced by" in caplog.text
         assert embed_fn.call_count == 2
         embed_fn.assert_any_call("likes-coffee. Michael likes coffee")
         embed_fn.assert_any_call("likes-tea. Michael likes tea")
 
-        assert _get_provenance(path, "episodes") == _TUNED
+        assert _get_provenance(path, "episodes") == _MODEL_A
 
         conn = sqlite3.connect(str(path))
         blobs = [row[0] for row in conn.execute("SELECT embedding FROM episodes").fetchall()]
@@ -332,10 +332,10 @@ class TestGenuineEpisodesMismatch:
         _insert_episode(path, subject="s", embedded=True)
         _set_provenance(path, "episodes", _OTHER)
 
-        mm = MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_TUNED)
+        mm = MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_MODEL_A)
 
         assert not hasattr(mm, "_episodes_stale")
-        assert _get_provenance(path, "episodes") == _TUNED
+        assert _get_provenance(path, "episodes") == _MODEL_A
 
 
 # ---------------------------------------------------------------------------
@@ -354,10 +354,10 @@ class TestSetEmbeddingSource:
         assert mm.embed_fn is None
 
         new_embed_fn = _stub_embed_fn(vector_value=0.7)
-        mm.set_embedding_source(new_embed_fn, _TUNED)
+        mm.set_embedding_source(new_embed_fn, _MODEL_A)
 
         assert mm.embed_fn is new_embed_fn
-        assert _get_provenance(path, "episodes") == _TUNED
+        assert _get_provenance(path, "episodes") == _MODEL_A
         new_embed_fn.assert_any_call("likes-coffee. Michael likes coffee")
 
     def test_switching_flags_mismatched_corpus_stale(self, tmp_path):
@@ -369,7 +369,7 @@ class TestSetEmbeddingSource:
         mm = MemoryManager(db_path=path)
         assert mm._corpus_stale is False
 
-        mm.set_embedding_source(_stub_embed_fn(), _TUNED)
+        mm.set_embedding_source(_stub_embed_fn(), _MODEL_A)
 
         assert mm._corpus_stale is True
 
@@ -377,14 +377,14 @@ class TestSetEmbeddingSource:
         path = tmp_path / "live_switch_clear.db"
         _build_schema(path)
         _insert_episode(path, subject="s", embedded=True)
-        _set_provenance(path, "episodes", _TUNED)
+        _set_provenance(path, "episodes", _MODEL_A)
 
-        mm = MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_TUNED)
+        mm = MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_MODEL_A)
         mm.set_embedding_source(None, None)
 
         assert mm.embed_fn is None
         # Provenance untouched — clearing isn't a "new model", nothing to compare.
-        assert _get_provenance(path, "episodes") == _TUNED
+        assert _get_provenance(path, "episodes") == _MODEL_A
 
 
 # ---------------------------------------------------------------------------
@@ -401,16 +401,16 @@ class TestReembedCorpus:
         _set_cache_row_valid(path)
 
         embed_fn = _stub_embed_fn(vector_value=0.42)
-        mm = MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_TUNED)
+        mm = MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_MODEL_A)
         assert mm._corpus_stale is True
         assert _cache_valid_count(path) == 0   # already flushed by the mismatch detection itself
         _set_cache_row_valid(path)              # simulate a fresh (still-stale-scored) cache entry
 
         result = mm.reembed_corpus()
 
-        assert result == {"reembedded": 2, "total": 2, "model": _TUNED}
+        assert result == {"reembedded": 2, "total": 2, "model": _MODEL_A}
         assert mm._corpus_stale is False
-        assert _get_provenance(path, "corpus") == _TUNED
+        assert _get_provenance(path, "corpus") == _MODEL_A
         assert _cache_valid_count(path) == 0
 
         conn = sqlite3.connect(str(path))
@@ -423,7 +423,7 @@ class TestReembedCorpus:
         """A manual 'just refresh it' call must work even when nothing is stale."""
         path = tmp_path / "fresh.db"
         embed_fn = _stub_embed_fn(vector_value=0.7)
-        mm = MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_TUNED)
+        mm = MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_MODEL_A)
         mm.index_document(path=tmp_path / "doc.md", doc_type="wiki", content="hi", embed=True)
         assert mm._corpus_stale is False
 
@@ -432,7 +432,7 @@ class TestReembedCorpus:
         assert result["reembedded"] == 1
         assert result["total"] == 1
         assert mm._corpus_stale is False
-        assert _get_provenance(path, "corpus") == _TUNED
+        assert _get_provenance(path, "corpus") == _MODEL_A
 
     def test_query_corpus_uses_embeddings_again_after_reembed(self, tmp_path):
         path = tmp_path / "mismatch.db"
@@ -441,7 +441,7 @@ class TestReembedCorpus:
         _set_provenance(path, "corpus", _OTHER)
 
         embed_fn = _stub_embed_fn()
-        mm = MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_TUNED)
+        mm = MemoryManager(db_path=path, embed_fn=embed_fn, embedding_model_name=_MODEL_A)
         assert mm._corpus_stale is True
 
         mm.reembed_corpus()

@@ -369,15 +369,14 @@ class MemoryManager:
         index_document() and used for cosine re-ranking in query_corpus().
         When absent, keyword overlap scoring is used exclusively.
     embedding_model_name :
-        Name of the embedding model actually producing embed_fn's vectors
-        (e.g. "mlx-community/embeddinggemma-300m-4bit"), or None when no
-        embedding source is configured at all. Compared at construction
-        time against the 'corpus' and 'episodes' rows in the
+        Name of the embedding model actually producing embed_fn's vectors,
+        or None when no embedding source is configured at all. Compared at
+        construction time against the 'corpus' and 'episodes' rows in the
         embedding_provenance table (see _check_embedding_provenance()) —
-        the same detect-and-fail-safe pattern as Planner's
-        _TUNED_EMBEDDING_MODEL guard, applied to stored vectors instead of
-        threshold constants. docs/architecture/16-runtime-backend-layer.md
-        §16.4.
+        the same detect-and-fail-safe pattern as Planner's per-gate
+        threshold resolution (resolve_gate_tiers()), applied to stored
+        vectors instead of threshold constants.
+        docs/architecture/16-runtime-backend-layer.md §16.4.
     """
 
     def __init__(
@@ -1190,8 +1189,9 @@ class MemoryManager:
     # -----------------------------------------------------------------------
     # Embedding provenance  (docs/architecture/16-runtime-backend-layer.md §16.4)
     #
-    # Same detect-and-fail-safe pattern as Planner's _TUNED_EMBEDDING_MODEL
-    # guard, applied to stored vectors: cosine similarity between a query
+    # Same detect-and-fail-safe pattern as Planner's per-gate threshold
+    # resolution (resolve_gate_tiers()), applied to stored vectors: cosine
+    # similarity between a query
     # embedding and a stored document/episode/turn embedding is only
     # meaningful if both came from the same model's geometry.
     # embedding_provenance tracks, per store ('corpus' | 'episodes' |

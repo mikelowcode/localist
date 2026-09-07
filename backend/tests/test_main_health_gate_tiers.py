@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from localist import main
 from localist.memory_manager import MemoryManager
-from localist.planner import _TUNED_EMBEDDING_MODEL, _GATE_NAMES
+from localist.planner import _GATE_NAMES
 
 
 @pytest.fixture()
@@ -21,7 +21,6 @@ def client(tmp_path):
     prev_settings = main._state.settings
     prev_runtime = main._state.runtime
     prev_memory = main._state.memory_manager
-    prev_embedding_engine = main._state.embedding_engine
     prev_active_model_name = main._state.active_embedding_model_name
 
     main._state.settings = main.Settings(
@@ -31,7 +30,6 @@ def client(tmp_path):
         ollama_url="http://localhost:11434", request_timeout=30.0,
         stream_timeout=60.0, episodic_write_approval=False,
     )
-    main._state.embedding_engine = None
     fake_runtime = MagicMock(name="fake-runtime")
     fake_runtime.health_check.return_value = {
         "reachable": True, "base_url": "http://localhost:11434",
@@ -46,22 +44,11 @@ def client(tmp_path):
     main._state.settings = prev_settings
     main._state.runtime = prev_runtime
     main._state.memory_manager = prev_memory
-    main._state.embedding_engine = prev_embedding_engine
     main._state.active_embedding_model_name = prev_active_model_name
 
 
 class TestHealthGateTiers:
-    def test_tuned_model_reports_all_gates_tuned(self, client):
-        main._state.active_embedding_model_name = _TUNED_EMBEDDING_MODEL
-
-        resp = client.get("/health")
-
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["active_embedding_model_name"] == _TUNED_EMBEDDING_MODEL
-        assert body["gate_tiers"] == {name: "tuned" for name in _GATE_NAMES}
-
-    def test_none_active_model_reports_all_gates_tuned(self, client):
+    def test_none_active_model_reports_all_gates_lexical_fallback(self, client):
         main._state.active_embedding_model_name = None
 
         resp = client.get("/health")
@@ -69,7 +56,7 @@ class TestHealthGateTiers:
         assert resp.status_code == 200
         body = resp.json()
         assert body["active_embedding_model_name"] is None
-        assert body["gate_tiers"] == {name: "tuned" for name in _GATE_NAMES}
+        assert body["gate_tiers"] == {name: "lexical-fallback" for name in _GATE_NAMES}
 
     def test_validated_model_reports_validated_tiers(self, client):
         main._state.active_embedding_model_name = "nomic-embed-text:latest"

@@ -14,25 +14,16 @@ resolved dependency tree — not just the top-level `package.json` entries.
 ## Backend / `localist-mcp` (Python)
 
 All direct and transitive dependencies are permissively licensed
-(MIT / BSD / Apache-2.0 / ISC / MPL-2.0 / PSF), **except two**:
+(MIT / BSD / Apache-2.0 / ISC / MPL-2.0 / PSF), **except one**:
 
 | Package | Version | License | Used for |
 |---|---|---|---|
-| `mlx-embeddings` | 0.1.0 | **GPLv3** | Local embedding inference (the `[mlx]` extra — EmbeddingGemma) |
 | `pymupdf` | 1.28.0 | **AGPL-3.0-or-later** (or Artifex commercial license) | PDF text-layer extraction + page rasterization in the local OCR service (`mcp_server/ocr.py`) |
 
 **Status:**
-- `mlx-embeddings` (GPLv3) — **kept**, scoped as an optional, separately
-  pip-installed extra (`localist[mlx]`), never statically bundled into the
-  same distributed artifact as the MIT-licensed core. This is the standard
-  pattern for an MIT project with an optional GPL dependency the user opts
-  into installing themselves. Revisit before any PyInstaller `.app` build
-  (build-order step 7a) — freezing everything into one binary is a
-  different distribution shape and may raise different obligations than a
-  pip extra does.
-- `pymupdf` (AGPL-3.0) — **flagged for replacement, not yet done.** Unlike
-  the GPLv3 embeddings dependency, AGPL's network-use clause is a real
-  concern for software that could be run as a hosted/multi-tenant service
+- `pymupdf` (AGPL-3.0) — **flagged for replacement, not yet done.** AGPL's
+  network-use clause is a real concern for software that could be run as a
+  hosted/multi-tenant service
   (Localist is local-first today, but that's a deployment choice, not a
   license guarantee against a future fork). Tracked as follow-up work:
   replace `pymupdf`'s two roles in `mcp_server/ocr.py`'s `_extract_pdf` —
@@ -104,7 +95,6 @@ Full audited list (via `pip-licenses --from=mixed` against a clean
 | miniaudio | 1.71 | MIT License |
 | mlx | 0.31.2 | MIT |
 | mlx-audio | 0.4.4 | MIT |
-| **mlx-embeddings** | 0.1.0 | **GPLv3 — see note above** |
 | mlx-lm | 0.31.3 | MIT |
 | mlx-metal | 0.31.2 | MIT |
 | mlx-vlm | 0.6.3 | MIT License |
@@ -163,10 +153,12 @@ Full audited list (via `pip-licenses --from=mixed` against a clean
 | xxhash | 3.7.0 | BSD License |
 | yarl | 1.24.2 | Apache-2.0 |
 
-Some rows above (`datasets`, `pyarrow`, `opencv-python`, `scipy`, etc.) are
-transitive dependencies pulled in by `mlx-embeddings`/`transformers`, not
-direct requirements — included here for completeness since they ship into
-the same environment.
+Some rows above (`mlx`, `mlx-audio`, `mlx-lm`, `mlx-metal`, `mlx-vlm`,
+`datasets`, `pyarrow`, `opencv-python`, `scipy`, etc.) are incidental to
+this dev venv — pulled in transitively by other local tooling (`transformers`
+and friends), not by anything `backend/pyproject.toml` itself declares —
+included here for completeness since they ship into the same environment,
+not because this repo depends on them directly.
 
 ## Frontend (`localist-ui`, npm)
 
@@ -189,29 +181,20 @@ No copyleft dependencies on the frontend.
 
 Localist's code is MIT-licensed; the model weights it downloads and runs
 are separate works under their own terms, chosen at install/runtime by
-whichever backend and models the user configures:
+whichever backend and models the user configures.
 
-- **`mlx-community/embeddinggemma-300m-4bit`** (~400MB) — downloaded
-  automatically by `EmbeddingEngine` on first startup when the `[mlx]`
-  extra is active (Apple Silicon only). Built on Google's Gemma, under the
-  [Gemma Terms of Use](https://ai.google.dev/gemma/terms) — **not MIT**,
-  and not OSI-approved open source (it's a permissive-but-custom license
-  with acceptable-use terms). This needs its own explicit line in the
-  README so a user installing `localist[mlx]` knows the code they're
-  running is MIT but the weights it fetches are under Google's terms, not
-  Localist's.
-- Chat models (oMLX/Ollama/Foundry) and any Ollama-served embedding model
-  (e.g. `nomic-embed-text`) are entirely user-chosen and pulled by the
-  user's own runtime — never bundled or shipped by this repo — so they
-  carry whatever license the user's chosen model/provider sets, and don't
-  need a line here beyond a general disclaimer that Localist ships no
-  model weights of its own except the one EmbeddingGemma download above.
+Chat models (oMLX/Ollama/Foundry) and any Ollama-served embedding model
+(e.g. `nomic-embed-text`) are entirely user-chosen and pulled by the user's
+own runtime — never bundled or shipped by this repo — so they carry
+whatever license the user's chosen model/provider sets. As of the 2026-09
+retirement of the local MLX EmbeddingGemma embedding path (see
+docs/architecture/16-runtime-backend-layer.md §16.18), Localist ships no
+model weights of its own at all; embeddings are either Ollama-served or
+keyword-only (BM25), both zero-weights-shipped-by-this-repo paths.
 
 ## Open items
 
 - Replace `pymupdf` (AGPL-3.0) with a permissively-licensed alternative for
   PDF text-layer extraction and rasterization — see note above. Not done.
-- Add the EmbeddingGemma/Gemma-license callout to the README (currently
-  documents the download at line ~58 but doesn't name the license terms).
 - Trademark/fork-naming note for "Localist" — open decision, unresolved,
   low priority (see project scoping doc §12).
