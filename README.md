@@ -4,7 +4,7 @@ A local-first, agentic general assistant built primarily for macOS Apple Silicon
 
 Inference-engine-agnostic: ships with oMLX, Ollama (including Ollama Cloud models), and Azure AI Foundry, swappable via one config variable or live at runtime with no restart. Embeddings, when configured, always run locally — via any locally-served Ollama embedding model (e.g. `nomic-embed-text`), live-switchable from Settings with no restart. With no embedding model configured, the framework runs zero-config on keyword (BM25) retrieval instead — real semantic-gating signal, not a degraded no-op, across every platform.
 
-See `PRIVACY.md` for what stays local, what can leave your machine and when, and what a fresh clone actually contains; `THIRD_PARTY_LICENSES.md` for the dependency/model-weight license audit.
+See `PRIVACY.md` for what stays local, what can leave your machine and when, and what a fresh clone actually contains; `THIRD_PARTY_LICENSES.md` for the dependency/model-weight license audit; `NAMING.md` for the naming convention forks are asked to follow.
 
 ---
 
@@ -36,7 +36,7 @@ Localist UI ──HTTP──► FastAPI :8001
 ```
 
 `ocr_extract` is also served by localist-mcp but bypasses this whole path — called directly by
-`POST /chat/files` at upload time (Apple Vision framework + PyMuPDF), never planner-routed and never
+`POST /chat/files` at upload time (Apple Vision framework + pypdfium2), never planner-routed and never
 reached via `MCPToolDispatcher`'s normal chat-turn dispatch; see Attachments below.
 
 ---
@@ -46,7 +46,7 @@ reached via `MCPToolDispatcher`'s normal chat-turn dispatch; see Attachments bel
 - Python 3.13, Node.js
 - One runtime backend: oMLX (chat model on :8000, macOS Apple Silicon only), [Ollama](https://ollama.com) (local or Ollama Cloud, :11434, any OS), or Azure AI Foundry
 - Local embeddings (optional, any OS): set `LOCALIST_EMBEDDING_MODEL` to any embedding model already pulled in your Ollama daemon (e.g. `nomic-embed-text`) — no separate extra or download to install. Without it, retrieval runs keyword-only (BM25), automatically, with no configuration at all
-- OCR'd PDF chat uploads (see Attachments below) require macOS on Apple Silicon (Apple Vision framework + PyMuPDF); on other platforms those uploads are cleanly rejected with an explanatory error, everything else in the app is unaffected. Image uploads work everywhere: Apple Silicon uses Vision framework, other platforms fall back to a configured Ollama vision-capable chat model (`LOCALIST_OLLAMA_VISION_MODEL`)
+- OCR'd PDF chat uploads (see Attachments below) require macOS on Apple Silicon (Apple Vision framework + pypdfium2); on other platforms those uploads are cleanly rejected with an explanatory error, everything else in the app is unaffected. Image uploads work everywhere: Apple Silicon uses Vision framework, other platforms fall back to a configured Ollama vision-capable chat model (`LOCALIST_OLLAMA_VISION_MODEL`)
 
 ## Installation
 
@@ -59,8 +59,8 @@ pip install -e ".[ocr,chart,dev]"   # Apple Silicon: full local stack (OCR, char
 ```
 
 `[ocr]` is Apple-Silicon-only (a platform marker makes it a no-op elsewhere); `[chart]` is
-cross-platform. See `THIRD_PARTY_LICENSES.md` — `[ocr]` pulls in a copyleft dependency
-(AGPL-3.0).
+cross-platform. See `THIRD_PARTY_LICENSES.md` for the full dependency license audit — the
+backend has no copyleft dependencies.
 
 Embeddings need no separate extra or download at all — there is no bundled local embedding model.
 Two supported configurations, either usable on any platform:
@@ -86,9 +86,9 @@ Two supported configurations, either usable on any platform:
 ### Native macOS app (optional)
 
 `./start_localist.sh` runs from source and is the recommended way to use every feature, including
-local OCR (Vision/PyMuPDF, Apple Silicon only). A native `Localist.app` is also buildable — a Tauri
+local OCR (Vision/pypdfium2, Apple Silicon only). A native `Localist.app` is also buildable — a Tauri
 shell that spawns two PyInstaller-frozen, base-only builds of the backend and localist-mcp (no
-Vision/PyMuPDF bundled, so OCR isn't available from the packaged app — Ollama-served embeddings and
+Vision/pypdfium2 bundled, so OCR isn't available from the packaged app — Ollama-served embeddings and
 keyword-only retrieval are unaffected either way, on both source and packaged installs). See
 `backend/packaging/README.md` (build the two frozen services) then `localist-ui/src-tauri/README.md`
 (build the `.app`). No first-run config UX or code signing yet — a fresh build defaults to the
@@ -131,7 +131,7 @@ See `backend/.env.example` for the full list (embedding engine, wiki/raw directo
 
 **Live Feed** — a collapsible right-side panel (collapsed by default to a slim vertical tab) surfacing daily-update content outside the normal chat flow, with three blocks — Daily News Brief, Hacker News, and GitHub Watch Feed, in that order — each independently collapsible/expandable (state persisted across reloads) on top of the whole-panel collapse. The Daily News Brief block shows the latest cached World/National/Local + 3 user-chosen special-interest topics (home country, local-area keyword, and topic picker configured under Settings), with a "Daily News Brief Refresh" link that always fetches a fresh brief from NewsAPI. The Hacker News block shows the current top 10 stories (HN's public Firebase API, no key), each linking straight to the original article (or the HN discussion page itself for a self-post with no external link); a "Hacker News Refresh" link always fetches fresh. The GitHub Watch Feed block mirrors that same refresh-link pattern: it lists the repos you watch (GitHub's native Watch feature, via `GET /user/subscriptions`) plus any repos you've *pinned* by `owner/repo` slug under Settings — pinning tracks a repo's releases independently of GitHub's Watch relationship, so it doesn't subscribe you to that repo's PR/issue emails the way clicking Watch on GitHub does. Both kinds are merged into one list (a pinned slug matching an already-watched repo is deduped, not shown twice), each row linking straight to that repo's Releases page and a small 📌 badge marking the pinned ones, cached in SQLite until the next explicit refresh; a missing `GITHUB_TOKEN` surfaces as a single inline "not configured" message rather than an error. Both the News Brief and Hacker News blocks additionally have a per-story "Ask about this" button that sends just that one item into the current chat conversation, pinned to it specifically (`news_search`'s/`hacker_news_search`'s `url` param) rather than trusting a fresh query to find the same story again — GitHub Watch has no such button, correctly, since it has no chat-callable tool behind it.
 
-**Attachments** — the "+" button in the chat UI uploads a local file into an ephemeral, session-scoped cache injected into every subsequent prompt. Text files, images (including HEIC), and PDFs are all supported: images and PDFs are OCR'd to plain text once at upload time by a local `ocr_extract` MCP tool — entirely independent of whichever chat runtime backend is active, so the attach button works the same whether oMLX, Ollama, or Foundry is running. On Apple Silicon, both use Apple's Vision framework (images) and PyMuPDF (PDFs — text-layer extraction first, falling back to per-page rasterize+OCR for scanned PDFs); on other platforms, image uploads fall back to a configured Ollama vision-capable chat model (`LOCALIST_OLLAMA_VISION_MODEL`, prompted for verbatim text transcription — same OCR-only contract, not image captioning), while PDF uploads still require Apple Silicon. An "Extracting text…" state shows briefly (real OCR latency, not mocked) before the file lands in the same cache as a text upload — same budget, same prompt slot, no separate image handling anywhere downstream. A second, paperclip-icon control pins an *existing wiki page* into the same cache instead, so asking Assistant to propose a diff against a specific page hands it the real, current file content rather than the model's own (possibly stale) memory of it. Either kind bypasses Planner routing and wiki indexing entirely for as long as it's attached, and clears on backend restart.
+**Attachments** — the "+" button in the chat UI uploads a local file into an ephemeral, session-scoped cache injected into every subsequent prompt. Text files, images (including HEIC), and PDFs are all supported: images and PDFs are OCR'd to plain text once at upload time by a local `ocr_extract` MCP tool — entirely independent of whichever chat runtime backend is active, so the attach button works the same whether oMLX, Ollama, or Foundry is running. On Apple Silicon, both use Apple's Vision framework (images) and pypdfium2 (PDFs — text-layer extraction first, falling back to per-page rasterize+OCR for scanned PDFs); on other platforms, image uploads fall back to a configured Ollama vision-capable chat model (`LOCALIST_OLLAMA_VISION_MODEL`, prompted for verbatim text transcription — same OCR-only contract, not image captioning), while PDF uploads still require Apple Silicon. An "Extracting text…" state shows briefly (real OCR latency, not mocked) before the file lands in the same cache as a text upload — same budget, same prompt slot, no separate image handling anywhere downstream. A second, paperclip-icon control pins an *existing wiki page* into the same cache instead, so asking Assistant to propose a diff against a specific page hands it the real, current file content rather than the model's own (possibly stale) memory of it. Either kind bypasses Planner routing and wiki indexing entirely for as long as it's attached, and clears on backend restart.
 
 **Chat turn editing & Compose Mode** — any completed assistant reply can be saved straight to disk. Hovering a reply reveals a pencil toggle that swaps the rendered markdown for a full-width editable textarea in place, with a filename + `.md`/`.txt` picker beneath it; editing is export-only (never rewrites the actual chat turn) and Save goes through a direct `POST /files/generated` endpoint — the same sandboxed, collision-versioned write the `file_op` tool above uses, just triggered by a user click instead of a model call, so no inference round trip. **Compose Mode** extends this across several turns: a document icon in the composer opens a persistent, drag-resizable side panel (280–800px, mirrors the left sidebar's own resize handle), and each turn gains an "Add to document" button that appends its content to one growing draft — always onto the end of whatever's there, never recomputed from the included turns, so a hand-edit is never clobbered by a later addition. The assembled document is then edited and saved as a single artifact through the same save flow. Both features are entirely frontend-side; neither adds backend state beyond the one write endpoint they share.
 
@@ -214,11 +214,11 @@ Tests are organized by phase (memory substrate, routing, controller dispatch, ex
 - ✅ Generalize the bullet/diff-marker collision edge case
 - ✅ GitHub integration: Watch Feed Live Feed panel (watched-repo releases, plus repos pinned by `owner/repo` slug independently of GitHub's Watch relationship) + `github_search`/`github_read`/`github_release` crawl tools, the latter keyword-routable without a pasted URL
 - ✅ Hacker News integration: top-stories Live Feed panel block + `hacker_news_search` crawl tool (Algolia HN Search, URL-pinning + real comment grounding); per-block Live Feed collapse/expand
-- ✅ Local OCR service — chat image (incl. HEIC) and PDF uploads extracted to text at upload time via a local `ocr_extract` MCP tool (Apple Vision framework + PyMuPDF), independent of the active chat runtime backend
+- ✅ Local OCR service — chat image (incl. HEIC) and PDF uploads extracted to text at upload time via a local `ocr_extract` MCP tool (Apple Vision framework + pypdfium2), independent of the active chat runtime backend
 - ✅ Cross-platform image OCR — a configured Ollama vision-capable chat model as a second `OCRProvider`, so image uploads work on non-Apple-Silicon platforms too (PDFs still require Apple Silicon)
 - ✅ Per-turn "Save as" — edit any assistant reply in place and save it to disk as `.md`/`.txt`, no model round trip
 - ✅ Compose Mode — accumulate multiple turns into one document in a persistent, drag-resizable side panel, then save the assembled draft as a single file
-- ✅ Native macOS `.app` packaging — both backend services frozen with PyInstaller (base-only: no MLX/Vision/PyMuPDF bundled) and wrapped in a Tauri shell that spawns/kills them; see `backend/packaging/README.md` and `localist-ui/src-tauri/README.md`
+- ✅ Native macOS `.app` packaging — both backend services frozen with PyInstaller (base-only: no MLX/Vision/pypdfium2 bundled) and wrapped in a Tauri shell that spawns/kills them; see `backend/packaging/README.md` and `localist-ui/src-tauri/README.md`
 
 **Open**
 - ⬜ Native `.app`: first-run config UX (a fresh app defaults to unreachable `foundry`), code signing/notarization, `tauri build` auto-triggering the PyInstaller build

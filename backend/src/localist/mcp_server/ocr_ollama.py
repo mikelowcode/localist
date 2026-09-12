@@ -7,10 +7,11 @@ fallback ocr_extract (mcp_server/main.py) reaches for on any platform
 where Apple's Vision framework (ocr.py) isn't available.
 
 Images only. PDFs are not handled here — extending PDF support would mean
-un-gating PyMuPDF (currently bundled Apple-Silicon-only alongside Vision in
-the [ocr] extra) for every platform, a real license-footprint decision
-(PyMuPDF is AGPL-3.0, already flagged in THIRD_PARTY_LICENSES.md as pending
-replacement) deliberately left for a future step, not a side effect of this
+un-gating pypdfium2 (currently bundled Apple-Silicon-only alongside Vision
+in the [ocr] extra) for every platform. pypdfium2 is permissively licensed
+(Apache-2.0 OR BSD-3-Clause, unlike the AGPL-3.0 PyMuPDF it replaced —
+see THIRD_PARTY_LICENSES.md), so cross-platform PDF support is no longer
+license-blocked, just left for a future step, not a side effect of this
 one. See docs/architecture/22-local-ocr-service.md §22.12.
 
 Text extraction only, same boundary as ocr.py (see §22.10): the prompt

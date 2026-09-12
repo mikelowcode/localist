@@ -6,7 +6,7 @@ cleared on backend restart. No persistence, no wiki ingestion, no embedding.
 
 Image (incl. HEIC) and PDF extensions in ALLOWED_EXTENSIONS are text by the
 time they reach add_file() — main.py's POST /chat/files routes them through
-the local ocr_extract MCP tool first (Apple Vision + PyMuPDF, see
+the local ocr_extract MCP tool first (Apple Vision + pypdfium2, see
 mcp_server/ocr.py) and hands this module the extracted text, same as any
 other upload. This module has no OCR/image awareness at all — the whole
 point of that design (see docs/architecture/22-local-ocr-service.md) is

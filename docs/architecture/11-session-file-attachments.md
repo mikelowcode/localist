@@ -131,7 +131,7 @@ alongside a clear affordance. Not scoped.
 **Open Item 4 — PDF and image support. RESOLVED 2026-08-01.**
 Built differently than originally framed here: rather than routing through
 oMLX's native multimodal support (which would have tied the feature to one
-runtime backend), a dedicated local OCR tool (Apple Vision + PyMuPDF, entirely
+runtime backend), a dedicated local OCR tool (Apple Vision + pypdfium2, entirely
 inference-engine-agnostic) extracts text from images and PDFs once at upload
 time. By the time content reaches this module, an OCR'd upload is plain text
 like any other — `ALLOWED_EXTENSIONS` widened, no other change needed here.

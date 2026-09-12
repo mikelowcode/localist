@@ -26,7 +26,7 @@ tool when the in-process fetch_url extraction fails; no primary mode, no
 Planner visibility, see ollama-web-search-mcp-tool-scoping.md §5 and
 mcp_server/ollama_web_fetch.py), and ocr_extract (local text extraction from
 uploaded images — including HEIC — and PDFs via Apple's Vision framework
-and PyMuPDF, entirely independent of whichever chat inference backend is
+and pypdfium2, entirely independent of whichever chat inference backend is
 active; never planner-routed, called directly by backend/main.py's
 POST /chat/files at upload time — see mcp_server/ocr.py and
 docs/architecture/22-local-ocr-service.md) — over SSE transport, using
@@ -259,7 +259,7 @@ async def hacker_news_search(query: str, url: str | None = None) -> dict:
 
 @mcp.tool()
 def ocr_extract(path: str, mime_type: str, max_pdf_pages: int | None = None) -> str:
-    """Extract text from an uploaded image (incl. HEIC) or PDF, entirely locally. Apple Silicon: Vision framework + PyMuPDF. Other platforms: images only, via a configured Ollama vision model (LOCALIST_OLLAMA_VISION_MODEL) — PDFs still require Apple Silicon. path is resolved relative to upload_root and sandboxed."""
+    """Extract text from an uploaded image (incl. HEIC) or PDF, entirely locally. Apple Silicon: Vision framework + pypdfium2. Other platforms: images only, via a configured Ollama vision model (LOCALIST_OLLAMA_VISION_MODEL) — PDFs still require Apple Silicon. path is resolved relative to upload_root and sandboxed."""
     if _ocr._is_apple_silicon():
         return _ocr.extract_text(path, mime_type, max_pdf_pages)
     if mime_type.startswith("image/"):

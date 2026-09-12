@@ -7,7 +7,7 @@ Closes the gap §22.8 explicitly flagged and deferred: `WikiAgent`'s raw-documen
 OCR step, but MarkItDown-based server-side document conversion, oMLX-only. On any other backend
 (Ollama, Foundry) the same file hit `read_text_file()`, a plain UTF-8 decode that raises
 `UnicodeDecodeError` on binary content, failing the whole ingest with a generic "File load error."
-Neither path used Apple Vision/PyMuPDF (§22). This section makes wiki ingestion of images/PDFs use
+Neither path used Apple Vision/pypdfium2 (§22). This section makes wiki ingestion of images/PDFs use
 the same `ocr_extract` MCP tool chat uploads already use (§22.2), and widens the product surface
 (`POST /files/upload`, the wiki upload UI) so a PDF/image can actually reach that path, mirroring
 how §22 did the same for chat attachments.

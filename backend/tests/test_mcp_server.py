@@ -36,7 +36,6 @@ import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-import fitz  # PyMuPDF
 import httpx
 import pytest
 
@@ -1146,34 +1145,74 @@ class TestGenerateChart:
 # _ocr_image_bytes (the actual PyObjC/Vision call) is mocked throughout —
 # Vision can't run in CI the way EmbeddingEngine.embed is already mocked in
 # this suite. Live-verified separately against the real Vision framework and
-# real PyMuPDF during development (see docs/architecture/22-local-ocr-service.md).
-# PDF fixtures are built with real PyMuPDF (fast, deterministic, already a
-# hard dependency) rather than mocking fitz's API surface.
+# real pypdfium2 during development (see docs/architecture/22-local-ocr-service.md).
+# PDF fixtures are built as minimal, hand-assembled PDF byte strings (no
+# PDF-authoring library needed just for test fixtures — pypdfium2 is a
+# reader/renderer, not a document-authoring API) rather than mocking
+# pypdfium2's API surface.
 # ---------------------------------------------------------------------------
 
 def _write_image(tmp_path: Path, name: str = "photo.png") -> None:
     (tmp_path / name).write_bytes(b"not-real-png-bytes-ocr-is-mocked-anyway")
 
 
+def _minimal_pdf_bytes(page_contents: list[bytes]) -> bytes:
+    """Assemble a minimal, valid single-xref-table PDF with one page per
+    entry in page_contents (each a raw PDF content-stream body, e.g. a `Tj`
+    text-show op, or b"" for a blank page)."""
+    n_pages = len(page_contents)
+    objs: list[bytes] = []
+    kids = " ".join(f"{3 + i} 0 R" for i in range(n_pages))
+    objs.append(b"1 0 obj<< /Type /Catalog /Pages 2 0 R >>endobj")
+    objs.append(
+        f"2 0 obj<< /Type /Pages /Kids [{kids}] /Count {n_pages} >>endobj".encode()
+    )
+    content_obj_start = 3 + n_pages
+    font_obj = content_obj_start + n_pages
+    for i in range(n_pages):
+        objs.append(
+            (
+                f"{3 + i} 0 obj<< /Type /Page /Parent 2 0 R "
+                f"/Resources << /Font << /F1 {font_obj} 0 R >> >> "
+                f"/MediaBox [0 0 300 100] /Contents {content_obj_start + i} 0 R "
+                f">>endobj"
+            ).encode()
+        )
+    for i, content in enumerate(page_contents):
+        objs.append(
+            b"%d 0 obj<< /Length %d >>stream\n" % (content_obj_start + i, len(content))
+            + content
+            + b"\nendstream endobj"
+        )
+    objs.append(f"{font_obj} 0 obj<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>endobj".encode())
+
+    out = b"%PDF-1.4\n"
+    offsets: list[int] = []
+    for obj in objs:
+        offsets.append(len(out))
+        out += obj + b"\n"
+    xref_start = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    for off in offsets:
+        out += b"%010d 00000 n \n" % off
+    out += b"trailer<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF" % (
+        len(objs) + 1,
+        xref_start,
+    )
+    return out
+
+
 def _write_text_layer_pdf(tmp_path: Path, name: str = "doc.pdf", pages: int = 1) -> None:
-    doc = fitz.open()
-    for _ in range(pages):
-        page = doc.new_page(width=300, height=100)
-        page.insert_text((20, 50), "This page has a real embedded text layer.")
-    doc.save(str(tmp_path / name))
-    doc.close()
+    content = b"BT /F1 12 Tf 20 50 Td (This page has a real embedded text layer.) Tj ET"
+    (tmp_path / name).write_bytes(_minimal_pdf_bytes([content] * pages))
 
 
 def _write_blank_pdf(tmp_path: Path, name: str = "scanned.pdf", pages: int = 1) -> None:
     """No text layer at all — triggers the rasterize+OCR fallback path.
-    get_pixmap() rasterizes fine on a blank page, and _ocr_image_bytes is
-    mocked in every test that uses this, so the actual pixel content
-    (or lack of it) never matters."""
-    doc = fitz.open()
-    for _ in range(pages):
-        doc.new_page(width=300, height=100)
-    doc.save(str(tmp_path / name))
-    doc.close()
+    pypdfium2 renders a blank page fine, and _ocr_image_bytes is mocked in
+    every test that uses this, so the actual pixel content (or lack of it)
+    never matters."""
+    (tmp_path / name).write_bytes(_minimal_pdf_bytes([b""] * pages))
 
 
 class TestOcrExtractImages:

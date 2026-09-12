@@ -14,7 +14,7 @@ Architectural contract
 ----------------------
 - This module defines the Protocol only. Zero platform-specific logic.
 - `ocr.py`'s `VisionOCRProvider` implements this interface today (Apple
-  Vision + PyMuPDF, macOS/Apple Silicon only).
+  Vision + pypdfium2, macOS/Apple Silicon only).
 - Text extraction only — see docs/architecture/22-local-ocr-service.md
   §22.10. A future implementation may target a different platform or
   technique (e.g. an Ollama vision model prompted to transcribe text

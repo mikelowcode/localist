@@ -2,7 +2,7 @@
 
 > **Status: Rejected (2026-08-01) — superseded by §22.** Never built. After this
 > outline was completed, a second alternative (a dedicated, inference-engine-agnostic
-> local OCR service — Apple Vision + PyMuPDF, no dependency on which chat backend is
+> local OCR service — Apple Vision + pypdfium2, no dependency on which chat backend is
 > active) was scoped and chosen instead; see §22.8 for the full reasoning. Kept in
 > place, not moved to `archive/`, as a documented record of the alternative
 > considered. §11.6's Open Item 4 and §3's Slot SF note are now resolved by §22, not

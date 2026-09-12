@@ -8,12 +8,18 @@ docs/architecture/22-local-ocr-service.md.
 Images (including HEIC — see _ocr_image_bytes) are OCR'd via Apple's Vision
 framework (VNRecognizeTextRequest): Neural Engine-accelerated, no model
 download, no extra process, not an inference engine in the Localist sense
-at all. PDFs try a direct text-layer extraction first (PyMuPDF) and only
+at all. PDFs try a direct text-layer extraction first (pypdfium2) and only
 fall back to per-page rasterize-then-OCR when no real text layer exists
 (scanned PDFs) — API surface for both live-verified against this venv
 (Vision: VNImageRequestHandler.initWithData_options_ +
-VNRecognizeTextRequest.initWithCompletionHandler_; PyMuPDF:
-fitz.open()/page.get_text()/page.get_pixmap().tobytes("png")).
+VNRecognizeTextRequest.initWithCompletionHandler_; pypdfium2:
+PdfDocument()/page.get_textpage().get_text_range()/page.render().to_pil()).
+
+pypdfium2 (Apache-2.0 OR BSD-3-Clause, wraps Google's PDFium) replaced
+PyMuPDF here 2026-09-12 — PyMuPDF's AGPL-3.0-or-commercial license was
+flagged in THIRD_PARTY_LICENSES.md as blocking the MIT OSS release; a
+single pypdfium2 dependency covers both roles PyMuPDF played (text-layer
+read + rasterization), so no split across two libraries was needed.
 
 macOS/Apple Silicon only, gated the same way EmbeddingEngine is gated in
 main.py's is_apple_silicon check. Like file_ops.py, every function here
@@ -32,6 +38,7 @@ implementation exists, without changing any of the logic below.
 
 from __future__ import annotations
 
+import io
 import os
 import platform
 from pathlib import Path
@@ -225,29 +232,34 @@ def _extract_pdf(resolved: Path, max_pdf_pages: int) -> str:
     absent/sparse (scanned PDF signal — see _MIN_CHARS_PER_TEXT_LAYER_PAGE).
     """
     try:
-        import fitz  # PyMuPDF
+        import pypdfium2 as pdfium
     except ImportError as exc:
         raise ValueError(
-            "ERROR: PyMuPDF is not installed — see backend/requirements.txt."
+            "ERROR: pypdfium2 is not installed — see backend/requirements.txt."
         ) from exc
 
-    doc = fitz.open(resolved)
+    doc = pdfium.PdfDocument(resolved)
     try:
-        text_layer = "\n".join(page.get_text() for page in doc)
-        if len(text_layer.strip()) >= _MIN_CHARS_PER_TEXT_LAYER_PAGE * doc.page_count:
+        page_count = len(doc)
+        text_layer = "\n".join(
+            page.get_textpage().get_text_range() for page in doc
+        )
+        if len(text_layer.strip()) >= _MIN_CHARS_PER_TEXT_LAYER_PAGE * page_count:
             return text_layer
 
-        if doc.page_count > max_pdf_pages:
+        if page_count > max_pdf_pages:
             raise ValueError(
-                f"ERROR: '{resolved.name}' has {doc.page_count} pages, "
+                f"ERROR: '{resolved.name}' has {page_count} pages, "
                 f"exceeding the {max_pdf_pages}-page OCR limit "
                 f"(no usable text layer to read directly instead)."
             )
 
         ocr_parts: list[str] = []
         for page_index, page in enumerate(doc):
-            pixmap = page.get_pixmap(dpi=200)
-            page_text = _ocr_image_bytes(pixmap.tobytes("png")).strip()
+            bitmap = page.render(scale=200 / 72)
+            png_buf = io.BytesIO()
+            bitmap.to_pil().save(png_buf, format="PNG")
+            page_text = _ocr_image_bytes(png_buf.getvalue()).strip()
             # Skip pages Vision found nothing on entirely, rather than
             # emitting a bare "--- page N ---" marker with no content under
             # it — a PDF where every page comes back empty must still trip
@@ -261,7 +273,7 @@ def _extract_pdf(resolved: Path, max_pdf_pages: int) -> str:
 
 
 class VisionOCRProvider:
-    """Apple Vision/PyMuPDF implementation of OCRProvider (see ocr_provider.py)."""
+    """Apple Vision/pypdfium2 implementation of OCRProvider (see ocr_provider.py)."""
 
     def extract_text(
         self,

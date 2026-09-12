@@ -34,14 +34,14 @@ dependencies = [
 
 [project.optional-dependencies]
 # Local OCR service (ocr_extract MCP tool) — Apple Vision framework for
-# images, PyMuPDF for PDFs. Apple Silicon only — see
-# backend/src/localist/mcp_server/ocr.py's is_apple_silicon() gate. PyMuPDF
-# is AGPL-3.0-or-commercial (see THIRD_PARTY_LICENSES.md) — flagged for
-# replacement, not yet done.
+# images, pypdfium2 for PDFs. Apple Silicon only — see
+# backend/src/localist/mcp_server/ocr.py's is_apple_silicon() gate.
+# pypdfium2 (Apache-2.0 OR BSD-3-Clause, wraps Google's PDFium) replaced
+# PyMuPDF (AGPL-3.0-or-commercial) 2026-09-12 — see THIRD_PARTY_LICENSES.md.
 ocr = [
     "pyobjc-framework-Vision>=10.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "pyobjc-framework-Quartz>=10.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "PyMuPDF>=1.24.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "pypdfium2>=4.30.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 # generate_chart MCP tool (server-side PNG rendering). Cross-platform;
 # matplotlib is imported lazily inside generate_chart() so its absence

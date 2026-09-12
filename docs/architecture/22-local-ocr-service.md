@@ -1,4 +1,4 @@
-## 22. Local OCR Service (Apple Vision + PyMuPDF)
+## 22. Local OCR Service (Apple Vision + pypdfium2)
 
 ### 22.1 Overview
 
@@ -49,12 +49,13 @@ internally, which already handles HEIC/HEIF system-wide on macOS (the same
 codec Photos/Preview use) alongside PNG/JPEG/WEBP — using that initializer on
 raw bytes is the entire HEIC story.
 
-**PDFs** (`application/pdf`): text-layer extraction first via PyMuPDF
-(`fitz.open()` + `page.get_text()`) — fast, exact for digitally-created
-PDFs, and skips OCR entirely when the average extracted-chars-per-page clears
-`_MIN_CHARS_PER_TEXT_LAYER_PAGE` (20). Below that threshold (scanned-PDF
-signal), each page is rasterized (`page.get_pixmap(dpi=200)`) and OCR'd
-through the same Vision path, joined with `--- page N ---` markers — pages
+**PDFs** (`application/pdf`): text-layer extraction first via `pypdfium2`
+(`pdfium.PdfDocument()` + `page.get_textpage().get_text_range()`) — fast,
+exact for digitally-created PDFs, and skips OCR entirely when the average
+extracted-chars-per-page clears `_MIN_CHARS_PER_TEXT_LAYER_PAGE` (20). Below
+that threshold (scanned-PDF signal), each page is rasterized
+(`page.render(scale=200/72).to_pil()`) and OCR'd through the same Vision
+path, joined with `--- page N ---` markers — pages
 Vision finds nothing on are dropped entirely rather than emitting a bare
 marker with no content under it (§22.9). `max_pdf_pages` (default from
 `LOCALIST_OCR_MAX_PDF_PAGES`, 20) bounds only the rasterize+OCR fallback
@@ -132,8 +133,9 @@ New in `backend/.env.example`, alongside the existing MCP-server block:
 - `LOCALIST_OCR_MAX_PDF_PAGES` — page cap for the rasterize+OCR fallback
   path only. Default 20.
 
-New in `backend/requirements.txt`: `pyobjc-framework-Vision`,
-`pyobjc-framework-Quartz`, `PyMuPDF`.
+New in `backend/pyproject.toml`'s `[ocr]` extra: `pyobjc-framework-Vision`,
+`pyobjc-framework-Quartz`, `pypdfium2` (originally `PyMuPDF` — replaced
+2026-09-12, see §22.13).
 
 ### 22.7 Test Coverage
 
@@ -142,8 +144,10 @@ New in `backend/requirements.txt`: `pyobjc-framework-Vision`,
   two `ocr_extract` cases in the existing in-process MCP-wiring class.
   `_ocr_image_bytes` (the actual PyObjC/Vision call) is mocked throughout —
   Vision can't run in CI the way `EmbeddingEngine.embed` is already mocked in
-  this suite; PDF fixtures use real PyMuPDF rather than mocking `fitz`'s API
-  surface.
+  this suite; PDF fixtures are minimal hand-assembled PDF byte strings (no
+  PDF-authoring library needed) rather than mocking `pypdfium2`'s API
+  surface — see §22.13 for why this changed from real-PyMuPDF-built
+  fixtures.
 - `tests/test_mcp_tool_dispatcher.py` — `TestOcrExtractRouting`: success,
   tool-level error, two distinct MCP-unreachable code paths
   (`_call_mcp_tool` raising vs. `_open_session` raising), missing-context
@@ -156,9 +160,10 @@ New in `backend/requirements.txt`: `pyobjc-framework-Vision`,
   OCR call, deleted after, including on failure).
 
 Full suite: 1406 → 1443 passed, 0 failed. Live-verified against the real
-running stack (real Apple Vision OCR, real PyMuPDF, real MCP round trip, no
-mocks) via direct `curl` upload during development — see §22.9's note on
-environment constraints during that pass.
+running stack (real Apple Vision OCR, real PyMuPDF at the time — see §22.13
+for its later replacement — real MCP round trip, no mocks) via direct
+`curl` upload during development — see §22.9's note on environment
+constraints during that pass.
 
 ### 22.8 Rejected Alternative: oMLX-Native Multimodal Routing (§21)
 
@@ -290,15 +295,18 @@ error" (README), since Apple's Vision framework has no equivalent
 elsewhere.
 
 **Images only.** PDFs are unaffected and still require Apple Silicon,
-unconditionally — a deliberate scope decision, not an oversight. Real PDF
-parity would mean un-gating PyMuPDF (currently bundled Apple-Silicon-only
-alongside Vision in the `[ocr]` extra, see §1/`pyproject.toml`) for every
-platform. PyMuPDF is AGPL-3.0 and already flagged in
-`THIRD_PARTY_LICENSES.md` as pending replacement — broadening where that
-dependency runs, ahead of its replacement, is a real license-footprint
-decision that deserves its own scoping pass, not a side effect of adding
-image support. `ocr.py`'s PDF path and `pyproject.toml`'s `[ocr]` extra are
-both untouched by this step.
+unconditionally — a deliberate scope decision, not an oversight. At the time
+this step was built, real PDF parity would have meant un-gating PyMuPDF
+(then bundled Apple-Silicon-only alongside Vision in the `[ocr]` extra) for
+every platform — PyMuPDF was AGPL-3.0, so broadening where that dependency
+ran, ahead of its replacement, was a real license-footprint decision left
+for its own scoping pass rather than a side effect of adding image support.
+`ocr.py`'s PDF path and `pyproject.toml`'s `[ocr]` extra were both untouched
+by this step. **That license constraint no longer applies** — PyMuPDF was
+replaced by the permissively-licensed `pypdfium2` (§22.13), so cross-platform
+PDF support is no longer license-blocked, just still unbuilt (a real,
+separate scoping pass — un-gating an Apple-Silicon-only pyproject.toml extra
+across platforms is more than a license question).
 
 **Provider selection** happens in `mcp_server/main.py`'s `ocr_extract` tool
 wrapper, not inside `ocr.py` (which stays exactly as `ocr.py` was before
@@ -349,3 +357,39 @@ Errors (missing config, unreachable Ollama, timeout, non-200, unexpected
 response shape) all raise `ValueError` — `OCRProvider`'s contract, not
 `BaseRuntimeClient`'s `RuntimeError` — converted to `isError=True` by the
 MCP protocol layer, same as every other failure mode in this service.
+
+### 22.13 PyMuPDF → pypdfium2 (OSS release, MIT-license blocker resolved)
+
+PyMuPDF (AGPL-3.0-or-later / Artifex commercial) was the one copyleft
+dependency standing between this repo and a clean MIT release — flagged in
+`THIRD_PARTY_LICENSES.md` since the 2026-08-30 license audit, used for both
+roles in `_extract_pdf`: text-layer extraction and per-page rasterization
+for the scanned-PDF OCR fallback. Replaced 2026-09-12 with `pypdfium2`
+(Apache-2.0 OR BSD-3-Clause, wraps Google's PDFium) — a single dependency
+covers both roles PyMuPDF played, so no split across a separate
+text-extraction library (`pypdf`/`pdfminer.six`, the original candidate) and
+a separate rasterizer was needed, and no Poppler/GPL system-binary exposure
+either, since PDFium ships as prebuilt binaries under pypdfium2's own
+permissive license.
+
+API mapping, same shape as before (see §22.2):
+- `fitz.open(path)` → `pdfium.PdfDocument(path)`
+- `page.get_text()` → `page.get_textpage().get_text_range()`
+- `page.get_pixmap(dpi=200).tobytes("png")` → `page.render(scale=200/72)
+  .to_pil()` (saved to PNG bytes via `io.BytesIO`)
+
+Verified as a true drop-in, not just a substitution that happens to import:
+the full backend test suite (1599 tests) was run and passed with `pymupdf`
+completely uninstalled from the venv. `tests/test_mcp_server.py`'s PDF test
+fixtures (`_write_text_layer_pdf`/`_write_blank_pdf`), previously built with
+real PyMuPDF calls (`fitz.open()` + `new_page()` + `insert_text()`), were
+rewritten as minimal hand-assembled PDF byte strings — pypdfium2 is a
+reader/renderer, not a document-authoring API, so building fixtures no
+longer has a convenient real-library path the way PyMuPDF's fixture-writing
+side offered.
+
+No other behavior changed: `_MIN_CHARS_PER_TEXT_LAYER_PAGE`,
+`_MIN_EXTRACTED_CHARS`, the page-cap semantics, and the empty-page-marker
+fix (§22.9) are all untouched — this was a library swap under an unchanged
+function contract, not a redesign. `THIRD_PARTY_LICENSES.md` updated to
+reflect zero remaining copyleft dependencies in the backend.

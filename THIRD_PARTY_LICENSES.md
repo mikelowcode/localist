@@ -10,30 +10,28 @@ Audited 2026-08-30 by inspecting each installed package's own metadata
 (`pip show`, `pip-licenses --from=mixed`) and, for the frontend, a full
 `npm install` + `license-checker` run against `localist-ui`'s actual
 resolved dependency tree — not just the top-level `package.json` entries.
+Updated 2026-09-12: `pymupdf` replaced by `pypdfium2` (see below).
 
 ## Backend / `localist-mcp` (Python)
 
 All direct and transitive dependencies are permissively licensed
-(MIT / BSD / Apache-2.0 / ISC / MPL-2.0 / PSF), **except one**:
+(MIT / BSD / Apache-2.0 / ISC / MPL-2.0 / PSF) — **no copyleft dependencies
+remain.**
 
 | Package | Version | License | Used for |
 |---|---|---|---|
-| `pymupdf` | 1.28.0 | **AGPL-3.0-or-later** (or Artifex commercial license) | PDF text-layer extraction + page rasterization in the local OCR service (`mcp_server/ocr.py`) |
+| `pypdfium2` | 5.13.0 | Apache-2.0 OR BSD-3-Clause | PDF text-layer extraction + page rasterization in the local OCR service (`mcp_server/ocr.py`), wraps Google's PDFium |
 
-**Status:**
-- `pymupdf` (AGPL-3.0) — **flagged for replacement, not yet done.** AGPL's
-  network-use clause is a real concern for software that could be run as a
-  hosted/multi-tenant service
-  (Localist is local-first today, but that's a deployment choice, not a
-  license guarantee against a future fork). Tracked as follow-up work:
-  replace `pymupdf`'s two roles in `mcp_server/ocr.py`'s `_extract_pdf` —
-  text-layer extraction and per-page rasterization for the scanned-PDF OCR
-  fallback — with permissively-licensed alternatives (candidates:
-  `pypdf`/`pdfminer.six` for text-layer extraction; rasterization needs
-  separate research since most drop-in options shell out to Poppler, which
-  carries its own GPL terms as a system binary, not a linked dependency —
-  a different legal shape than PyMuPDF's, but worth confirming rather than
-  assuming). Not resolved as of this audit.
+**Resolved 2026-09-12:** `pymupdf` (AGPL-3.0-or-later / Artifex commercial)
+was the one copyleft dependency in this repo, used for PDF text-layer
+extraction and per-page rasterization in `mcp_server/ocr.py`'s
+`_extract_pdf` (the scanned-PDF OCR fallback path). Replaced with
+`pypdfium2`, which covers both roles PyMuPDF played — no split across a
+separate text-extraction library (`pypdf`/`pdfminer.six`) and a separate
+rasterizer was needed, and no Poppler/GPL system-binary exposure either,
+since PDFium is bundled as prebuilt binaries under pypdfium2's own
+Apache-2.0/BSD-3-Clause license. Verified as a drop-in: full backend test
+suite (1599 tests) passes with `pymupdf` fully uninstalled.
 
 `sentencepiece` (0.2.1) reports no license classifier in package metadata
 (`UNKNOWN`) — its actual license is Apache-2.0, publicly documented at
@@ -114,7 +112,7 @@ Full audited list (via `pip-licenses --from=mixed` against a clean
 | pydantic | 2.13.4 | MIT |
 | pydantic-settings | 2.14.1 | MIT |
 | pydantic_core | 2.46.4 | MIT |
-| **pymupdf** | 1.28.0 | **Dual: AGPL-3.0 or Artifex Commercial — see note above** |
+| pypdfium2 | 5.13.0 | Apache-2.0 OR BSD-3-Clause |
 | pyobjc-core | 12.2.1 | MIT |
 | pyobjc-framework-Cocoa | 12.2.1 | MIT |
 | pyobjc-framework-CoreML | 12.2.1 | MIT |
@@ -194,7 +192,5 @@ keyword-only (BM25), both zero-weights-shipped-by-this-repo paths.
 
 ## Open items
 
-- Replace `pymupdf` (AGPL-3.0) with a permissively-licensed alternative for
-  PDF text-layer extraction and rasterization — see note above. Not done.
-- Trademark/fork-naming note for "Localist" — open decision, unresolved,
-  low priority (see project scoping doc §12).
+None. (Naming: no formal trademark filed — see `NAMING.md` for the
+lightweight, non-legal naming courtesy asked of forks.)

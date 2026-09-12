@@ -250,7 +250,7 @@ def read_text_file(path: Path) -> str:
 def extract_raw_content_via_ocr(runtime: Any, raw_path: Path, mime_type: str) -> str:
     """
     Extract raw_path's text via the ocr_extract MCP tool (Apple Vision +
-    PyMuPDF — mcp_server/ocr.py), mirroring main.py's
+    pypdfium2 — mcp_server/ocr.py), mirroring main.py's
     _extract_text_via_ocr() for chat uploads (docs/architecture/
     22-local-ocr-service.md). ocr_extract's sandboxing only resolves paths
     under its own upload root (mcp_server.ocr.get_upload_root()), so
