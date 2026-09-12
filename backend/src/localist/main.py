@@ -1230,6 +1230,28 @@ class AssistantNameRequest(BaseModel):
     assistant_name: str
 
 
+class ApiKeysStatusResponse(BaseModel):
+    """Response body for GET/PUT /settings/api-keys — whether each key is
+    configured, never the value itself. These are secrets and must never be
+    echoed back to a client once set."""
+    langsearch_api_key_set: bool
+    brave_api_key_set:      bool
+    newsapi_api_key_set:    bool
+
+
+class ApiKeysUpdateRequest(BaseModel):
+    """Payload accepted by PUT /settings/api-keys. A field left unset is
+    untouched; an empty string clears that key."""
+    langsearch_api_key: str | None = None
+    brave_api_key:      str | None = None
+    newsapi_api_key:    str | None = None
+
+
+class ApiKeysUpdateResponse(ApiKeysStatusResponse):
+    """Response body for PUT /settings/api-keys."""
+    warning: str | None = None
+
+
 class ChatTurnItem(BaseModel):
     """A single chat_turns record returned by GET /chat/history."""
     id:                 int
@@ -2927,6 +2949,74 @@ async def put_assistant_name_setting(
         _state.controller.invalidate_persona_cache()
     name = await asyncio.to_thread(mm.get_assistant_name)
     return AssistantNameResponse(assistant_name=name)
+
+
+# ---------------------------------------------------------------------------
+# Optional API keys  (Settings tab — BRAVE/LANGSEARCH/NEWSAPI, .env-backed)
+# ---------------------------------------------------------------------------
+
+_API_KEY_ENV_NAMES: dict[str, str] = {
+    "langsearch_api_key": "LANGSEARCH_API_KEY",
+    "brave_api_key":      "BRAVE_API_KEY",
+    "newsapi_api_key":    "NEWSAPI_API_KEY",
+}
+
+
+def _api_keys_status() -> ApiKeysStatusResponse:
+    return ApiKeysStatusResponse(
+        langsearch_api_key_set = bool(os.environ.get("LANGSEARCH_API_KEY")),
+        brave_api_key_set      = bool(os.environ.get("BRAVE_API_KEY")),
+        newsapi_api_key_set    = bool(os.environ.get("NEWSAPI_API_KEY")),
+    )
+
+
+@app.get(
+    "/settings/api-keys",
+    response_model = ApiKeysStatusResponse,
+    summary        = "Check which optional API keys are configured",
+)
+async def get_api_keys_status() -> ApiKeysStatusResponse:
+    """
+    Reports only whether each key is set (non-empty) — never the value
+    itself. These keys (web_search / news_search) are consumed by the
+    separate localist-mcp process, not this one.
+    """
+    return _api_keys_status()
+
+
+@app.put(
+    "/settings/api-keys",
+    response_model = ApiKeysUpdateResponse,
+    summary        = "Set optional API keys (BRAVE/LANGSEARCH/NEWSAPI) used by localist-mcp tools",
+)
+async def put_api_keys(request: ApiKeysUpdateRequest) -> ApiKeysUpdateResponse:
+    """
+    Write each provided key to backend/.env (a field left unset is
+    untouched; an empty string clears that key) and mirror it into this
+    process's os.environ.
+
+    These keys are actually read by the separate localist-mcp process
+    (mcp_server/web_search.py, mcp_server/news_search.py), not this one —
+    so the .env write makes the value survive a restart, but localist-mcp
+    itself must be restarted to pick up a changed or newly-set key.
+    """
+    updates = request.model_dump(exclude_unset=True)
+    warning: str | None = None
+    for field, value in updates.items():
+        if value is None:
+            continue
+        env_key = _API_KEY_ENV_NAMES[field]
+        try:
+            _write_env_var(_PROJECT_ROOT, env_key, value)
+        except OSError as exc:
+            warning = f"Failed writing {env_key} to .env ({exc})."
+            continue
+        os.environ[env_key] = value
+
+    if updates and warning is None:
+        warning = "Restart localist-mcp (./start_localist.sh) for the new key(s) to take effect."
+
+    return ApiKeysUpdateResponse(**_api_keys_status().model_dump(), warning=warning)
 
 
 # ---------------------------------------------------------------------------

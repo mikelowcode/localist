@@ -55,6 +55,13 @@
     loadGithubWatchPins,
     setGithubWatchPins
   } from '$lib/stores/githubWatchPins';
+  import {
+    apiKeysStatus,
+    apiKeysLoading,
+    apiKeysError,
+    loadApiKeysStatus,
+    setApiKeys
+  } from '$lib/stores/apiKeys';
 
   const EVICTION_PRESETS: { value: EvictionPreset; label: string }[] = [
     { value: '7d',      label: '7 days' },
@@ -77,6 +84,7 @@
     void loadGithubWatchPins().then(() => {
       pinnedRepos = $githubWatchPins.repos;
     });
+    void loadApiKeysStatus();
   });
 
   // Corpus staleness — fetched once on mount and again after a re-embed
@@ -416,6 +424,32 @@
       assistantNameSaveResult = `Saved — now called "${$assistantName.assistant_name}".`;
     }
   }
+
+  // Optional API keys — inputs start blank regardless of whether a key is
+  // already configured (the backend never echoes a saved value back), and
+  // an empty field is left out of the PUT payload so saving the other two
+  // fields can't accidentally clear one you didn't touch.
+  let langsearchKeyInput = '';
+  let braveKeyInput = '';
+  let newsapiKeyInput = '';
+  let apiKeysSaveResult: string | null = null;
+
+  async function handleSaveApiKeys() {
+    apiKeysSaveResult = null;
+    const update: { langsearch_api_key?: string; brave_api_key?: string; newsapi_api_key?: string } = {};
+    if (langsearchKeyInput.trim()) update.langsearch_api_key = langsearchKeyInput.trim();
+    if (braveKeyInput.trim()) update.brave_api_key = braveKeyInput.trim();
+    if (newsapiKeyInput.trim()) update.newsapi_api_key = newsapiKeyInput.trim();
+    if (Object.keys(update).length === 0) return;
+
+    const warning = await setApiKeys(update);
+    if (warning !== null) {
+      langsearchKeyInput = '';
+      braveKeyInput = '';
+      newsapiKeyInput = '';
+      apiKeysSaveResult = warning || 'Saved.';
+    }
+  }
 </script>
 
 <svelte:head>
@@ -742,6 +776,68 @@
       {/if}
       {#if $assistantNameError}
         <p class="card-hint" style="color:var(--error)">{$assistantNameError}</p>
+      {/if}
+    </section>
+
+    <!-- Optional API keys (BRAVE/LANGSEARCH/NEWSAPI — .env-backed, used by localist-mcp) -->
+    <section class="settings-card">
+      <div class="card-title">API Keys</div>
+      <p class="card-desc">
+        Optional keys for web search and news tools, saved to backend/.env. Only
+        LANGSEARCH_API_KEY is required for full web_search functionality — the others enable
+        Brave as a search fallback and the daily news brief. Values are never shown once saved;
+        leave a field blank to keep its current key unchanged.
+      </p>
+
+      <label class="news-field-label" for="langsearch-key-input">
+        LANGSEARCH_API_KEY {#if $apiKeysStatus.langsearch_api_key_set}<span class="card-hint">(configured)</span>{/if}
+      </label>
+      <input
+        id="langsearch-key-input"
+        class="news-text-input"
+        type="password"
+        autocomplete="off"
+        bind:value={langsearchKeyInput}
+        placeholder={$apiKeysStatus.langsearch_api_key_set ? '••••••••' : 'Not set'}
+      />
+
+      <label class="news-field-label" for="brave-key-input" style="margin-top: var(--sp-3)">
+        BRAVE_API_KEY {#if $apiKeysStatus.brave_api_key_set}<span class="card-hint">(configured)</span>{/if}
+      </label>
+      <input
+        id="brave-key-input"
+        class="news-text-input"
+        type="password"
+        autocomplete="off"
+        bind:value={braveKeyInput}
+        placeholder={$apiKeysStatus.brave_api_key_set ? '••••••••' : 'Not set'}
+      />
+
+      <label class="news-field-label" for="newsapi-key-input" style="margin-top: var(--sp-3)">
+        NEWSAPI_API_KEY {#if $apiKeysStatus.newsapi_api_key_set}<span class="card-hint">(configured)</span>{/if}
+      </label>
+      <input
+        id="newsapi-key-input"
+        class="news-text-input"
+        type="password"
+        autocomplete="off"
+        bind:value={newsapiKeyInput}
+        placeholder={$apiKeysStatus.newsapi_api_key_set ? '••••••••' : 'Not set'}
+      />
+
+      <button
+        type="button"
+        class="seg-btn news-save-btn"
+        style="margin-top: var(--sp-3)"
+        disabled={$apiKeysLoading || (!langsearchKeyInput.trim() && !braveKeyInput.trim() && !newsapiKeyInput.trim())}
+        on:click={handleSaveApiKeys}
+      >Save</button>
+
+      {#if apiKeysSaveResult}
+        <p class="card-hint">{apiKeysSaveResult}</p>
+      {/if}
+      {#if $apiKeysError}
+        <p class="card-hint" style="color:var(--error)">{$apiKeysError}</p>
       {/if}
     </section>
 
