@@ -28,6 +28,12 @@
     type HackerNewsStory
   } from '$lib/stores/hackerNews';
   import { previewBlocksCollapsed, togglePreviewBlock } from '$lib/stores/previewBlocks';
+  import { openExternal } from '$lib/openExternal';
+
+  function handleOpenExternalLink(event: MouseEvent, url: string) {
+    event.preventDefault();
+    openExternal(url);
+  }
   import { tasksStore, submitTask } from '$lib/stores/tasks';
   import { chatHistoryStore } from '$lib/stores/chatHistory';
   import { currentConversationId, isFirstTurnOfConversation } from '$lib/stores/conversation';
@@ -272,6 +278,7 @@
                           href={article.url}
                           target="_blank"
                           rel="noopener noreferrer"
+                          on:click={(e) => handleOpenExternalLink(e, article.url)}
                         >
                           <span class="preview-news-article-title">{article.title}</span>
                           <span class="preview-news-article-source">{article.source}</span>
@@ -337,6 +344,7 @@
                       href={story.url}
                       target="_blank"
                       rel="noopener noreferrer"
+                      on:click={(e) => handleOpenExternalLink(e, story.url)}
                     >
                       <span class="preview-news-article-title">{story.title}</span>
                       <span class="preview-news-article-source">
@@ -398,6 +406,7 @@
                     href={repo.repo_url}
                     target="_blank"
                     rel="noopener noreferrer"
+                    on:click={(e) => handleOpenExternalLink(e, repo.repo_url)}
                   >
                     <span class="preview-news-article-title">{repo.label}</span>
                     {#if repo.error}
