@@ -7,13 +7,13 @@ Layer placement
 ---------------
   ControllerAgent / Sub-agents  →  BaseRuntimeClient (this contract)
                                          ↓
-                               FoundryRuntimeClient  |  OMLXRuntimeClient  |  …
+                               OMLXRuntimeClient  |  OllamaRuntimeClient  |  …
 
 Architectural contract
 ----------------------
 - This module defines the Protocol only.  Zero backend-specific logic.
-- All concrete runtime clients (foundry_runtime_client.py,
-  omlx_runtime_client.py, …) implement this interface.
+- All concrete runtime clients (omlx_runtime_client.py,
+  ollama_runtime_client.py, …) implement this interface.
 - The Controller, Planner, Synthesizer, and all sub-agents are typed
   against BaseRuntimeClient — never against a concrete class.
 - Adding a new backend requires only: (a) implementing this Protocol,
@@ -23,9 +23,10 @@ Why a Protocol rather than an ABC?
 -----------------------------------
 Using typing.Protocol keeps the design structurally typed: any class that
 implements the required methods satisfies the interface without inheriting
-from it.  This preserves the existing FoundryRuntimeClient without forcing
-a refactor of its class hierarchy, and makes mock/test runtimes trivial to
-write.  @runtime_checkable enables isinstance() checks where needed.
+from it.  This preserves concrete clients like OMLXRuntimeClient and
+OllamaRuntimeClient without forcing a shared class hierarchy, and makes
+mock/test runtimes trivial to write.  @runtime_checkable enables
+isinstance() checks where needed.
 
 Streaming design note
 ----------------------
@@ -75,7 +76,7 @@ class BaseRuntimeClient(Protocol):
     ----------
     is_local: bool
         True when this client's inference runs on this machine (oMLX,
-        Foundry, or Ollama serving a locally-resident model); False when it
+        or Ollama serving a locally-resident model); False when it
         runs on someone else's hardware (Ollama Cloud). This is the single
         signal every backend-tier-aware ceiling (context_profile.py) keys
         off — set once at construction, never recomputed per request.

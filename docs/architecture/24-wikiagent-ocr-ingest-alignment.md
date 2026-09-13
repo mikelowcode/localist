@@ -5,7 +5,7 @@
 Closes the gap §22.8 explicitly flagged and deferred: `WikiAgent`'s raw-document ingest path
 (`wiki_agent.py`) accepted a PDF/image `raw_path` only via oMLX's `infer_with_file()` — not a real
 OCR step, but MarkItDown-based server-side document conversion, oMLX-only. On any other backend
-(Ollama, Foundry) the same file hit `read_text_file()`, a plain UTF-8 decode that raises
+(Ollama) the same file hit `read_text_file()`, a plain UTF-8 decode that raises
 `UnicodeDecodeError` on binary content, failing the whole ingest with a generic "File load error."
 Neither path used Apple Vision/pypdfium2 (§22). This section makes wiki ingestion of images/PDFs use
 the same `ocr_extract` MCP tool chat uploads already use (§22.2), and widens the product surface
@@ -75,7 +75,7 @@ Two changes, both gated on the raw file's extension:
    string-prompt path, even on oMLX. Once OCR output is plain text, this is exactly the design
    principle §22.1 already established for chat uploads: nothing downstream needs to know OCR
    happened. This is the actual fix — ingestion of a PDF/image raw file is now identical across
-   oMLX/Ollama/Foundry, where before it silently depended on which backend was active.
+   oMLX/Ollama, where before it silently depended on which backend was active.
 
 `.md`/`.txt` raw files are completely unaffected by any of this — `ocr_mime_type` is `None` for
 them, so every branch above falls through to the pre-existing behavior byte-for-byte.

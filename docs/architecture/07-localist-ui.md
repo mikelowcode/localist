@@ -389,7 +389,7 @@ length grid tracks this way needs no `@property` registration, unlike animating 
 custom property value itself would have.
 
 **Appbar (`StatusBar.svelte`).** Single consolidated chip (green dot + active inference-engine
-name — `Ollama`/`oMLX`/`Foundry`, not the model id), shown only on the Chat screen; a separate
+name — `Ollama`/`oMLX`, not the model id), shown only on the Chat screen; a separate
 "N pending" chip shown only on Memory. New sidebar show/hide toggle button at the start of the bar.
 Screen title now derives from `$page.url.pathname` rather than the component's previously-unused
 `<slot />`. See §7.6 for what this replaced.
@@ -447,9 +447,8 @@ removed for being inert everywhere; this replacement is wired to a real, working
 base-only PyInstaller freeze has no MLX `EmbeddingEngine` available at all, leaving Ollama's
 `/api/embed` as the only local-embedding option that build can offer. Selected value reflects a new
 `embedding_model` field on `GET /health` (there was previously no GET surface for the configured
-value, only the boolean `embed_model_found`). oMLX and Foundry are both left out of the UI for this
-pass — oMLX per its documented backend-side gap (§16.4), Foundry as a smaller audience scoped out
-rather than built speculatively even though the backend endpoint supports it identically to Ollama.
+value, only the boolean `embed_model_found`). oMLX is left out of the UI for this
+pass, per its documented backend-side gap (§16.4).
 
 **Episode Browsing — Superseded filter + total count (2026-09-05).** `EpisodesPanel.svelte` gained a
 "Superseded" filter chip alongside the existing All/type/Pending/Retracted chips, and a total-episode

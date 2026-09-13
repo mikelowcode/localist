@@ -181,7 +181,7 @@ Localist's code is MIT-licensed; the model weights it downloads and runs
 are separate works under their own terms, chosen at install/runtime by
 whichever backend and models the user configures.
 
-Chat models (oMLX/Ollama/Foundry) and any Ollama-served embedding model
+Chat models (oMLX/Ollama) and any Ollama-served embedding model
 (e.g. `nomic-embed-text`) are entirely user-chosen and pulled by the user's
 own runtime — never bundled or shipped by this repo — so they carry
 whatever license the user's chosen model/provider sets. As of the 2026-09

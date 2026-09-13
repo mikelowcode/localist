@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Localist Framework is a local-first, agentic general assistant running entirely on macOS Apple
 Silicon: persistent cross-session memory, live web fetch/search, indexed document retrieval, and a
 deterministic priority engine that routes every query before any inference is spent. It is
-inference-engine-agnostic (oMLX, Ollama/Ollama Cloud, Azure AI Foundry, swappable via one config
+inference-engine-agnostic (oMLX, Ollama/Ollama Cloud, swappable via one config
 variable); embeddings always run locally regardless of the active chat backend.
 
 ## Commands
@@ -18,7 +18,7 @@ cd backend
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[ocr,chart,dev]"       # Apple Silicon: full local stack
-# pip install -e ".[dev]"               # any OS: base install, Ollama/Foundry only
+# pip install -e ".[dev]"               # any OS: base install, Ollama only
 ```
 `backend/pyproject.toml` is the dependency source of truth (`src/localist/` layout, installed
 editable). Base install is cross-platform with no Vision/PyMuPDF; `[ocr]` (local OCR — Apple
@@ -37,7 +37,7 @@ functionality (`web_search`); everything else has a working default.
 ```
 This is the standard way to bring the system up — it also handles log tailing
 (`[backend]`/`[mcp]`/`[frontend]` prefixes) and clean shutdown on Ctrl+C. A runtime backend (oMLX on
-:8000, or Ollama on :11434, or Foundry) must already be reachable; it is managed separately.
+:8000, or Ollama on :11434) must already be reachable; it is managed separately.
 
 ### Backend tests
 ```bash
@@ -76,9 +76,9 @@ standalone Fetcher microservice (former port 8002) are both retired — their lo
 localist-mcp.
 
 All inference goes through a `BaseRuntimeClient`-conforming runtime selected at startup via
-`LOCALIST_RUNTIME_BACKEND` and constructed by `runtime_factory.py`: `OMLXRuntimeClient`,
-`OllamaRuntimeClient` (also serves Ollama Cloud models over the same local daemon), or
-`FoundryRuntimeClient`. The active backend can also be changed live, without a restart, via
+`LOCALIST_RUNTIME_BACKEND` and constructed by `runtime_factory.py`: `OMLXRuntimeClient` or
+`OllamaRuntimeClient` (also serves Ollama Cloud models over the same local daemon). The active
+backend can also be changed live, without a restart, via
 `POST /settings/runtime-backend` (health-checks the target before swapping, persists the choice to
 `.env`; see `docs/architecture/16-runtime-backend-layer.md` §16.5) — so never assume the backend
 active at startup is still the one active when a request is handled; always resolve it from
@@ -86,7 +86,7 @@ active at startup is still the one active when a request is handled; always reso
 Backend control is wired to this endpoint (§7.10, §16.6) — a live switch there is a real,
 confirm-gated action, not a display preference. There is no local embedding model in this repo —
 vector embeddings, when configured, come from the active runtime backend's own `embed()`
-(`LOCALIST_EMBEDDING_MODEL`, Ollama/Foundry only; oMLX does not yet wire this through). Two-tier
+(`LOCALIST_EMBEDDING_MODEL`, Ollama only; oMLX does not yet wire this through). Two-tier
 precedence (§16.4): a runtime-backend embed source, if configured and found by the active backend,
 is used; otherwise MemoryManager runs the true zero-config default — keyword-only (BM25) retrieval.
 (Historical note: a local MLX EmbeddingGemma path, `EmbeddingEngine`, existed as a third,

@@ -240,8 +240,7 @@ mirroring `OMLXRuntimeClient.infer_stream()`'s real request/response contract
 exactly (`stream=True`, OpenAI-compatible SSE envelope, `choices[0].delta.content`)
 after an initial mis-shaped non-streaming test attempt failed with `KeyError`
 and was corrected by reading `omlx_runtime_client.py`'s real `infer_stream()`
-and `foundry_runtime_client.py`'s real `_iter_sse_chunks()` source directly
-rather than assuming the response shape.
+and `_iter_sse_chunks()` source directly rather than assuming the response shape.
 
 Three cases run, `temperature=0.0` throughout:
 1. **All-NONE previous state, `max_tokens=200`** (reproduction attempt): bare

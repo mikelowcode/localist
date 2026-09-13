@@ -158,7 +158,7 @@ class ConversationalAgent:
     Parameters
     ----------
     runtime :
-        A RuntimeClient instance (OMLXRuntimeClient or FoundryRuntimeClient).
+        A RuntimeClient instance (OMLXRuntimeClient or OllamaRuntimeClient).
     memory_manager :
         MemoryManager instance.  When provided, query_corpus() is called
         before every inference to inject grounded wiki context.

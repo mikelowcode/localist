@@ -9,7 +9,7 @@ That standalone script has been deleted.  All logic now lives here.
 
 Layer placement
 ---------------
-  ControllerAgent  →  WikiAgent  →  FoundryRuntimeClient (inference)
+  ControllerAgent  →  WikiAgent  →  BaseRuntimeClient (inference)
                                  →  MemoryManager (optional — index updates)
 
 Architectural contract
@@ -17,7 +17,7 @@ Architectural contract
 - Pure Python module.  No FastAPI, no HTTP, no stdin, no sys.exit().
 - Satisfies the AgentInterface Protocol defined in controller_agent.py.
 - All model inference is requested through the injected RuntimeClient —
-  never by calling the Foundry HTTP API directly.
+  never by calling a backend's HTTP API directly.
 - All file I/O is scoped to paths supplied by the Controller via SubTask.context.
   The agent does NOT resolve paths relative to its own __file__ location.
 - Changes are written to the wiki directory only when
@@ -1219,7 +1219,7 @@ class WikiAgent:
         3. Build wiki_context (always — informs model regardless of path).
         4. Detect runtime capability and call model:
              - infer_with_file() if runtime supports it (oMLX 0.4.2+)
-             - infer() with full string prompt otherwise (Foundry + others)
+             - infer() with full string prompt otherwise (other backends)
         5. Parse the model's XML response into Actions.
         6. Journal / apply / index / return — see _finalize().
 
@@ -2009,10 +2009,10 @@ if __name__ == "__main__":
 
     _logging.basicConfig(level=_logging.INFO, stream=sys.stdout)
 
-    from .foundry_runtime_client import FoundryRuntimeClient
+    from .omlx_runtime_client import OMLXRuntimeClient
     from .controller_agent import ControllerAgent
 
-    runtime    = FoundryRuntimeClient()
+    runtime    = OMLXRuntimeClient()
     wiki_agent = WikiAgent(runtime=runtime)
     controller = ControllerAgent(runtime=runtime, agents=[wiki_agent])
 

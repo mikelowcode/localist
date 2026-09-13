@@ -10,19 +10,18 @@ export interface ModelState {
 
 const BACKEND_KEY = 'localist-runtime-backend';
 
-export const RUNTIME_BACKENDS = ['omlx', 'ollama', 'foundry'] as const;
+export const RUNTIME_BACKENDS = ['omlx', 'ollama'] as const;
 export type RuntimeBackend = (typeof RUNTIME_BACKENDS)[number];
 
 export const RUNTIME_BACKEND_LABELS: Record<RuntimeBackend, string> = {
   omlx: 'oMLX',
-  ollama: 'Ollama',
-  foundry: 'Foundry'
+  ollama: 'Ollama'
 };
 
 function readStoredBackend(): string {
-  if (!browser) return 'foundry';
+  if (!browser) return 'omlx';
   const stored = localStorage.getItem(BACKEND_KEY);
-  return stored && (RUNTIME_BACKENDS as readonly string[]).includes(stored) ? stored : 'foundry';
+  return stored && (RUNTIME_BACKENDS as readonly string[]).includes(stored) ? stored : 'omlx';
 }
 
 export const modelConfig = writable<ModelState>({

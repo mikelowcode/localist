@@ -4,8 +4,6 @@ context_profile.py to let every backend-tier-aware ceiling key off one
 flag instead of three ad-hoc special cases.
 
 - oMLX only ever runs on-device: always True.
-- Foundry is local-only in this deployment (its own module docstring says
-  "local only, never cloud"): always True.
 - Ollama can serve either a local pull or an Ollama-Cloud-hosted model
   through the *same* local daemon (base_url stays localhost:11434 either
   way — see docs/architecture/16-runtime-backend-layer.md §16.4's
@@ -28,7 +26,6 @@ double rather than importing a constant.
 from __future__ import annotations
 
 from localist.omlx_runtime_client import OMLXRuntimeClient
-from localist.foundry_runtime_client import FoundryRuntimeClient
 from localist.ollama_runtime_client import OllamaRuntimeClient
 from localist.context_profile import (
     CLOUD_PROFILE,
@@ -53,10 +50,6 @@ class TestIsLocalPerBackend:
 
     def test_omlx_is_always_local(self):
         assert OMLXRuntimeClient().is_local is True
-
-    def test_foundry_is_always_local(self):
-        client = FoundryRuntimeClient(base_url="http://127.0.0.1:59999")
-        assert client.is_local is True
 
     def test_ollama_local_model(self):
         client = OllamaRuntimeClient(chat_model="gemma4:e4b-mlx")

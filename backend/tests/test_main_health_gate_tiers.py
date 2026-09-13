@@ -25,8 +25,8 @@ def client(tmp_path):
 
     main._state.settings = main.Settings(
         runtime_backend="ollama", chat_model=None, chat_model_omlx=None,
-        chat_model_ollama=None, chat_model_foundry=None, embedding_model="",
-        foundry_url=None, omlx_url="http://localhost:8000",
+        chat_model_ollama=None, embedding_model="",
+        omlx_url="http://localhost:8000",
         ollama_url="http://localhost:11434", request_timeout=30.0,
         stream_timeout=60.0, episodic_write_approval=False,
     )

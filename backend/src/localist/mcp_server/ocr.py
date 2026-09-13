@@ -2,7 +2,7 @@
 Localist MCP Server — ocr_extract tool implementation
 ========================================================
 Extracts text from images and PDFs entirely locally, independent of
-whichever chat inference backend (oMLX/Ollama/Foundry) is active — see
+whichever chat inference backend (oMLX/Ollama) is active — see
 docs/architecture/22-local-ocr-service.md.
 
 Images (including HEIC — see _ocr_image_bytes) are OCR'd via Apple's Vision

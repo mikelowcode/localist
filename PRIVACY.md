@@ -39,7 +39,7 @@ wiki, memory, or raw documents wholesale:
 
 **Inference** stays fully local when the active runtime backend is oMLX or a
 local Ollama daemon. It leaves your machine only if you deliberately
-configure Azure AI Foundry or Ollama Cloud as the active backend
+configure Ollama Cloud as the active backend
 (`LOCALIST_RUNTIME_BACKEND`) — an explicit, visible config choice, not a
 default.
 

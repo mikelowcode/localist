@@ -226,7 +226,7 @@ class AgentInterface(Protocol):
 @runtime_checkable
 class RuntimeClient(Protocol):
     """
-    Abstraction over the Local Runtime Layer (Azure AI Foundry / oMLX).
+    Abstraction over the Local Runtime Layer (oMLX / Ollama).
     The Controller and sub-agents call this — never a model API directly.
     """
 
@@ -1916,7 +1916,7 @@ class ControllerAgent:
             logger.debug("_execute_plan: working memory fetch failed (%s).", exc)
 
         # emit_structured_working_memory is opt-in and, today, oMLX-only:
-        # every other runtime client (Ollama, Foundry) keeps consuming the
+        # every other runtime client (Ollama) keeps consuming the
         # flattened [WORKING MEMORY] text inside user_prompt exactly as
         # before. The oMLX request-building side that will actually consume
         # working_memory_turns as discrete messages is a later step — this

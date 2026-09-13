@@ -4,7 +4,7 @@
 
 Chat uploads accept images (incl. HEIC) and PDFs, extracted to plain text at
 upload time by a dedicated local OCR tool — entirely independent of whichever
-chat inference backend (oMLX/Ollama/Foundry) is active. **This is text
+chat inference backend (oMLX/Ollama) is active. **This is text
 extraction only** — a photo, screenshot, or scan with visible text works; a
 photo with no text in it (a portrait, a movie poster with only stylized
 logo art, a landscape) does not describe or caption, it correctly finds
@@ -176,7 +176,7 @@ instead, in order of weight:
 
 1. **Backend independence.** `infer_with_file()` only exists on
    `OMLXRuntimeClient`. Wiring chat images through it would mean the attach
-   affordance had to be disabled whenever Ollama or Foundry was the active
+   affordance had to be disabled whenever Ollama was the active
    runtime (§16) — a real UX regression compared to every other chat
    capability, none of which care which backend is active.
 2. **No new multimodal contract.** Routing images through the model would
@@ -198,7 +198,7 @@ alternative considered and why it lost, per its own updated status line.
 **Explicitly not addressed by this build** (kept out of scope on purpose):
 `WikiAgent`'s existing `infer_with_file()` PDF/image ingest path still
 depends on oMLX specifically and still degrades to a plain-text prompt with
-no real PDF/image handling on Ollama/Foundry. The new `ocr_extract` tool
+no real PDF/image handling on Ollama. The new `ocr_extract` tool
 could close that gap too — same tool, second caller — but that's a separate,
 not-yet-scoped follow-up, not bundled into this feature.
 

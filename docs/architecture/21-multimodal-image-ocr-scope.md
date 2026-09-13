@@ -21,17 +21,17 @@ to get bytes to oMLX in its existing multimodal wire format.
 - No PDF support in this pass (mentioned alongside images in the original §11.6
   note, but out of scope here — different content-type handling, revisit
   separately).
-- No attempt to give Ollama or Foundry backends image support in this pass (see
+- No attempt to give Ollama backends image support in this pass (see
   §21.3, Decision 1).
 
 ## 21.3 Decisions already made
 
 1. **oMLX-only.** Matches the docs' existing framing ("oMLX and Gemma 4B
    natively support OCR, image, and PDF") and reuses the one piece of prior art
-   that already exists, `OMLXRuntimeClient.infer_with_file()`. When Ollama or
-   Foundry is the active runtime (resolved fresh from `_state.runtime` per the
+   that already exists, `OMLXRuntimeClient.infer_with_file()`. When Ollama
+   is the active runtime (resolved fresh from `_state.runtime` per the
    live-swap rule in §16), image attachment is disabled/rejected rather than
-   silently dropped or attempted. Ollama and Foundry are not extended to carry
+   silently dropped or attempted. Ollama is not extended to carry
    images in this scope.
 2. **Images flow through `PromptBuilder`, not around it.** The existing
    `infer_with_file()` bypasses `PromptBuilder` entirely (used only by
@@ -110,7 +110,7 @@ image.
 `ChatPanel.svelte`: add image extensions to `ALLOWED_EXTENSIONS` and the
 `accept` attribute; attached-file chips get an image/thumbnail variant. Gate
 the attach affordance on the currently active runtime backend (read from the
-existing runtime-backend settings store) — disable when Ollama/Foundry is
+existing runtime-backend settings store) — disable when Ollama is
 active, with an explanatory tooltip, so the Phase 4 rejection is a backstop,
 not the primary UX.
 

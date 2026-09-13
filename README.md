@@ -2,7 +2,7 @@
 
 A local-first, agentic general assistant built primarily for macOS Apple Silicon. Persistent memory across sessions, live web search/fetch, indexed document search, and a deterministic priority-based router — no inference spent deciding how to route a query.
 
-Inference-engine-agnostic: ships with oMLX, Ollama (including Ollama Cloud models), and Azure AI Foundry, swappable via one config variable or live at runtime with no restart. Embeddings, when configured, always run locally — via any locally-served Ollama embedding model (e.g. `nomic-embed-text`), live-switchable from Settings with no restart. With no embedding model configured, the framework runs zero-config on keyword (BM25) retrieval instead — real semantic-gating signal, not a degraded no-op, across every platform.
+Inference-engine-agnostic: ships with oMLX and Ollama (including Ollama Cloud models), swappable via one config variable or live at runtime with no restart. Embeddings, when configured, always run locally — via any locally-served Ollama embedding model (e.g. `nomic-embed-text`), live-switchable from Settings with no restart. With no embedding model configured, the framework runs zero-config on keyword (BM25) retrieval instead — real semantic-gating signal, not a degraded no-op, across every platform.
 
 See `PRIVACY.md` for what stays local, what can leave your machine and when, and what a fresh clone actually contains; `THIRD_PARTY_LICENSES.md` for the dependency/model-weight license audit; `NAMING.md` for the naming convention forks are asked to follow.
 
@@ -44,7 +44,7 @@ reached via `MCPToolDispatcher`'s normal chat-turn dispatch; see Attachments bel
 ## Prerequisites
 
 - Python 3.13, Node.js
-- One runtime backend: oMLX (chat model on :8000, macOS Apple Silicon only), [Ollama](https://ollama.com) (local or Ollama Cloud, :11434, any OS), or Azure AI Foundry
+- One runtime backend: oMLX (chat model on :8000, macOS Apple Silicon only), or [Ollama](https://ollama.com) (local or Ollama Cloud, :11434, any OS)
 - Local embeddings (optional, any OS): set `LOCALIST_EMBEDDING_MODEL` to any embedding model already pulled in your Ollama daemon (e.g. `nomic-embed-text`) — no separate extra or download to install. Without it, retrieval runs keyword-only (BM25), automatically, with no configuration at all
 - OCR'd PDF chat uploads (see Attachments below) require macOS on Apple Silicon (Apple Vision framework + pypdfium2); on other platforms those uploads are cleanly rejected with an explanatory error, everything else in the app is unaffected. Image uploads work everywhere: Apple Silicon uses Vision framework, other platforms fall back to a configured Ollama vision-capable chat model (`LOCALIST_OLLAMA_VISION_MODEL`)
 
@@ -55,7 +55,7 @@ cd backend
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[ocr,chart,dev]"   # Apple Silicon: full local stack (OCR, chart tool)
-# pip install -e ".[dev]"           # any OS: base install — Ollama/Foundry, keyword-only retrieval
+# pip install -e ".[dev]"           # any OS: base install — Ollama only, keyword-only retrieval
 ```
 
 `[ocr]` is Apple-Silicon-only (a platform marker makes it a no-op elsewhere); `[chart]` is
@@ -92,7 +92,7 @@ Vision/pypdfium2 bundled, so OCR isn't available from the packaged app — Ollam
 keyword-only retrieval are unaffected either way, on both source and packaged installs). See
 `backend/packaging/README.md` (build the two frozen services) then `localist-ui/src-tauri/README.md`
 (build the `.app`). No first-run config UX or code signing yet — a fresh build defaults to the
-unreachable `foundry` runtime backend, same as an unconfigured source install.
+unreachable `omlx` runtime backend, same as an unconfigured source install.
 
 ## Configuration
 
@@ -100,10 +100,10 @@ Copy `backend/.env.example` to `backend/.env`. Only an API key for the active `w
 
 | Variable | Default | Description |
 |---|---|---|
-| `LOCALIST_RUNTIME_BACKEND` | `foundry` | `foundry`, `omlx`, or `ollama` — also swappable live at runtime, see below |
+| `LOCALIST_RUNTIME_BACKEND` | `omlx` | `omlx` or `ollama` — also swappable live at runtime, see below |
 | `LOCALIST_CHAT_MODEL` | *(none)* | Chat model ID override — wins over any per-backend pin below; required for `ollama` if no pin is set either (fails fast at startup if unset) |
-| `LOCALIST_CHAT_MODEL_OLLAMA` / `_OMLX` / `_FOUNDRY` | *(none)* | Per-backend chat model pin, used when `LOCALIST_CHAT_MODEL` is unset — lets each backend remember its own model choice independently, including across a live runtime-backend switch |
-| `LOCALIST_EMBEDDING_MODEL` | *(none)* | Embedding model ID for the active backend (`foundry`/`ollama`); if set and found, this is used instead of the zero-config keyword-only (BM25) retrieval default |
+| `LOCALIST_CHAT_MODEL_OLLAMA` / `_OMLX` | *(none)* | Per-backend chat model pin, used when `LOCALIST_CHAT_MODEL` is unset — lets each backend remember its own model choice independently, including across a live runtime-backend switch |
+| `LOCALIST_EMBEDDING_MODEL` | *(none)* | Embedding model ID for the active backend (`ollama`); if set and found, this is used instead of the zero-config keyword-only (BM25) retrieval default |
 | `SEARCH_PROVIDER` | `langsearch` | `web_search` provider: `langsearch` or `brave` |
 | `LANGSEARCH_API_KEY` | *(none)* | Required when `SEARCH_PROVIDER=langsearch`; without it, `web_search` fails and falls back to corpus |
 | `BRAVE_API_KEY` | *(none)* | Required when `SEARCH_PROVIDER=brave`; without it, `web_search` fails and falls back to corpus |
@@ -117,7 +117,7 @@ Copy `backend/.env.example` to `backend/.env`. Only an API key for the active `w
 
 See `backend/.env.example` for the full list (embedding engine, wiki/raw directories, MCP project root, etc.).
 
-**Live runtime-backend switching** — the active backend doesn't require a restart to change: the Settings UI (or `POST /settings/runtime-backend` directly) health-checks the target backend, swaps it in, and persists the choice to `.env`, all while the server keeps running. Each backend remembers its own chat-model pin (`LOCALIST_CHAT_MODEL_OLLAMA`/`_OMLX`/`_FOUNDRY` above), so switching back to a backend you'd previously configured doesn't lose that choice.
+**Live runtime-backend switching** — the active backend doesn't require a restart to change: the Settings UI (or `POST /settings/runtime-backend` directly) health-checks the target backend, swaps it in, and persists the choice to `.env`, all while the server keeps running. Each backend remembers its own chat-model pin (`LOCALIST_CHAT_MODEL_OLLAMA`/`_OMLX` above), so switching back to a backend you'd previously configured doesn't lose that choice.
 
 ---
 
@@ -131,7 +131,7 @@ See `backend/.env.example` for the full list (embedding engine, wiki/raw directo
 
 **Live Feed** — a collapsible right-side panel (collapsed by default to a slim vertical tab) surfacing daily-update content outside the normal chat flow, with three blocks — Daily News Brief, Hacker News, and GitHub Watch Feed, in that order — each independently collapsible/expandable (state persisted across reloads) on top of the whole-panel collapse. The Daily News Brief block shows the latest cached World/National/Local + 3 user-chosen special-interest topics (home country, local-area keyword, and topic picker configured under Settings), with a "Daily News Brief Refresh" link that always fetches a fresh brief from NewsAPI. The Hacker News block shows the current top 10 stories (HN's public Firebase API, no key), each linking straight to the original article (or the HN discussion page itself for a self-post with no external link); a "Hacker News Refresh" link always fetches fresh. The GitHub Watch Feed block mirrors that same refresh-link pattern: it lists the repos you watch (GitHub's native Watch feature, via `GET /user/subscriptions`) plus any repos you've *pinned* by `owner/repo` slug under Settings — pinning tracks a repo's releases independently of GitHub's Watch relationship, so it doesn't subscribe you to that repo's PR/issue emails the way clicking Watch on GitHub does. Both kinds are merged into one list (a pinned slug matching an already-watched repo is deduped, not shown twice), each row linking straight to that repo's Releases page and a small 📌 badge marking the pinned ones, cached in SQLite until the next explicit refresh; a missing `GITHUB_TOKEN` surfaces as a single inline "not configured" message rather than an error. Both the News Brief and Hacker News blocks additionally have a per-story "Ask about this" button that sends just that one item into the current chat conversation, pinned to it specifically (`news_search`'s/`hacker_news_search`'s `url` param) rather than trusting a fresh query to find the same story again — GitHub Watch has no such button, correctly, since it has no chat-callable tool behind it.
 
-**Attachments** — the "+" button in the chat UI uploads a local file into an ephemeral, session-scoped cache injected into every subsequent prompt. Text files, images (including HEIC), and PDFs are all supported: images and PDFs are OCR'd to plain text once at upload time by a local `ocr_extract` MCP tool — entirely independent of whichever chat runtime backend is active, so the attach button works the same whether oMLX, Ollama, or Foundry is running. On Apple Silicon, both use Apple's Vision framework (images) and pypdfium2 (PDFs — text-layer extraction first, falling back to per-page rasterize+OCR for scanned PDFs); on other platforms, image uploads fall back to a configured Ollama vision-capable chat model (`LOCALIST_OLLAMA_VISION_MODEL`, prompted for verbatim text transcription — same OCR-only contract, not image captioning), while PDF uploads still require Apple Silicon. An "Extracting text…" state shows briefly (real OCR latency, not mocked) before the file lands in the same cache as a text upload — same budget, same prompt slot, no separate image handling anywhere downstream. A second, paperclip-icon control pins an *existing wiki page* into the same cache instead, so asking Assistant to propose a diff against a specific page hands it the real, current file content rather than the model's own (possibly stale) memory of it. Either kind bypasses Planner routing and wiki indexing entirely for as long as it's attached, and clears on backend restart.
+**Attachments** — the "+" button in the chat UI uploads a local file into an ephemeral, session-scoped cache injected into every subsequent prompt. Text files, images (including HEIC), and PDFs are all supported: images and PDFs are OCR'd to plain text once at upload time by a local `ocr_extract` MCP tool — entirely independent of whichever chat runtime backend is active, so the attach button works the same whether oMLX or Ollama is running. On Apple Silicon, both use Apple's Vision framework (images) and pypdfium2 (PDFs — text-layer extraction first, falling back to per-page rasterize+OCR for scanned PDFs); on other platforms, image uploads fall back to a configured Ollama vision-capable chat model (`LOCALIST_OLLAMA_VISION_MODEL`, prompted for verbatim text transcription — same OCR-only contract, not image captioning), while PDF uploads still require Apple Silicon. An "Extracting text…" state shows briefly (real OCR latency, not mocked) before the file lands in the same cache as a text upload — same budget, same prompt slot, no separate image handling anywhere downstream. A second, paperclip-icon control pins an *existing wiki page* into the same cache instead, so asking Assistant to propose a diff against a specific page hands it the real, current file content rather than the model's own (possibly stale) memory of it. Either kind bypasses Planner routing and wiki indexing entirely for as long as it's attached, and clears on backend restart.
 
 **Chat turn editing & Compose Mode** — any completed assistant reply can be saved straight to disk. Hovering a reply reveals a pencil toggle that swaps the rendered markdown for a full-width editable textarea in place, with a filename + `.md`/`.txt` picker beneath it; editing is export-only (never rewrites the actual chat turn) and Save goes through a direct `POST /files/generated` endpoint — the same sandboxed, collision-versioned write the `file_op` tool above uses, just triggered by a user click instead of a model call, so no inference round trip. **Compose Mode** extends this across several turns: a document icon in the composer opens a persistent, drag-resizable side panel (280–800px, mirrors the left sidebar's own resize handle), and each turn gains an "Add to document" button that appends its content to one growing draft — always onto the end of whatever's there, never recomputed from the included turns, so a hand-edit is never clobbered by a later addition. The assembled document is then edited and saved as a single artifact through the same save flow. Both features are entirely frontend-side; neither adds backend state beyond the one write endpoint they share.
 
@@ -162,7 +162,7 @@ localist/
 │   │   ├── episodic_extractor.py    # Episode extraction
 │   │   ├── content_safety.py        # Pre-write content scanner
 │   │   ├── embedding_engine.py      # Local embedding engine
-│   │   ├── runtime_factory.py       # Backend selection (foundry/omlx/ollama), live-swappable
+│   │   ├── runtime_factory.py       # Backend selection (omlx/ollama), live-swappable
 │   │   ├── chart_tool_schema.py     # generate_chart argument extraction/validation
 │   │   ├── news_brief.py            # Daily News Brief: NewsAPI calls, formatting (Live Feed panel)
 │   │   ├── github_watch.py          # GitHub Watch Feed: watched-repo releases (Live Feed panel)
@@ -221,4 +221,4 @@ Tests are organized by phase (memory substrate, routing, controller dispatch, ex
 - ✅ Native macOS `.app` packaging — both backend services frozen with PyInstaller (base-only: no MLX/Vision/pypdfium2 bundled) and wrapped in a Tauri shell that spawns/kills them; see `backend/packaging/README.md` and `localist-ui/src-tauri/README.md`
 
 **Open**
-- ⬜ Native `.app`: first-run config UX (a fresh app defaults to unreachable `foundry`), code signing/notarization, `tauri build` auto-triggering the PyInstaller build
+- ⬜ Native `.app`: first-run config UX (a fresh app defaults to unreachable `omlx`), code signing/notarization, `tauri build` auto-triggering the PyInstaller build

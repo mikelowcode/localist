@@ -533,7 +533,7 @@ why the signature had to change) and threads the result into both
 
 | Profile | `working_memory_limit` (rows fetched) | `working_memory_tokens` (ceiling) |
 |---|---|---|
-| **Local** (oMLX, Foundry, Ollama serving a locally-resident model) | None (unbounded, as of §16.11) | `max_model_len − 27,000`, floored at 300 (§16.11) |
+| **Local** (oMLX, Ollama serving a locally-resident model) | None (unbounded, as of §16.11) | `max_model_len − 27,000`, floored at 300 (§16.11) |
 | **Cloud** (Ollama Cloud — model tag ends `-cloud`) | None (unbounded) | 60,000 |
 
 **Corrected 2026-07-19 (§16.11) — the RAM-tiered mechanism this paragraph
@@ -608,8 +608,8 @@ Turn -1 [assistant]: {most recent prior assistant response}
   same turns as a structured, chronologically-ordered `list[Turn]` instead,
   which `OMLXRuntimeClient` sends as discrete `messages` array entries —
   mirroring oMLX's own web UI, and the multi-turn shape §3.7b originally
-  speculated a future engine might use. Ollama/Foundry are unaffected and
-  still receive this slot exactly as described above.
+  speculated a future engine might use. Ollama is unaffected and
+  still receives this slot exactly as described above.
   `working_memory_tokens`'s ceiling math (§16.11: `max_model_len - 27,000`,
   floored at 300) is unchanged by this — only the *representation* changed,
   not the token budget or the drop-oldest-first trim rule, which
@@ -1428,8 +1428,8 @@ failure during development caught the missing one). The resulting turns are thre
 `conversational_agent.py`'s prebuilt-prompt passthrough never read that context key at all, so the
 controller-side wiring alone would have been inert — it now forwards
 `working_memory_turns=context.get("_prebuilt_working_memory_turns")` to the runtime's
-`infer()`/`infer_stream()`, but only when that key is present, so Ollama/Foundry — which never
-populate it — call the runtime exactly as before with no new keyword at all.
+`infer()`/`infer_stream()`, but only when that key is present, so Ollama — which never
+populates it — calls the runtime exactly as before with no new keyword at all.
 
 **Consumption (`OMLXRuntimeClient`) and "Prompt too long" recovery.** See §16.12 in
 `16-runtime-backend-layer.md` for the full detail: the outgoing `messages` array now mirrors oMLX's

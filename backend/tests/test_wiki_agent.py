@@ -67,7 +67,7 @@ class _FakeRuntime:
     """Protocol-shaped fake — has only infer() and embed(), matching
     RuntimeClient exactly. Deliberately has no infer_with_file, so
     run()'s hasattr() check correctly routes to the infer() string-prompt
-    path, the same way a real OMLXRuntimeClient/FoundryRuntimeClient
+    path, the same way a real OMLXRuntimeClient/OllamaRuntimeClient
     without infer_with_file support would."""
 
     def __init__(self, response: str) -> None:
@@ -1529,7 +1529,7 @@ def test_end_to_end_diff_only_run_regenerates_index_and_logs(tmp_path: Path):
 # §22.8 follow-up: OCR-eligible image/PDF raw_path files are now extracted
 # via extract_raw_content_via_ocr() instead of read_text_file(), and always
 # take the infer() string-prompt path — never infer_with_file()/MarkItDown —
-# so ingestion behaves identically across oMLX/Ollama/Foundry.)
+# so ingestion behaves identically across oMLX/Ollama.)
 # ---------------------------------------------------------------------------
 
 from localist import wiki_agent as wiki_agent_module

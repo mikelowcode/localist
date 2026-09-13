@@ -272,7 +272,7 @@ even attempt to recover, when it should fail fast and let the
 repeat-guard/reformulation machinery move on instead. This required a new
 `timeout: float | None = None` parameter on `BaseRuntimeClient.infer()` /
 `infer_stream()` (and every concrete implementation —
-`OllamaRuntimeClient`, `OMLXRuntimeClient`, `FoundryRuntimeClient`) —
+`OllamaRuntimeClient`, `OMLXRuntimeClient`) —
 `None` (the default for every pre-existing call site) means "use the
 client's configured default timeout," so this is additive, not a
 behavior change for anything except the two research-loop call sites

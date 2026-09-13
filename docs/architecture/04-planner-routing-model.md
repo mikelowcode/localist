@@ -684,7 +684,7 @@ or there may be a second, distinct cause producing an identical symptom.
 established, no correlation tested against prompt length/shape, tool
 identity, temperature (`0.30` here, same as the 2026-07-17 baseline),
 model, or backend (`OllamaRuntimeClient` specifically — unconfirmed
-whether `OMLXRuntimeClient`/`FoundryRuntimeClient` share this behavior at
+whether `OMLXRuntimeClient` shares this behavior at
 all). The existing retry/fallback machinery already absorbs every known
 occurrence transparently, so there is no user-visible failure today; this
 item exists to scope *whether the zero-content completion itself* is
@@ -727,6 +727,18 @@ guard (§4.6.2 above) still owns recovery. Covered by
 `TestDoneMeta`/`TestZeroContentWarning` in
 `tests/test_ollama_runtime_client.py`; full suite green (1498 passed) at
 implementation time. Item (3) remains not started.
+
+*Update 2026-08-05 — `think:false` decision re-tested live for an unrelated job, reconfirmed.*
+A pilot for a proposed "scratchpad" feature (`ConversationalAgent` reasoning to an ephemeral doc
+before answering) considered re-enabling `thinking` on `gemma4:e4b-mlx` and ran a live A/B
+(`diagnostics/diag_ollama_thinking_fabrication_repro.py`, N=20 per condition, same
+`temp=0.30`/`max_tokens=1024` as production) to check its effect on a different failure mode —
+`_is_fabricated_toolcall()` fabrication rate (§8.8 Open Item 11), not the zero-content bug this
+section is about. The fabrication result was inconclusive (0/20 in both arms — too rare to detect
+at this N; full detail logged at Open Item 11), but the run reconfirmed this section's `think:false`
+decision from a cost angle: under `think:true`, mean wall time rose ~3.4x (10.25s → 35.29s) and
+20%/5% of trials hit the exact budget-exhaustion/zero-content shapes Finding A above describes,
+live, on the same model. No code change resulted; `think:false` remains the default.
 
 *Update 2026-08-04 — item (2) done: live reproduction sweep run, two
 distinct findings, one repro count each.* `diagnostics/
@@ -781,8 +793,8 @@ frontend so the user sees why they're waiting — was considered and
 declined. It would require a second, thinking-specific callback path
 alongside the existing `on_token` threading (`ConversationalAgent` →
 `ControllerAgent` → `main.py`'s SSE bridge → frontend), which only
-`OllamaRuntimeClient` could ever populate — `OMLXRuntimeClient` and
-`FoundryRuntimeClient` have no equivalent concept. That would make the
+`OllamaRuntimeClient` could ever populate — `OMLXRuntimeClient`
+has no equivalent concept. That would make the
 streaming contract backend-specific for the first time; every other
 piece of it (`on_token`, the plain-`str` `Generator` return, the SSE
 `"token"` event) is deliberately backend-agnostic today. Rejected to

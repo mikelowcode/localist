@@ -13,17 +13,16 @@ Architectural contract
 - Implements BaseRuntimeClient (base_runtime_client.py).
 - No FastAPI imports.  No agent logic.  Pure transport + normalisation.
 - Normalises all oMLX-specific response shapes to the same types that
-  FoundryRuntimeClient returns, so the Controller and agents are
+  every other runtime client returns, so the Controller and agents are
   completely unaware of which backend is active.
 - All network/decode errors are caught and re-raised as RuntimeError —
-  the same contract as FoundryRuntimeClient.
+  the same contract as OllamaRuntimeClient.
 
 oMLX integration notes
 -----------------------
 oMLX exposes an OpenAI-compatible local HTTP API by default.  The
-endpoints and request/response shapes mirror the OpenAI spec, so most
-of the transport code here is structurally identical to
-FoundryRuntimeClient.  The differences are:
+endpoints and request/response shapes mirror the OpenAI spec.  Notable
+details:
 
   - Port/URL resolution: oMLX uses a fixed port by default (see
     _DEFAULT_BASE_URL) rather than an ephemeral one, so no CLI
@@ -33,9 +32,8 @@ FoundryRuntimeClient.  The differences are:
     These are configured at construction time and must match the model
     IDs returned by GET /v1/models on your oMLX instance.
   - Streaming: oMLX supports SSE streaming with the same
-    "data: {...}\ndata: [DONE]" envelope as OpenAI, so _iter_sse_chunks
-    from foundry_runtime_client is reusable.  We import it directly to
-    avoid duplicating the SSE parsing logic.
+    "data: {...}\ndata: [DONE]" envelope as OpenAI; _iter_sse_chunks
+    below implements that parsing.
 
 TODOs are marked with # TODO(omlx) and indicate where integration
 details need to be filled in once the oMLX API surface is confirmed.
@@ -49,16 +47,53 @@ import logging
 import mimetypes
 import threading
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Iterator
 
 import requests
 
-# Reuse the SSE chunk iterator from FoundryRuntimeClient — the wire
-# format is identical (OpenAI-compatible SSE envelope).
-from .foundry_runtime_client import _iter_sse_chunks
 from .prompt_builder import Turn
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# SSE streaming helper
+# ---------------------------------------------------------------------------
+
+def _iter_sse_chunks(response: requests.Response) -> Iterator[str]:
+    """
+    Yield text delta strings from an OpenAI-compatible SSE stream.
+
+    Each line from the stream looks like:
+        data: {"choices": [{"delta": {"content": "hello"}, ...}], ...}
+    or:
+        data: [DONE]
+
+    Malformed lines and empty deltas are silently skipped.
+    """
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+        if not raw_line.startswith("data:"):
+            continue
+
+        data_str = raw_line[len("data:"):].strip()
+        if data_str == "[DONE]":
+            return
+
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            logger.debug("SSE: skipping non-JSON line: %s", raw_line[:120])
+            continue
+
+        choices = data.get("choices", [])
+        if not choices:
+            continue
+
+        delta_content = choices[0].get("delta", {}).get("content", "")
+        if delta_content:
+            yield delta_content
 
 # ---------------------------------------------------------------------------
 # Concurrency guard
@@ -168,7 +203,7 @@ class OMLXRuntimeClient:
     conformance only checks for member presence, not signatures, so this
     extra optional parameter doesn't affect isinstance() checks against
     BaseRuntimeClient). See infer_stream()'s docstring for the full
-    contract; Ollama/Foundry never receive this keyword and are unaffected.
+    contract; Ollama never receives this keyword and is unaffected.
 
     Parameters
     ----------
@@ -531,9 +566,8 @@ class OMLXRuntimeClient:
                     )
 
                 # _iter_sse_chunks handles the OpenAI-compatible SSE envelope
-                # ("data: {...}" lines, "data: [DONE]" sentinel) identically for
-                # both Foundry and oMLX.  If oMLX uses a non-standard SSE format,
-                # replace this with a custom iterator.
+                # ("data: {...}" lines, "data: [DONE]" sentinel).  If oMLX uses
+                # a non-standard SSE format, replace this with a custom iterator.
                 # TODO(omlx): Verify the SSE envelope format matches OpenAI spec.
                 try:
                     yield from _iter_sse_chunks(response)

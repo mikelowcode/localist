@@ -204,9 +204,9 @@
 
   // Embedding model — Ollama-only for now. oMLX has no configurable
   // embedding model (runtime_factory._make_omlx() hardcodes it; see
-  // docs/architecture/16-runtime-backend-layer.md §16.4), and Foundry is
-  // scoped out of the UI for now even though the backend endpoint itself
-  // is backend-agnostic. Always scoped to the real active backend
+  // docs/architecture/16-runtime-backend-layer.md §16.4) and is the only
+  // backend scoped out of the embedding-model UI, even though the backend
+  // endpoint itself is backend-agnostic. Always scoped to the real active backend
   // ($modelConfig.backend), never the Chat Model card's preview-only
   // selectedUiBackend — setting an embedding model always applies to
   // whichever backend is actually live right now.

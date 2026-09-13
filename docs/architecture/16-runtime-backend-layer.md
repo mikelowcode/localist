@@ -7,12 +7,10 @@
 `runtime_factory.py`'s `create_runtime()` is the single entry point that constructs the active
 backend at process startup, selected via `LOCALIST_RUNTIME_BACKEND`. Concurrency posture is
 swap-only: exactly one backend is active per process; dual-runtime/concurrent-backend operation is
-explicitly out of scope for all three backends below.
+explicitly out of scope for both backends below.
 
-Three backends are registered in `_REGISTRY` today:
+Two backends are registered in `_REGISTRY` today:
 
-- **`FoundryRuntimeClient`** (`foundry_runtime_client.py`) — Azure AI Foundry, local execution,
-  ephemeral-port resolution via `foundry service status`.
 - **`OMLXRuntimeClient`** (`omlx_runtime_client.py`) — oMLX local inference, fixed port 8000,
   OpenAI-compatible SSE streaming, native MarkItDown file ingestion (`infer_with_file()`, an
   oMLX-only capability not part of the Protocol).
@@ -231,8 +229,8 @@ unit-testable function — see Testing note below) in this order:
 
 1. **Runtime-backend embed** — if `Settings.embedding_model` (`LOCALIST_EMBEDDING_MODEL`) is set
    and the active runtime's `health_check()` reports the model present, `MemoryManager.embed_fn`
-   is bound to `runtime.embed`. This is wired through for the Foundry and Ollama backends and is
-   platform-agnostic for both. **Not yet wired for the oMLX backend** —
+   is bound to `runtime.embed`. This is wired through for the Ollama backend. **Not yet wired for
+   the oMLX backend** —
    `runtime_factory._make_omlx()` hardcodes `embedding_model=""` regardless of
    `Settings.embedding_model`, so this tier can never actually engage while `runtime_backend="omlx"`
    is active, even though `OMLXRuntimeClient.embed()` itself supports a configurable
@@ -548,9 +546,6 @@ identically even when Ollama Cloud (~128K real context) was active.
 **Per-backend derivation — grounded in live code, not assumed:**
 
 - **`OMLXRuntimeClient.is_local = True`, always.** oMLX only ever runs on-device; no branching.
-- **`FoundryRuntimeClient.is_local = True`, always.** The module's own docstring states Foundry is
-  "local execution... (local only, never cloud)" (§16.1) — confirmed by grep before writing any
-  branching logic for a cloud case that doesn't exist in this deployment.
 - **`OllamaRuntimeClient.is_local`** — **not derivable from `base_url`.** The obvious-looking
   signal (a `localhost` vs. a cloud hostname) is wrong for this backend: §16.4's live-verified
   reference configuration runs a cloud chat model (`gemma4:31b-cloud`, "proxied through
@@ -1009,9 +1004,8 @@ backend is actually live, there is no "preview a different backend's embedding m
 the way chat-model preview has). Model choices are fetched via the existing
 `GET /settings/runtime-backend/{backend}/models` (unfiltered by embedding-capability, same
 established convention the Chat Model dropdown already uses — Ollama's `/api/tags` doesn't cleanly
-separate chat- from embedding-capable models). Foundry was deliberately left out of the UI for this
-pass even though the backend endpoint is backend-agnostic and already supports it (§16.4) — a
-smaller audience, scoped out rather than built speculatively; oMLX is excluded per the 409 above.
+separate chat- from embedding-capable models). oMLX is the only backend excluded from this UI, per
+the 409 above.
 
 **Live-verified end-to-end (2026-09-05), not just unit-tested** — against the real Ollama daemon,
 real `.env`, and the real dev `localist_memory.db`: set → `nomic-embed-text:latest`
@@ -1034,8 +1028,6 @@ directly (re-embeds episodes on a new model, flags corpus stale on mismatch, cle
 provenance check). 1551 passed / 0 failed full-suite after this change (1540 baseline).
 
 **Open items:**
-- Foundry is not exposed in the Settings UI for this endpoint, though the backend supports it
-  identically to Ollama — pick up if there's demand.
 - No first-run/onboarding surface points a new desktop user at this control the way
   `start_localist.sh`'s interactive prompt does on the CLI/dev build — a fresh packaged install
   still defaults to keyword-only with no in-app nudge to configure Ollama embeddings. Tracked
@@ -1365,3 +1357,16 @@ fixtures, not functional assertions) — left as-is per the original plan's own 
 
 **Test suite:** full backend suite 1599 passed / 0 failed after this pass; frontend
 `svelte-check` 0 errors / 0 warnings.
+
+### §16.19 — Foundry backend retired (2026-09-13)
+
+Azure AI Foundry support removed entirely. `FoundryRuntimeClient`
+(`foundry_runtime_client.py`) deleted; its `_iter_sse_chunks` SSE helper moved verbatim into
+`omlx_runtime_client.py`, its only remaining consumer. `_REGISTRY` in `runtime_factory.py`
+reduced to `omlx`/`ollama`. `Settings.chat_model_foundry` and `Settings.foundry_url` fields
+removed from `main.py`; `LOCALIST_RUNTIME_BACKEND` default changed from `"foundry"` to `"omlx"`.
+Frontend `RUNTIME_BACKENDS`/`RUNTIME_BACKEND_LABELS` (`model.ts`) reduced to two entries, with
+`readStoredBackend()`'s fallback changed to `"omlx"`. `backend/.env.example` updated to match.
+`backend/tests/test_runtime_is_local.py`'s `test_foundry_is_always_local` case removed, along
+with related fixture fields across the runtime-backend-switch/health-gate/embedding-switch test
+files. Full backend suite: 1598 passed / 0 failed after this change.

@@ -13,16 +13,15 @@ Architectural contract
 - Implements BaseRuntimeClient (base_runtime_client.py).
 - No FastAPI imports.  No agent logic.  Pure transport + normalisation.
 - Normalises Ollama's response shapes to the same types that
-  FoundryRuntimeClient / OMLXRuntimeClient return, so the Controller and
-  agents are completely unaware of which backend is active.
+  OMLXRuntimeClient returns, so the Controller and agents are completely
+  unaware of which backend is active.
 - All network/decode errors are caught and re-raised as RuntimeError —
-  the same contract as FoundryRuntimeClient / OMLXRuntimeClient.
+  the same contract as OMLXRuntimeClient.
 
 Ollama integration notes
 --------------------------
 Ollama exposes its own native HTTP API (not OpenAI-compatible), so the
-transport code here is structurally different from Foundry/oMLX in two
-places:
+transport code here is structurally different from oMLX in two places:
 
   - Model listing: GET /api/tags returns {"models": [{"model": "...", ...}]}
     — a "models" list keyed by "model" (plus a duplicate "name" field) —
@@ -30,16 +29,16 @@ places:
   - Streaming: POST /api/chat with "stream": true returns NDJSON (one raw
     JSON object per line), not an SSE "data: {...}" envelope.  Each line
     carries the next content delta at message.content, and the final line
-    is marked "done": true.  This is NOT the same wire format as Foundry's
+    is marked "done": true.  This is NOT the same wire format as oMLX's
     SSE stream, so _iter_sse_chunks is not reusable here — this module
     implements its own line-delimited JSON parser (_iter_ndjson_chunks).
 
 embed() calls Ollama's native POST /api/embed endpoint, which is also
-structurally different from Foundry/oMLX:
+structurally different from oMLX:
 
   - Response shape: {"embeddings": [[...]], ...} — a plural "embeddings"
     key holding a list of vectors (batch-shaped), not the OpenAI-style
-    {"data": [{"embedding": [...]}]} shape Foundry/oMLX use. This client
+    {"data": [{"embedding": [...]}]} shape oMLX uses. This client
     only ever sends a single string as "input", so it extracts index 0
     of that list.
 """

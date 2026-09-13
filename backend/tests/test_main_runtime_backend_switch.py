@@ -31,9 +31,7 @@ def _settings(**overrides):
         chat_model=None,
         chat_model_omlx=None,
         chat_model_ollama=None,
-        chat_model_foundry=None,
         embedding_model="",
-        foundry_url=None,
         omlx_url="http://localhost:8000",
         ollama_url="http://localhost:11434",
         request_timeout=30.0,
@@ -273,17 +271,17 @@ class TestGetRuntimeBackendModels:
         monkeypatch.setattr(
             main, "create_runtime",
             _fake_create_runtime(
-                reachable=True, base_url="http://foundry:9999",
+                reachable=True, base_url="http://ollama:9999",
                 models=["m1", "m2"], chat_model_found=True,
             ),
         )
 
-        resp = test_client.get("/settings/runtime-backend/foundry/models")
+        resp = test_client.get("/settings/runtime-backend/ollama/models")
 
         assert resp.status_code == 200
         assert resp.json() == {
             "reachable":        True,
-            "base_url":         "http://foundry:9999",
+            "base_url":         "http://ollama:9999",
             "models":           ["m1", "m2"],
             "chat_model_found": True,
             "error":            None,
@@ -436,10 +434,10 @@ class TestWriteEnvVar:
         )
         env_path.write_text(original)
 
-        main._write_env_var(tmp_path, "LOCALIST_RUNTIME_BACKEND", "foundry")
+        main._write_env_var(tmp_path, "LOCALIST_RUNTIME_BACKEND", "ollama")
 
         expected = original.replace(
-            "LOCALIST_RUNTIME_BACKEND=omlx\n", "LOCALIST_RUNTIME_BACKEND=foundry\n",
+            "LOCALIST_RUNTIME_BACKEND=omlx\n", "LOCALIST_RUNTIME_BACKEND=ollama\n",
         )
         assert env_path.read_text() == expected
 
@@ -538,7 +536,7 @@ class TestConcurrentSwitchRequestsDoNotBlockEventLoop:
         async def _run():
             return await asyncio.gather(
                 main.switch_runtime_backend(main.RuntimeBackendSwitchRequest(backend="ollama")),
-                main.switch_runtime_backend(main.RuntimeBackendSwitchRequest(backend="foundry")),
+                main.switch_runtime_backend(main.RuntimeBackendSwitchRequest(backend="omlx")),
                 _heartbeat(HOLD_SECONDS * 2.5),
             )
 
@@ -573,7 +571,7 @@ class TestConcurrentSwitchRequestsDoNotBlockEventLoop:
         switch_results = outcome["results"][:2]
 
         assert all(r.reachable for r in switch_results)
-        assert {r.backend for r in switch_results} == {"ollama", "foundry"}
+        assert {r.backend for r in switch_results} == {"ollama", "omlx"}
         assert len(heartbeat_gaps) > 5
         # The busy-blocking bug would stall the heartbeat for ~HOLD_SECONDS
         # straight; a healthy asyncio.Lock keeps every gap near the 10ms tick.

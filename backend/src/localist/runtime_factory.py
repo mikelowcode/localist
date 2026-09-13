@@ -7,8 +7,8 @@ a backend identifier string.
 Layer placement
 ---------------
   main.py (lifespan startup)  →  runtime_factory.py  →  concrete clients
-                                                         (FoundryRuntimeClient,
-                                                          OMLXRuntimeClient, …)
+                                                         (OMLXRuntimeClient,
+                                                          OllamaRuntimeClient, …)
 
 Architectural contract
 ----------------------
@@ -22,13 +22,12 @@ Architectural contract
 
 Usage in main.py
 ----------------
-Replace the direct FoundryRuntimeClient construction in the lifespan
-function with:
+The lifespan function constructs the active runtime via:
 
     from .runtime_factory import create_runtime
 
     runtime = create_runtime(
-        backend  = settings.runtime_backend,   # "foundry" | "omlx"
+        backend  = settings.runtime_backend,   # "omlx" | "ollama"
         settings = settings,
     )
 
@@ -36,11 +35,11 @@ Settings integration
 --------------------
 Add one field to the Settings class in main.py:
 
-    runtime_backend: str = "foundry"   # override with LOCALIST_RUNTIME_BACKEND
+    runtime_backend: str = "omlx"   # override with LOCALIST_RUNTIME_BACKEND
 
-All other settings fields (chat_model, embedding_model, foundry_url, …)
-remain as-is.  The factory reads only the fields relevant to the chosen
-backend, so unused fields are silently ignored.
+All other settings fields (chat_model, embedding_model, …) remain as-is.
+The factory reads only the fields relevant to the chosen backend, so
+unused fields are silently ignored.
 """
 
 from __future__ import annotations
@@ -62,18 +61,6 @@ logger = logging.getLogger(__name__)
 # importing runtime_factory.py never triggers a heavy import chain for a
 # backend that isn't being used.  This keeps startup fast and keeps optional
 # dependencies (e.g. oMLX's SDK) from failing the import if not installed.
-
-def _make_foundry(kwargs: dict[str, Any]) -> BaseRuntimeClient:
-    """Construct a FoundryRuntimeClient from flattened settings kwargs."""
-    from .foundry_runtime_client import FoundryRuntimeClient
-    return FoundryRuntimeClient(
-        chat_model      = kwargs.get("chat_model") or "Phi-4-mini-instruct-generic-gpu:5",
-        embedding_model = kwargs.get("embedding_model", "text-embedding-3-small"),
-        base_url        = kwargs.get("foundry_url"),        # None → auto-resolve from CLI
-        request_timeout = kwargs.get("request_timeout", 30.0),
-        stream_timeout  = kwargs.get("stream_timeout",  60.0),
-    )
-
 
 def _make_omlx(kwargs: dict[str, Any]) -> BaseRuntimeClient:
     """
@@ -110,7 +97,6 @@ def _make_ollama(kwargs: dict[str, Any]) -> BaseRuntimeClient:
 # Registry maps backend name → factory function.
 # All entries must return a BaseRuntimeClient-conforming object.
 _REGISTRY: dict[str, Any] = {
-    "foundry": _make_foundry,
     "omlx":    _make_omlx,
     "ollama":  _make_ollama,
 }
@@ -131,7 +117,7 @@ def create_runtime(
     ----------
     backend:
         Backend identifier string.  Case-insensitive.
-        Supported values: "foundry", "omlx".
+        Supported values: "omlx", "ollama".
         New backends are added by inserting an entry into _REGISTRY.
 
     **kwargs:
@@ -139,16 +125,12 @@ def create_runtime(
         The factory function for each backend extracts only the keys it
         needs; unrecognised keys are silently ignored.
 
-        Common keys (used by all backends):
+        Common keys (used by both backends):
             chat_model (str)       — model ID for chat completions
             embedding_model (str)  — model ID for embeddings; honored by
-                                      all three backends ("foundry",
-                                      "omlx", "ollama")
+                                      both backends ("omlx", "ollama")
             request_timeout (float)
             stream_timeout (float)
-
-        Foundry-specific keys:
-            foundry_url (str | None) — override auto-resolved base URL
 
         oMLX-specific keys:
             omlx_url (str) — base URL of the oMLX server
@@ -170,7 +152,6 @@ def create_runtime(
         backend         = settings.runtime_backend,
         chat_model      = settings.chat_model,
         embedding_model = settings.embedding_model,
-        foundry_url     = settings.foundry_url,
         omlx_url        = settings.omlx_url,
         request_timeout = settings.request_timeout,
         stream_timeout  = settings.stream_timeout,

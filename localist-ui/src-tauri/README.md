@@ -67,6 +67,6 @@ CORS errors (confirms `main.py`'s `tauri://localhost` origin fix), a
 screenshot confirmed the real frontend renders correctly (not blank), and
 quitting via AppleScript reliably leaves zero orphaned processes. Not yet
 covered: first-run config UX (Phase D — a fresh `.app` still defaults to
-`foundry`, unreachable without setup, same as source-tree today), code
+`omlx`, unreachable without setup, same as source-tree today), code
 signing/notarization (Phase E), and wiring `tauri build` to trigger the
 PyInstaller build itself rather than assuming it's already done.

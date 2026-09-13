@@ -84,12 +84,10 @@ Environment / configuration
 All tuneable values are in the ``Settings`` class (pydantic-settings).  They
 can be overridden via environment variables or a .env file:
 
-  LOCALIST_RUNTIME_BACKEND             Runtime backend: "foundry" | "omlx" (default "foundry")
+  LOCALIST_RUNTIME_BACKEND             Runtime backend: "omlx" | "ollama" (default "omlx")
   LOCALIST_CHAT_MODEL                  Chat model ID override (wins over any per-backend pin below)
   LOCALIST_CHAT_MODEL_OMLX             Per-backend chat model pin for "omlx"
   LOCALIST_CHAT_MODEL_OLLAMA           Per-backend chat model pin for "ollama"
-  LOCALIST_CHAT_MODEL_FOUNDRY          Per-backend chat model pin for "foundry"
-  LOCALIST_FOUNDRY_URL                 Override auto-resolved Foundry base URL (foundry only)
   LOCALIST_OMLX_URL                    oMLX server base URL (omlx only, default http://localhost:8000)
   LOCALIST_OLLAMA_URL                  Ollama server base URL (ollama only, default http://localhost:11434)
   LOCALIST_LOG_LEVEL                   Root log level (default INFO)
@@ -103,7 +101,7 @@ can be overridden via environment variables or a .env file:
   LOCALIST_REQUEST_TIMEOUT             Non-streaming timeout in seconds (float)
   LOCALIST_MEMORY_DB                   Absolute path to the SQLite memory DB file.
                                        Defaults to <project_root>/localist_memory.db
-  LOCALIST_EMBEDDING_MODEL             Runtime-backend embedding model ID (foundry/ollama
+  LOCALIST_EMBEDDING_MODEL             Runtime-backend embedding model ID (ollama
                                        only; omlx does not yet wire this through). Empty
                                        string (default) = not configured, MemoryManager
                                        runs in keyword-only (BM25) retrieval mode.
@@ -177,27 +175,23 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="LOCALIST_", env_file=".env", extra="ignore")
 
     # Runtime backend selection
-    runtime_backend: str = "foundry"
+    runtime_backend: str = "omlx"
 
     # Model ID — chat only. Embeddings are handled separately (see
     # embedding_model below); when embedding_model is unset or not found by
     # the active runtime backend, MemoryManager runs keyword-only (BM25).
     chat_model:       str | None = None
 
-    # Per-backend chat-model pins (LOCALIST_CHAT_MODEL_OMLX / _OLLAMA / _FOUNDRY).
+    # Per-backend chat-model pins (LOCALIST_CHAT_MODEL_OMLX / _OLLAMA).
     # Used by _resolve_chat_model() when chat_model above is unset; lets a
     # live runtime-backend switch remember which model to use per backend
     # instead of carrying one backend's model id into another's client.
     chat_model_omlx:    str | None = None
     chat_model_ollama:  str | None = None
-    chat_model_foundry: str | None = None
 
-    # Runtime-backend embedding model ID (foundry/ollama only; empty string =
+    # Runtime-backend embedding model ID (ollama only; empty string =
     # not configured, MemoryManager runs keyword-only (BM25)).
     embedding_model:  str = ""
-
-    # Foundry network (foundry backend only)
-    foundry_url:      str | None = None
 
     # oMLX network (omlx backend only)
     omlx_url:         str = "http://localhost:8000"
@@ -410,13 +404,11 @@ _runtime_switch_lock = asyncio.Lock()
 _CHAT_MODEL_SETTINGS_FIELD: dict[str, str] = {
     "omlx":    "chat_model_omlx",
     "ollama":  "chat_model_ollama",
-    "foundry": "chat_model_foundry",
 }
 
 _CHAT_MODEL_ENV_KEY: dict[str, str] = {
     "omlx":    "LOCALIST_CHAT_MODEL_OMLX",
     "ollama":  "LOCALIST_CHAT_MODEL_OLLAMA",
-    "foundry": "LOCALIST_CHAT_MODEL_FOUNDRY",
 }
 
 
@@ -509,7 +501,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         backend         = settings.runtime_backend,
         chat_model      = _resolve_chat_model(settings, settings.runtime_backend),
         embedding_model = settings.embedding_model,
-        foundry_url     = settings.foundry_url,
         omlx_url        = settings.omlx_url,
         ollama_url      = settings.ollama_url,
         request_timeout = settings.request_timeout,
@@ -1603,7 +1594,6 @@ def _create_and_check_backend(settings: Settings, backend: str) -> tuple[BaseRun
         backend         = backend,
         chat_model      = chat_model,
         embedding_model = settings.embedding_model,
-        foundry_url     = settings.foundry_url,
         omlx_url        = settings.omlx_url,
         ollama_url      = settings.ollama_url,
         request_timeout = settings.request_timeout,
@@ -1628,7 +1618,6 @@ def _create_and_check_embedding_candidate(
         backend         = backend,
         chat_model      = chat_model,
         embedding_model = embedding_model,
-        foundry_url     = settings.foundry_url,
         omlx_url        = settings.omlx_url,
         ollama_url      = settings.ollama_url,
         request_timeout = settings.request_timeout,
@@ -1858,7 +1847,7 @@ async def set_embedding_model(request: EmbeddingModelRequest) -> EmbeddingModelR
             detail      = (
                 "oMLX does not support a configurable embedding model yet "
                 "(docs/architecture/16-runtime-backend-layer.md §16.4) — "
-                "switch to Ollama or Foundry first."
+                "switch to Ollama first."
             ),
         )
 
