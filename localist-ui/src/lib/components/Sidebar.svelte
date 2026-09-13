@@ -24,6 +24,18 @@
   } from '$lib/stores/files';
   import { selectedFile, selectFile, closeFile } from '$lib/stores/fileSelection';
   import { OCR_EXTENSIONS, extOf } from '$lib/utils/ocr';
+  import { tipIndex, tipsDismissed, cycleTip, dismissTips } from '$lib/stores/tips';
+  import { tips, type Tip } from '$lib/data/tips';
+
+  $: currentTip = tips[$tipIndex];
+
+  function tipKicker(tip: Tip): string {
+    if (tip.category === 'slash-command') return 'Try';
+    if (tip.category === 'ui-action') return 'Click';
+    return 'Say';
+  }
+
+  let showAllTips = false;
 
   $: active = $page.url.pathname;
   $: isChatActive  = active.startsWith('/conversation');
@@ -608,6 +620,87 @@
     </ul>
   </nav>
 
+  {#if !$tipsDismissed}
+    <div class="tips-panel">
+      <button
+        type="button"
+        class="tips-body"
+        on:click={cycleTip}
+        title="Click for another tip"
+      >
+        <span class="tips-kicker">
+          {tipKicker(currentTip)}
+        </span>
+        <span class="tips-example">{currentTip.example}</span>
+      </button>
+      <button
+        type="button"
+        class="tips-view-all"
+        on:click={() => (showAllTips = true)}
+        title="View all tips"
+        aria-label="View all tips"
+      >
+        ⋯
+      </button>
+      <button
+        type="button"
+        class="tips-dismiss"
+        on:click={dismissTips}
+        title="Hide tips"
+        aria-label="Hide tips"
+      >
+        ×
+      </button>
+    </div>
+  {/if}
+
+  {#if showAllTips}
+    <!-- svelte-ignore a11y-no-noninteractive-tabindex -->
+    <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
+    <div
+      class="tips-modal-backdrop"
+      role="button"
+      tabindex="0"
+      aria-label="Close tips"
+      on:click={() => (showAllTips = false)}
+      on:keydown={(e) => e.key === 'Escape' && (showAllTips = false)}
+    >
+      <!-- svelte-ignore a11y-click-events-have-key-events -->
+      <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
+      <div
+        class="tips-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="All tips"
+        on:click|stopPropagation
+      >
+        <div class="tips-modal-header">
+          <span class="tips-modal-title">All tips</span>
+          <button
+            type="button"
+            class="tips-dismiss"
+            on:click={() => (showAllTips = false)}
+            title="Close"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+        <ul class="tips-modal-list">
+          {#each tips as tip (tip.id)}
+            <li class="tips-modal-item">
+              <span class="tips-kicker">
+                {tipKicker(tip)}
+              </span>
+              <span class="tips-example">{tip.example}</span>
+              <span class="tips-modal-desc text-tertiary">{tip.description}</span>
+            </li>
+          {/each}
+        </ul>
+      </div>
+    </div>
+  {/if}
+
   <!-- Footer: version + theme toggle -->
   <div class="sidebar-footer">
     <span class="text-tertiary sf-version">v0.2.0</span>
@@ -1011,6 +1104,137 @@
   }
   .spinner-sm.accent { border-color: currentColor; border-top-color: transparent; }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Tips panel */
+  .tips-panel {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: var(--sp-2) var(--sp-4);
+    flex-shrink: 0;
+  }
+
+  .tips-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding: 6px 8px;
+    border-radius: var(--radius);
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    text-align: left;
+    cursor: pointer;
+    transition: color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
+  }
+
+  .tips-body:hover {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+  }
+
+  .tips-kicker {
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-tertiary);
+  }
+
+  .tips-example {
+    font-size: 12px;
+    font-family: var(--font-mono);
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .tips-view-all,
+  .tips-dismiss {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius);
+    background: none;
+    border: none;
+    color: var(--text-tertiary);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    transition: color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
+  }
+
+  .tips-view-all:hover,
+  .tips-dismiss:hover {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+  }
+
+  /* Tips modal (view-all) */
+  .tips-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+    background: rgba(0, 0, 0, 0.35);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .tips-modal {
+    width: min(480px, 90vw);
+    max-height: 70vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-md, 0 4px 12px rgba(0, 0, 0, 0.25));
+    overflow: hidden;
+  }
+
+  .tips-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: var(--sp-3) var(--sp-4);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .tips-modal-title {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+
+  .tips-modal-list {
+    overflow-y: auto;
+    padding: var(--sp-2);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .tips-modal-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 10px;
+    border-radius: var(--radius);
+  }
+
+  .tips-modal-item:hover {
+    background: var(--bg-hover);
+  }
+
+  .tips-modal-desc {
+    font-size: 11px;
+  }
 
   /* Footer */
   .sidebar-footer {
