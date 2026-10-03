@@ -36,6 +36,35 @@ plain copy, and one category lives entirely outside the repo directory:
    not bring this over; it needs its own explicit step if the user wants
    that history on the new machine (see §25.5).
 
+## 25.1a The project directory can be renamed on the new machine
+
+Confirmed by grepping the whole repo for the current directory name
+(`lora-app-demo`): nothing functional depends on it. `paths.py`'s
+`get_backend_root()`/`get_resource_root()` resolve from the file's own
+location (`Path(__file__).resolve().parent...`) or from `sys.frozen`/
+`sys._MEIPASS` when packaged — never from an assumed parent folder name.
+`start_localist.sh`, `tauri.conf.json`'s `bundle.resources` paths, and
+both `pyproject.toml`/`package.json` configs are the same way: relative
+to their own location, not the repo's directory name. The project can be
+renamed to anything (e.g. `localist-app`) when set up on the new machine,
+with no functional breakage.
+
+What *does* reference the current name, all cosmetic (safe to ignore, not
+worth fixing up on rename):
+
+- Comment headers in `PLAN_retire_mlx_embeddinggemma.md`/
+  `PLAN_semantic_gating_calibration.md` and one docstring example in
+  `memory_manager.py` — descriptive text, not executed logic.
+- Usage-example comments in several `diagnostics/*.py` scripts
+  (`# cd /Users/.../lora-app-demo`) — instructional text inside a comment
+  block, not a path the script actually uses at runtime.
+- `.claude/settings.local.json` — one literal absolute-path permission
+  rule baked in by Claude Code itself. This is local tooling
+  configuration, not project code; it will simply go stale/unused on a
+  renamed or relocated directory rather than break anything. No action
+  needed — Claude Code regenerates entries like this as needed on the new
+  machine.
+
 Also outside the repo: **Ollama** itself (a separate macOS app) and its
 model weights (`~/.ollama`, not project-scoped). Re-pulling cloud-model
 references doesn't re-download weights, but the Ollama daemon must still
