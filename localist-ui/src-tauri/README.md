@@ -104,3 +104,32 @@ hdiutil create -volname "Localist" -srcfolder "$APP" -ov -format UDZO "$DMG"
 This is automated as a build step in `.github/workflows/release-macos.yml`
 ("Re-sign .app and rebuild DMG") — a local `tauri build` still needs this
 run manually afterward, same as before CI picked it up.
+
+## Releasing a new version
+
+No auto-update path exists yet — every release is a fresh manual
+download/install for users (drag to Applications, `xattr -cr`, relaunch).
+To cut a new one:
+
+1. Bump the version number in **both** `localist-ui/package.json` and
+   `localist-ui/src-tauri/tauri.conf.json` (`"version"` field in each —
+   they must match).
+2. Commit that bump.
+3. Tag the commit and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+   This is what triggers `.github/workflows/release-macos.yml` — pushing
+   the branch alone does not.
+4. The workflow builds the sidecars, builds + re-signs the `.app`/`.dmg`,
+   and creates (or updates) a **draft** release for that tag. It does not
+   publish automatically.
+5. Review the draft on GitHub (download and test the DMG if in doubt),
+   then click **Publish release** when satisfied.
+
+Re-running the workflow against a tag that already has a draft release
+updates that draft's assets but does **not** overwrite its title/body —
+confirmed live: a workflow body-text edit landed in the build but the
+existing draft kept its old text until the draft was deleted
+(`gh release delete vX.Y.Z --yes --cleanup-tag=false`, keeping the tag)
+and the workflow re-run (`gh workflow run release-macos.yml --ref vX.Y.Z`)
+to recreate it from scratch. Only matters if you edit the workflow's
+release body/notes between runs on the same tag — a plain rebuild (new
+commit, new tag) is unaffected.
