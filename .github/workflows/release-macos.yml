@@ -65,6 +65,26 @@ jobs:
         working-directory: localist-ui
         run: npm run tauri:build
 
+      - name: Re-sign .app and rebuild DMG
+        # Tauri's bundler ad-hoc-signs Localist.app before bundle.resources
+        # (the sidecar folders) are copied in, which invalidates the
+        # signature's resource seal (`codesign --verify` fails: "code has
+        # no resources but signature indicates they must be present").
+        # Confirmed live: a DMG built with that broken signature produces
+        # macOS's "is damaged and can't be opened" error on a real
+        # quarantined download — not the normal, xattr-cr-fixable
+        # "unidentified developer" Gatekeeper gate. Re-signing ad-hoc
+        # after resources are in place, then rebuilding the DMG from the
+        # corrected .app, fixes this (verified: codesign --verify passes,
+        # and the fix survives a simulated quarantined copy).
+        run: |
+          APP=$(find localist-ui/src-tauri/target/release/bundle/macos -name "*.app" -maxdepth 1 | head -1)
+          DMG=$(find localist-ui/src-tauri/target/release/bundle/dmg -name "*.dmg" -maxdepth 1 | head -1)
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=4 "$APP"
+          rm -f "$DMG"
+          hdiutil create -volname "Localist" -srcfolder "$APP" -ov -format UDZO "$DMG"
+
       - name: Locate DMG
         id: dmg
         run: |
@@ -88,10 +108,14 @@ jobs:
           generate_release_notes: true
           body: |
             Unsigned build — no Apple Developer ID certificate is used for this project.
-            After downloading, macOS Gatekeeper will block a plain double-click. Either:
+            After downloading and moving the app to Applications, run this once from Terminal:
 
-            - Right-click (or Control-click) the app → **Open**, then confirm **Open** in the dialog, or
-            - Run `xattr -cr /Applications/Localist.app` from Terminal after moving it to Applications.
+            ```
+            xattr -cr /Applications/Localist.app
+            ```
+
+            Then launch normally. Right-click → Open does **not** bypass this on current macOS —
+            it will still say "is damaged and can't be opened"; `xattr -cr` is the actual fix.
 
             See the repo README's "Native macOS app" section for details.
         env:

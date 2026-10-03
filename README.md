@@ -95,16 +95,18 @@ keyword-only retrieval are unaffected either way, on both source and packaged in
 runtime backend, same as an unconfigured source install.
 
 **Unsigned build — Gatekeeper will flag it.** There's no Apple Developer ID certificate behind
-this build, so macOS treats `Localist.app`/the `.dmg` as from an unidentified developer. A plain
-double-click refuses to open it. To run it anyway, after dragging `Localist.app` to
-Applications (or wherever you keep it):
+this build, so macOS treats `Localist.app`/the `.dmg` as from an unidentified developer. After
+dragging `Localist.app` to Applications (or wherever you keep it), run this once from Terminal:
 
-- **Right-click (or Control-click) → Open**, then confirm "Open" in the dialog that follows — this
-  only needs to be done once per copy of the app; normal double-click launches work after that, or
-- From Terminal: `xattr -cr /Applications/Localist.app` (strips the quarantine flag Gatekeeper
-  checks), then launch normally.
+```bash
+xattr -cr /Applications/Localist.app
+```
 
-This is expected for an unsigned OSS build, not a sign of a broken download.
+Then launch normally. This strips the quarantine flag macOS attaches to anything downloaded from
+the internet; once removed, Gatekeeper no longer blocks the launch. On current macOS (Sequoia and
+later), **right-click → Open does not bypass this** the way it used to on older versions — it will
+still report "is damaged and can't be opened," which looks alarming but isn't a sign of a broken
+download; `xattr -cr` is the fix. This is expected for an unsigned OSS build.
 
 ## Configuration
 

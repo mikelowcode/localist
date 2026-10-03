@@ -75,5 +75,32 @@ Code signing/notarization (Phase E) is a deliberate scope decision, not a
 gap: no Apple Developer ID certificate is available for this project, so
 the `.dmg`/`.app` ship unsigned. Gatekeeper flags them on first launch —
 documented for end users in the root `README.md`'s "Native macOS app"
-section (right-click → Open, or `xattr -cr`). `tauri.conf.json`'s `bundle`
-block has no signing identity or entitlements config for the same reason.
+section (`xattr -cr`; right-click → Open does not bypass this on current
+macOS). `tauri.conf.json`'s `bundle` block has no signing identity or
+entitlements config for the same reason.
+
+## A real bug this caught: `tauri build`'s ad-hoc signature breaks once resources are added
+
+`tauri build` ad-hoc-signs `Localist.app` before `bundle.resources`
+(the sidecar folders) are copied in, which invalidates the signature's
+resource seal — `codesign --verify --deep --strict` fails with "code has
+no resources but signature indicates they must be present". Live-tested:
+a `.dmg` built from that broken signature triggers macOS's **"is damaged
+and can't be opened"** error on a real quarantined download — the harsher
+failure mode current macOS uses for an invalid signature, distinct from
+(and not fixable by) the normal "unidentified developer" gate that
+`xattr -cr` resolves. The fix is to re-sign ad-hoc *after* resources are
+in place and rebuild the DMG from the corrected `.app`:
+
+```bash
+APP=target/release/bundle/macos/Localist.app
+DMG=target/release/bundle/dmg/Localist_0.1.0_aarch64.dmg
+codesign --force --deep --sign - "$APP"
+codesign --verify --deep --strict --verbose=4 "$APP"   # should report "valid on disk"
+rm -f "$DMG"
+hdiutil create -volname "Localist" -srcfolder "$APP" -ov -format UDZO "$DMG"
+```
+
+This is automated as a build step in `.github/workflows/release-macos.yml`
+("Re-sign .app and rebuild DMG") — a local `tauri build` still needs this
+run manually afterward, same as before CI picked it up.
