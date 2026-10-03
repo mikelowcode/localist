@@ -1,0 +1,92 @@
+name: Release macOS app
+
+# Builds the two PyInstaller sidecars (localist-backend, localist-mcp) and
+# the Tauri .app/.dmg, then attaches the DMG to a GitHub Release. Runs on
+# an Apple Silicon runner to match the arm64-only sidecar builds — see
+# backend/packaging/README.md and localist-ui/src-tauri/README.md for what
+# this automates locally.
+#
+# Unsigned build (no Apple Developer ID cert available) — see README.md's
+# "Native macOS app" section for the Gatekeeper workaround end users need.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: macos-14 # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build PyInstaller sidecars (extras-free)
+        working-directory: backend
+        run: |
+          python3 -m venv .venv-packaging
+          source .venv-packaging/bin/activate
+          pip install -e ".[dev,packaging]"
+          cd packaging
+          pyinstaller -y localist-backend.spec
+          pyinstaller -y localist-mcp.spec
+
+      - name: Smoke-test sidecars
+        run: |
+          backend/packaging/dist/localist-backend/localist-backend &
+          BPID=$!
+          sleep 6
+          kill -0 $BPID
+          kill $BPID
+          backend/packaging/dist/localist-mcp/localist-mcp &
+          MPID=$!
+          sleep 6
+          kill -0 $MPID
+          kill $MPID
+
+      - name: Install frontend dependencies
+        working-directory: localist-ui
+        run: npm ci
+
+      - name: Build Tauri app (.app + .dmg)
+        working-directory: localist-ui
+        run: npm run tauri:build
+
+      - name: Locate DMG
+        id: dmg
+        run: |
+          DMG=$(find localist-ui/src-tauri/target/release/bundle/dmg -name "*.dmg" -maxdepth 1 | head -1)
+          echo "path=$DMG" >> "$GITHUB_OUTPUT"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Localist-macos-dmg
+          path: ${{ steps.dmg.outputs.path }}
+
+      - name: Attach DMG to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.dmg.outputs.path }}
+          generate_release_notes: true
+          body: |
+            Unsigned build — no Apple Developer ID certificate is used for this project.
+            After downloading, macOS Gatekeeper will block a plain double-click. Either:
+
+            - Right-click (or Control-click) the app → **Open**, then confirm **Open** in the dialog, or
+            - Run `xattr -cr /Applications/Localist.app` from Terminal after moving it to Applications.
+
+            See the repo README's "Native macOS app" section for details.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

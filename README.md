@@ -91,8 +91,20 @@ shell that spawns two PyInstaller-frozen, base-only builds of the backend and lo
 Vision/pypdfium2 bundled, so OCR isn't available from the packaged app — Ollama-served embeddings and
 keyword-only retrieval are unaffected either way, on both source and packaged installs). See
 `backend/packaging/README.md` (build the two frozen services) then `localist-ui/src-tauri/README.md`
-(build the `.app`). No first-run config UX or code signing yet — a fresh build defaults to the
-unreachable `omlx` runtime backend, same as an unconfigured source install.
+(build the `.app`). No first-run config UX yet — a fresh build defaults to the unreachable `omlx`
+runtime backend, same as an unconfigured source install.
+
+**Unsigned build — Gatekeeper will flag it.** There's no Apple Developer ID certificate behind
+this build, so macOS treats `Localist.app`/the `.dmg` as from an unidentified developer. A plain
+double-click refuses to open it. To run it anyway, after dragging `Localist.app` to
+Applications (or wherever you keep it):
+
+- **Right-click (or Control-click) → Open**, then confirm "Open" in the dialog that follows — this
+  only needs to be done once per copy of the app; normal double-click launches work after that, or
+- From Terminal: `xattr -cr /Applications/Localist.app` (strips the quarantine flag Gatekeeper
+  checks), then launch normally.
+
+This is expected for an unsigned OSS build, not a sign of a broken download.
 
 ## Configuration
 

@@ -67,6 +67,13 @@ CORS errors (confirms `main.py`'s `tauri://localhost` origin fix), a
 screenshot confirmed the real frontend renders correctly (not blank), and
 quitting via AppleScript reliably leaves zero orphaned processes. Not yet
 covered: first-run config UX (Phase D — a fresh `.app` still defaults to
-`omlx`, unreachable without setup, same as source-tree today), code
-signing/notarization (Phase E), and wiring `tauri build` to trigger the
-PyInstaller build itself rather than assuming it's already done.
+`omlx`, unreachable without setup, same as source-tree today), and wiring
+`tauri build` to trigger the PyInstaller build itself rather than assuming
+it's already done.
+
+Code signing/notarization (Phase E) is a deliberate scope decision, not a
+gap: no Apple Developer ID certificate is available for this project, so
+the `.dmg`/`.app` ship unsigned. Gatekeeper flags them on first launch —
+documented for end users in the root `README.md`'s "Native macOS app"
+section (right-click → Open, or `xattr -cr`). `tauri.conf.json`'s `bundle`
+block has no signing identity or entitlements config for the same reason.
