@@ -15,6 +15,9 @@ on:
       - "v*"
   workflow_dispatch: {}
 
+permissions:
+  contents: write # needed to create the draft release and upload the DMG
+
 jobs:
   build:
     runs-on: macos-14 # Apple Silicon (arm64)
