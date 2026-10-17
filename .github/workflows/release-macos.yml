@@ -99,7 +99,25 @@ jobs:
           codesign --force --deep --sign - "$APP"
           codesign --verify --deep --strict --verbose=4 "$APP"
           rm -f "$DMG"
-          hdiutil create -volname "Localist" -srcfolder "$APP" -ov -format UDZO "$DMG"
+          # hdiutil intermittently fails with "Resource busy" on GitHub's
+          # macOS runners (a stale mount from Tauri's own DMG step, or
+          # Spotlight/XProtect still scanning the fresh .app) — seen on the
+          # first v0.1.1 run (2026-10-17). Detach any leftover
+          # "Localist" volumes and retry with backoff instead of failing.
+          for attempt in 1 2 3 4 5; do
+            for vol in /Volumes/Localist*; do
+              [ -d "$vol" ] && hdiutil detach "$vol" -force || true
+            done
+            if hdiutil create -volname "Localist" -srcfolder "$APP" -ov -format UDZO "$DMG"; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::hdiutil create failed after $attempt attempts"
+              exit 1
+            fi
+            echo "hdiutil create failed (attempt $attempt) — retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
 
       - name: Locate DMG
         id: dmg
