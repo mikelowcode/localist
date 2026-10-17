@@ -594,3 +594,298 @@ class TestResolveChatModel:
     def test_none_when_neither_is_set(self):
         settings = _settings(chat_model=None, chat_model_ollama=None)
         assert main._resolve_chat_model(settings, "ollama") is None
+
+
+# ---------------------------------------------------------------------------
+# First-run chat-model auto-selection (_pick_default_chat_model /
+# _recover_missing_chat_model, wired into lifespan() and
+# POST /settings/runtime-backend)
+# ---------------------------------------------------------------------------
+
+def _model_aware_create_runtime(models, calls=None):
+    """
+    Like _fake_create_runtime, but chat_model_found reflects whether the
+    chat_model actually passed to create_runtime is in `models` — needed to
+    observe the rebuild after an auto-selection. Records each call's
+    chat_model in `calls` if given.
+    """
+    def _create(backend, **kwargs):
+        chat_model = kwargs.get("chat_model")
+        if calls is not None:
+            calls.append(chat_model)
+        client = MagicMock(name=f"fake-runtime-{backend}-{chat_model}")
+        client.health_check.return_value = {
+            "reachable":         True,
+            "base_url":          "http://fake",
+            "models":            models,
+            "chat_model_found":  chat_model in models,
+            "embed_model_found": None,
+            "error":             None,
+        }
+        return client
+
+    return _create
+
+
+class TestPickDefaultChatModel:
+    def test_skips_utility_and_embedding_entries(self):
+        models = ["MarkItDown", "nomic-embed-text:latest", "bge-reranker", "qwen3-8b-4bit"]
+        assert main._pick_default_chat_model(models) == "qwen3-8b-4bit"
+
+    def test_prefers_local_over_ollama_cloud(self):
+        models = ["gemma4:31b-cloud", "gpt-oss:120b:cloud", "llama3.2:3b"]
+        assert main._pick_default_chat_model(models) == "llama3.2:3b"
+
+    def test_falls_back_to_cloud_when_nothing_local(self):
+        assert main._pick_default_chat_model(["gemma4:31b-cloud"]) == "gemma4:31b-cloud"
+
+    def test_none_when_nothing_qualifies(self):
+        assert main._pick_default_chat_model([]) is None
+        assert main._pick_default_chat_model(["MarkItDown", "nomic-embed-text"]) is None
+
+
+class TestRecoverMissingChatModel:
+    def _health(self, *, reachable=True, found=False, models=None):
+        return {
+            "reachable":        reachable,
+            "chat_model_found": found,
+            "models":           models if models is not None else ["MarkItDown", "qwen3-8b-4bit"],
+        }
+
+    def test_unconfigured_backend_picks_pins_and_rebuilds(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(main, "_PROJECT_ROOT", tmp_path)
+        calls: list = []
+        monkeypatch.setattr(
+            main, "create_runtime",
+            _model_aware_create_runtime(["MarkItDown", "qwen3-8b-4bit"], calls),
+        )
+        settings = _settings()
+        original = MagicMock(name="original")
+
+        runtime, health = main._recover_missing_chat_model(
+            settings, "omlx", original, self._health(),
+        )
+
+        assert settings.chat_model_omlx == "qwen3-8b-4bit"
+        assert settings.chat_model_ollama is None
+        assert "LOCALIST_CHAT_MODEL_OMLX=qwen3-8b-4bit" in (tmp_path / ".env").read_text()
+        assert runtime is not original
+        assert calls == ["qwen3-8b-4bit"]
+        assert health["chat_model_found"] is True
+
+    def test_explicit_pin_is_never_replaced(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(main, "_PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(
+            main, "create_runtime",
+            MagicMock(side_effect=AssertionError("create_runtime must not be called")),
+        )
+        settings = _settings(chat_model_omlx="my-chosen-model")
+        original = MagicMock(name="original")
+        health_in = self._health()
+
+        runtime, health = main._recover_missing_chat_model(
+            settings, "omlx", original, health_in,
+        )
+
+        assert runtime is original and health is health_in
+        assert settings.chat_model_omlx == "my-chosen-model"
+        assert not (tmp_path / ".env").exists()
+
+    def test_explicit_global_override_is_never_replaced(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(main, "_PROJECT_ROOT", tmp_path)
+        settings = _settings(chat_model="gemma4:31b-cloud")
+        original = MagicMock(name="original")
+
+        runtime, _health = main._recover_missing_chat_model(
+            settings, "omlx", original, self._health(),
+        )
+
+        assert runtime is original
+        assert settings.chat_model_omlx is None
+        assert not (tmp_path / ".env").exists()
+
+    @pytest.mark.parametrize("health_kwargs", [
+        dict(reachable=False),
+        dict(found=True),
+        dict(models=["MarkItDown"]),
+    ])
+    def test_no_op_cases(self, monkeypatch, tmp_path, health_kwargs):
+        monkeypatch.setattr(main, "_PROJECT_ROOT", tmp_path)
+        settings = _settings()
+        original = MagicMock(name="original")
+
+        runtime, _health = main._recover_missing_chat_model(
+            settings, "omlx", original, self._health(**health_kwargs),
+        )
+
+        assert runtime is original
+        assert settings.chat_model_omlx is None
+        assert not (tmp_path / ".env").exists()
+
+
+class TestSwitchAutopicksUnconfiguredChatModel:
+    def test_switch_to_unconfigured_backend_autopicks(self, client, monkeypatch, tmp_path):
+        test_client, initial_runtime = client
+        (tmp_path / ".env").write_text("LOCALIST_RUNTIME_BACKEND=omlx\n")
+        monkeypatch.setattr(
+            main, "create_runtime",
+            _model_aware_create_runtime(["nomic-embed-text:latest", "llama3.2:3b"]),
+        )
+
+        resp = test_client.post("/settings/runtime-backend", json={"backend": "ollama"})
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["chat_model"] == "llama3.2:3b"
+        assert body["chat_model_found"] is True
+        assert main._state.settings.chat_model_ollama == "llama3.2:3b"
+        env = (tmp_path / ".env").read_text()
+        assert "LOCALIST_CHAT_MODEL_OLLAMA=llama3.2:3b" in env
+        assert "LOCALIST_RUNTIME_BACKEND=ollama" in env
+
+
+# ---------------------------------------------------------------------------
+# Stale global override demotion (_plan_chat_model_recovery /
+# _demote_global_chat_model_override) and GET /health's poll-time recovery
+# (_recover_chat_model_on_poll)
+# ---------------------------------------------------------------------------
+
+class TestPlanChatModelRecovery:
+    def test_stale_override_with_served_pin_is_demoted(self):
+        settings = _settings(chat_model="gemma4:31b-cloud", chat_model_omlx="gemma-4-e4b-it-4bit")
+        plan = main._plan_chat_model_recovery(settings, "omlx", ["gemma-4-e4b-it-4bit"])
+        assert plan == ("demote-override", "gemma-4-e4b-it-4bit")
+
+    def test_stale_override_with_unserved_pin_is_unrecoverable(self):
+        settings = _settings(chat_model="gemma4:31b-cloud", chat_model_omlx="other-model")
+        assert main._plan_chat_model_recovery(settings, "omlx", ["gemma-4-e4b-it-4bit"]) is None
+
+    def test_stale_override_without_pin_is_unrecoverable(self):
+        settings = _settings(chat_model="gemma4:31b-cloud")
+        assert main._plan_chat_model_recovery(settings, "omlx", ["gemma-4-e4b-it-4bit"]) is None
+
+    def test_unserved_pin_is_unrecoverable(self):
+        settings = _settings(chat_model_omlx="other-model")
+        assert main._plan_chat_model_recovery(settings, "omlx", ["gemma-4-e4b-it-4bit"]) is None
+
+    def test_unconfigured_autopicks(self):
+        plan = main._plan_chat_model_recovery(_settings(), "omlx", ["MarkItDown", "qwen3-8b-4bit"])
+        assert plan == ("autopick", "qwen3-8b-4bit")
+
+
+class TestDemoteGlobalChatModelOverride:
+    def test_fills_unset_pins_keeps_set_pins_and_clears_override(self):
+        settings = _settings(chat_model="gemma4:31b-cloud", chat_model_omlx="gemma-4-e4b-it-4bit")
+
+        main._demote_global_chat_model_override(settings)
+
+        assert settings.chat_model is None
+        assert settings.chat_model_omlx == "gemma-4-e4b-it-4bit"
+        # Ollama keeps resolving to exactly what the override gave it.
+        assert main._resolve_chat_model(settings, "ollama") == "gemma4:31b-cloud"
+
+
+class TestRecoverMissingChatModelDemotesStaleOverride:
+    def test_demotes_in_process_only_and_rebuilds_with_pin(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(main, "_PROJECT_ROOT", tmp_path)
+        env_path = tmp_path / ".env"
+        original_env = (
+            "LOCALIST_CHAT_MODEL=gemma4:31b-cloud\n"
+            "LOCALIST_CHAT_MODEL_OMLX=gemma-4-e4b-it-4bit\n"
+        )
+        env_path.write_text(original_env)
+        calls: list = []
+        monkeypatch.setattr(
+            main, "create_runtime",
+            _model_aware_create_runtime(["gemma-4-e4b-it-4bit", "MarkItDown"], calls),
+        )
+        settings = _settings(chat_model="gemma4:31b-cloud", chat_model_omlx="gemma-4-e4b-it-4bit")
+        original = MagicMock(name="original")
+        health_in = {
+            "reachable": True, "chat_model_found": False,
+            "models": ["gemma-4-e4b-it-4bit", "MarkItDown"],
+        }
+
+        runtime, health = main._recover_missing_chat_model(settings, "omlx", original, health_in)
+
+        assert runtime is not original
+        assert calls == ["gemma-4-e4b-it-4bit"]
+        assert health["chat_model_found"] is True
+        assert settings.chat_model is None
+        assert settings.chat_model_ollama == "gemma4:31b-cloud"
+        assert env_path.read_text() == original_env
+
+    def test_unrecoverable_warning_can_be_suppressed(self, monkeypatch, tmp_path, caplog):
+        monkeypatch.setattr(main, "_PROJECT_ROOT", tmp_path)
+        settings = _settings(chat_model_omlx="other-model")
+        health_in = {"reachable": True, "chat_model_found": False, "models": ["qwen3-8b-4bit"]}
+
+        with caplog.at_level("WARNING", logger=main.logger.name):
+            main._recover_missing_chat_model(
+                settings, "omlx", MagicMock(), health_in, warn_if_unrecoverable=False,
+            )
+        assert "not auto-recoverable" not in caplog.text
+
+        with caplog.at_level("WARNING", logger=main.logger.name):
+            main._recover_missing_chat_model(settings, "omlx", MagicMock(), health_in)
+        assert "not auto-recoverable" in caplog.text
+
+
+class TestHealthPollRecoversChatModel:
+    def _broken_runtime(self, models):
+        runtime = MagicMock(name="late-started-runtime")
+        runtime.health_check.return_value = {
+            "reachable": True, "base_url": "http://fake", "models": models,
+            "chat_model": "gemma-4-e4b-it-4bit", "chat_model_found": False,
+            "embed_model_found": None, "error": None,
+        }
+        return runtime
+
+    def test_backend_started_after_localist_gets_autopicked(self, client, monkeypatch, tmp_path):
+        test_client, _initial_runtime = client
+        broken = self._broken_runtime(["MarkItDown", "qwen3-8b-4bit"])
+        main._state.runtime = broken
+        monkeypatch.setattr(
+            main, "create_runtime",
+            _model_aware_create_runtime(["MarkItDown", "qwen3-8b-4bit"]),
+        )
+
+        body = test_client.get("/health").json()
+
+        assert body["healthy"] is True
+        assert body["chat_model_found"] is True
+        assert main._state.runtime is not broken
+        assert main._state.settings.chat_model_omlx == "qwen3-8b-4bit"
+        assert "LOCALIST_CHAT_MODEL_OMLX=qwen3-8b-4bit" in (tmp_path / ".env").read_text()
+
+    def test_unrecoverable_poll_rebuilds_nothing(self, client, monkeypatch):
+        test_client, _initial_runtime = client
+        main._state.settings.chat_model_omlx = "user-chosen-model"
+        broken = self._broken_runtime(["qwen3-8b-4bit"])
+        main._state.runtime = broken
+        monkeypatch.setattr(
+            main, "create_runtime",
+            MagicMock(side_effect=AssertionError("create_runtime must not be called")),
+        )
+
+        body = test_client.get("/health").json()
+
+        assert body["healthy"] is False
+        assert main._state.runtime is broken
+
+    def test_runtime_swapped_while_waiting_is_left_alone(self, client, monkeypatch):
+        _test_client, _initial_runtime = client
+        stale = self._broken_runtime(["qwen3-8b-4bit"])
+        current = MagicMock(name="switched-in-runtime")
+        main._state.runtime = current
+        monkeypatch.setattr(
+            main, "create_runtime",
+            MagicMock(side_effect=AssertionError("create_runtime must not be called")),
+        )
+        health_in = stale.health_check.return_value
+
+        result = asyncio.run(main._recover_chat_model_on_poll(stale, health_in))
+
+        assert result is health_in
+        assert main._state.runtime is current
+        assert main._state.settings.chat_model_omlx is None

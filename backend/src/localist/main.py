@@ -427,6 +427,130 @@ def _resolve_chat_model(settings: Settings, backend: str) -> str | None:
     return getattr(settings, field) if field else None
 
 
+# Substrings (lowercased) marking a listed model as not chat-capable — oMLX
+# lists utility entries (e.g. "MarkItDown") alongside chat models, and both
+# backends list embedding models in the same catalog as chat models.
+_NON_CHAT_MODEL_MARKERS: tuple[str, ...] = ("embed", "rerank", "markitdown")
+
+
+def _pick_default_chat_model(models: list[str]) -> str | None:
+    """
+    Pick a chat model from a backend's reported model list, for first-run
+    use when no chat model is configured for that backend. Skips entries
+    matching _NON_CHAT_MODEL_MARKERS, and prefers local models over Ollama
+    Cloud ones ("-cloud" / ":cloud" tags), which need an `ollama signin`
+    a first-time user may not have done. Returns None if nothing qualifies.
+    """
+    candidates = [
+        m for m in models
+        if not any(marker in m.lower() for marker in _NON_CHAT_MODEL_MARKERS)
+    ]
+    local = [m for m in candidates if not m.lower().endswith(("-cloud", ":cloud"))]
+    if local:
+        return local[0]
+    return candidates[0] if candidates else None
+
+
+def _plan_chat_model_recovery(
+    settings: Settings, backend: str, models: list[str],
+) -> tuple[str, str] | None:
+    """
+    Decide how to recover when `backend` is reachable but its resolved chat
+    model isn't in `models`. Pure — no side effects. Returns one of:
+
+      ("demote-override", pin) — the global LOCALIST_CHAT_MODEL isn't served
+          here, but this backend's own pin is: the override is stale for this
+          backend (e.g. an Ollama Cloud id carried over in a copied .env) and
+          is shadowing a valid pin.
+      ("autopick", model) — nothing configured for this backend (no override,
+          no pin): pick one via _pick_default_chat_model().
+      None — not recoverable without the user: an explicit choice is missing
+          from the backend, or it serves no usable chat model at all.
+    """
+    pin = getattr(settings, _CHAT_MODEL_SETTINGS_FIELD[backend.strip().lower()])
+    if settings.chat_model:
+        return ("demote-override", pin) if pin and pin in models else None
+    if pin:
+        return None
+    picked = _pick_default_chat_model(models)
+    return ("autopick", picked) if picked else None
+
+
+def _demote_global_chat_model_override(settings: Settings) -> None:
+    """
+    In-process only: copy settings.chat_model onto every per-backend pin that
+    is still unset (so each other backend keeps resolving to exactly what the
+    override gave it), then clear the override. Deliberately does NOT touch
+    .env — the user's file stays as written, and the same demotion simply
+    re-runs (with its warning) on the next startup until they remove it.
+    """
+    for field in _CHAT_MODEL_SETTINGS_FIELD.values():
+        if not getattr(settings, field):
+            setattr(settings, field, settings.chat_model)
+    settings.chat_model = None
+
+
+def _recover_missing_chat_model(
+    settings: Settings, backend: str, runtime: BaseRuntimeClient, health: dict,
+    *, warn_if_unrecoverable: bool = True,
+) -> tuple[BaseRuntimeClient, dict]:
+    """
+    Safety net for a reachable backend whose resolved chat model isn't found
+    — otherwise chat silently never reaches a model (§16.20). Applies
+    _plan_chat_model_recovery()'s plan:
+
+      demote-override — _demote_global_chat_model_override(), in-process only.
+      autopick — persist the picked model as this backend's pin (Settings
+          field + .env, so the choice is stable across restarts).
+
+    and returns a rebuilt, re-checked runtime. An explicitly configured model
+    is never replaced by an auto-pick. Unrecoverable cases return
+    (runtime, health) unchanged, logging a warning naming what the backend
+    does serve unless warn_if_unrecoverable is False (GET /health passes
+    False — it runs this on every 15s poll, and the chat view's banner
+    already reports the problem).
+
+    Blocking (runs a health check) — call via asyncio.to_thread from async code.
+    """
+    if not health.get("reachable") or health.get("chat_model_found"):
+        return runtime, health
+
+    models = health.get("models", [])
+    plan = _plan_chat_model_recovery(settings, backend, models)
+    if plan is None:
+        if warn_if_unrecoverable:
+            logger.warning(
+                "%s: chat model %r not found and not auto-recoverable — available: %s",
+                backend.upper(), _resolve_chat_model(settings, backend), models,
+            )
+        return runtime, health
+
+    action, model = plan
+    normalized = backend.strip().lower()
+    if action == "demote-override":
+        logger.warning(
+            "%s: LOCALIST_CHAT_MODEL=%r isn't served by this backend — ignoring it this "
+            "session in favor of %s=%r. Remove LOCALIST_CHAT_MODEL from .env to silence this.",
+            backend.upper(), settings.chat_model, _CHAT_MODEL_ENV_KEY[normalized], model,
+        )
+        _demote_global_chat_model_override(settings)
+    else:
+        setattr(settings, _CHAT_MODEL_SETTINGS_FIELD[normalized], model)
+        try:
+            _write_env_var(_PROJECT_ROOT, _CHAT_MODEL_ENV_KEY[normalized], model)
+        except OSError as exc:
+            logger.warning(
+                "%s: auto-selected chat model %r in-process, but writing .env failed (%s) — "
+                "it will be re-selected on next restart.",
+                backend.upper(), model, exc,
+            )
+        logger.info(
+            "%s: no chat model configured — auto-selected %r from %s",
+            backend.upper(), model, models,
+        )
+    return _create_and_check_backend(settings, backend)
+
+
 def _write_env_var(project_root: Path, key: str, value: str) -> None:
     """
     Set `key=value` in project_root/.env, preserving every other line
@@ -506,9 +630,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         request_timeout = settings.request_timeout,
         stream_timeout  = settings.stream_timeout,
     )
+    health = runtime.health_check()
+    runtime, health = _recover_missing_chat_model(
+        settings, settings.runtime_backend, runtime, health,
+    )
     _state.runtime = runtime
 
-    health = runtime.health_check()
     if health["reachable"]:
         logger.info(
             "%s runtime reachable at %s — chat_found=%s  embed_found=%s",
@@ -779,6 +906,10 @@ class HealthResponse(BaseModel):
     backend:           str
     base_url:          str
     models:            list[str]  = Field(default_factory=list)
+    # The chat model id the active runtime is actually configured with (after
+    # _resolve_chat_model() and runtime_factory.py's per-backend fallback) —
+    # lets the chat view name the missing model when chat_model_found is False.
+    chat_model:        str        = ""
     chat_model_found:  bool       = False
     embed_model_found: bool       = False
     embedding_model:   str        = ""
@@ -1515,6 +1646,60 @@ async def post_task_stream(request: TaskRequest) -> StreamingResponse:
     )
 
 
+async def _recover_chat_model_on_poll(runtime: BaseRuntimeClient, health: dict) -> dict:
+    """
+    GET /health's hook into _recover_missing_chat_model(): covers a backend
+    that only became reachable after startup (e.g. a new user who opened
+    Localist before oMLX/Ollama), which lifespan()'s one-shot recovery
+    missed. Returns the health dict to report — the rebuilt runtime's if a
+    recovery was applied, otherwise `health` unchanged.
+
+    Only takes _runtime_switch_lock when _plan_chat_model_recovery() says
+    there is something to do, so the steady-state poll (healthy, or broken
+    in a way only the user can fix) never contends with a real switch.
+    """
+    settings = _state.settings
+    if (
+        settings is None
+        or not health.get("reachable")
+        or health.get("chat_model_found")
+        or _plan_chat_model_recovery(settings, settings.runtime_backend, health.get("models", [])) is None
+    ):
+        return health
+
+    async with _runtime_switch_lock:
+        # A switch or pin may have landed while this poll waited on the lock;
+        # the next poll will see that runtime instead.
+        if _state.runtime is not runtime:
+            return health
+
+        candidate_runtime, new_health = await asyncio.to_thread(
+            _recover_missing_chat_model,
+            settings, settings.runtime_backend, runtime, health,
+            warn_if_unrecoverable=False,
+        )
+        if candidate_runtime is runtime:
+            return health
+
+        memory_manager = _require_memory_manager()
+        # Same embedding-source rule as switch_runtime_backend(): a chat-model
+        # change never re-derives embed_fn (§16.5).
+        embed_fn = memory_manager.embed_fn
+        embedding_model_name = _state.active_embedding_model_name
+
+        wiki_agent, _conversational_agent, controller = await asyncio.to_thread(
+            _build_controller,
+            settings, candidate_runtime, memory_manager, embed_fn,
+            _PROJECT_ROOT, _state.templates_dir, embedding_model_name,
+        )
+
+        _state.runtime    = candidate_runtime
+        _state.wiki_agent = wiki_agent
+        _state.controller = controller
+
+    return new_health
+
+
 @app.get(
     "/health",
     response_model = HealthResponse,
@@ -1527,6 +1712,7 @@ async def get_health() -> HealthResponse:
     """
     runtime = _require_runtime()
     raw: dict[str, Any] = await asyncio.to_thread(runtime.health_check)
+    raw = await _recover_chat_model_on_poll(runtime, raw)
 
     # Mirrors the embed_fn precedence lifespan() establishes at startup: the
     # runtime backend's own embed() is the only embedding source — active
@@ -1547,6 +1733,7 @@ async def get_health() -> HealthResponse:
         backend           = settings.runtime_backend if settings is not None else "",
         base_url          = str(raw.get("base_url", "")),
         models            = raw.get("models", []),
+        chat_model        = str(raw.get("chat_model") or ""),
         chat_model_found  = bool(raw.get("chat_model_found", False)),
         embed_model_found = embed_available,
         embedding_model   = settings.embedding_model if settings is not None else "",
@@ -1648,8 +1835,6 @@ async def switch_runtime_backend(request: RuntimeBackendSwitchRequest) -> Runtim
         setattr(settings, _CHAT_MODEL_SETTINGS_FIELD[backend], request.chat_model)
         _write_env_var(_PROJECT_ROOT, _CHAT_MODEL_ENV_KEY[backend], request.chat_model)
 
-    chat_model = _resolve_chat_model(settings, backend)
-
     async with _runtime_switch_lock:
         candidate_runtime, health = await asyncio.to_thread(
             _create_and_check_backend, settings, backend,
@@ -1663,6 +1848,12 @@ async def switch_runtime_backend(request: RuntimeBackendSwitchRequest) -> Runtim
                     f"{health.get('base_url')!r} — current backend left untouched."
                 ),
             )
+
+        candidate_runtime, health = await asyncio.to_thread(
+            _recover_missing_chat_model,
+            settings, backend, candidate_runtime, health,
+        )
+        chat_model = _resolve_chat_model(settings, backend)
 
         memory_manager = _require_memory_manager()
         # Deliberately NOT re-derived from candidate_runtime — a chat-backend switch changes

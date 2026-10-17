@@ -1370,3 +1370,113 @@ Frontend `RUNTIME_BACKENDS`/`RUNTIME_BACKEND_LABELS` (`model.ts`) reduced to two
 `backend/tests/test_runtime_is_local.py`'s `test_foundry_is_always_local` case removed, along
 with related fixture fields across the runtime-backend-switch/health-gate/embedding-switch test
 files. Full backend suite: 1598 passed / 0 failed after this change.
+
+### §16.20 — First-run chat-model auto-selection (2026-10-17)
+
+**Problem.** A fresh desktop install starts with no `.env` in `~/Library/Application Support/Localist`,
+so `_resolve_chat_model()` returns `None` and `runtime_factory.py`'s hardcoded per-backend default
+applies: oMLX → `gemma-4-e4b-it-4bit` (one specific build), Ollama → `""`. Any user whose backend
+serves a different model got a reachable backend with `chat_model_found: false`. Chat then never
+reached a model, and nothing explained why. The trigger was a report against the packaged app. In
+that case a stray global `LOCALIST_CHAT_MODEL=gemma4:31b-cloud` (carried over from a dev `.env`
+during the §25 migration) shadowed the correct `LOCALIST_CHAT_MODEL_OMLX` pin. That exact variant
+can't occur on a fresh install, because nothing writes the global override, but the hardcoded-default
+variant can.
+
+**Fix.** Two new helpers in `main.py`:
+- `_pick_default_chat_model(models)` skips non-chat catalog entries (`_NON_CHAT_MODEL_MARKERS`: any
+  id containing `embed`, `rerank` or `markitdown`, case-insensitive) and prefers local models over
+  Ollama Cloud ones (`-cloud`/`:cloud`, which need `ollama signin`). It falls back to a cloud model
+  only when nothing local qualifies.
+- `_autopick_chat_model_if_unconfigured(settings, backend, runtime, health)` (renamed
+  `_recover_missing_chat_model()` and generalized in §16.22) acts only when the
+  backend is reachable, its chat model wasn't found, and **nothing was configured for it** (no
+  global override, no per-backend pin). It then picks a model, persists it as that backend's pin
+  (Settings field + `.env`, so the choice is stable across restarts) and returns a rebuilt,
+  re-checked runtime. An explicitly configured model is never replaced; that case only logs a
+  warning naming the models the backend actually serves.
+
+Wired into `lifespan()` (before `_state.runtime` is set) and `POST /settings/runtime-backend`
+(inside `_runtime_switch_lock`, after the reachability check; the response's `chat_model` is now
+resolved after the auto-pick). Deliberately **not** wired into `GET .../models`, which must never
+mutate state, or into `POST .../chat-model`, where the pin is explicit by definition.
+
+**Not addressed here (planned follow-ups):** a chat-view banner when the backend is reachable but no
+usable chat model is found (phase 2); a missing explicit global override shadowing a valid
+per-backend pin (phase 3).
+
+Tests: `TestPickDefaultChatModel`, `TestAutopickChatModelIfUnconfigured` and
+`TestSwitchAutopicksUnconfiguredChatModel` in `tests/test_main_runtime_backend_switch.py`. Full suite
+1609 passed.
+
+### §16.21 — Chat-view model status banner (2026-10-17)
+
+**Problem.** When the runtime backend was reachable but its chat model wasn't found (or it wasn't
+reachable at all), the only signal anywhere in the UI was the conversation appbar chip turning
+yellow or red. Chat just silently failed. §16.20 removes the most common first-run cause, but an
+explicitly configured model can still go missing (unloaded, renamed, or a stale `.env`).
+
+**Fix.**
+- `GET /health` gains `chat_model`: the id the active runtime is actually configured with, after
+  `_resolve_chat_model()` and `runtime_factory.py`'s fallback. Both runtime clients' `health_check()`
+  now include it in their result dict, reachable or not.
+- New `localist-ui/src/lib/components/ModelStatusBanner.svelte`, mounted at the top of `ChatPanel`.
+  It is driven entirely by the existing 15s health poll and clears itself on the next healthy poll.
+  It has four states:
+  - **Localist backend down:** `GET /api/health` itself failed, tracked by a new `api_ok` flag on the
+    `health` store.
+  - **Runtime backend unreachable:** shows `base_url`.
+  - **Reachable, but no chat models listed at all.**
+  - **Reachable, configured model missing:** names `chat_model`, lists the available chat models
+    (filtered with the same markers as `_NON_CHAT_MODEL_MARKERS`) and links to `/settings#chat-model`.
+  - Every state has a "Check again" button that calls `checkHealth()` without waiting for the poll.
+  - Hidden until the first poll answers, so a normal launch never flashes it.
+
+**Known gap (closed in §16.22):** §16.20's auto-pick runs only at startup and on a backend switch. If a
+new user launches Localist before starting oMLX/Ollama, startup sees an unreachable backend and
+skips the auto-pick. When the backend later comes up, its hardcoded default may be missing, and this
+banner (correctly) reports it. The auto-pick doesn't retry on its own.
+
+Tests: `TestHealthCheckReportsChatModel` (`test_omlx_runtime_client_concurrency.py`) and
+`TestHealthChatModel` (`test_main_health_gate_tiers.py`). Frontend has no test runner;
+`npm run check` reports 0 errors.
+
+### §16.22 — Stale global chat-model override demoted; poll-time chat-model recovery (2026-10-17)
+
+**Problems.**
+- **Stale global override.** A global `LOCALIST_CHAT_MODEL` that the active backend doesn't serve
+  shadowed a valid per-backend pin, because `_resolve_chat_model()` always gives the override
+  priority. This was the original incident behind §16.20: `gemma4:31b-cloud` was carried over from a
+  dev `.env` and hid `LOCALIST_CHAT_MODEL_OMLX=gemma-4-e4b-it-4bit`.
+- **Backend started late.** §16.21's known gap: recovery ran only at startup and on a backend
+  switch, so a backend that came up after Localist never got one.
+
+**Fix.** §16.20's helper is now split into three:
+- **`_plan_chat_model_recovery(settings, backend, models)`** decides what to do and has no side
+  effects. It returns one of:
+  - `("demote-override", pin)`: the override isn't served here but this backend's pin is.
+  - `("autopick", model)`: nothing is configured; this is §16.20's behavior, unchanged.
+  - `None`: not recoverable without the user.
+- **`_demote_global_chat_model_override(settings)`** works **in-process only**. It copies the
+  override onto every per-backend pin that is still unset, so each other backend keeps resolving to
+  exactly what the override gave it, then clears the override. `.env` is never touched, so the
+  demotion and its warning re-run on every startup until the user removes the line.
+  `_resolve_chat_model()`'s documented precedence is unchanged.
+- **`_recover_missing_chat_model(..., *, warn_if_unrecoverable=True)`** carries out the plan, then
+  rebuilds and re-checks the runtime.
+
+New `_recover_chat_model_on_poll()` hooks this into `GET /health`:
+- It runs on the existing 15s UI poll and takes `_runtime_switch_lock` only when the pure plan says
+  there is something to do, so a steady-state poll never contends with a real switch.
+- Under the lock it bails out if `_state.runtime` changed while it waited.
+- On success it rebuilds the controller exactly as `switch_runtime_backend()` does, never
+  re-deriving `embed_fn` (§16.5).
+- It passes `warn_if_unrecoverable=False` so an unfixable state doesn't log every 15s; the §16.21
+  banner reports it instead.
+
+An explicitly chosen model is still never replaced by an auto-pick.
+
+Tests: `TestPlanChatModelRecovery`, `TestDemoteGlobalChatModelOverride`,
+`TestRecoverMissingChatModelDemotesStaleOverride` and `TestHealthPollRecoversChatModel` in
+`tests/test_main_runtime_backend_switch.py`. One §16.21 test (`TestHealthChatModel`) now pins an
+explicit model so its missing model stays unrecoverable. Full suite 1624 passed.

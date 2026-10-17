@@ -7,12 +7,18 @@ export interface HealthState {
   backend: string;
   base_url: string;
   models: string[];
+  // The chat model id the active runtime is configured with — named by
+  // ModelStatusBanner when chat_model_found is false.
+  chat_model: string;
   chat_model_found: boolean;
   embed_model_found: boolean;
   embedding_model: string;
   error?: string;
   last_checked: number | null;
   checking: boolean;
+  // False when the last GET /api/health itself failed — the Localist
+  // backend is down, as opposed to the runtime backend it talks to.
+  api_ok: boolean;
   // active_embedding_model_name / gate_tiers (PLAN_semantic_gating_
   // calibration.md §6): the RESOLVED model name Planner compares against
   // its tuned model, and a per-gate trust tier ("tuned"/"validated"/
@@ -33,11 +39,13 @@ const initialHealth: HealthState = {
   backend: '',
   base_url: '',
   models: [],
+  chat_model: '',
   chat_model_found: false,
   embed_model_found: false,
   embedding_model: '',
   last_checked: null,
   checking: false,
+  api_ok: true,
   active_embedding_model_name: null,
   gate_tiers: {}
 };
@@ -62,7 +70,8 @@ export async function checkHealth(): Promise<void> {
     health.set({
       ...data,
       last_checked: Date.now(),
-      checking: false
+      checking: false,
+      api_ok: true
     });
   } catch (err) {
     health.update((s) => ({
@@ -71,7 +80,8 @@ export async function checkHealth(): Promise<void> {
       reachable: false,
       error: String(err),
       last_checked: Date.now(),
-      checking: false
+      checking: false,
+      api_ok: false
     }));
   }
 }

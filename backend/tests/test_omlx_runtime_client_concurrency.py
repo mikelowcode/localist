@@ -373,3 +373,34 @@ class TestPromptTooLongRetry:
 
         assert mock_post.call_count == 1
         assert "returned HTTP 400" in str(exc_info.value)
+
+
+class TestHealthCheckReportsChatModel:
+    """
+    health_check() reports the configured chat model id (surfaced by
+    GET /health so the chat view can name a missing model), whether or not
+    the service is reachable.
+    """
+
+    def test_chat_model_reported_when_not_listed(self):
+        client = OMLXRuntimeClient(chat_model="gemma-4-e4b-it-4bit")
+        entries = [{"id": "qwen3-8b-4bit", "object": "model", "created": 1, "owned_by": "omlx"}]
+        with patch.object(
+            _omlx_mod.requests, "get",
+            return_value=_fake_models_response(entries),
+        ):
+            result = client.health_check()
+
+        assert result["chat_model"] == "gemma-4-e4b-it-4bit"
+        assert result["chat_model_found"] is False
+
+    def test_chat_model_reported_when_unreachable(self):
+        client = OMLXRuntimeClient(chat_model="gemma-4-e4b-it-4bit")
+        with patch.object(
+            _omlx_mod.requests, "get",
+            side_effect=ConnectionError("refused"),
+        ):
+            result = client.health_check()
+
+        assert result["reachable"] is False
+        assert result["chat_model"] == "gemma-4-e4b-it-4bit"

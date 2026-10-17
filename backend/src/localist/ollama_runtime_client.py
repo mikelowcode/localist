@@ -543,7 +543,8 @@ class OllamaRuntimeClient:
 
         Returns a dict with keys:
             reachable (bool), models (list[str]), chat_model_found (bool),
-            embed_model_found (bool | None), base_url (str)
+            embed_model_found (bool | None), base_url (str),
+            chat_model (str) — the configured chat model id checked above
 
         embed_model_found is None when no embedding model is configured
         (not applicable), False when configured but not found, True when
@@ -558,6 +559,7 @@ class OllamaRuntimeClient:
             # None = not applicable (no embedding model configured)
             "embed_model_found": None if not self._embedding_model else False,
             "base_url":          self._base_url,
+            "chat_model":        self._chat_model,
         }
 
         try:

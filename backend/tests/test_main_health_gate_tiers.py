@@ -92,3 +92,26 @@ class TestHealthGateTiers:
 
         assert resp.status_code == 200
         assert resp.json()["gate_tiers"] == {name: "lexical-fallback" for name in _GATE_NAMES}
+
+
+class TestHealthChatModel:
+    def test_chat_model_passed_through_from_runtime(self, client):
+        # An explicit pin makes the missing model unrecoverable, so GET
+        # /health's poll-time recovery (§16.22) leaves it as reported.
+        main._state.settings.chat_model_ollama = "gemma4:31b-cloud"
+        main._state.runtime.health_check.return_value = {
+            "reachable": True, "base_url": "http://localhost:11434",
+            "models": ["llama3.2:3b"], "chat_model": "gemma4:31b-cloud",
+            "chat_model_found": False, "embed_model_found": False, "error": None,
+        }
+
+        body = client.get("/health").json()
+
+        assert body["chat_model"] == "gemma4:31b-cloud"
+        assert body["chat_model_found"] is False
+        assert body["healthy"] is False
+
+    def test_chat_model_defaults_to_empty_when_runtime_omits_it(self, client):
+        body = client.get("/health").json()
+
+        assert body["chat_model"] == ""

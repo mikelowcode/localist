@@ -11,6 +11,7 @@
   import EditableTurnContent from '$lib/components/EditableTurnContent.svelte';
   import ChartRenderer from '$lib/components/ChartRenderer.svelte';
   import DiffBlock from '$lib/components/DiffBlock.svelte';
+  import ModelStatusBanner from '$lib/components/ModelStatusBanner.svelte';
   import { OCR_EXTENSIONS, extOf } from '$lib/utils/ocr';
 
   let instruction = '';
@@ -386,6 +387,8 @@
 </script>
 
 <div class="chat-panel">
+  <ModelStatusBanner />
+
   <!-- Messages -->
   <div class="messages" bind:this={messagesEl}>
     {#if $chatHistoryStore.length === 0}
