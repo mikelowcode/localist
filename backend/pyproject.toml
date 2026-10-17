@@ -42,6 +42,11 @@ ocr = [
     "pyobjc-framework-Vision>=10.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "pyobjc-framework-Quartz>=10.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "pypdfium2>=4.30.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    # Scanned-PDF fallback rasterizes pages via pypdfium2's bitmap.to_pil().
+    # Previously undeclared — only worked when [chart]'s matplotlib happened
+    # to pull Pillow in; a bare [ocr] install (e.g. the packaged
+    # localist-mcp) failed with "No module named 'PIL'".
+    "pillow>=10.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 # generate_chart MCP tool (server-side PNG rendering). Cross-platform;
 # matplotlib is imported lazily inside generate_chart() so its absence

@@ -123,7 +123,7 @@ deactivate
 
 python3 -m venv .venv-packaging
 source .venv-packaging/bin/activate
-pip install -e ".[dev,packaging]"   # extras-free — see backend/packaging/README.md for why
+pip install -e ".[dev,packaging,ocr]"   # base + [ocr] for localist-mcp — see backend/packaging/README.md (§22.14)
 deactivate
 ```
 

@@ -1,12 +1,20 @@
 # Packaging — PyInstaller (Phase B of native `.app` packaging)
 
-Freezes the base-only backend (`localist.main`) and `localist-mcp`
-(`localist.mcp_server.main`) into standalone executables. No MLX
-embeddings, no Vision-framework OCR, no PyMuPDF — see the OSS release
-build order's step 7a for why (license footprint; not lost, just outside
-this bundle — those stay available via `pip install -e ".[mlx,ocr]"`).
+Freezes the backend (`localist.main`) and `localist-mcp`
+(`localist.mcp_server.main`) into standalone executables.
 
-## Build from a clean, extras-free venv — not `backend/.venv`
+- **localist-mcp** bundles the `[ocr]` extra (Apple Vision via pyobjc,
+  pypdfium2, Pillow), so image and PDF uploads work in the packaged app.
+  The extra was originally left out for license footprint (PyMuPDF, AGPL);
+  PyMuPDF was replaced by pypdfium2 (Apache-2.0/BSD-3), and pyobjc and
+  Pillow are permissive, so that no longer applies — see §22.14.
+- **localist-backend** stays base-only: `localist-backend.spec` excludes the
+  OCR modules explicitly, since OCR always runs through localist-mcp.
+
+Neither ships `[chart]` (matplotlib) — `generate_chart` is unavailable in
+the packaged app.
+
+## Build from a clean venv with only `[ocr]` — not `backend/.venv`
 
 This matters more than it looks. PyInstaller's static analysis bundles
 anything syntactically importable anywhere in the source tree,
@@ -21,7 +29,7 @@ that were never supposed to ship, discovered the hard way during Phase B.
 cd backend
 python3 -m venv .venv-packaging      # separate from .venv, gitignored
 source .venv-packaging/bin/activate
-pip install -e ".[dev,packaging]"    # base + pytest/pre-commit + pyinstaller — no mlx/ocr/chart
+pip install -e ".[dev,packaging,ocr]"    # base + [ocr] + pytest/pre-commit + pyinstaller — no chart
 ```
 
 ## Build
@@ -54,6 +62,14 @@ looks instead).
 For local testing without writing to your real
 `~/Library/Application Support/Localist`, set `LOCALIST_BACKEND_ROOT` to
 a scratch directory first.
+
+To smoke-test a frozen localist-mcp next to an installed, running Localist
+(which already holds port 8003), move it to another port and sandbox its
+uploads: `LOCALIST_MCP_PORT=8013 LOCALIST_MCP_UPLOAD_ROOT=/tmp/ocr-test
+./dist/localist-mcp/localist-mcp`, then call `ocr_extract` over MCP SSE at
+`http://127.0.0.1:8013/sse` on an image, a text-layer PDF and a scanned
+(image-only) PDF placed in `/tmp/ocr-test/chat_uploads/`. The scanned PDF is
+the one that matters most — it is the only path that needs Pillow.
 
 ## Where a frozen build's data lives
 

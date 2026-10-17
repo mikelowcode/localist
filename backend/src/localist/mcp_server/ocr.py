@@ -38,6 +38,7 @@ implementation exists, without changing any of the logic below.
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import os
 import platform
@@ -145,6 +146,16 @@ def _is_apple_silicon() -> bool:
     return platform.system() == "Darwin" and platform.machine() in ("arm64", "aarch64")
 
 
+def _vision_available() -> bool:
+    """
+    Whether the pyobjc Vision bindings ([ocr] extra) are importable — checked
+    without importing them. Lets ocr_extract (mcp_server/main.py) fall back to
+    the Ollama vision route on Apple Silicon when they're missing (e.g. a
+    base-only install), instead of failing every image upload.
+    """
+    return importlib.util.find_spec("Vision") is not None
+
+
 def extract_text(path: str, mime_type: str, max_pdf_pages: int | None = None) -> str:
     """
     Extract text from an uploaded image or PDF, sandboxed under upload_root.
@@ -194,8 +205,10 @@ def _ocr_image_bytes(data: bytes) -> str:
         from Foundation import NSData
     except ImportError as exc:
         raise ValueError(
-            "ERROR: pyobjc-framework-Vision is not installed — "
-            "see backend/requirements.txt."
+            "ERROR: Apple Vision OCR is unavailable — pyobjc-framework-Vision "
+            "is not installed. Install the backend's [ocr] extra "
+            "(pip install -e \".[ocr]\"), or set LOCALIST_OLLAMA_VISION_MODEL "
+            "to OCR images with an Ollama vision model instead."
         ) from exc
 
     ns_data = NSData.dataWithBytes_length_(data, len(data))
@@ -235,7 +248,8 @@ def _extract_pdf(resolved: Path, max_pdf_pages: int) -> str:
         import pypdfium2 as pdfium
     except ImportError as exc:
         raise ValueError(
-            "ERROR: pypdfium2 is not installed — see backend/requirements.txt."
+            "ERROR: PDF OCR is unavailable — pypdfium2 is not installed. "
+            "Install the backend's [ocr] extra (pip install -e \".[ocr]\")."
         ) from exc
 
     doc = pdfium.PdfDocument(resolved)

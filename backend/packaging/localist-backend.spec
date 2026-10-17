@@ -5,9 +5,9 @@
 # executable. Phase C (Tauri sidecar) can revisit onefile if needed for
 # final distribution.
 #
-# No MLX/Vision/PyMuPDF anywhere here — this is the pure-Python base
-# install only (see pyproject.toml's base `dependencies`, no `[mlx]`/
-# `[ocr]` extras). Confirmed via grep that every module-level import in
+# No MLX/Vision/pypdfium2 here — this is the pure-Python base install
+# only. The packaging venv does have the `[ocr]` extra (localist-mcp needs
+# it), so the OCR modules are excluded explicitly below. Confirmed via grep that every module-level import in
 # backend/src/localist/ referencing those extras is already deferred, so
 # PyInstaller's static analysis never even sees them.
 #
@@ -44,7 +44,17 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # The packaging venv now has the [ocr] extra installed (for
+    # localist-mcp, which runs ocr_extract). This process only imports
+    # ocr.py's get_upload_root/OCR_MIME_BY_EXTENSION — OCR itself always
+    # goes through localist-mcp — but PyInstaller would still follow
+    # ocr.py's deferred Vision/pypdfium2 imports (and [ocr]'s Pillow, which
+    # nothing in this process uses) and bundle them a second time.
+    excludes=[
+        'Vision', 'Quartz', 'Foundation', 'AppKit', 'CoreML',
+        'CoreFoundation', 'objc', 'PyObjCTools',
+        'pypdfium2', 'pypdfium2_raw', 'PIL',
+    ],
     noarchive=False,
     cipher=block_cipher,
 )

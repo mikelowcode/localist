@@ -260,11 +260,23 @@ async def hacker_news_search(query: str, url: str | None = None) -> dict:
 @mcp.tool()
 def ocr_extract(path: str, mime_type: str, max_pdf_pages: int | None = None) -> str:
     """Extract text from an uploaded image (incl. HEIC) or PDF, entirely locally. Apple Silicon: Vision framework + pypdfium2. Other platforms: images only, via a configured Ollama vision model (LOCALIST_OLLAMA_VISION_MODEL) — PDFs still require Apple Silicon. path is resolved relative to upload_root and sandboxed."""
-    if _ocr._is_apple_silicon():
-        return _ocr.extract_text(path, mime_type, max_pdf_pages)
-    if mime_type.startswith("image/"):
+    if mime_type.startswith("image/") and _use_ollama_for_image_ocr():
         return _ocr_ollama.OllamaVisionOCRProvider().extract_text(path, mime_type, max_pdf_pages)
-    return _ocr.extract_text(path, mime_type, max_pdf_pages)  # PDFs: unchanged rejection
+    return _ocr.extract_text(path, mime_type, max_pdf_pages)  # incl. PDFs off Apple Silicon: unchanged rejection
+
+
+def _use_ollama_for_image_ocr() -> bool:
+    """
+    Image OCR provider selection (§22.12, §22.14). Off Apple Silicon: always
+    Ollama — there is no Vision framework. On Apple Silicon: Vision, unless
+    its pyobjc bindings aren't installed AND an Ollama vision model is
+    configured — without one, falling back would only swap ocr.py's
+    actionable "install [ocr]" error for Ollama's less specific
+    "LOCALIST_OLLAMA_VISION_MODEL is not set".
+    """
+    if not _ocr._is_apple_silicon():
+        return True
+    return not _ocr._vision_available() and bool(os.environ.get("LOCALIST_OLLAMA_VISION_MODEL"))
 
 
 # ── App ──────────────────────────────────────────────────────────────────────

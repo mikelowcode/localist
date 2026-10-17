@@ -393,3 +393,57 @@ No other behavior changed: `_MIN_CHARS_PER_TEXT_LAYER_PAGE`,
 fix (§22.9) are all untouched — this was a library swap under an unchanged
 function contract, not a redesign. `THIRD_PARTY_LICENSES.md` updated to
 reflect zero remaining copyleft dependencies in the backend.
+
+### 22.14 OCR bundled into the packaged app; Vision-missing fallback (2026-10-17)
+
+**Problem.** Every image upload in the packaged desktop app failed with
+`pyobjc-framework-Vision is not installed — see backend/requirements.txt.`
+The release workflow froze both sidecars from an extras-free venv
+(`pip install -e ".[dev,packaging]"`). The packaging README gave license
+footprint as the reason, which was true while `[ocr]` carried PyMuPDF (AGPL).
+That reason disappeared in §22.13, but the build was never updated. On Apple
+Silicon, `ocr_extract` always chose Vision, so the §22.12 Ollama route never
+ran there either. The error text also pointed at a `requirements.txt` that no
+longer exists (`pyproject.toml` is the source of truth).
+
+**Second, pre-existing bug found while verifying the fix.** The scanned-PDF
+fallback (`bitmap.to_pil()`, §22.13) needs Pillow, which `[ocr]` never
+declared. It only worked in dev because `[chart]`'s matplotlib pulls Pillow in.
+A bare `[ocr]` install failed every image-only PDF with `No module named 'PIL'`.
+
+**Fix.**
+- `pyproject.toml` `[ocr]` adds `pillow>=10.0` (MIT-CMU, already in
+  `THIRD_PARTY_LICENSES.md`), with the same Apple-Silicon markers as the
+  rest of the extra.
+- **Packaging.**
+  - The packaging venv and the release workflow now install
+    `.[dev,packaging,ocr]`.
+  - `localist-mcp.spec` adds `hiddenimports=['PIL.Image']`, because
+    pypdfium2's lazy PIL import isn't seen by static analysis.
+  - `localist-backend.spec` excludes the Vision/pyobjc, pypdfium2 and PIL
+    modules. That process only imports `ocr.py`'s `get_upload_root` and
+    `OCR_MIME_BY_EXTENSION`; OCR itself always runs in localist-mcp.
+  - A new workflow step, "Check OCR bundling", fails the build if
+    localist-mcp is missing any OCR module or localist-backend contains one.
+  - Size: localist-mcp went from 58M to 82M; localist-backend is unchanged at
+    54M.
+- **Fallback.** New `ocr._vision_available()` (an `importlib.util.find_spec`
+  check that doesn't import anything) and `_use_ollama_for_image_ocr()` in
+  `mcp_server/main.py`. On Apple Silicon, image OCR falls back to the §22.12
+  Ollama route only when Vision is missing *and* `LOCALIST_OLLAMA_VISION_MODEL`
+  is set. Without a configured model, the fallback would only replace an
+  actionable error with a vaguer one. Off Apple Silicon, behavior is unchanged.
+- **Error text.** The Vision and pypdfium2 import errors now name
+  `pip install -e ".[ocr]"`, and the Vision error also names the Ollama option.
+- `packaging/run_mcp_server.py` honors `LOCALIST_MCP_PORT` (default 8003), so
+  a frozen build can be smoke-tested next to an installed, running Localist.
+
+**Verification.** A frozen localist-mcp built locally, run on port 8013 with a
+sandboxed upload root, passed `ocr_extract` over MCP SSE for:
+- a PNG (Vision)
+- a text-layer PDF (pypdfium2 text path)
+- an image-only PDF (pypdfium2 rasterize + Pillow + Vision)
+
+The image-only PDF failed before the Pillow fix and passed after it. New tests:
+`TestOcrExtractVisionMissingFallback` in `tests/test_mcp_server.py`. Full
+suite: 1628 passed.

@@ -21,10 +21,11 @@ pip install -e ".[ocr,chart,dev]"       # Apple Silicon: full local stack
 # pip install -e ".[dev]"               # any OS: base install, Ollama only
 ```
 `backend/pyproject.toml` is the dependency source of truth (`src/localist/` layout, installed
-editable). Base install is cross-platform with no Vision/PyMuPDF; `[ocr]` (local OCR — Apple
-Vision + PyMuPDF) is an Apple-Silicon-only extra, gated by a `platform_machine == 'arm64'` marker
-matching its own runtime gate; `[chart]` (matplotlib, for `generate_chart`) is cross-platform. See
-`THIRD_PARTY_LICENSES.md` for why `[ocr]` pulls in a copyleft dependency (AGPL-3.0). There is no
+editable). Base install is cross-platform with no OCR libraries; `[ocr]` (local OCR — Apple
+Vision + pypdfium2 + Pillow, all permissively licensed) is an Apple-Silicon-only extra, gated by a
+`platform_machine == 'arm64'` marker matching its own runtime gate, and is bundled into the
+packaged app's localist-mcp sidecar (§22.14); `[chart]` (matplotlib, for `generate_chart`) is
+cross-platform. There is no
 local embedding extra — embeddings are either Ollama-served or keyword-only (BM25); see below.
 
 Copy `backend/.env.example` to `backend/.env`. Only `LANGSEARCH_API_KEY` is required for full

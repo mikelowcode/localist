@@ -1611,3 +1611,67 @@ class TestMCPToolsInProcess:
             )
         assert is_error is True
         assert "requires macOS on Apple Silicon" in text
+
+
+class TestOcrExtractVisionMissingFallback:
+    """
+    On Apple Silicon without the pyobjc Vision bindings (a base-only install),
+    image OCR falls back to the Ollama vision route only when an Ollama
+    vision model is configured; otherwise ocr.py's actionable "install [ocr]"
+    error surfaces (§22.14).
+    """
+
+    def test_vision_missing_with_ollama_model_delegates_to_ollama(self, tmp_path: Path, monkeypatch):
+        ocr.set_upload_root(tmp_path)
+        _write_image(tmp_path)
+        monkeypatch.setenv("LOCALIST_OLLAMA_VISION_MODEL", "qwen2.5vl:7b")
+        with patch.object(ocr, "_is_apple_silicon", return_value=True), \
+             patch.object(ocr, "_vision_available", return_value=False), \
+             patch.object(
+                 ocr_ollama.OllamaVisionOCRProvider, "extract_text",
+                 return_value="Recognized via Ollama fallback",
+             ):
+            text, is_error = asyncio.run(
+                _call_tool("ocr_extract", {"path": "photo.png", "mime_type": "image/png"})
+            )
+        assert is_error is False
+        assert text == "Recognized via Ollama fallback"
+
+    def test_vision_missing_without_ollama_model_surfaces_install_hint(self, tmp_path: Path, monkeypatch):
+        ocr.set_upload_root(tmp_path)
+        _write_image(tmp_path)
+        monkeypatch.delenv("LOCALIST_OLLAMA_VISION_MODEL", raising=False)
+        # sys.modules[name] = None makes `import Vision` raise ImportError.
+        with patch.object(ocr, "_is_apple_silicon", return_value=True), \
+             patch.object(ocr, "_vision_available", return_value=False), \
+             patch.dict("sys.modules", {"Vision": None}):
+            text, is_error = asyncio.run(
+                _call_tool("ocr_extract", {"path": "photo.png", "mime_type": "image/png"})
+            )
+        assert is_error is True
+        assert 'pip install -e ".[ocr]"' in text
+        assert "LOCALIST_OLLAMA_VISION_MODEL" in text
+        assert "requirements.txt" not in text
+
+    def test_vision_available_ignores_configured_ollama_model(self, tmp_path: Path, monkeypatch):
+        ocr.set_upload_root(tmp_path)
+        _write_image(tmp_path)
+        monkeypatch.setenv("LOCALIST_OLLAMA_VISION_MODEL", "qwen2.5vl:7b")
+        with patch.object(ocr, "_is_apple_silicon", return_value=True), \
+             patch.object(ocr, "_vision_available", return_value=True), \
+             patch.object(ocr, "_ocr_image_bytes", return_value="Recognized via Vision"), \
+             patch.object(
+                 ocr_ollama.OllamaVisionOCRProvider, "extract_text",
+                 side_effect=AssertionError("Ollama route must not be used"),
+             ):
+            text, is_error = asyncio.run(
+                _call_tool("ocr_extract", {"path": "photo.png", "mime_type": "image/png"})
+            )
+        assert is_error is False
+        assert text == "Recognized via Vision"
+
+    def test_vision_available_reflects_find_spec(self):
+        with patch.object(ocr.importlib.util, "find_spec", return_value=None):
+            assert ocr._vision_available() is False
+        with patch.object(ocr.importlib.util, "find_spec", return_value=object()):
+            assert ocr._vision_available() is True

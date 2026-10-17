@@ -34,15 +34,31 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build PyInstaller sidecars (extras-free)
+      - name: Build PyInstaller sidecars (base + [ocr])
         working-directory: backend
+        # [ocr] is for localist-mcp's ocr_extract (Apple Vision + pypdfium2 +
+        # Pillow); localist-backend.spec excludes those modules explicitly.
+        # See backend/packaging/README.md.
         run: |
           python3 -m venv .venv-packaging
           source .venv-packaging/bin/activate
-          pip install -e ".[dev,packaging]"
+          pip install -e ".[dev,packaging,ocr]"
           cd packaging
           pyinstaller -y localist-backend.spec
           pyinstaller -y localist-mcp.spec
+
+      - name: Check OCR bundling
+        # A missing [ocr] install or a lost hiddenimport otherwise still
+        # builds and starts fine, and only fails at the first image upload.
+        run: |
+          for m in Vision objc pypdfium2 pypdfium2_raw PIL; do
+            test -d "backend/packaging/dist/localist-mcp/_internal/$m" \
+              || { echo "::error::localist-mcp is missing OCR module $m"; exit 1; }
+          done
+          for m in Vision pypdfium2 PIL; do
+            test ! -e "backend/packaging/dist/localist-backend/_internal/$m" \
+              || { echo "::error::localist-backend unexpectedly bundles $m"; exit 1; }
+          done
 
       - name: Smoke-test sidecars
         run: |
