@@ -5,7 +5,7 @@
   // saw chat silently fail (docs/architecture/16-runtime-backend-layer.md
   // §16.21). Driven entirely by the existing 15s health poll; clears itself
   // as soon as a poll comes back healthy.
-  import { health, checkHealth } from '$lib/stores/server';
+  import { health, checkHealth, isStillStarting } from '$lib/stores/server';
   import { runtimeBackendLabel } from '$lib/stores/model';
 
   // Mirrors main.py's _NON_CHAT_MODEL_MARKERS — utility and embedding
@@ -18,10 +18,11 @@
 
   type Problem = 'api-down' | 'backend-down' | 'no-chat-models' | 'model-missing' | null;
 
-  // Nothing until the first poll has answered, so the banner never flashes
-  // on a normal launch.
+  // Nothing until the first poll has answered, or while the backend is still
+  // starting (see isStillStarting), so the banner never flashes on a normal
+  // launch.
   $: problem = ((): Problem => {
-    if ($health.last_checked === null) return null;
+    if ($health.last_checked === null || isStillStarting($health)) return null;
     if (!$health.api_ok) return 'api-down';
     if (!$health.reachable) return 'backend-down';
     if ($health.chat_model_found) return null;
@@ -36,7 +37,7 @@
     <div class="model-banner-text">
       {#if problem === 'api-down'}
         <strong>Can't reach the Localist backend.</strong>
-        It may still be starting up. If this doesn't clear in a few seconds, try restarting Localist.
+        Try restarting Localist. This message clears on its own once the backend answers.
       {:else if problem === 'backend-down'}
         <strong>Can't reach {$runtimeBackendLabel}</strong>{#if $health.base_url}&nbsp;at
           <code>{$health.base_url}</code>{/if}.

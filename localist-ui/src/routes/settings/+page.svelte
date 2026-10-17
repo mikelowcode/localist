@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { isTauri } from '@tauri-apps/api/core';
+  import { APP_VERSION } from '$lib/version';
   import { onMount } from 'svelte';
   import { health, checkHealth } from '$lib/stores/server';
   import { apiUrl } from '$lib/api';
@@ -1009,7 +1011,7 @@
     <!-- Version -->
     <section class="settings-card row">
       <div class="card-title">Version</div>
-      <div class="card-value text-mono">0.2.0 · web</div>
+      <div class="card-value text-mono">{APP_VERSION} · {isTauri() ? 'desktop' : 'web'}</div>
     </section>
 
   </div>

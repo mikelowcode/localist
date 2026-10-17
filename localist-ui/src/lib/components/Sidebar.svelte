@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { APP_VERSION } from '$lib/version';
   import { onMount, onDestroy } from 'svelte';
   import { get, type Writable } from 'svelte/store';
   import { browser } from '$app/environment';
@@ -703,7 +704,7 @@
 
   <!-- Footer: version + theme toggle -->
   <div class="sidebar-footer">
-    <span class="text-tertiary sf-version">v0.2.0</span>
+    <span class="text-tertiary sf-version">v{APP_VERSION}</span>
     <button
       type="button"
       class="switch"

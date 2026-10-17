@@ -1,8 +1,17 @@
+import { readFileSync } from 'node:fs';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 
+// package.json is the version source of truth (bumped together with
+// src-tauri/tauri.conf.json at release time) — injected at build time so UI
+// labels can't drift from the shipped version. Read via $lib/version.
+const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf-8'));
+
 export default defineConfig({
 	plugins: [sveltekit()],
+	define: {
+		__APP_VERSION__: JSON.stringify(pkg.version)
+	},
 	server: {
 		host: '127.0.0.1',
 		port: 5173,

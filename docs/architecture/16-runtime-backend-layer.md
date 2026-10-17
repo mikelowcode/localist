@@ -1431,6 +1431,18 @@ explicitly configured model can still go missing (unloaded, renamed, or a stale 
     (filtered with the same markers as `_NON_CHAT_MODEL_MARKERS`) and links to `/settings#chat-model`.
   - Every state has a "Check again" button that calls `checkHealth()` without waiting for the poll.
   - Hidden until the first poll answers, so a normal launch never flashes it.
+  - **Corrected 2026-10-17 (v0.1.1 live test):** the line above was wrong. In the packaged
+    app the UI's first poll ran before the backend sidecar was up, so every launch showed the red
+    "Can't reach the Localist backend" banner for up to one 15s interval. Fixed in `stores/server.ts`:
+    - Polling is now a `setTimeout` chain. It checks every 2s until the backend first answers, then
+      every 15s.
+    - New `ever_ok` and `startup_grace_over` fields (20s grace from when polling starts) feed
+      `isStillStarting()`. While it returns true, the banner stays hidden and the appbar chip shows
+      "checking" instead of "offline".
+    - After the grace period, or if the backend answered before and then stopped, the banner reads
+      "Can't reach the Localist backend. Try restarting Localist…".
+    - Verified live with the dev UI against a backend started late: no banner at about 4s, banner
+      after 20s, cleared on the next check once the backend came up.
 
 **Known gap (closed in §16.22):** §16.20's auto-pick runs only at startup and on a backend switch. If a
 new user launches Localist before starting oMLX/Ollama, startup sees an unreachable backend and
