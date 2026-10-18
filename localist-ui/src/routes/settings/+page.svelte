@@ -34,7 +34,9 @@
     reembedLoading,
     reembedError,
     reembedCorpus,
-    type CalibrationResponse
+    type CalibrationResponse,
+    type ReembedCorpusResponse,
+    type ReembedStoreCounts
   } from '$lib/stores/reembedCorpus';
   import {
     newsPreferences,
@@ -89,11 +91,14 @@
     void loadApiKeysStatus();
   });
 
-  // Corpus staleness — fetched once on mount and again after a re-embed
-  // completes, so the badge reflects the server's current MemoryManager
-  // state without adding a dedicated poll.
+  // Corpus/chat-history staleness — fetched once on mount and again after a
+  // re-embed completes, so the badges reflect the server's current
+  // MemoryManager state without adding a dedicated poll. Episodes carry no
+  // stale flag (auto-corrected at startup), so there's no badge for them.
   let corpusStale = false;
+  let chatTurnsStale = false;
   let reembedResult: string | null = null;
+  let reembedWarning: string | null = null;
 
   async function loadMemoryStats() {
     try {
@@ -101,6 +106,7 @@
       if (!res.ok) return;
       const data = await res.json();
       corpusStale = Boolean(data.corpus_stale);
+      chatTurnsStale = Boolean(data.chat_turns_stale);
     } catch {
       // Leave last-known state — a transient fetch failure here isn't
       // worth surfacing on its own card.
@@ -128,20 +134,45 @@
     return ` Recalibrated semantic gating for ${calibration.model} (${clean.join(', ')}).`;
   }
 
+  function formatReembedResult(result: ReembedCorpusResponse): { summary: string; warning: string | null } {
+    const stores: [string, ReembedStoreCounts][] = [
+      ['Documents', { reembedded: result.reembedded, total: result.total, failed_ids: result.failed_ids ?? [] }]
+    ];
+    if (result.chat_turns) stores.push(['Chat history', result.chat_turns]);
+    if (result.episodes) stores.push(['Episodes', result.episodes]);
+
+    const summary = 'Re-embedded ' + stores
+      .map(([label, s]) => `${label} ${s.reembedded}/${s.total}`)
+      .join(' · ') + '.';
+
+    const failures = stores.filter(([, s]) => s.failed_ids.length > 0);
+    if (!failures.length) return { summary, warning: null };
+    const failedCount = failures.reduce((n, [, s]) => n + s.failed_ids.length, 0);
+    const detail = failures.map(([label, s]) => `${label.toLowerCase()}: ${s.failed_ids.length}`).join(', ');
+    return {
+      summary,
+      warning: `${failedCount} item(s) couldn't be re-embedded (${detail}) and still use the previous ` +
+        'embeddings. Check that the embedding model is loaded, then run Re-embed Memory again — ' +
+        'only the remaining items are redone.'
+    };
+  }
+
   async function handleReembedCorpus() {
     const proceed = await confirmDialog(
-      'Re-embed the wiki/raw corpus now with the active embedding model? ' +
-      'This blocks until every document has been re-embedded, which can take ' +
-      'a while for a large corpus. This also re-runs semantic-gating threshold ' +
-      'calibration for the active model.'
+      'Re-embed all memory now with the active embedding model? This covers ' +
+      'wiki/raw documents, chat history and episodes, and blocks until every ' +
+      'item has been re-embedded, which can take a while for a large corpus. ' +
+      'This also re-runs semantic-gating threshold calibration for the active model.'
     );
     if (!proceed) return;
 
     reembedResult = null;
+    reembedWarning = null;
     const result = await reembedCorpus();
     if (result) {
-      reembedResult = `Re-embedded ${result.reembedded} of ${result.total} documents.`
-        + formatCalibrationSummary(result.calibration);
+      const { summary, warning } = formatReembedResult(result);
+      reembedResult = summary + formatCalibrationSummary(result.calibration);
+      reembedWarning = warning;
       await loadMemoryStats();
       await checkHealth();
     }
@@ -491,22 +522,32 @@
       {/if}
     </section>
 
-    <!-- Corpus re-embed -->
+    <!-- Memory re-embed -->
     <section class="settings-card">
-      <div class="card-title">Corpus Embeddings</div>
+      <div class="card-title">Re-embed Memory</div>
       <p class="card-hint">
-        Re-embeds the wiki/raw corpus with the active embedding model via
-        <code>POST /memory/reembed</code> (docs/architecture/16-runtime-backend-layer.md §16.4).
-        Needed after switching embedding models or embed sources — until then, retrieval
-        falls back to keyword-only ranking. Also re-runs semantic-gating threshold
-        calibration for the active model (see the Embedding Model card's trust badge below) —
-        useful to retry a model that calibrated poorly, or after the calibration method itself
-        improves.
+        Re-embeds wiki/raw documents, chat history and episodes with the active embedding
+        model via <code>POST /memory/reembed</code> (docs/architecture/16-runtime-backend-layer.md §16.4).
+        Needed after switching embedding models or embed sources — until then, document
+        retrieval and chat-history search fall back to keyword-only ranking. Items that fail
+        are retried automatically; any still failing are reported below, and running it again
+        redoes only those. Also re-runs semantic-gating threshold calibration for the active
+        model (see the Embedding Model card's trust badge below) — useful to retry a model that
+        calibrated poorly, or after the calibration method itself improves.
       </p>
-      {#if corpusStale}
-        <span class="badge badge-warning">
-          Corpus embeddings out of date — re-ranking is running keyword-only.
-        </span>
+      {#if corpusStale || chatTurnsStale}
+        <div class="stale-badges">
+          {#if corpusStale}
+            <span class="badge badge-warning">
+              Document embeddings out of date — re-ranking is running keyword-only.
+            </span>
+          {/if}
+          {#if chatTurnsStale}
+            <span class="badge badge-warning">
+              Chat history embeddings out of date — history search is running keyword-only.
+            </span>
+          {/if}
+        </div>
       {/if}
       <div class="field-row">
         <button
@@ -519,12 +560,15 @@
             <span class="spinner" aria-hidden="true" />
             Re-embedding…
           {:else}
-            Re-embed Corpus Now
+            Re-embed Memory Now
           {/if}
         </button>
       </div>
       {#if reembedResult}
         <p class="card-hint">{reembedResult}</p>
+      {/if}
+      {#if reembedWarning}
+        <p class="card-hint" style="color:var(--warning)">{reembedWarning}</p>
       {/if}
       {#if $reembedError}
         <p class="card-hint" style="color:var(--error)">{$reembedError}</p>
@@ -591,10 +635,10 @@
             <code>POST /settings/embedding-model</code> — the only local embedding
             source; leave it unset to run in keyword-only (BM25) mode instead.
             Applies immediately; switching models flags the wiki/raw corpus and chat
-            history stale for re-embedding (see the Corpus Embeddings card above) —
+            history stale for re-embedding (see the Re-embed Memory card above) —
             episodic memory re-embeds itself automatically. Switching to a new model
             also triggers automatic first-time semantic-gating calibration; "Re-embed
-            Corpus Now" re-runs it on demand. The badge above shows the least-trusted
+            Memory Now" re-runs it on demand. The badge above shows the least-trusted
             tier across the four gates it drives — hover for the per-gate breakdown.
           </p>
         </div>
@@ -1058,6 +1102,12 @@
   .card-title .badge {
     margin-left: var(--sp-2);
     vertical-align: middle;
+  }
+
+  .stale-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
   }
 
   .card-desc {

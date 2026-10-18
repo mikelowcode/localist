@@ -389,7 +389,7 @@ class TestReembedChatTurns:
 
         result = mm.reembed_chat_turns()
 
-        assert result == {"reembedded": 2, "total": 2, "model": _MODEL_A}
+        assert result == {"reembedded": 2, "total": 2, "model": _MODEL_A, "failed_ids": []}
         assert mm._chat_turns_stale is False
         assert _get_provenance(path, "chat_turns") == _MODEL_A
 

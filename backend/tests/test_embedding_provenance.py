@@ -25,6 +25,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from localist import memory_manager
 from localist.memory_manager import (
     MemoryManager,
     _pack_embedding,
@@ -339,6 +340,63 @@ class TestGenuineEpisodesMismatch:
 
 
 # ---------------------------------------------------------------------------
+# reembed_episodes() — the manual counterpart to the startup auto-correct,
+# called by POST /memory/reembed alongside the corpus and chat_turns
+# ---------------------------------------------------------------------------
+
+class TestReembedEpisodes:
+    def test_reembeds_every_episode_and_advances_provenance(self, tmp_path):
+        path = tmp_path / "reembed_episodes.db"
+        _build_schema(path)
+        _insert_episode(path, subject="likes-coffee", content="Michael likes coffee", embedded=True)
+        _insert_episode(path, subject="likes-tea", content="Michael likes tea", embedded=True)
+        _set_provenance(path, "episodes", _MODEL_A)
+
+        mm = MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_MODEL_A)
+        new_embed_fn = _stub_embed_fn(vector_value=0.4)
+        mm._embed_fn = new_embed_fn
+
+        result = mm.reembed_episodes()
+
+        assert result == {"reembedded": 2, "total": 2, "model": _MODEL_A, "failed_ids": []}
+        new_embed_fn.assert_any_call("likes-coffee. Michael likes coffee")
+        assert _get_provenance(path, "episodes") == _MODEL_A
+        conn = sqlite3.connect(str(path))
+        blobs = [row[0] for row in conn.execute("SELECT embedding FROM episodes").fetchall()]
+        conn.close()
+        for blob in blobs:
+            assert _unpack_embedding(blob) == pytest.approx([0.4] * _EMBEDDING_DIM)
+
+    @pytest.mark.usefixtures("no_retry_sleep")
+    def test_partial_failure_leaves_provenance_unchanged(self, tmp_path):
+        path = tmp_path / "reembed_episodes_partial.db"
+        _build_schema(path)
+        _insert_episode(path, subject="ok", content="fine", embedded=True)
+        _insert_episode(path, subject="bad", content="boom", embedded=True)
+        _set_provenance(path, "episodes", _OTHER)
+
+        mm = MemoryManager(db_path=path)  # no embed source -> startup check skipped
+        def flaky_embed(text):
+            if "boom" in text:
+                raise RuntimeError("embed down")
+            return [0.5] * _EMBEDDING_DIM
+
+        mm._embed_fn = flaky_embed
+        mm._embedding_model_name = _MODEL_A
+
+        result = mm.reembed_episodes()
+
+        assert result["reembedded"] == 1
+        assert result["total"] == 2
+        assert _get_provenance(path, "episodes") == _OTHER
+
+    def test_raises_without_embed_fn(self, tmp_path):
+        mm = MemoryManager(db_path=tmp_path / "keyword_only.db")
+        with pytest.raises(RuntimeError):
+            mm.reembed_episodes()
+
+
+# ---------------------------------------------------------------------------
 # set_embedding_source() — the live-switch counterpart to passing embed_fn/
 # embedding_model_name at construction time (POST /settings/embedding-model)
 # ---------------------------------------------------------------------------
@@ -408,7 +466,7 @@ class TestReembedCorpus:
 
         result = mm.reembed_corpus()
 
-        assert result == {"reembedded": 2, "total": 2, "model": _MODEL_A}
+        assert result == {"reembedded": 2, "total": 2, "model": _MODEL_A, "failed_ids": []}
         assert mm._corpus_stale is False
         assert _get_provenance(path, "corpus") == _MODEL_A
         assert _cache_valid_count(path) == 0
@@ -450,3 +508,149 @@ class TestReembedCorpus:
         mm.query_corpus("doc", use_embeddings=True)
 
         embed_fn.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Re-embed retry + partial-failure handling (docs/architecture/
+# 16-runtime-backend-layer.md §16.4) — shared by reembed_corpus(),
+# reembed_chat_turns() and reembed_episodes()
+# ---------------------------------------------------------------------------
+
+_VEC = [0.6] * _EMBEDDING_DIM
+
+
+@pytest.fixture()
+def no_retry_sleep(monkeypatch):
+    """Keep the retry schedule's attempt count but skip its real sleeps."""
+    monkeypatch.setattr(memory_manager, "_REEMBED_RETRY_DELAYS_S", (0.0, 0.0))
+
+
+def _doc_ids(path: Path) -> list[int]:
+    conn = sqlite3.connect(str(path))
+    ids = [row[0] for row in conn.execute("SELECT id FROM document_index ORDER BY id")]
+    conn.close()
+    return ids
+
+
+def _corpus_mm_on_other_model(tmp_path, n_docs: int) -> tuple[Path, MemoryManager]:
+    """n_docs embedded under _OTHER, MemoryManager now active on _MODEL_A (stale)."""
+    path = tmp_path / "corpus_retry.db"
+    _build_schema(path)
+    for i in range(n_docs):
+        _insert_document(path, name=f"doc-{i}", embedded=True)
+    _set_provenance(path, "corpus", _OTHER)
+    mm = MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_MODEL_A)
+    assert mm._corpus_stale is True
+    return path, mm
+
+
+@pytest.mark.usefixtures("no_retry_sleep")
+class TestReembedRetry:
+    def test_transient_failure_is_retried_and_store_completes(self, tmp_path):
+        path, mm = _corpus_mm_on_other_model(tmp_path, n_docs=2)
+        mm._embed_fn = MagicMock(side_effect=[RuntimeError("timeout"), _VEC, _VEC])
+
+        result = mm.reembed_corpus()
+
+        assert result["reembedded"] == 2
+        assert result["failed_ids"] == []
+        assert mm._embed_fn.call_count == 3
+        assert mm._corpus_stale is False
+        assert _get_provenance(path, "corpus") == _MODEL_A
+
+    def test_persistent_failure_keeps_store_stale_and_reports_the_row(self, tmp_path):
+        path, mm = _corpus_mm_on_other_model(tmp_path, n_docs=2)
+        first_id, second_id = _doc_ids(path)
+        err = RuntimeError("embed down")
+        mm._embed_fn = MagicMock(side_effect=[err, err, err, _VEC])
+
+        result = mm.reembed_corpus()
+
+        assert result["reembedded"] == 1
+        assert result["total"] == 2
+        assert result["failed_ids"] == [first_id]
+        assert mm._corpus_stale is True
+        assert _get_provenance(path, "corpus") == _OTHER
+        # The row that succeeded keeps its new vector, so a retry only has
+        # the failure left to fix.
+        conn = sqlite3.connect(str(path))
+        blob = conn.execute(
+            "SELECT embedding FROM document_index WHERE id = ?", (second_id,),
+        ).fetchone()[0]
+        conn.close()
+        assert _unpack_embedding(blob) == pytest.approx(_VEC)
+
+    def test_rerun_after_partial_failure_completes_the_store(self, tmp_path):
+        path, mm = _corpus_mm_on_other_model(tmp_path, n_docs=2)
+        err = RuntimeError("embed down")
+        mm._embed_fn = MagicMock(side_effect=[err, err, err, _VEC])
+        mm.reembed_corpus()
+        assert mm._corpus_stale is True
+
+        mm._embed_fn = _stub_embed_fn(0.6)
+        result = mm.reembed_corpus()
+
+        assert result["failed_ids"] == []
+        assert mm._corpus_stale is False
+        assert _get_provenance(path, "corpus") == _MODEL_A
+
+    def test_same_model_refresh_with_a_failure_does_not_mark_stale(self, tmp_path):
+        """Provenance already names the active model, so the failed row's old
+        vector is still in the right space — degrading to keyword-only would
+        be a regression, not a safeguard."""
+        path = tmp_path / "same_model.db"
+        _build_schema(path)
+        _insert_document(path, name="doc-a", embedded=True)
+        _insert_document(path, name="doc-b", embedded=True)
+        _set_provenance(path, "corpus", _MODEL_A)
+        mm = MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_MODEL_A)
+        err = RuntimeError("embed down")
+        mm._embed_fn = MagicMock(side_effect=[err, err, err, _VEC])
+
+        result = mm.reembed_corpus()
+
+        assert len(result["failed_ids"]) == 1
+        assert mm._corpus_stale is False
+        assert _get_provenance(path, "corpus") == _MODEL_A
+
+    def test_aborts_after_consecutive_failures_and_reports_every_skipped_row(self, tmp_path):
+        path, mm = _corpus_mm_on_other_model(tmp_path, n_docs=5)
+        mm._embed_fn = MagicMock(side_effect=RuntimeError("embed down"))
+
+        result = mm.reembed_corpus()
+
+        attempts_per_row = 1 + len(memory_manager._REEMBED_RETRY_DELAYS_S)
+        assert mm._embed_fn.call_count == (
+            memory_manager._REEMBED_ABORT_AFTER_CONSECUTIVE_FAILURES * attempts_per_row
+        )
+        assert result["reembedded"] == 0
+        assert result["failed_ids"] == _doc_ids(path)
+        assert mm._corpus_stale is True
+
+    def test_wrong_dimension_is_not_retried(self, tmp_path):
+        path, mm = _corpus_mm_on_other_model(tmp_path, n_docs=2)
+        mm._embed_fn = MagicMock(side_effect=[[0.1] * 3, _VEC])
+
+        result = mm.reembed_corpus()
+
+        assert mm._embed_fn.call_count == 2
+        assert result["failed_ids"] == [_doc_ids(path)[0]]
+        assert mm._corpus_stale is True
+
+    def test_chat_turns_persistent_failure_keeps_store_stale(self, tmp_path):
+        path = tmp_path / "chat_retry.db"
+        mm = MemoryManager(db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_OTHER)
+        mm.add_chat_turn(task_id="t", role="user", content="hello", conversation_id="c")
+        mm.add_chat_turn(task_id="t", role="assistant", content="hi there", conversation_id="c")
+        assert _get_provenance(path, "chat_turns") == _OTHER
+
+        mm._embedding_model_name = _MODEL_A
+        err = RuntimeError("embed down")
+        mm._embed_fn = MagicMock(side_effect=[err, err, err, _VEC])
+
+        result = mm.reembed_chat_turns()
+
+        assert result["reembedded"] == 1
+        assert len(result["failed_ids"]) == 1
+        assert mm._chat_turns_stale is True
+        assert _get_provenance(path, "chat_turns") == _OTHER

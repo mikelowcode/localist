@@ -1,5 +1,6 @@
 /**
- * reembedCorpus.ts — manual wiki/raw corpus re-embed
+ * reembedCorpus.ts — manual re-embed of every embedded store (wiki/raw
+ * corpus, chat history, episodes)
  *
  * Talks to POST /memory/reembed (docs/architecture/16-runtime-backend-layer.md
  * §16.4), the explicit counterpart to episodes' automatic startup re-embed.
@@ -32,10 +33,26 @@ export interface CalibrationResponse {
   gates: Record<string, GateCalibrationResponse>;
 }
 
+// One store's outcome — mirrors main.py's ReembedStoreCounts. A non-empty
+// failed_ids means rows were left on their previous embedding after retries
+// (§16.4); the store wasn't advanced to the active model, and re-running
+// the re-embed retries just those rows.
+export interface ReembedStoreCounts {
+  reembedded: number;
+  total:      number;
+  failed_ids: number[];
+}
+
+// POST /memory/reembed re-embeds every store: the top-level counts are the
+// wiki/raw corpus, chat_turns/episodes the other two. Those two are optional
+// only so an older backend's corpus-only response still parses.
 export interface ReembedCorpusResponse {
   reembedded:  number;
   total:       number;
   model:       string | null;
+  failed_ids?: number[];
+  chat_turns?: ReembedStoreCounts | null;
+  episodes?:   ReembedStoreCounts | null;
   calibration: CalibrationResponse | null;
 }
 

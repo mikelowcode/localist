@@ -47,6 +47,7 @@ class TestReembedChatTurnsEndpoint:
             "reembedded": 2,
             "total": 2,
             "model": "some-embedding-model:latest",
+            "failed_ids": [],
         }
 
     def test_returns_503_when_memory_manager_not_initialised(self, client):

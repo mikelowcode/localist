@@ -436,6 +436,20 @@ when `MemoryManager._corpus_stale` is set. On success the card shows "Re-embedde
 documents."; on failure it shows `reembedError` in `var(--error)`, same as the Runtime Backend
 card's error paragraph.
 
+**Updated 2026-10-18 (§16.23): renamed "Re-embed Memory".**
+- The button is now "Re-embed Memory Now". It still calls `POST /memory/reembed`, which now covers
+  wiki/raw documents, chat history and episodes. Previously chat history was never re-embedded
+  from the UI, since nothing called `POST /memory/reembed-chat-turns`.
+- A second stale badge, sourced from `GET /memory/stats`'s `chat_turns_stale`, reads "Chat history
+  embeddings out of date — history search is running keyword-only." Episodes have no stale flag,
+  so no badge.
+- The result line is per store: "Re-embedded Documents X/Y · Chat history X/Y · Episodes X/Y."
+  It's followed by the calibration summary.
+- When any store returns `failed_ids`, a `var(--warning)` paragraph gives the failed count per
+  store and says that running it again redoes only the remaining items.
+- `reembedCorpus.ts` gained `ReembedStoreCounts`. The response's new fields are optional, so an
+  older backend's corpus-only response still parses.
+
 **Embedding Model (2026-09-05, §16.14).** New card directly below Chat Model, shown only when
 `$modelConfig.backend === 'ollama'` (the real active backend, not the Chat Model card's preview-only
 `selectedUiBackend` — an embedding-model switch always targets whichever backend is actually live).

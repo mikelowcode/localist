@@ -1095,13 +1095,30 @@ class MemoryStatsResponse(BaseModel):
     available:        bool   # False when MemoryManager is not initialised
 
 
+class ReembedStoreCounts(BaseModel):
+    """
+    Per-store result for one store re-embedded by POST /memory/reembed.
+    `failed_ids` lists every row left on its previous embedding after
+    retries; non-empty means the store wasn't advanced to the active model
+    (still stale if it was on a different one) and the call can be re-run.
+    """
+    reembedded: int
+    total:      int
+    failed_ids: list[int] = []
+
+
 class ReembedCorpusResponse(BaseModel):
     """
     Response body for POST /memory/reembed — the manual, explicitly-
-    triggered wiki/raw corpus re-embed (docs/architecture/
+    triggered re-embed of every embedded store (docs/architecture/
     16-runtime-backend-layer.md §16.4's confirmed embedding-provenance
-    follow-up). Episodes get no equivalent endpoint — a genuine embedding-
-    model mismatch there is auto-corrected at startup, not left pending.
+    follow-up).
+
+    The top-level `reembedded`/`total` are the wiki/raw corpus counts (kept
+    at the top level so existing callers reading them are unaffected);
+    `chat_turns` and `episodes` carry the other two stores' counts. They
+    default to None only so the model stays constructible without them;
+    the endpoint always fills both.
 
     `calibration` is populated whenever an embedding source is active —
     POST /memory/reembed always re-runs calibration as its second phase
@@ -1113,6 +1130,9 @@ class ReembedCorpusResponse(BaseModel):
     reembedded:  int
     total:       int
     model:       str | None
+    failed_ids:  list[int] = []
+    chat_turns:  ReembedStoreCounts | None = None
+    episodes:    ReembedStoreCounts | None = None
     calibration: CalibrationResponse | None = None
 
 
@@ -1126,6 +1146,7 @@ class ReembedChatTurnsResponse(BaseModel):
     reembedded: int
     total:      int
     model:      str | None
+    failed_ids: list[int] = []
 
 
 class EpisodeItem(BaseModel):
@@ -2172,19 +2193,27 @@ async def get_memory_stats() -> MemoryStatsResponse:
 @app.post(
     "/memory/reembed",
     response_model = ReembedCorpusResponse,
-    summary        = "Manually re-embed the wiki/raw corpus with the active embedding model",
+    summary        = "Manually re-embed every embedded store with the active embedding model",
 )
 async def reembed_corpus() -> ReembedCorpusResponse:
     """
-    Explicit, manually-triggered corpus re-embed — the counterpart to
-    episodes' automatic startup re-embed (docs/architecture/
-    16-runtime-backend-layer.md §16.4). Wiki/raw corpora can be arbitrarily
-    large, so unlike episodes a detected embedding-model mismatch never
-    triggers this automatically; call it after switching embedding models
-    to clear MemoryManager's corpus_stale flag and restore embedding-based
-    re-ranking in query_corpus().
+    Explicit, manually-triggered re-embed of all three embedded stores —
+    the wiki/raw corpus, chat_turns, and episodes, in that order
+    (docs/architecture/16-runtime-backend-layer.md §16.4). Wiki/raw corpora
+    and chat history can be arbitrarily large, so a detected embedding-model
+    mismatch never re-embeds them automatically; call this after switching
+    embedding models to clear MemoryManager's corpus_stale and
+    chat_turns_stale flags and restore embedding-based retrieval for both.
+    Episodes are already auto-corrected at startup, but are re-run here too
+    so a partially failed startup re-embed doesn't wait for the next boot.
 
-    Idempotent — safe to call whether or not the corpus is currently
+    Previously this re-embedded only the corpus, while the Settings UI's
+    one re-embed button was its only caller — chat_turns stayed on the old
+    model's vectors (stale, keyword-only) after every embedding switch,
+    since nothing in the UI called POST /memory/reembed-chat-turns. That
+    endpoint stays for direct callers.
+
+    Idempotent — safe to call whether or not any store is currently
     flagged stale (a "just refresh it" operation).
 
     Second phase (PLAN_semantic_gating_calibration.md §5): after the corpus
@@ -2207,7 +2236,9 @@ async def reembed_corpus() -> ReembedCorpusResponse:
             detail      = "No embedding source configured — nothing to re-embed with.",
         )
 
-    result = await asyncio.to_thread(mm.reembed_corpus)
+    result     = await asyncio.to_thread(mm.reembed_corpus)
+    chat_turns = await asyncio.to_thread(mm.reembed_chat_turns)
+    episodes   = await asyncio.to_thread(mm.reembed_episodes)
 
     calibration: CalibrationResponse | None = None
     embedding_model_name = _state.active_embedding_model_name
@@ -2228,7 +2259,18 @@ async def reembed_corpus() -> ReembedCorpusResponse:
             _state.wiki_agent = wiki_agent
             _state.controller = controller
 
-    return ReembedCorpusResponse(calibration=calibration, **result)
+    return ReembedCorpusResponse(
+        calibration = calibration,
+        chat_turns  = ReembedStoreCounts(
+            reembedded=chat_turns["reembedded"], total=chat_turns["total"],
+            failed_ids=chat_turns["failed_ids"],
+        ),
+        episodes    = ReembedStoreCounts(
+            reembedded=episodes["reembedded"], total=episodes["total"],
+            failed_ids=episodes["failed_ids"],
+        ),
+        **result,
+    )
 
 
 @app.post(

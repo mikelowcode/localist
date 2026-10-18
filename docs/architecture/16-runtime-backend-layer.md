@@ -17,6 +17,16 @@ Two backends are registered in `_REGISTRY` today:
 - **`OllamaRuntimeClient`** (`ollama_runtime_client.py`, added 2026-07-08) — Ollama local
   inference, fixed port 11434, native NDJSON streaming (not OpenAI-compatible SSE). See §16.2.
 
+**Known-working oMLX chat models.** Model IDs below are exactly as oMLX's `GET /v1/models` lists
+them. Each one shows up in the Settings Chat Model dropdown (§16.6) with no code change.
+`max_model_len` is the value `OMLXRuntimeClient` reads for the per-model working-memory budget
+(§16.10, §16.11).
+
+| Model ID | `max_model_len` | Status |
+|---|---|---|
+| `gemma-4-e4b-it-4bit` | 131072 | Baseline. The original oMLX chat model; the Gemma 4B behavioral constraints in §4.7 and the diagnostic numbers in §14.8 were measured on it. |
+| `gemma-4-12B-it-MLX-4bit` | 262144 | Available and working (added 2026-10-18). Listed by the desktop app's Chat Model dropdown and selectable there. Performance evaluation is in progress. None of the model-specific findings for the E4B model (§4.7, §14.8) have been re-measured on it yet. |
+
 ### 16.2 OllamaRuntimeClient — Added 2026-07-08
 
 > **Superseded in part (2026-07-14) — see §16.4.** `embed()` is no longer a permanent stub (it now
@@ -336,7 +346,9 @@ platform-gating change (+7 new tests).
       `MemoryManager.reembed_corpus()` (exposed as `POST /memory/reembed`), which re-embeds every
       `document_index` row, flushes the cache, updates the provenance row, and clears
       `_corpus_stale` — idempotent, callable regardless of whether the corpus is currently flagged
-      stale.
+      stale. *(2026-10-18, §16.23: `POST /memory/reembed` now also re-embeds chat_turns and
+      episodes, retries failed rows, and advances provenance / clears the flag only when every row
+      succeeded.)*
     - **`'episodes'`**: small and bounded, so auto-corrected in place before `__init__` returns —
       every `episodes` row is re-embedded via the active `embed_fn` (`"{subject}. {content}"`, the
       same convention `EpisodicMemoryWriter.insert()` uses) and the provenance row is advanced to the
@@ -1104,7 +1116,8 @@ session's changes.
 
 **Open items:**
 - The `reembedded < total` silent-success gap above (`memory_manager.py`) — not closed this
-  session.
+  session. **Closed 2026-10-18 in §16.23:** provenance advances only when every row succeeded,
+  with per-row retry.
 - No automated test covers the Tauri-webview dialog path (inherently hard to unit-test — this was
   caught and fixed via live injection against a real build, not a test file). A future regression
   here would need the same manual technique to catch, or a Tauri-specific e2e harness this project
@@ -1492,3 +1505,84 @@ Tests: `TestPlanChatModelRecovery`, `TestDemoteGlobalChatModelOverride`,
 `TestRecoverMissingChatModelDemotesStaleOverride` and `TestHealthPollRecoversChatModel` in
 `tests/test_main_runtime_backend_switch.py`. One §16.21 test (`TestHealthChatModel`) now pins an
 explicit model so its missing model stays unrecoverable. Full suite 1624 passed.
+
+### §16.23 — One re-embed covers every store; partial failures stay stale (2026-10-18)
+
+**Problem.** Two gaps came up after moving the desktop install to oMLX with
+`embeddinggemma-300m-4bit` (the 768-dim model oMLX serves on `/v1/embeddings`; listed
+alongside the oMLX chat models in §16.1):
+- **The Settings re-embed button skipped chat history.** It called only `POST /memory/reembed`,
+  which re-embedded the wiki/raw corpus. `POST /memory/reembed-chat-turns` had no UI caller, so
+  chat history stayed on the previous model's vectors (`chat_turns_stale`, keyword-only search)
+  after every embedding switch. Confirmed live: after a button re-embed, 62 of 78 rows still held
+  nomic vectors, 14 had none, and the `chat_turns` provenance row still read
+  `nomic-embed-text:latest`.
+- **A partial failure was recorded as success.** This is the open item from §16.15.
+  `reembed_corpus()`/`reembed_chat_turns()` skipped any row whose embed call failed, then still
+  advanced provenance and cleared the stale flag. The store was left mixing two models' vectors,
+  with nothing flagging it.
+
+**Fix.** Changes are in `memory_manager.py` and `main.py`.
+- **`POST /memory/reembed` re-embeds every store.** It runs corpus, then chat_turns, then
+  episodes, then calibration as before.
+  - Episodes go through a new public `MemoryManager.reembed_episodes()`. It shares
+    `_reembed_episodes_locked()` with the startup auto-correct, so a partially failed startup run
+    doesn't have to wait for the next boot.
+  - The response keeps its top-level corpus `reembedded`/`total`/`model` and adds `chat_turns` and
+    `episodes` (`ReembedStoreCounts`).
+  - `POST /memory/reembed-chat-turns` stays for direct callers.
+- **Per-row retry.** All three stores go through `_reembed_rows_locked()` →
+  `_embed_with_retry()`.
+  - Each row gets `1 + len(_REEMBED_RETRY_DELAYS_S)` attempts (currently 3, sleeping 0.5s then
+    2s).
+  - A wrong-dimension vector is not retried, since it's deterministic.
+  - After `_REEMBED_ABORT_AFTER_CONSECUTIVE_FAILURES` (3) consecutive rows fail every attempt, the
+    store gives up and reports every remaining row as failed. The run holds `self._lock`, so
+    retrying a whole large corpus against a dead backend would stall all DB access.
+  - The startup episodes auto-correct uses the same path, so it costs up to 2.5s per failing row,
+    and nothing extra when no row fails.
+- **All-rows rule for every store.** `_finish_store_reembed_locked()` advances provenance only
+  when no row failed, matching what episodes already did.
+  - On a partial failure the store stays stale, unless its provenance already names the active
+    model. In that same-model refresh case the failed rows' old vectors are still in the right
+    space, so dropping to keyword-only would be a regression.
+  - Rows that succeeded keep their new vectors, so re-running the button only has the failures
+    left to fix.
+  - Every store result carries `failed_ids`.
+
+**UI (§7, Settings).**
+- The "Corpus Embeddings" card is now **"Re-embed Memory"** ("Re-embed Memory Now").
+- It shows a stale badge for documents and for chat history (`chat_turns_stale` was already on
+  `GET /memory/stats`, just unused).
+- The result line is per store, e.g. "Documents 42/42 · Chat history 78/78 · Episodes 69/69".
+- A partial failure shows a warning listing failed counts per store, with a re-run hint.
+
+**Tests.**
+- `test_embedding_provenance.py`:
+  - `TestReembedEpisodes`
+  - `TestReembedRetry`: transient retry, persistent failure stays stale, re-run completes,
+    same-model refresh not stale, consecutive-failure abort, no retry on wrong dimension, chat_turns
+    partial failure.
+- `test_main_memory_reembed.py`: the endpoint re-embeds chat_turns and episodes and surfaces
+  `failed_ids`.
+- Seven existing exact-dict assertions were updated for the new `failed_ids` field, by design.
+- Full suite 1641 passed. `localist-ui` `npm run check` clean.
+
+**Not yet live-verified.** The desktop app runs the packaged backend and UI, so this ships with
+the next build. Verify there by re-embedding once after an embedding-model switch and confirming
+all three provenance rows advance.
+
+**Open items:**
+- Episodes still have no stale flag. After a partial failure their provenance stays on the old
+  model (retried at next boot), but episodic retrieval keeps using the mixed vectors until then.
+  Adding the flag would change retrieval behavior, so it was left out of this change.
+- `settings.embedding_model` is still one global value rather than per-backend pins (cf. the chat
+  model's §16.20/§16.22). Switching backends carries an embedding model ID the other backend doesn't
+  serve, and every switch back and forth needs another full re-embed.
+- `POST /settings/embedding-model` still refuses oMLX with a 409, and the Embedding Model card is
+  Ollama-only. On oMLX the model can only be set via `.env` plus a restart, and first-time
+  semantic-gating calibration (which only that endpoint triggers) never runs, so all four gates
+  stay `lexical-fallback`. Separately, the `min_score=0.45` episodic recall floor was set for nomic.
+  EmbeddingGemma scored the right episode 0.387 on a live turn, below the floor. It also gets no
+  task-prefix formatting (`task: … | query: …`), which the model was trained to expect. Measure
+  both before changing the floor.

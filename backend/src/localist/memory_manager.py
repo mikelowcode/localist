@@ -169,6 +169,20 @@ _PROVENANCE_STORES: tuple[str, ...] = ("corpus", "episodes", "chat_turns")
 # tripwire, not a hard limit — re-embedding still runs regardless.
 _EPISODES_REEMBED_WARN_ROW_COUNT = 500
 
+# Re-embed retry policy (docs/architecture/16-runtime-backend-layer.md §16.4).
+# Each row gets 1 + len(_REEMBED_RETRY_DELAYS_S) embed attempts, sleeping the
+# listed seconds before each retry, so a transient runtime-backend hiccup
+# (one timed-out request, a model briefly reloading) doesn't leave a row on
+# the previous model's vector. A wrong-dimension vector is never retried —
+# it's deterministic, not transient.
+_REEMBED_RETRY_DELAYS_S: tuple[float, ...] = (0.5, 2.0)
+
+# A store's re-embed gives up after this many consecutive rows fail every
+# attempt — the embed source is almost certainly down, and retrying every
+# remaining row while holding self._lock would stall all DB access for
+# minutes on a large corpus. Rows not attempted are reported as failed.
+_REEMBED_ABORT_AFTER_CONSECUTIVE_FAILURES = 3
+
 # get_chat_turns(mode="semantic") does a full-table cosine scan (chat_turns
 # has no token_set column to cheaply pre-filter with, unlike document_index)
 # — this just logs a warning past this many rows rather than bounding
@@ -1313,19 +1327,140 @@ class MemoryManager:
             finally:
                 conn.close()
 
-    def _reembed_episodes_locked(self, conn: sqlite3.Connection, stored_model: str) -> None:
+    def _embed_with_retry(self, text: str, store: str, row_id: int) -> list[float] | None:
+        """
+        Embed `text` for one re-embed row, retrying per _REEMBED_RETRY_DELAYS_S.
+
+        Returns the vector, or None if every attempt raised or the vector had
+        the wrong dimension (not retried — deterministic). Logs one warning
+        per failed row, not per attempt.
+        """
+        last_exc: Exception | None = None
+        for delay in (0.0, *_REEMBED_RETRY_DELAYS_S):
+            if delay:
+                time.sleep(delay)
+            try:
+                vec = self._embed_fn(text)
+            except Exception as exc:
+                last_exc = exc
+                continue
+            if len(vec) != _EMBEDDING_DIM:
+                logger.warning(
+                    "%s re-embed: embed returned dim=%d, expected %d for id=%d — skipping.",
+                    store, len(vec), _EMBEDDING_DIM, row_id,
+                )
+                return None
+            return vec
+
+        logger.warning(
+            "%s re-embed: embed failed for id=%d after %d attempt(s) (%s) — "
+            "leaving its previous embedding in place.",
+            store, row_id, 1 + len(_REEMBED_RETRY_DELAYS_S), last_exc,
+        )
+        return None
+
+    def _reembed_rows_locked(
+        self,
+        conn:    sqlite3.Connection,
+        rows:    list[sqlite3.Row],
+        *,
+        store:   str,
+        table:   str,
+        text_of: Callable[[sqlite3.Row], str],
+    ) -> list[int]:
+        """
+        Re-embed `rows` of `table` in place (UPDATE only — never commits),
+        with per-row retry via _embed_with_retry(). Must be called with
+        self._lock held. `table` is always an internal constant, never
+        caller input.
+
+        Returns the ids of every row left on its previous embedding — rows
+        that failed, plus every row not attempted once
+        _REEMBED_ABORT_AFTER_CONSECUTIVE_FAILURES consecutive rows failed.
+        """
+        failed: list[int] = []
+        consecutive = 0
+        for i, row in enumerate(rows):
+            vec = self._embed_with_retry(text_of(row), store, row["id"])
+            if vec is None:
+                failed.append(row["id"])
+                consecutive += 1
+                if consecutive >= _REEMBED_ABORT_AFTER_CONSECUTIVE_FAILURES:
+                    remaining = [r["id"] for r in rows[i + 1:]]
+                    if remaining:
+                        logger.warning(
+                            "%s re-embed: %d consecutive rows failed — embed source "
+                            "looks unavailable; skipping the remaining %d row(s).",
+                            store, consecutive, len(remaining),
+                        )
+                        failed.extend(remaining)
+                    break
+                continue
+            consecutive = 0
+            conn.execute(
+                f"UPDATE {table} SET embedding = ? WHERE id = ?",
+                (_pack_embedding(vec), row["id"]),
+            )
+        return failed
+
+    def _finish_store_reembed_locked(
+        self,
+        conn:   sqlite3.Connection,
+        store:  str,
+        failed: list[int],
+    ) -> bool:
+        """
+        Settle `store`'s embedding_provenance row after a manual re-embed and
+        return whether the store must be treated as stale. Must be called
+        with self._lock held; the caller commits.
+
+        Provenance advances to the active model only when no row failed —
+        the same all-rows rule _reembed_episodes_locked() already applied.
+        On a partial failure the store holds a mix of new vectors and
+        whatever the failed rows had before, so it stays stale unless its
+        provenance already names the active model (a same-model refresh,
+        where the failed rows' old vectors are still the right space).
+        Rows that did succeed keep their new vectors, so a retry only has
+        the failures left to fix.
+        """
+        if not failed:
+            conn.execute(
+                """
+                INSERT INTO embedding_provenance (store, model) VALUES (?, ?)
+                ON CONFLICT(store) DO UPDATE SET model = excluded.model
+                """,
+                (store, self._embedding_model_name),
+            )
+            return False
+
+        row = conn.execute(
+            "SELECT model FROM embedding_provenance WHERE store = ?", (store,),
+        ).fetchone()
+        return row is None or row["model"] != self._embedding_model_name
+
+    def _reembed_episodes_locked(
+        self,
+        conn:         sqlite3.Connection,
+        stored_model: str | None,
+        *,
+        manual:       bool = False,
+    ) -> dict[str, int]:
         """
         Re-embed every episodes row in place with the currently active
         embed_fn, then update the 'episodes' provenance row.
 
-        Must be called with self._lock already held (only caller today is
-        _check_embedding_provenance()) — threading.Lock is not reentrant.
+        Must be called with self._lock already held (callers:
+        _check_embedding_provenance()'s startup auto-correct, and
+        reembed_episodes() with manual=True) — threading.Lock is not
+        reentrant.
 
         Provenance is only advanced to the new model if every row succeeded;
         a partial failure leaves both the surviving stale rows and the old
         provenance value in place (so the mismatch is detected again, and
         retried, on the next boot) rather than claiming a clean re-embed
         that didn't fully happen.
+
+        Returns {"reembedded": n, "total": m, "failed_ids": [...]}.
         """
         rows = conn.execute("SELECT id, subject, content FROM episodes").fetchall()
         if len(rows) > _EPISODES_REEMBED_WARN_ROW_COUNT:
@@ -1335,36 +1470,30 @@ class MemoryManager:
                 "startup with no bounding/pagination; that assumption may need "
                 "revisiting.", len(rows),
             )
-        logger.warning(
-            "MemoryManager: episodes embeddings were produced by %r, but the "
-            "active embedding model is now %r — auto re-embedding %d episode "
-            "row(s) now (small, bounded cost; see docs/architecture/"
-            "16-runtime-backend-layer.md §16.4).",
-            stored_model, self._embedding_model_name, len(rows),
+        if not manual:
+            logger.warning(
+                "MemoryManager: episodes embeddings were produced by %r, but the "
+                "active embedding model is now %r — auto re-embedding %d episode "
+                "row(s) now (small, bounded cost; see docs/architecture/"
+                "16-runtime-backend-layer.md §16.4).",
+                stored_model, self._embedding_model_name, len(rows),
+            )
+
+        failed = self._reembed_rows_locked(
+            conn, rows, store="episodes", table="episodes",
+            text_of=lambda row: f"{row['subject']}. {row['content']}",
         )
+        reembedded = len(rows) - len(failed)
 
-        reembedded = 0
-        for row in rows:
-            try:
-                vector = self._embed_fn(f"{row['subject']}. {row['content']}")
-                blob   = _pack_embedding(vector)
-            except Exception as exc:
-                logger.warning(
-                    "MemoryManager: episodes re-embed failed for id=%d (%s) — "
-                    "leaving its previous embedding in place.", row["id"], exc,
-                )
-                continue
-            conn.execute("UPDATE episodes SET embedding = ? WHERE id = ?", (blob, row["id"]))
-            reembedded += 1
-
-        if rows and reembedded < len(rows):
+        counts = {"reembedded": reembedded, "total": len(rows), "failed_ids": failed}
+        if failed:
             logger.warning(
                 "MemoryManager: episodes re-embed incomplete (%d/%d succeeded) — "
                 "leaving 'episodes' provenance at %r; will retry on next boot.",
                 reembedded, len(rows), stored_model,
             )
             conn.commit()
-            return
+            return counts
 
         conn.execute(
             """
@@ -1374,6 +1503,7 @@ class MemoryManager:
             (self._embedding_model_name,),
         )
         conn.commit()
+        return counts
         logger.info(
             "MemoryManager: episodes re-embed complete — %d/%d row(s) updated to %r.",
             reembedded, len(rows), self._embedding_model_name,
@@ -1441,51 +1571,77 @@ class MemoryManager:
             conn = self._connect()
             try:
                 rows = conn.execute("SELECT id, content FROM document_index").fetchall()
-                reembedded = 0
-                for row in rows:
-                    try:
-                        vec = self._embed_fn(row["content"][:500])
-                    except Exception as exc:
-                        logger.warning(
-                            "reembed_corpus: embed failed for document id=%d (%s) — "
-                            "leaving its previous embedding in place.", row["id"], exc,
-                        )
-                        continue
-                    if len(vec) != _EMBEDDING_DIM:
-                        logger.warning(
-                            "reembed_corpus: embed returned dim=%d, expected %d for "
-                            "document id=%d — skipping.",
-                            len(vec), _EMBEDDING_DIM, row["id"],
-                        )
-                        continue
-                    conn.execute(
-                        "UPDATE document_index SET embedding = ? WHERE id = ?",
-                        (_pack_embedding(vec), row["id"]),
-                    )
-                    reembedded += 1
-
-                self._invalidate_cache(conn)
-                conn.execute(
-                    """
-                    INSERT INTO embedding_provenance (store, model) VALUES ('corpus', ?)
-                    ON CONFLICT(store) DO UPDATE SET model = excluded.model
-                    """,
-                    (self._embedding_model_name,),
+                failed = self._reembed_rows_locked(
+                    conn, rows, store="corpus", table="document_index",
+                    text_of=lambda row: row["content"][:500],
                 )
+                self._invalidate_cache(conn)
+                stale = self._finish_store_reembed_locked(conn, "corpus", failed)
                 conn.commit()
             finally:
                 conn.close()
 
-        self._corpus_stale = False
-        logger.info(
-            "reembed_corpus: complete — %d/%d document(s) re-embedded to %r.",
-            reembedded, len(rows), self._embedding_model_name,
-        )
+        self._corpus_stale = stale
+        reembedded = len(rows) - len(failed)
+        if failed:
+            logger.warning(
+                "reembed_corpus: incomplete — %d/%d document(s) re-embedded to %r; "
+                "failed ids=%s (corpus_stale=%s).",
+                reembedded, len(rows), self._embedding_model_name, failed, stale,
+            )
+        else:
+            logger.info(
+                "reembed_corpus: complete — %d/%d document(s) re-embedded to %r.",
+                reembedded, len(rows), self._embedding_model_name,
+            )
         return {
             "reembedded": reembedded,
             "total":      len(rows),
             "model":      self._embedding_model_name,
+            "failed_ids": failed,
         }
+
+    def reembed_episodes(self) -> dict[str, Any]:
+        """
+        Manually re-embed every episodes row with the currently active
+        embed_fn — the explicit counterpart to the automatic startup
+        re-embed in _check_embedding_provenance(), sharing its
+        _reembed_episodes_locked() implementation (and so its
+        all-rows-or-provenance-stays-put rule).
+
+        The startup path only retries a partially failed episodes re-embed
+        on the next boot; this lets POST /memory/reembed retry it on demand
+        alongside the corpus and chat_turns, so one call leaves every store
+        on the active model.
+
+        Idempotent — safe to call whether or not the provenance row matches.
+
+        Raises
+        ------
+        RuntimeError
+            If no embed_fn is configured — there is nothing to re-embed with.
+        """
+        if self._embed_fn is None:
+            raise RuntimeError("reembed_episodes: no embed_fn configured — cannot re-embed.")
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT model FROM embedding_provenance WHERE store = 'episodes'"
+                ).fetchone()
+                counts = self._reembed_episodes_locked(
+                    conn, row["model"] if row else None, manual=True,
+                )
+            finally:
+                conn.close()
+
+        if not counts["failed_ids"]:
+            logger.info(
+                "reembed_episodes: complete — %d/%d episode(s) re-embedded to %r.",
+                counts["reembedded"], counts["total"], self._embedding_model_name,
+            )
+        return {**counts, "model": self._embedding_model_name}
 
     def reembed_chat_turns(self) -> dict[str, Any]:
         """
@@ -1513,49 +1669,33 @@ class MemoryManager:
             conn = self._connect()
             try:
                 rows = conn.execute("SELECT id, content FROM chat_turns").fetchall()
-                reembedded = 0
-                for row in rows:
-                    try:
-                        vec = self._embed_fn(row["content"][:500])
-                    except Exception as exc:
-                        logger.warning(
-                            "reembed_chat_turns: embed failed for chat_turns id=%d (%s) — "
-                            "leaving its previous embedding in place.", row["id"], exc,
-                        )
-                        continue
-                    if len(vec) != _EMBEDDING_DIM:
-                        logger.warning(
-                            "reembed_chat_turns: embed returned dim=%d, expected %d for "
-                            "chat_turns id=%d — skipping.",
-                            len(vec), _EMBEDDING_DIM, row["id"],
-                        )
-                        continue
-                    conn.execute(
-                        "UPDATE chat_turns SET embedding = ? WHERE id = ?",
-                        (_pack_embedding(vec), row["id"]),
-                    )
-                    reembedded += 1
-
-                conn.execute(
-                    """
-                    INSERT INTO embedding_provenance (store, model) VALUES ('chat_turns', ?)
-                    ON CONFLICT(store) DO UPDATE SET model = excluded.model
-                    """,
-                    (self._embedding_model_name,),
+                failed = self._reembed_rows_locked(
+                    conn, rows, store="chat_turns", table="chat_turns",
+                    text_of=lambda row: row["content"][:500],
                 )
+                stale = self._finish_store_reembed_locked(conn, "chat_turns", failed)
                 conn.commit()
             finally:
                 conn.close()
 
-        self._chat_turns_stale = False
-        logger.info(
-            "reembed_chat_turns: complete — %d/%d row(s) re-embedded to %r.",
-            reembedded, len(rows), self._embedding_model_name,
-        )
+        self._chat_turns_stale = stale
+        reembedded = len(rows) - len(failed)
+        if failed:
+            logger.warning(
+                "reembed_chat_turns: incomplete — %d/%d row(s) re-embedded to %r; "
+                "failed ids=%s (chat_turns_stale=%s).",
+                reembedded, len(rows), self._embedding_model_name, failed, stale,
+            )
+        else:
+            logger.info(
+                "reembed_chat_turns: complete — %d/%d row(s) re-embedded to %r.",
+                reembedded, len(rows), self._embedding_model_name,
+            )
         return {
             "reembedded": reembedded,
             "total":      len(rows),
             "model":      self._embedding_model_name,
+            "failed_ids": failed,
         }
 
     # -----------------------------------------------------------------------
