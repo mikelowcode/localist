@@ -31,6 +31,11 @@ export interface GateCalibrationResponse {
 export interface CalibrationResponse {
   model: string;
   gates: Record<string, GateCalibrationResponse>;
+  // Episodic recall floor (§16.28): this calibration's outcome, and the
+  // floor actually in use (a hand-validated one wins). Optional so an older
+  // backend's response still parses.
+  recall_floor?: GateCalibrationResponse | null;
+  recall_floor_in_use?: number | null;
 }
 
 // One store's outcome — mirrors main.py's ReembedStoreCounts. Re-embedding

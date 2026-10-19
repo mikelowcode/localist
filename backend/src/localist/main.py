@@ -158,7 +158,7 @@ from .mcp_server.file_ops import set_project_root as _set_generated_file_root
 from .mcp_tool_dispatcher import MCPToolDispatcher
 from .memory_manager import MemoryManager, EpisodicMemoryWriter, EpisodicMemoryReader
 from . import news_brief
-from .planner import _VALIDATED_MODEL_THRESHOLDS, resolve_gate_tiers
+from .planner import _VALIDATED_MODEL_THRESHOLDS, resolve_episodic_recall_floor, resolve_gate_tiers
 from .runtime_factory import available_backends, create_runtime
 from .threshold_calibration import calibrate_thresholds, CalibrationResult
 from . import session_files
@@ -1134,21 +1134,33 @@ class CalibrationResponse(BaseModel):
     """
     model: str
     gates: dict[str, GateCalibrationResponse]
+    # Episodic recall floor (§16.28) — not a gate, so not in `gates`.
+    # recall_floor is this calibration's outcome; recall_floor_in_use is
+    # what ControllerAgent will use: a hand-validated floor
+    # (planner._EPISODIC_RECALL_FLOORS) beats a calibrated one, and a
+    # degenerate calibration falls back to 0.45.
+    recall_floor:        GateCalibrationResponse | None = None
+    recall_floor_in_use: float | None = None
+
+
+def _gate_calibration_response(gate: Any) -> GateCalibrationResponse:
+    return GateCalibrationResponse(
+        threshold      = gate.threshold,
+        degenerate     = gate.degenerate,
+        reason         = gate.reason,
+        positive_count = gate.positive_count,
+        negative_count = gate.negative_count,
+    )
 
 
 def _calibration_result_to_response(model: str, result: CalibrationResult) -> CalibrationResponse:
     return CalibrationResponse(
         model = model,
-        gates = {
-            name: GateCalibrationResponse(
-                threshold      = gate.threshold,
-                degenerate     = gate.degenerate,
-                reason         = gate.reason,
-                positive_count = gate.positive_count,
-                negative_count = gate.negative_count,
-            )
-            for name, gate in result.gates.items()
-        },
+        gates = {name: _gate_calibration_response(gate) for name, gate in result.gates.items()},
+        recall_floor = (
+            _gate_calibration_response(result.recall_floor) if result.recall_floor is not None else None
+        ),
+        recall_floor_in_use = resolve_episodic_recall_floor(model, result.thresholds),
     )
 
 

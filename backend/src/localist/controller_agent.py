@@ -44,7 +44,12 @@ if TYPE_CHECKING:
     # the dependency graph clean.
     from .memory_manager import MemoryManager
 
-from .planner import Planner as _RulePlanner, RoutingPlan, resolve_graph_target
+from .planner import (
+    Planner as _RulePlanner,
+    RoutingPlan,
+    resolve_episodic_recall_floor,
+    resolve_graph_target,
+)
 from pathlib import Path
 from .paths import get_backend_root
 from .prompt_builder import PromptBuilder, Turn, EpisodeBullet, RagSource, UserProfileFact, GraphQueryResult, GraphNeighborhood, GraphLinkEntry, WorkingMemoryState
@@ -805,6 +810,11 @@ class ControllerAgent:
             calibrated_thresholds = calibrated_thresholds,
         )
         self._synthesizer    = Synthesizer(runtime)
+        # Per-model episodic recall floor (§16.28). Resolved once: the
+        # controller is rebuilt whenever the embedding model changes.
+        self._episodic_recall_floor = resolve_episodic_recall_floor(
+            embedding_model_name, calibrated_thresholds,
+        )
         # IntentClassifier retired — routing is now handled by _RulePlanner
         self._memory_manager = memory_manager   # None → use ephemeral shim per request
         self._persona_cache: str | None = None
@@ -1686,13 +1696,13 @@ class ControllerAgent:
                 # like "the user intends to download oMLX V0.5.0" — written
                 # as project_fact, so invisible to by_recency() above —
                 # actually answerable when the user later asks about it.
-                # min_score is intentionally low: cosine scores for short
-                # episode text vs. a full question rarely exceed ~0.5-0.6,
-                # mirroring the 0.45 threshold already used for profile
-                # facts in _score_profile_facts().
+                # min_score is the active embedding model's recall floor
+                # (planner._EPISODIC_RECALL_FLOORS, §16.28): cosine scales
+                # differ enough between models that one floor either drops
+                # right episodes or injects wrong ones.
                 try:
                     similar = reader.by_similarity(
-                        task.instruction, top_n=5, min_score=0.45,
+                        task.instruction, top_n=5, min_score=self._episodic_recall_floor,
                     )
                 except Exception as exc:
                     logger.debug(
@@ -1723,6 +1733,7 @@ class ControllerAgent:
                 # Mode 3 alone. Silent, best-effort degrade on any failure,
                 # same posture as every other try/except in this function.
                 added_from_graph = 0
+                graph_records: list = []
                 if similar and self._memory_manager is not None:
                     top_similar = similar[0]
                     try:
@@ -1759,6 +1770,7 @@ class ControllerAgent:
                                     if rec.id not in seen_ids:
                                         records.append(rec)
                                         seen_ids.add(rec.id)
+                                        graph_records.append(rec)
                                         added_from_graph += 1
                     except Exception as exc:
                         logger.debug(
@@ -1776,7 +1788,10 @@ class ControllerAgent:
                     # by_recency() + 5 from by_similarity(), more with graph
                     # expansion) reached the prompt instead of the intended
                     # top 5. See select_top_episodes()'s docstring.
-                    for record in select_top_episodes(records):
+                    # Episodes matched to this instruction (semantic hits,
+                    # then graph neighbours) rank ahead of recency priming,
+                    # after corrections — see select_top_episodes(relevant=).
+                    for record in select_top_episodes(records, relevant=similar + graph_records):
                         episodic_bullets.append(EpisodeBullet(
                             content      = record.content,
                             episode_type = record.episode_type,
@@ -1785,10 +1800,10 @@ class ControllerAgent:
                     self._planner.mark_episodic_injected()
                     logger.info(
                         "_execute_plan: episodic retrieval complete — "
-                        "%d recency + %d new-from-semantic + %d "
+                        "%d recency + %d new-from-semantic (floor %.2f) + %d "
                         "new-from-graph-neighbor → %d bullet(s).",
-                        recency_count, added_from_similarity, added_from_graph,
-                        len(episodic_bullets),
+                        recency_count, added_from_similarity, self._episodic_recall_floor,
+                        added_from_graph, len(episodic_bullets),
                     )
             except Exception as exc:
                 logger.warning(

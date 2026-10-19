@@ -1883,7 +1883,128 @@ calibrated, and written to `.env`; an oMLX model that isn't served returns 422 a
 Full suite 1682 passed. `npm run check` clean.
 
 **Open items:**
-- *Carried from §16.23, not built (optional Phase 6):* the `min_score=0.45` episodic recall floor was
-  tuned for nomic. EmbeddingGemma scored the right episode 0.387 on a live turn, below the floor, and
+- **Measured 2026-10-19 (§16.28); the fix is not built yet:** *carried from §16.23, not built
+  (optional Phase 6):* the `min_score=0.45` episodic recall floor was tuned for nomic. EmbeddingGemma scored the right episode 0.387 on a live turn, below the floor, and
   gets no `task: … | query: …` prefix formatting, which the model was trained to expect. Measure both
   with a read-only `diagnostics/` script before changing either.
+
+### §16.28 — Episodic recall floor measured per model (measurement record, 2026-10-19)
+
+**Question.** §16.27's open item. Is the single `min_score=0.45` floor on episodic recall
+(`ControllerAgent` → `EpisodicMemoryReader.by_similarity(task.instruction, top_n=5,
+min_score=0.45)`) right for EmbeddingGemma, and do its trained task prefixes help? A live turn had
+dropped the right episode at 0.387.
+
+**Method.** A read-only diagnostic, `diagnostics/diag_embeddinggemma_episodic_recall_floor.py`,
+against real oMLX and Ollama. It uses a synthetic fixture: 30 episodes shaped like real ones and
+embedded exactly as `EpisodicMemoryWriter` does, 31 paraphrased positive queries and 15 off-topic
+negatives. Four variants: EmbeddingGemma and nomic, each without and with its trained prefixes.
+Full results: `diagnostics/reports/episodic_recall_floor_assessment_2026-10-19.md`.
+
+**Findings.**
+- **EmbeddingGemma at 0.45:** 52% recall, even though the right episode was in the top 5 for every
+  query. It ranks well but scores low. Without prefixes the usable floor is about 0.37: 87% recall,
+  0% off-topic false positives, 0.7 wrong episodes per question. That's a knife edge, since the
+  worst off-topic score is 0.367.
+- **EmbeddingGemma with task prefixes at 0.30:** 90% recall, 0% off-topic false positives, 0.9 wrong
+  episodes per question. The best balance measured, with somewhat wider separation.
+- **nomic at 0.45 (today's default setup):** 94% recall, but it injects memory into 60% of
+  off-topic questions and about 3 wrong episodes into every real question. At about 0.55: 68%
+  recall, 7% false positives, 0.4 wrong episodes. This prompt noise existed before this work.
+- **No single floor fits both models.** Like the gate thresholds, the recall floor needs to be per
+  model.
+
+**Decision.** The options are in the report: A, a hand-validated per-model floor (nomic ≈ 0.55,
+EmbeddingGemma ≈ 0.37); B, per-model calibration alongside `threshold_calibration.py`; C,
+EmbeddingGemma prefixes stored under a distinct archive key (they need a re-embed), which pairs with
+A or B. Synthetic fixture with small N, so the floors are estimates. The user chose A first, then a
+retest before B.
+
+**Option A, built (2026-10-19).**
+- `planner._EPISODIC_RECALL_FLOORS` holds `nomic-embed-text:latest` 0.55 and
+  `embeddinggemma-300m-4bit` 0.37.
+- `resolve_episodic_recall_floor()` returns `_DEFAULT_EPISODIC_RECALL_FLOOR` (0.45) for unlisted
+  models and keyword-only.
+- `ControllerAgent` resolves the floor once in `__init__` (it's rebuilt on every embedding change),
+  passes it as Mode 3's `min_score`, and logs it on the "episodic retrieval complete" line.
+- The profile-facts threshold (`_score_profile_facts`, also 0.45) is unchanged and unmeasured.
+- Tests: `TestEpisodicRecallFloor` in `test_controller_phase4.py`, covering resolution and the floor
+  reaching `by_similarity()` per model. Full suite 1689 passed.
+
+**Retest** (details in the report's "Retest after option A"):
+- **Diagnostic:** EmbeddingGemma recall went from 52% to 87%, with 0% off-topic false positives.
+  nomic's off-topic false positives fell from 60% to 7% and wrong episodes per question from 3.0 to
+  0.4, but its recall fell from 94% to 68%. nomic's right and off-topic scores overlap (0.50–0.57),
+  so an absolute floor is a blunt tool for it. A relative cut (margin or rank) is worth considering
+  in option B.
+- **Real episodes in the sandbox:** the right episode is still ranked first for every personal
+  question on both models, and nomic's off-topic noise went to 0.
+- **Live turns:** the log confirmed floor 0.55 on nomic and 0.37 on EmbeddingGemma.
+- **New pre-existing finding:** for a `project_fact` question, semantic recall found the episode on
+  both backends, but `select_top_episodes()` (type priority first, then confidence, capped at 5)
+  kept the 5 recency-primed preference/workflow episodes instead. Both models answered "I don't have
+  that information". Whenever the user has 5 or more such episodes, Mode 3's facts never reach the
+  prompt, whatever the floor. This dates from the 2026-09-06 cap fix. Not fixed; needs a decision
+  before option B, since B tunes something this cap hides.
+
+**Episode cap fixed: relevant episodes before recency (2026-10-19).** The user chose ordering
+option 1.
+- `select_top_episodes()` takes an optional `relevant` list. The order is now eligible corrections
+  first, then `relevant` in relevance order, then everything else by type priority and confidence,
+  capped at 5.
+- `ControllerAgent` passes the semantic hits, then the graph neighbours, as `relevant`. That
+  includes a semantic hit recency also returned.
+- Without `relevant`, `format_episodic_summary()` and any other caller behave as before.
+- Live re-run in the sandbox: the `project_fact` question both models had answered "I don't have
+  that information" now came back "M1 MacBook with 16G RAM" on Ollama/nomic and oMLX/EmbeddingGemma,
+  with the same 3 semantic hits and 5 bullets, now including the relevant ones.
+- Tests: `TestRelevantEpisodesRankAheadOfRecency` (ordering, unchanged default, and a regression test
+  where a semantic fact beats 5 recency preferences into the prompt).
+
+**Option B, built: the recall floor is calibrated per model (2026-10-19).**
+- **Fixture:** moved verbatim from the diagnostic into `threshold_calibration_fixtures.RECALL_*`.
+  The diagnostic now imports it, so offline and live calibration score the same battery, as the gate
+  fixtures already do.
+- **`threshold_calibration.calibrate_recall_floor(embed_fn)`:** the diagnostic's objective, run as a
+  pure `_recall_floor_from_scores()`.
+  - Recall counts the right episode in the top 5 at or above the floor; FP counts off-topic queries
+    with any episode at or above it. It maximises recall − FP over 0.10–0.90.
+  - Ties go to the highest floor, which admits the fewest wrong extras.
+  - A floor counts as clean only above `_MIN_ACCEPTABLE_J` (0.5); otherwise it's degenerate and
+    unused.
+  - It runs inside `calibrate_thresholds()` as `CalibrationResult.recall_floor`, kept out of `gates`
+    so the four gate tiers and the badge are unaffected. `thresholds` adds `episodic_recall_floor`
+    when clean.
+- **Schema v19:** `embedding_model_thresholds.episodic_recall_floor` (fresh DB, migration, and the
+  `_ensure_recall_floor_column()` self-heal). Rows from before v19 stay NULL until the next
+  calibration, which runs on a switch to a never-calibrated model or on Re-embed Memory.
+  `get/set_calibrated_thresholds()` carry the key via `_CALIBRATED_THRESHOLD_KEYS`.
+- **Precedence:** `resolve_episodic_recall_floor(model, calibrated_thresholds)` uses the
+  hand-validated table, then this model's calibrated floor, then 0.45. `ControllerAgent` passes its
+  `calibrated_thresholds`.
+- **API and UI:** `CalibrationResponse` gains `recall_floor` (this calibration's outcome) and
+  `recall_floor_in_use`. The Settings calibration summary appends "Memory recall floor 0.37.", or
+  says when a hand-validated floor overrides the measured one, or "calibration inconclusive".
+
+**Verified live (option B).**
+- Calling `calibrate_recall_floor()` directly reproduced option A exactly: EmbeddingGemma 0.37
+  (87% / 0%), nomic 0.55 (68% / 7%).
+- In the sandbox: migrated v18→v19. `POST /memory/reembed` on each backend returned
+  `recall_floor` 0.55 / 0.37 with `recall_floor_in_use` equal, and stored them.
+- Not live-tested: the case calibration exists for, a model with no hand-validated floor. Only
+  `nomic-embed-text:latest` and `embeddinggemma-300m-4bit` are installed, and both are in the table.
+  That case is covered by `TestControllerUsesCalibratedFloor`, `TestPrecedence` and a
+  perfect-embedder calibration test.
+
+**Tests.** New `test_episodic_recall_floor_calibration.py` (18 tests): selection, degenerate cases,
+the persisted key, storage round trip, recalibration clearing a floor, v18→v19 migration,
+precedence, the controller using a calibrated floor, and the response's in-use floor. Two migration
+tests updated by design for the new column and version. Full suite 1710 passed. `npm run check`
+clean.
+
+**Open items.**
+- An absolute floor stays blunt for nomic, whose right and off-topic scores overlap (0.50–0.57). A
+  relative cut (margin over the next episode, or rank) is the next lever if nomic's 68% recall
+  matters in practice.
+- The profile-facts threshold (`_score_profile_facts`, 0.45) is still single and unmeasured.
+- EmbeddingGemma task prefixes (option C) are not built.

@@ -53,6 +53,9 @@ from .threshold_calibration_fixtures import (
     EP_POSITIVES,
     EP_POSITIVES_LIVE,
     EP_NEGATIVES,
+    RECALL_EPISODES,
+    RECALL_NEGATIVES,
+    RECALL_POSITIVES,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,6 +77,13 @@ _RI_EP_GRID: list[float] = [x / 100 for x in range(30, 96, 2)]
 # tunings ever saw.
 _MIN_ACCEPTABLE_J: float = 0.5
 
+# Episodic recall floor grid (calibrate_recall_floor()) — the same 0.10–0.90
+# step-0.01 sweep diagnostics/diag_embeddinggemma_episodic_recall_floor.py
+# used to pick the hand-validated floors, so live and hand-picked values are
+# comparable. by_similarity() returns top_n=5, as ControllerAgent asks for.
+_RECALL_FLOOR_GRID: list[float] = [x / 100 for x in range(10, 91)]
+_RECALL_TOP_N: int = 5
+
 
 @dataclass
 class GateCalibration:
@@ -92,18 +102,26 @@ class GateCalibration:
 
 @dataclass
 class CalibrationResult:
-    """Per-gate calibration outcomes for one embed_fn/model."""
+    """Per-gate calibration outcomes for one embed_fn/model, plus the
+    episodic recall floor (not a Planner gate — see calibrate_recall_floor();
+    kept out of `gates` so the four-gate tiers and badges are unaffected)."""
 
     gates: dict[str, GateCalibration] = field(default_factory=dict)
+    recall_floor: GateCalibration | None = None
 
     @property
     def thresholds(self) -> dict[str, float]:
-        """Only the gates that calibrated cleanly -- what a caller persists."""
-        return {
+        """Only what calibrated cleanly -- what a caller persists. Includes
+        "episodic_recall_floor" when the recall floor did."""
+        clean = {
             name: gate.threshold
             for name, gate in self.gates.items()
             if not gate.degenerate and gate.threshold is not None
         }
+        floor = self.recall_floor
+        if floor is not None and not floor.degenerate and floor.threshold is not None:
+            clean["episodic_recall_floor"] = floor.threshold
+        return clean
 
     @property
     def all_degenerate(self) -> bool:
@@ -258,6 +276,107 @@ def _youden_calibrate(
     )
 
 
+def recall_document_text(content: str) -> str:
+    """What EpisodicMemoryWriter embeds for an episode: f"{subject}. {content}"[:500],
+    with subject = content[:80] as the extractor writes it."""
+    return f"{content[:80]}. {content}"[:500]
+
+
+def _recall_floor_from_scores(
+    positives: list[tuple[float, int]],
+    negatives: list[float],
+    grid: list[float] | None = None,
+) -> GateCalibration:
+    """
+    Pick the episodic recall floor from scored fixture queries. Pure.
+
+    positives: (right episode's score, its rank) per positive query.
+    negatives: the best score of any episode, per negative query.
+
+    At each candidate floor, recall = share of positives whose right episode
+    is in the top _RECALL_TOP_N and scores >= floor (what by_similarity()
+    would return); FP = share of negatives with any episode >= floor
+    (irrelevant memory injected). Maximises recall − FP (Youden's J, as the
+    gates do); among equal J the highest floor wins, since it admits fewer
+    wrong episodes alongside the right one. Degenerate below
+    _MIN_ACCEPTABLE_J, with threshold=None.
+    """
+    grid = grid or _RECALL_FLOOR_GRID
+    if not positives or not negatives:
+        return GateCalibration(
+            threshold=None, degenerate=True,
+            reason="empty positive or negative pool (embed_fn failures thinned the battery)",
+            min_positive_score=None, max_negative_score=max(negatives) if negatives else None,
+            tpr_at_threshold=None, fpr_at_threshold=None,
+            positive_count=len(positives), negative_count=len(negatives),
+        )
+
+    best = (-1.0, None, None, None)   # (j, floor, recall, fp)
+    for floor in grid:
+        recall = sum(1 for score, rank in positives if rank <= _RECALL_TOP_N and score >= floor) / len(positives)
+        fp = sum(1 for score in negatives if score >= floor) / len(negatives)
+        j = recall - fp
+        if j >= best[0]:
+            best = (j, floor, recall, fp)
+
+    best_j, floor, recall, fp = best
+    degenerate = best_j < _MIN_ACCEPTABLE_J
+    return GateCalibration(
+        threshold=floor if not degenerate else None,
+        degenerate=degenerate,
+        reason=None if not degenerate else f"best Youden's J ({best_j:.2f}) below floor ({_MIN_ACCEPTABLE_J})",
+        min_positive_score=min(score for score, _ in positives),
+        max_negative_score=max(negatives),
+        tpr_at_threshold=recall,
+        fpr_at_threshold=fp,
+        positive_count=len(positives),
+        negative_count=len(negatives),
+    )
+
+
+def calibrate_recall_floor(embed_fn: EmbedFn) -> GateCalibration:
+    """
+    Measure the episodic recall floor for the model behind embed_fn on the
+    shared RECALL_* battery — the same scoring as
+    diagnostics/diag_embeddinggemma_episodic_recall_floor.py (no prefixes,
+    as production sends), so a live result is comparable to the
+    hand-validated planner._EPISODIC_RECALL_FLOORS. Never raises on an
+    embed_fn failure: a failed episode or query is dropped, thinning the
+    pool toward a degenerate verdict.
+    """
+    doc_vecs: dict[str, list[float]] = {}
+    for key, (_episode_type, content) in RECALL_EPISODES.items():
+        try:
+            doc_vecs[key] = embed_fn(recall_document_text(content))
+        except Exception as exc:
+            logger.warning("threshold_calibration: recall episode %r embed failed (%s)", key, exc)
+
+    def ranked(query: str) -> list[tuple[float, str]] | None:
+        try:
+            qv = embed_fn(query)
+        except Exception as exc:
+            logger.warning("threshold_calibration: recall query embed failed (%s)", exc)
+            return None
+        return sorted(((_cosine_similarity(qv, v), k) for k, v in doc_vecs.items()), reverse=True)
+
+    positives: list[tuple[float, int]] = []
+    for query, right in RECALL_POSITIVES:
+        scores = ranked(query) if right in doc_vecs else None
+        if scores:
+            rank, score = next((i, s) for i, (s, k) in enumerate(scores, 1) if k == right)
+            positives.append((score, rank))
+    negatives = [scores[0][0] for q in RECALL_NEGATIVES if (scores := ranked(q))]
+
+    floor = _recall_floor_from_scores(positives, negatives)
+    logger.info(
+        "threshold_calibration: episodic_recall_floor degenerate=%s floor=%s "
+        "recall=%s fp=%s pos_n=%d neg_n=%d reason=%s",
+        floor.degenerate, floor.threshold, floor.tpr_at_threshold,
+        floor.fpr_at_threshold, floor.positive_count, floor.negative_count, floor.reason,
+    )
+    return floor
+
+
 def calibrate_thresholds(embed_fn: EmbedFn) -> CalibrationResult:
     """
     Measure Youden's-J-optimal semantic-gating thresholds for the currently
@@ -309,6 +428,7 @@ def calibrate_thresholds(embed_fn: EmbedFn) -> CalibrationResult:
             gate.positive_count, gate.negative_count, gate.reason,
         )
 
+    result.recall_floor = calibrate_recall_floor(embed_fn)
     return result
 
 

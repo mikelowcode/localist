@@ -1,0 +1,185 @@
+variant,kind,query,right,right_score,rank,top1,top1_score,best_wrong_score
+gemma-raw,positive,What console do I usually play on?,console,0.4889,1,console,0.4889,0.3968
+gemma-raw,positive,Recommend a controller accessory that would work with my gaming setup.,console,0.3745,1,console,0.3745,0.3693
+gemma-raw,positive,Suggest a loadout for me in the new Call of Duty season.,fps_style,0.445,1,fps_style,0.445,0.3013
+gemma-raw,positive,Should I buy the new Gran Turismo?,racing,0.4121,1,racing,0.4121,0.3113
+gemma-raw,positive,How much RAM does my dev machine have?,laptop,0.51,1,laptop,0.51,0.3844
+gemma-raw,positive,Can my laptop run a 30B parameter model locally?,laptop,0.3705,4,runtime,0.4738,0.4738
+gemma-raw,positive,Where do my backups go?,home_server,0.4302,1,home_server,0.4302,0.3871
+gemma-raw,positive,Which web search service does my assistant use now?,search_api,0.6586,1,search_api,0.6586,0.3568
+gemma-raw,positive,Where do the headlines in my morning brief come from?,news_api,0.6601,1,news_api,0.6601,0.323
+gemma-raw,positive,What do I use to run local LLMs?,runtime,0.5678,1,runtime,0.5678,0.5018
+gemma-raw,positive,Why does my local model forget things after long conversations?,context_cap,0.4073,1,context_cap,0.4073,0.3712
+gemma-raw,positive,Set up a good config for my text editor.,editor,0.4233,2,fps_style,0.4266,0.4266
+gemma-raw,positive,Which language should I write this new API service in?,language,0.453,1,language,0.453,0.4341
+gemma-raw,positive,What should I call the branch for the login page work?,tabs,0.398,2,deploy,0.4215,0.4215
+gemma-raw,positive,Where should the tests for the parser module go?,test_style,0.5144,1,test_style,0.5144,0.3378
+gemma-raw,positive,Order me my usual coffee.,coffee,0.3865,1,coffee,0.3865,0.3273
+gemma-raw,positive,Find me a dinner recipe for tonight.,diet,0.3225,2,api_dir,0.3231,0.3231
+gemma-raw,positive,Is this granola safe for me to eat? It has almonds.,allergy,0.514,1,allergy,0.514,0.3963
+gemma-raw,positive,Build me a training plan for the next few weeks.,running,0.5017,1,running,0.5017,0.3396
+gemma-raw,positive,Find a good bike route for my commute.,city,0.5216,1,city,0.5216,0.3668
+gemma-raw,positive,What's the weather going to be like this weekend?,weather_unit,0.3472,1,weather_unit,0.3472,0.2655
+gemma-raw,positive,Schedule a call for early tomorrow my time.,timezone,0.384,1,timezone,0.384,0.3004
+gemma-raw,positive,Why does my phone keep crashing after the update?,phone,0.3666,1,phone,0.3666,0.2907
+gemma-raw,positive,What do you think of the Pixel lineup's product names?,brand_view,0.5736,1,brand_view,0.5736,0.4099
+gemma-raw,positive,Make me a playlist for a focused coding session.,music,0.5552,1,music,0.5552,0.3805
+gemma-raw,positive,Explain how transformers work.,reading,0.2542,3,runtime,0.2835,0.2835
+gemma-raw,positive,Where can I find a free weather API for my side project?,api_dir,0.5438,1,api_dir,0.5438,0.3203
+gemma-raw,positive,How do I ship the latest frontend changes?,deploy,0.5113,1,deploy,0.5113,0.4044
+gemma-raw,positive,What database does my app use?,db,0.5196,1,db,0.5196,0.3766
+gemma-raw,positive,What's a good name for a toy for my dog?,pet,0.5669,1,pet,0.5669,0.3434
+gemma-raw,positive,What should I pack for my upcoming trip?,travel,0.4292,1,travel,0.4292,0.3483
+gemma-raw,negative,What is the capital of Australia?,,,,city,0.2585,0.2585
+gemma-raw,negative,Summarize the causes of the French Revolution.,,,,reading,0.2411,0.2411
+gemma-raw,negative,Convert 250 grams to ounces.,,,,coffee,0.2921,0.2921
+gemma-raw,negative,Write a haiku about autumn leaves.,,,,music,0.303,0.303
+gemma-raw,negative,How do vaccines train the immune system?,,,,running,0.2366,0.2366
+gemma-raw,negative,Explain the difference between TCP and UDP.,,,,language,0.3521,0.3521
+gemma-raw,negative,Who won the 1998 World Cup?,,,,pet,0.1505,0.1505
+gemma-raw,negative,What's the derivative of x squared times sine x?,,,,tone,0.2718,0.2718
+gemma-raw,negative,Translate 'good morning' into Spanish.,,,,timezone,0.3235,0.3235
+gemma-raw,negative,How many moons does Jupiter have?,,,,pet,0.2997,0.2997
+gemma-raw,negative,Give me a regex that matches an email address.,,,,tabs,0.3672,0.3672
+gemma-raw,negative,What year did the Berlin Wall fall?,,,,allergy,0.1931,0.1931
+gemma-raw,negative,Explain compound interest with an example.,,,,tone,0.292,0.292
+gemma-raw,negative,What is photosynthesis?,,,,diet,0.2953,0.2953
+gemma-raw,negative,List three famous paintings by Monet.,,,,pet,0.2672,0.2672
+gemma-prefixed,positive,What console do I usually play on?,console,0.5025,1,console,0.5025,0.3594
+gemma-prefixed,positive,Recommend a controller accessory that would work with my gaming setup.,console,0.3761,1,console,0.3761,0.3103
+gemma-prefixed,positive,Suggest a loadout for me in the new Call of Duty season.,fps_style,0.4667,1,fps_style,0.4667,0.2372
+gemma-prefixed,positive,Should I buy the new Gran Turismo?,racing,0.3034,1,racing,0.3034,0.208
+gemma-prefixed,positive,How much RAM does my dev machine have?,laptop,0.493,1,laptop,0.493,0.3777
+gemma-prefixed,positive,Can my laptop run a 30B parameter model locally?,laptop,0.3595,3,runtime,0.4371,0.4371
+gemma-prefixed,positive,Where do my backups go?,home_server,0.4245,1,home_server,0.4245,0.3399
+gemma-prefixed,positive,Which web search service does my assistant use now?,search_api,0.5802,1,search_api,0.5802,0.2803
+gemma-prefixed,positive,Where do the headlines in my morning brief come from?,news_api,0.6214,1,news_api,0.6214,0.2453
+gemma-prefixed,positive,What do I use to run local LLMs?,runtime,0.5855,1,runtime,0.5855,0.437
+gemma-prefixed,positive,Why does my local model forget things after long conversations?,context_cap,0.3959,1,context_cap,0.3959,0.3527
+gemma-prefixed,positive,Set up a good config for my text editor.,editor,0.3857,1,editor,0.3857,0.3473
+gemma-prefixed,positive,Which language should I write this new API service in?,language,0.3625,2,api_dir,0.3965,0.3965
+gemma-prefixed,positive,What should I call the branch for the login page work?,tabs,0.3796,2,deploy,0.3932,0.3932
+gemma-prefixed,positive,Where should the tests for the parser module go?,test_style,0.4963,1,test_style,0.4963,0.2991
+gemma-prefixed,positive,Order me my usual coffee.,coffee,0.3638,1,coffee,0.3638,0.294
+gemma-prefixed,positive,Find me a dinner recipe for tonight.,diet,0.2169,1,diet,0.2169,0.1977
+gemma-prefixed,positive,Is this granola safe for me to eat? It has almonds.,allergy,0.4332,1,allergy,0.4332,0.3158
+gemma-prefixed,positive,Build me a training plan for the next few weeks.,running,0.4927,1,running,0.4927,0.3132
+gemma-prefixed,positive,Find a good bike route for my commute.,city,0.4597,1,city,0.4597,0.2618
+gemma-prefixed,positive,What's the weather going to be like this weekend?,weather_unit,0.2836,1,weather_unit,0.2836,0.1913
+gemma-prefixed,positive,Schedule a call for early tomorrow my time.,timezone,0.3014,1,timezone,0.3014,0.2023
+gemma-prefixed,positive,Why does my phone keep crashing after the update?,phone,0.3287,1,phone,0.3287,0.2138
+gemma-prefixed,positive,What do you think of the Pixel lineup's product names?,brand_view,0.5197,1,brand_view,0.5197,0.3782
+gemma-prefixed,positive,Make me a playlist for a focused coding session.,music,0.5117,1,music,0.5117,0.3367
+gemma-prefixed,positive,Explain how transformers work.,reading,0.1327,11,runtime,0.1996,0.1996
+gemma-prefixed,positive,Where can I find a free weather API for my side project?,api_dir,0.4117,1,api_dir,0.4117,0.2358
+gemma-prefixed,positive,How do I ship the latest frontend changes?,deploy,0.5361,1,deploy,0.5361,0.3801
+gemma-prefixed,positive,What database does my app use?,db,0.4757,1,db,0.4757,0.3015
+gemma-prefixed,positive,What's a good name for a toy for my dog?,pet,0.4439,1,pet,0.4439,0.2285
+gemma-prefixed,positive,What should I pack for my upcoming trip?,travel,0.382,1,travel,0.382,0.2278
+gemma-prefixed,negative,What is the capital of Australia?,,,,city,0.12,0.12
+gemma-prefixed,negative,Summarize the causes of the French Revolution.,,,,racing,0.132,0.132
+gemma-prefixed,negative,Convert 250 grams to ounces.,,,,coffee,0.1808,0.1808
+gemma-prefixed,negative,Write a haiku about autumn leaves.,,,,travel,0.2573,0.2573
+gemma-prefixed,negative,How do vaccines train the immune system?,,,,running,0.178,0.178
+gemma-prefixed,negative,Explain the difference between TCP and UDP.,,,,language,0.203,0.203
+gemma-prefixed,negative,Who won the 1998 World Cup?,,,,pet,0.0608,0.0608
+gemma-prefixed,negative,What's the derivative of x squared times sine x?,,,,news_api,0.122,0.122
+gemma-prefixed,negative,Translate 'good morning' into Spanish.,,,,timezone,0.2576,0.2576
+gemma-prefixed,negative,How many moons does Jupiter have?,,,,pet,0.201,0.201
+gemma-prefixed,negative,Give me a regex that matches an email address.,,,,tabs,0.2941,0.2941
+gemma-prefixed,negative,What year did the Berlin Wall fall?,,,,pet,0.0892,0.0892
+gemma-prefixed,negative,Explain compound interest with an example.,,,,running,0.1963,0.1963
+gemma-prefixed,negative,What is photosynthesis?,,,,diet,0.1127,0.1127
+gemma-prefixed,negative,List three famous paintings by Monet.,,,,running,0.1223,0.1223
+nomic-raw,positive,What console do I usually play on?,console,0.6761,1,console,0.6761,0.6017
+nomic-raw,positive,Recommend a controller accessory that would work with my gaming setup.,console,0.6179,1,console,0.6179,0.5398
+nomic-raw,positive,Suggest a loadout for me in the new Call of Duty season.,fps_style,0.6129,1,fps_style,0.6129,0.452
+nomic-raw,positive,Should I buy the new Gran Turismo?,racing,0.5189,1,racing,0.5189,0.4877
+nomic-raw,positive,How much RAM does my dev machine have?,laptop,0.6537,1,laptop,0.6537,0.5248
+nomic-raw,positive,Can my laptop run a 30B parameter model locally?,laptop,0.5095,3,runtime,0.6137,0.6137
+nomic-raw,positive,Where do my backups go?,home_server,0.5218,1,home_server,0.5218,0.4771
+nomic-raw,positive,Which web search service does my assistant use now?,search_api,0.751,1,search_api,0.751,0.5903
+nomic-raw,positive,Where do the headlines in my morning brief come from?,news_api,0.6797,1,news_api,0.6797,0.5205
+nomic-raw,positive,What do I use to run local LLMs?,runtime,0.7492,1,runtime,0.7492,0.5215
+nomic-raw,positive,Why does my local model forget things after long conversations?,context_cap,0.6766,1,context_cap,0.6766,0.628
+nomic-raw,positive,Set up a good config for my text editor.,editor,0.5061,3,language,0.5193,0.5193
+nomic-raw,positive,Which language should I write this new API service in?,language,0.5743,2,api_dir,0.5984,0.5984
+nomic-raw,positive,What should I call the branch for the login page work?,tabs,0.6193,1,tabs,0.6193,0.5403
+nomic-raw,positive,Where should the tests for the parser module go?,test_style,0.6508,1,test_style,0.6508,0.5513
+nomic-raw,positive,Order me my usual coffee.,coffee,0.5009,1,coffee,0.5009,0.4416
+nomic-raw,positive,Find me a dinner recipe for tonight.,diet,0.3796,10,timezone,0.4198,0.4198
+nomic-raw,positive,Is this granola safe for me to eat? It has almonds.,allergy,0.5124,2,coffee,0.5279,0.5279
+nomic-raw,positive,Build me a training plan for the next few weeks.,running,0.5426,1,running,0.5426,0.4264
+nomic-raw,positive,Find a good bike route for my commute.,city,0.6239,1,city,0.6239,0.4889
+nomic-raw,positive,What's the weather going to be like this weekend?,weather_unit,0.5179,1,weather_unit,0.5179,0.4685
+nomic-raw,positive,Schedule a call for early tomorrow my time.,timezone,0.6093,1,timezone,0.6093,0.4733
+nomic-raw,positive,Why does my phone keep crashing after the update?,phone,0.5741,1,phone,0.5741,0.4874
+nomic-raw,positive,What do you think of the Pixel lineup's product names?,brand_view,0.6618,1,brand_view,0.6618,0.5511
+nomic-raw,positive,Make me a playlist for a focused coding session.,music,0.6815,1,music,0.6815,0.5299
+nomic-raw,positive,Explain how transformers work.,reading,0.3924,24,language,0.4845,0.4845
+nomic-raw,positive,Where can I find a free weather API for my side project?,api_dir,0.6678,1,api_dir,0.6678,0.5777
+nomic-raw,positive,How do I ship the latest frontend changes?,deploy,0.5603,1,deploy,0.5603,0.4924
+nomic-raw,positive,What database does my app use?,db,0.6778,1,db,0.6778,0.5772
+nomic-raw,positive,What's a good name for a toy for my dog?,pet,0.5524,1,pet,0.5524,0.4705
+nomic-raw,positive,What should I pack for my upcoming trip?,travel,0.5622,1,travel,0.5622,0.4472
+nomic-raw,negative,What is the capital of Australia?,,,,city,0.5307,0.5307
+nomic-raw,negative,Summarize the causes of the French Revolution.,,,,reading,0.5096,0.5096
+nomic-raw,negative,Convert 250 grams to ounces.,,,,laptop,0.427,0.427
+nomic-raw,negative,Write a haiku about autumn leaves.,,,,travel,0.5474,0.5474
+nomic-raw,negative,How do vaccines train the immune system?,,,,running,0.4614,0.4614
+nomic-raw,negative,Explain the difference between TCP and UDP.,,,,language,0.5698,0.5698
+nomic-raw,negative,Who won the 1998 World Cup?,,,,console,0.4458,0.4458
+nomic-raw,negative,What's the derivative of x squared times sine x?,,,,console,0.4432,0.4432
+nomic-raw,negative,Translate 'good morning' into Spanish.,,,,timezone,0.5119,0.5119
+nomic-raw,negative,How many moons does Jupiter have?,,,,travel,0.4578,0.4578
+nomic-raw,negative,Give me a regex that matches an email address.,,,,city,0.4973,0.4973
+nomic-raw,negative,What year did the Berlin Wall fall?,,,,travel,0.4201,0.4201
+nomic-raw,negative,Explain compound interest with an example.,,,,pet,0.485,0.485
+nomic-raw,negative,What is photosynthesis?,,,,coffee,0.4292,0.4292
+nomic-raw,negative,List three famous paintings by Monet.,,,,travel,0.4268,0.4268
+nomic-prefixed,positive,What console do I usually play on?,console,0.7354,1,console,0.7354,0.667
+nomic-prefixed,positive,Recommend a controller accessory that would work with my gaming setup.,console,0.683,1,console,0.683,0.6105
+nomic-prefixed,positive,Suggest a loadout for me in the new Call of Duty season.,fps_style,0.6861,1,fps_style,0.6861,0.5411
+nomic-prefixed,positive,Should I buy the new Gran Turismo?,racing,0.5151,1,racing,0.5151,0.4804
+nomic-prefixed,positive,How much RAM does my dev machine have?,laptop,0.7134,1,laptop,0.7134,0.6094
+nomic-prefixed,positive,Can my laptop run a 30B parameter model locally?,laptop,0.5462,3,context_cap,0.633,0.633
+nomic-prefixed,positive,Where do my backups go?,home_server,0.6265,1,home_server,0.6265,0.5822
+nomic-prefixed,positive,Which web search service does my assistant use now?,search_api,0.755,1,search_api,0.755,0.5868
+nomic-prefixed,positive,Where do the headlines in my morning brief come from?,news_api,0.6719,1,news_api,0.6719,0.5575
+nomic-prefixed,positive,What do I use to run local LLMs?,runtime,0.7379,1,runtime,0.7379,0.6019
+nomic-prefixed,positive,Why does my local model forget things after long conversations?,context_cap,0.6855,1,context_cap,0.6855,0.6117
+nomic-prefixed,positive,Set up a good config for my text editor.,editor,0.6269,2,context_cap,0.6461,0.6461
+nomic-prefixed,positive,Which language should I write this new API service in?,language,0.6289,2,api_dir,0.6519,0.6519
+nomic-prefixed,positive,What should I call the branch for the login page work?,tabs,0.6454,1,tabs,0.6454,0.6077
+nomic-prefixed,positive,Where should the tests for the parser module go?,test_style,0.7055,1,test_style,0.7055,0.6238
+nomic-prefixed,positive,Order me my usual coffee.,coffee,0.5533,2,tabs,0.5624,0.5624
+nomic-prefixed,positive,Find me a dinner recipe for tonight.,diet,0.4088,29,deploy,0.4961,0.4961
+nomic-prefixed,positive,Is this granola safe for me to eat? It has almonds.,allergy,0.4791,2,coffee,0.5884,0.5884
+nomic-prefixed,positive,Build me a training plan for the next few weeks.,running,0.6396,1,running,0.6396,0.5441
+nomic-prefixed,positive,Find a good bike route for my commute.,city,0.7403,1,city,0.7403,0.6276
+nomic-prefixed,positive,What's the weather going to be like this weekend?,weather_unit,0.5266,2,running,0.5277,0.5277
+nomic-prefixed,positive,Schedule a call for early tomorrow my time.,timezone,0.6643,1,timezone,0.6643,0.5901
+nomic-prefixed,positive,Why does my phone keep crashing after the update?,phone,0.583,1,phone,0.583,0.5318
+nomic-prefixed,positive,What do you think of the Pixel lineup's product names?,brand_view,0.6543,1,brand_view,0.6543,0.6223
+nomic-prefixed,positive,Make me a playlist for a focused coding session.,music,0.6788,1,music,0.6788,0.63
+nomic-prefixed,positive,Explain how transformers work.,reading,0.4705,28,deploy,0.6214,0.6214
+nomic-prefixed,positive,Where can I find a free weather API for my side project?,api_dir,0.6438,1,api_dir,0.6438,0.5914
+nomic-prefixed,positive,How do I ship the latest frontend changes?,deploy,0.6323,1,deploy,0.6323,0.5397
+nomic-prefixed,positive,What database does my app use?,db,0.7303,1,db,0.7303,0.6518
+nomic-prefixed,positive,What's a good name for a toy for my dog?,pet,0.6108,1,pet,0.6108,0.5372
+nomic-prefixed,positive,What should I pack for my upcoming trip?,travel,0.5789,1,travel,0.5789,0.503
+nomic-prefixed,negative,What is the capital of Australia?,,,,city,0.5841,0.5841
+nomic-prefixed,negative,Summarize the causes of the French Revolution.,,,,tone,0.6396,0.6396
+nomic-prefixed,negative,Convert 250 grams to ounces.,,,,laptop,0.5389,0.5389
+nomic-prefixed,negative,Write a haiku about autumn leaves.,,,,travel,0.5768,0.5768
+nomic-prefixed,negative,How do vaccines train the immune system?,,,,running,0.5593,0.5593
+nomic-prefixed,negative,Explain the difference between TCP and UDP.,,,,editor,0.6099,0.6099
+nomic-prefixed,negative,Who won the 1998 World Cup?,,,,search_api,0.4621,0.4621
+nomic-prefixed,negative,What's the derivative of x squared times sine x?,,,,console,0.4796,0.4796
+nomic-prefixed,negative,Translate 'good morning' into Spanish.,,,,timezone,0.5619,0.5619
+nomic-prefixed,negative,How many moons does Jupiter have?,,,,travel,0.4963,0.4963
+nomic-prefixed,negative,Give me a regex that matches an email address.,,,,tone,0.6188,0.6188
+nomic-prefixed,negative,What year did the Berlin Wall fall?,,,,deploy,0.4837,0.4837
+nomic-prefixed,negative,Explain compound interest with an example.,,,,tone,0.6287,0.6287
+nomic-prefixed,negative,What is photosynthesis?,,,,coffee,0.4842,0.4842
+nomic-prefixed,negative,List three famous paintings by Monet.,,,,tabs,0.529,0.529

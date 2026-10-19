@@ -2850,3 +2850,90 @@ class TestRoutingPlanNoForceRagField:
                 fetch_rag      = False,
                 force_rag      = True,   # no longer a field — must raise
             )
+
+
+# ---------------------------------------------------------------------------
+# Per-model episodic recall floor (docs/architecture/16-runtime-backend-layer.md §16.28)
+# ---------------------------------------------------------------------------
+
+class TestEpisodicRecallFloor:
+    @pytest.mark.parametrize("model, floor", [
+        ("nomic-embed-text:latest",  0.55),
+        ("embeddinggemma-300m-4bit", 0.37),
+        ("some-unmeasured-model",    0.45),
+        (None,                       0.45),
+    ])
+    def test_floor_resolves_per_model(self, model, floor):
+        from localist.planner import resolve_episodic_recall_floor
+        assert resolve_episodic_recall_floor(model) == floor
+
+    @pytest.mark.parametrize("model, floor", [
+        ("nomic-embed-text:latest",  0.55),
+        ("embeddinggemma-300m-4bit", 0.37),
+        (None,                       0.45),
+    ])
+    def test_semantic_recall_uses_the_active_models_floor(self, mm, model, floor):
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm, embedding_model_name=model)
+        plan = RoutingPlan(agent="conversational_agent", fetch_episodic=False, fetch_rag=False, priority=6)
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch.object(EpisodicMemoryReader, "by_recency", return_value=[]), \
+             patch.object(EpisodicMemoryReader, "by_similarity", return_value=[]) as by_similarity:
+            ctrl.handle_task({"instruction": "what console do I play on"})
+
+        by_similarity.assert_called_once()
+        assert by_similarity.call_args.kwargs["min_score"] == floor
+
+
+# ---------------------------------------------------------------------------
+# Relevance-aware 5-bullet cap (§16.28 retest finding)
+# ---------------------------------------------------------------------------
+
+def _ep(id_, episode_type, content, confidence=0.9, status="active"):
+    return EpisodeRecord(
+        id=id_, episode_type=episode_type, subject="s", content=content,
+        confidence=confidence, source="model_extracted", task_id=None,
+        conversation_id=None, project_context="general", status=status,
+        created_at=time.time(), last_accessed=None,
+    )
+
+
+class TestRelevantEpisodesRankAheadOfRecency:
+    def test_order_is_corrections_then_relevant_then_type_priority(self):
+        from localist.memory_manager import select_top_episodes
+        prefs   = [_ep(i, "preference", f"pref {i}") for i in range(1, 6)]
+        fact    = _ep(10, "project_fact", "relevant fact")
+        fix     = _ep(11, "correction", "a correction")
+        weak    = _ep(12, "project_fact", "low-confidence fact", confidence=0.5)
+
+        top = select_top_episodes(prefs + [fact, fix, weak], relevant=[weak, fact])
+
+        assert [e.id for e in top] == [11, 10, 1, 2, 3]   # correction, relevant (eligible only), then prefs
+
+    def test_without_relevant_type_priority_is_unchanged(self):
+        from localist.memory_manager import select_top_episodes
+        prefs = [_ep(i, "preference", f"pref {i}") for i in range(1, 6)]
+        fact  = _ep(10, "project_fact", "fact")
+
+        assert [e.id for e in select_top_episodes(prefs + [fact])] == [1, 2, 3, 4, 5]
+
+    def test_semantic_fact_reaches_the_prompt_past_five_recency_preferences(self, mm):
+        recency = [_ep(i, "preference", f"recency preference {i}") for i in range(1, 6)]
+        fact    = _ep(20, "project_fact", "The user built the orchestration layer on an M1 MacBook.")
+
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent()
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        plan = RoutingPlan(agent="conversational_agent", fetch_episodic=False, fetch_rag=False, priority=6)
+
+        with patch.object(ctrl._planner, "route", return_value=plan), \
+             patch.object(EpisodicMemoryReader, "by_recency", return_value=recency), \
+             patch.object(EpisodicMemoryReader, "by_similarity", return_value=[fact]):
+            ctrl.handle_task({"instruction": "What machine did I build my orchestration layer on?"})
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        bullets = [l for l in prompt.splitlines() if l.startswith("- ") and ("recency preference" in l or "M1 MacBook" in l)]
+        assert len(bullets) == 5
+        assert any("M1 MacBook" in l for l in bullets)

@@ -836,7 +836,7 @@ class TestSchemaV18Migration:
             "SELECT name FROM sqlite_master WHERE type = 'trigger'"
         ).fetchall()}
         conn.close()
-        assert version == _SCHEMA_VERSION == 18
+        assert version == _SCHEMA_VERSION
         assert {"trg_archive_drop_document_index", "trg_archive_drop_episodes",
                 "trg_archive_drop_chat_turns"} <= triggers
         assert _get_complete(path, "corpus") is True

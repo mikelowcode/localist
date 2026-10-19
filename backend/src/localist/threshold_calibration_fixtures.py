@@ -7,6 +7,10 @@ lookup_request, research_intent, episodic_relevance). Read by both:
   - diagnostics/nomic_embed_text_threshold_probe.py (offline, human-reviewed)
   - threshold_calibration.py (live, in-app calibration)
 
+Also the episodic recall floor battery (RECALL_*, bottom of this file), read
+by diagnostics/diag_embeddinggemma_episodic_recall_floor.py and
+threshold_calibration.calibrate_recall_floor().
+
 These must never drift apart, since a discrepancy would make live-calibrated
 thresholds not comparable to the hand-validated ones. Data copied verbatim
 from the original tuning diagnostics (score_lookup_request_templates.py,
@@ -155,4 +159,107 @@ EP_POSITIVES_LIVE: list[str] = [
     "What games do I play?",
     "What console do I own?",
     "Tell me about my Xbox.",
+]
+
+
+# ---------------------------------------------------------------------------
+# Episodic recall floor — the min_score for EpisodicMemoryReader.by_similarity()
+# (docs/architecture/16-runtime-backend-layer.md §16.28). SYNTHETIC: made-up
+# facts shaped like real episodes (one sentence starting "The user …";
+# subject = content[:80]), with near-miss distractors in the same domains.
+# Real episodes are personal data and never belong here. Positive queries
+# are paraphrased full user instructions with one right episode; negatives
+# have no relevant episode. Moved verbatim from the diagnostic that first
+# measured it, so the hand-validated floors in planner._EPISODIC_RECALL_FLOORS
+# and live calibration score the same battery.
+# ---------------------------------------------------------------------------
+
+RECALL_EPISODES: dict[str, tuple[str, str]] = {
+    # key: (episode_type, content) — subject is derived as content[:80]
+    "console":      ("preference",   "The user plays most games on a PlayStation 5 with a DualSense controller."),
+    "fps_style":    ("preference",   "The user prefers aggressive close-range loadouts in shooters and plays with high stick sensitivity."),
+    "racing":       ("preference",   "The user dislikes racing games and finds them repetitive."),
+    "laptop":       ("project_fact", "The user develops on a 14-inch MacBook Pro with an M3 Pro chip and 36GB of unified memory."),
+    "home_server":  ("project_fact", "The user runs a small Linux home server for backups and media streaming."),
+    "search_api":   ("project_fact", "The user switched the assistant's web search provider from SerpAPI to Tavily."),
+    "news_api":     ("project_fact", "The user's daily news brief pulls headlines from the NewsAPI developer tier."),
+    "runtime":      ("project_fact", "The user runs local models through LM Studio and occasionally uses hosted models for long documents."),
+    "context_cap":  ("project_fact", "The user capped the local model's context window at 16k tokens to keep memory usage stable."),
+    "editor":       ("preference",   "The user writes code in Neovim with a minimal plugin setup."),
+    "language":     ("preference",   "The user prefers Python for backend work and TypeScript for frontends."),
+    "tabs":         ("naming_convention", "The user names feature branches with the prefix feat/ followed by a short kebab-case description."),
+    "test_style":   ("naming_convention", "The user names test files test_<module>.py and keeps them in a top-level tests folder."),
+    "coffee":       ("preference",   "The user drinks oat milk flat whites and avoids dairy."),
+    "diet":         ("preference",   "The user is vegetarian but eats eggs."),
+    "allergy":      ("project_fact", "The user is allergic to tree nuts."),
+    "running":      ("preference",   "The user runs three mornings a week and is training for a half marathon in the spring."),
+    "city":         ("project_fact", "The user lives in Portland, Oregon and commutes by bike."),
+    "weather_unit": ("preference",   "The user wants temperatures shown in Celsius, not Fahrenheit."),
+    "timezone":     ("project_fact", "The user works on Pacific time and usually starts at 7am."),
+    "phone":        ("project_fact", "The user's phone is a Pixel 8 running the latest Android beta."),
+    "brand_view":   ("preference",   "The user thinks Google's hardware naming has become confusing and should be simplified."),
+    "music":        ("preference",   "The user listens to ambient electronic music while coding."),
+    "reading":      ("preference",   "The user prefers short summaries with bullet points over long prose answers."),
+    "tone":         ("preference",   "The user wants direct answers without filler or excessive caveats."),
+    "api_dir":      ("project_fact", "The user recommends the GitHub public-apis list as a starting point for finding free APIs."),
+    "deploy":       ("workflow",     "The user deploys the frontend to Netlify from the main branch and previews pull requests on separate URLs."),
+    "db":           ("project_fact", "The user stores app data in SQLite with WAL mode enabled."),
+    "pet":          ("project_fact", "The user has a border collie named Juniper."),
+    "travel":       ("project_fact", "The user is planning a trip to Japan in October and wants to visit Kyoto."),
+}
+
+# (query, key of the one right episode). Paraphrased, indirect, and phrased
+# as a full user instruction — never copying the episode's wording.
+RECALL_POSITIVES: list[tuple[str, str]] = [
+    ("What console do I usually play on?", "console"),
+    ("Recommend a controller accessory that would work with my gaming setup.", "console"),
+    ("Suggest a loadout for me in the new Call of Duty season.", "fps_style"),
+    ("Should I buy the new Gran Turismo?", "racing"),
+    ("How much RAM does my dev machine have?", "laptop"),
+    ("Can my laptop run a 30B parameter model locally?", "laptop"),
+    ("Where do my backups go?", "home_server"),
+    ("Which web search service does my assistant use now?", "search_api"),
+    ("Where do the headlines in my morning brief come from?", "news_api"),
+    ("What do I use to run local LLMs?", "runtime"),
+    ("Why does my local model forget things after long conversations?", "context_cap"),
+    ("Set up a good config for my text editor.", "editor"),
+    ("Which language should I write this new API service in?", "language"),
+    ("What should I call the branch for the login page work?", "tabs"),
+    ("Where should the tests for the parser module go?", "test_style"),
+    ("Order me my usual coffee.", "coffee"),
+    ("Find me a dinner recipe for tonight.", "diet"),
+    ("Is this granola safe for me to eat? It has almonds.", "allergy"),
+    ("Build me a training plan for the next few weeks.", "running"),
+    ("Find a good bike route for my commute.", "city"),
+    ("What's the weather going to be like this weekend?", "weather_unit"),
+    ("Schedule a call for early tomorrow my time.", "timezone"),
+    ("Why does my phone keep crashing after the update?", "phone"),
+    ("What do you think of the Pixel lineup's product names?", "brand_view"),
+    ("Make me a playlist for a focused coding session.", "music"),
+    ("Explain how transformers work.", "reading"),
+    ("Where can I find a free weather API for my side project?", "api_dir"),
+    ("How do I ship the latest frontend changes?", "deploy"),
+    ("What database does my app use?", "db"),
+    ("What's a good name for a toy for my dog?", "pet"),
+    ("What should I pack for my upcoming trip?", "travel"),
+]
+
+# Questions with no relevant episode — anything scoring >= floor here would
+# be injected into the prompt as irrelevant memory.
+RECALL_NEGATIVES: list[str] = [
+    "What is the capital of Australia?",
+    "Summarize the causes of the French Revolution.",
+    "Convert 250 grams to ounces.",
+    "Write a haiku about autumn leaves.",
+    "How do vaccines train the immune system?",
+    "Explain the difference between TCP and UDP.",
+    "Who won the 1998 World Cup?",
+    "What's the derivative of x squared times sine x?",
+    "Translate 'good morning' into Spanish.",
+    "How many moons does Jupiter have?",
+    "Give me a regex that matches an email address.",
+    "What year did the Berlin Wall fall?",
+    "Explain compound interest with an example.",
+    "What is photosynthesis?",
+    "List three famous paintings by Monet.",
 ]

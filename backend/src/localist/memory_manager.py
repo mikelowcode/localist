@@ -152,7 +152,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION   = 18         # increment when schema changes require migration
+_SCHEMA_VERSION   = 19         # increment when schema changes require migration
 _EMBEDDING_DIM    = 768        # EmbeddingGemma-300M-4bit output dimension
 _EMBEDDING_FORMAT = ">768f"    # big-endian float32 × 768
 
@@ -162,6 +162,13 @@ _CONV_LOG_CAP_PER_TASK = 200
 
 # embedding_provenance store keys — see _check_embedding_provenance().
 _PROVENANCE_STORES: tuple[str, ...] = ("corpus", "episodes", "chat_turns")
+
+# embedding_model_thresholds' calibrated columns — the four Planner gates,
+# plus the episodic recall floor (schema v19), which isn't a gate.
+_CALIBRATED_THRESHOLD_KEYS: tuple[str, ...] = (
+    "explicit_search_action", "lookup_request", "research_intent",
+    "episodic_relevance", "episodic_recall_floor",
+)
 
 # The table each provenance store's vectors live in (its `embedding` column).
 _STORE_TABLE: dict[str, str] = {
@@ -415,6 +422,19 @@ def _ensure_embedding_archive_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE embedding_provenance ADD COLUMN complete INTEGER NOT NULL DEFAULT 1"
         )
+
+
+def _ensure_recall_floor_column(conn: sqlite3.Connection) -> None:
+    """Add embedding_model_thresholds.episodic_recall_floor (schema v19) if
+    the table exists without it. Idempotent; doesn't commit."""
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).fetchall()}
+    if "embedding_model_thresholds" not in tables:
+        return
+    cols = {c[1] for c in conn.execute("PRAGMA table_info(embedding_model_thresholds)").fetchall()}
+    if "episodic_recall_floor" not in cols:
+        conn.execute("ALTER TABLE embedding_model_thresholds ADD COLUMN episodic_recall_floor REAL")
 
 
 class MemoryManager:
@@ -782,7 +802,8 @@ class MemoryManager:
                             lookup_request          REAL,
                             research_intent         REAL,
                             episodic_relevance      REAL,
-                            calibrated_at           REAL NOT NULL
+                            calibrated_at           REAL NOT NULL,
+                            episodic_recall_floor   REAL
                         );
                     """)
 
@@ -941,6 +962,11 @@ class MemoryManager:
                 # Same self-heal, same rationale, for the per-model vector
                 # archive (schema v18) — idempotent table/trigger/column checks.
                 _ensure_embedding_archive_schema(conn)
+                conn.commit()
+
+                # Same self-heal, same rationale, for
+                # embedding_model_thresholds.episodic_recall_floor (schema v19).
+                _ensure_recall_floor_column(conn)
                 conn.commit()
 
             finally:
@@ -1266,6 +1292,16 @@ class MemoryManager:
                 "the archive fills on the first embedding-model change."
             )
             _ensure_embedding_archive_schema(conn)
+
+        if from_version < 19:
+            logger.info(
+                "Applying migration v18→v19: adding embedding_model_thresholds."
+                "episodic_recall_floor (per-model episodic recall floor "
+                "calibration, docs/architecture/16-runtime-backend-layer.md "
+                "§16.28). NULL for existing rows until the next calibration "
+                "(an embedding-model switch to a new model, or Re-embed Memory)."
+            )
+            _ensure_recall_floor_column(conn)
 
         conn.execute(
             "UPDATE schema_version SET version = ?", (_SCHEMA_VERSION,)
@@ -2692,13 +2728,15 @@ class MemoryManager:
         The returned dict may contain fewer than four keys if some gates
         calibrated as degenerate — callers must resolve any missing gate
         against a lower trust tier (see Planner's per-gate resolution),
-        never assume all four keys are present.
+        never assume all four keys are present. It also carries
+        "episodic_recall_floor" when that calibrated cleanly (schema v19;
+        see planner.resolve_episodic_recall_floor()).
         """
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT explicit_search_action, lookup_request, research_intent, "
-                "episodic_relevance FROM embedding_model_thresholds WHERE model = ?",
+                f"SELECT {', '.join(_CALIBRATED_THRESHOLD_KEYS)} "
+                "FROM embedding_model_thresholds WHERE model = ?",
                 (model_name,),
             ).fetchone()
         finally:
@@ -2706,11 +2744,7 @@ class MemoryManager:
 
         if row is None:
             return None
-        return {
-            key: row[key]
-            for key in ("explicit_search_action", "lookup_request", "research_intent", "episodic_relevance")
-            if row[key] is not None
-        }
+        return {key: row[key] for key in _CALIBRATED_THRESHOLD_KEYS if row[key] is not None}
 
     def set_calibrated_thresholds(self, model_name: str, thresholds: dict[str, float]) -> None:
         """
@@ -2721,14 +2755,15 @@ class MemoryManager:
         thresholds :
             Typically `CalibrationResult.thresholds` — may contain any
             subset of (explicit_search_action, lookup_request,
-            research_intent, episodic_relevance). A key omitted here (a
+            research_intent, episodic_relevance, episodic_recall_floor).
+            A key omitted here (a
             gate that calibrated as degenerate) is stored as SQL NULL, not
             skipped — this call always writes/replaces the full row for
             `model_name`, so re-running calibration after a methodology
             change correctly clears a gate that used to calibrate cleanly
             but no longer does, rather than leaving a stale value behind.
         """
-        allowed = {"explicit_search_action", "lookup_request", "research_intent", "episodic_relevance"}
+        allowed = set(_CALIBRATED_THRESHOLD_KEYS)
         unknown = set(thresholds) - allowed
         if unknown:
             raise ValueError(f"set_calibrated_thresholds: unknown keys {sorted(unknown)}. Allowed: {sorted(allowed)}")
@@ -2740,13 +2775,15 @@ class MemoryManager:
                     """
                     INSERT INTO embedding_model_thresholds
                         (model, explicit_search_action, lookup_request,
-                         research_intent, episodic_relevance, calibrated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                         research_intent, episodic_relevance, episodic_recall_floor,
+                         calibrated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(model) DO UPDATE SET
                         explicit_search_action = excluded.explicit_search_action,
                         lookup_request         = excluded.lookup_request,
                         research_intent        = excluded.research_intent,
                         episodic_relevance      = excluded.episodic_relevance,
+                        episodic_recall_floor   = excluded.episodic_recall_floor,
                         calibrated_at           = excluded.calibrated_at
                     """,
                     (
@@ -2755,17 +2792,20 @@ class MemoryManager:
                         thresholds.get("lookup_request"),
                         thresholds.get("research_intent"),
                         thresholds.get("episodic_relevance"),
+                        thresholds.get("episodic_recall_floor"),
                         time.time(),
                     ),
                 )
                 conn.commit()
                 logger.info(
-                    "set_calibrated_thresholds: model=%r ESA=%s LR=%s RI=%s episodic=%s",
+                    "set_calibrated_thresholds: model=%r ESA=%s LR=%s RI=%s episodic=%s "
+                    "recall_floor=%s",
                     model_name,
                     thresholds.get("explicit_search_action"),
                     thresholds.get("lookup_request"),
                     thresholds.get("research_intent"),
                     thresholds.get("episodic_relevance"),
+                    thresholds.get("episodic_recall_floor"),
                 )
             finally:
                 conn.close()
@@ -5715,6 +5755,8 @@ def select_top_episodes(
     episodes:       list["EpisodeRecord"],
     max_bullets:    int   = 5,
     min_confidence: float = 0.7,
+    *,
+    relevant:       list["EpisodeRecord"] | None = None,
 ) -> list["EpisodeRecord"]:
     """
     Filter, rank, and cap `episodes` per the confidence>=0.7 / max-5-bullet
@@ -5737,18 +5779,39 @@ def select_top_episodes(
     sorted by type priority (_EPISODE_TYPE_PRIORITY — correction first,
     task_completion last) then confidence descending, capped at
     `max_bullets`. Returns [] if nothing survives filtering.
+
+    `relevant`: episodes matched to the current query, best first (semantic
+    recall, then graph neighbours). When given, the order is corrections
+    first, then `relevant` in that order, then everything else by type
+    priority. Without it, type priority alone ran ahead of relevance:
+    recency priming returns up to 5 preference/workflow episodes, which
+    always outranked a semantically recalled project_fact, so the facts
+    Mode 3 exists to surface never reached the prompt once a user had 5
+    such episodes (found live, docs/architecture/16-runtime-backend-layer.md
+    §16.28).
     """
-    eligible = [
-        ep for ep in episodes
-        if ep.status == "active" and ep.confidence >= min_confidence
-    ]
-    eligible.sort(
-        key=lambda ep: (
-            _EPISODE_TYPE_PRIORITY.get(ep.episode_type, 99),
-            -ep.confidence,
-        )
-    )
-    return eligible[:max_bullets]
+    def by_type(ep: "EpisodeRecord") -> tuple[int, float]:
+        return (_EPISODE_TYPE_PRIORITY.get(ep.episode_type, 99), -ep.confidence)
+
+    def is_eligible(ep: "EpisodeRecord") -> bool:
+        return ep.status == "active" and ep.confidence >= min_confidence
+
+    eligible = sorted((ep for ep in episodes if is_eligible(ep)), key=by_type)
+    if not relevant:
+        return eligible[:max_bullets]
+
+    picked: list["EpisodeRecord"] = []
+    seen: set[int] = set()
+    def take(eps) -> None:
+        for ep in eps:
+            if len(picked) < max_bullets and ep.id not in seen:
+                picked.append(ep)
+                seen.add(ep.id)
+
+    take(ep for ep in eligible if ep.episode_type == "correction")
+    take(ep for ep in relevant if is_eligible(ep))
+    take(eligible)
+    return picked
 
 
 def format_episodic_summary(

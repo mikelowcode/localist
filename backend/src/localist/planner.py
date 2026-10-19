@@ -823,6 +823,54 @@ _VALIDATED_MODEL_THRESHOLDS: dict[str, dict[str, float]] = {
 
 
 # ---------------------------------------------------------------------------
+# Episodic recall floor — the min_score ControllerAgent passes to
+# EpisodicMemoryReader.by_similarity() for semantic episodic recall (Mode 3).
+# Not a Planner gate: the episodic_relevance gate above decides whether
+# episodic fetch runs; this floor decides which episodes it returns.
+#
+# Per model, because cosine scales differ (docs/architecture/
+# 16-runtime-backend-layer.md §16.28, diagnostics/reports/
+# episodic_recall_floor_assessment_2026-10-19.md). The old single 0.45 kept
+# only 52% of right episodes for embeddinggemma-300m-4bit (it ranks well
+# but scores low), while nomic-embed-text:latest at 0.45 injected memory
+# into 60% of off-topic questions and ~3 wrong episodes per real question.
+# Measured floors (recall / off-topic FP / wrong episodes per question):
+#   nomic-embed-text:latest   0.55 — 68% / 7% / 0.4
+#   embeddinggemma-300m-4bit  0.37 — 87% / 0% / 0.7  (worst off-topic 0.367:
+#                                    a narrow margin; revisit with more data)
+# Hand-validated from a synthetic fixture (31 positive / 15 negative
+# queries, threshold_calibration_fixtures.RECALL_*), so estimates to within
+# a few hundredths. Other models use their calibrated floor
+# (threshold_calibration.calibrate_recall_floor(), persisted with the gate
+# thresholds) when one calibrated cleanly, else the old 0.45
+# (_DEFAULT_EPISODIC_RECALL_FLOOR). Live calibration reproduces both values
+# below exactly.
+_EPISODIC_RECALL_FLOORS: dict[str, float] = {
+    "nomic-embed-text:latest":  0.55,
+    "embeddinggemma-300m-4bit": 0.37,
+}
+_DEFAULT_EPISODIC_RECALL_FLOOR = 0.45
+
+
+def resolve_episodic_recall_floor(
+    embedding_model_name:  str | None,
+    calibrated_thresholds: dict[str, float] | None = None,
+) -> float:
+    """The episodic recall min_score for `embedding_model_name`, with the
+    same precedence as the gates: hand-validated (_EPISODIC_RECALL_FLOORS),
+    then this model's calibrated floor (calibrated_thresholds
+    ["episodic_recall_floor"], from MemoryManager.get_calibrated_thresholds()),
+    then the 0.45 default — also for keyword-only (None), where
+    by_similarity() scores by BM25 and the floor doesn't apply anyway."""
+    if embedding_model_name is None:
+        return _DEFAULT_EPISODIC_RECALL_FLOOR
+    if embedding_model_name in _EPISODIC_RECALL_FLOORS:
+        return _EPISODIC_RECALL_FLOORS[embedding_model_name]
+    calibrated = (calibrated_thresholds or {}).get("episodic_recall_floor")
+    return calibrated if calibrated is not None else _DEFAULT_EPISODIC_RECALL_FLOOR
+
+
+# ---------------------------------------------------------------------------
 # Lexical/BM25 fallback tier — the fifth, model-independent threshold tier
 # (PLAN_semantic_gating_calibration.md §9), sitting below "auto-calibrated"
 # and above "disabled" in resolve_gate_tiers()'s per-gate resolution.

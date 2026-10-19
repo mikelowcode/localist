@@ -142,10 +142,27 @@
     const clean = Object.entries(calibration.gates)
       .filter(([, g]) => !g.degenerate && g.threshold !== null)
       .map(([name, g]) => `${GATE_ABBREV[name] ?? name}=${g.threshold!.toFixed(2)}`);
+    const recall = formatRecallFloor(calibration);
     if (!clean.length) {
-      return ` No gate calibrated cleanly for ${calibration.model} — semantic gating stays disabled for it.`;
+      return ` No gate calibrated cleanly for ${calibration.model} — semantic gating stays disabled for it.${recall}`;
     }
-    return ` Recalibrated semantic gating for ${calibration.model} (${clean.join(', ')}).`;
+    return ` Recalibrated semantic gating for ${calibration.model} (${clean.join(', ')}).${recall}`;
+  }
+
+  // Episodic recall floor (§16.28) — the min score for recalling a memory.
+  // Says so when a hand-validated floor overrides the calibrated one.
+  function formatRecallFloor(calibration: CalibrationResponse): string {
+    const inUse = calibration.recall_floor_in_use;
+    if (inUse == null) return '';
+    const cal = calibration.recall_floor;
+    const calibrated = cal && !cal.degenerate && cal.threshold !== null ? cal.threshold : null;
+    if (calibrated !== null && Math.abs(calibrated - inUse) < 1e-9) {
+      return ` Memory recall floor ${inUse.toFixed(2)}.`;
+    }
+    if (calibrated !== null) {
+      return ` Memory recall floor ${inUse.toFixed(2)} (hand-validated; calibration measured ${calibrated.toFixed(2)}).`;
+    }
+    return ` Memory recall floor ${inUse.toFixed(2)} (calibration inconclusive).`;
   }
 
   function formatReembedResult(result: ReembedCorpusResponse): { summary: string; warning: string | null } {
