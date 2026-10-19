@@ -133,12 +133,44 @@ export function isStillStarting(h: HealthState): boolean {
   return !h.api_ok && !h.ever_ok && !h.startup_grace_over;
 }
 
+// Resolves once the backend has answered GET /api/health at least once.
+// Code that fetches data exactly once (e.g. on mount) awaits this first: in
+// the packaged app the window opens alongside the backend sidecar, and a
+// fetch that lands before the sidecar is listening fails silently, leaving
+// defaults that look like empty settings (§7, §16.21). Resolves immediately
+// once the backend has answered, so later navigation pays nothing.
+//
+// Deliberately NOT released when STARTUP_GRACE_MS runs out: a cold launch
+// slower than the grace would then fire every once-only fetch at a backend
+// that still isn't listening — the original bug, just later (seen live: a
+// backend that answered ~25s after the page opened). Callers show their
+// own "still waiting" state instead, escalating it once
+// startup_grace_over is set.
+export function backendReady(): Promise<void> {
+  return new Promise((resolve) => {
+    let done = false;
+    let unsubscribe: (() => void) | null = null;
+    unsubscribe = health.subscribe((h) => {
+      if (done || !h.ever_ok) return;
+      done = true;
+      unsubscribe?.();
+      resolve();
+    });
+    // subscribe() calls back synchronously, before `unsubscribe` is assigned.
+    if (done) unsubscribe();
+  });
+}
+
 async function _pollTick(): Promise<void> {
   await checkHealth();
   loadAgents();
   if (_pollingStartedAt === null) return; // stopped while the check was in flight
   const h = get(health);
-  const delay = !h.ever_ok && !h.startup_grace_over ? STARTUP_POLL_MS : POLL_MS;
+  // Not cut off by the startup grace: backendReady() callers are still
+  // waiting on the first answer, so a slow cold launch shouldn't add up to
+  // a full POLL_MS on top. A backend that answered once and then went away
+  // drops back to POLL_MS.
+  const delay = !h.ever_ok ? STARTUP_POLL_MS : POLL_MS;
   _pollTimer = setTimeout(_pollTick, delay);
 }
 

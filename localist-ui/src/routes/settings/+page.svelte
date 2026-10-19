@@ -2,7 +2,7 @@
   import { isTauri } from '@tauri-apps/api/core';
   import { APP_VERSION } from '$lib/version';
   import { onMount } from 'svelte';
-  import { health, checkHealth } from '$lib/stores/server';
+  import { health, checkHealth, backendReady } from '$lib/stores/server';
   import { apiUrl } from '$lib/api';
   import { modelConfig, RUNTIME_BACKENDS, RUNTIME_BACKEND_LABELS, type RuntimeBackend } from '$lib/stores/model';
   import {
@@ -74,22 +74,33 @@
     { value: 'forever', label: 'Forever' }
   ];
 
+  // Every loader below fetches once. Waiting for backendReady() keeps an
+  // early fetch (Settings opened while the packaged app's backend sidecar is
+  // still starting) from failing silently and leaving every card on its
+  // defaults until the page is reopened.
   onMount(() => {
-    loadRetentionSettings();
-    loadMemoryStats();
-    void loadNewsPreferences().then(() => {
-      homeCountryInput = $newsPreferences.home_country;
-      localQueryInput  = $newsPreferences.local_query ?? '';
-      selectedTopics   = $newsPreferences.topics;
+    void backendReady().then(() => {
+      loadRetentionSettings();
+      loadMemoryStats();
+      void loadNewsPreferences().then(() => {
+        homeCountryInput = $newsPreferences.home_country;
+        localQueryInput  = $newsPreferences.local_query ?? '';
+        selectedTopics   = $newsPreferences.topics;
+      });
+      void loadAssistantName().then(() => {
+        assistantNameInput = $assistantName.assistant_name;
+      });
+      void loadGithubWatchPins().then(() => {
+        pinnedRepos = $githubWatchPins.repos;
+      });
+      void loadApiKeysStatus();
     });
-    void loadAssistantName().then(() => {
-      assistantNameInput = $assistantName.assistant_name;
-    });
-    void loadGithubWatchPins().then(() => {
-      pinnedRepos = $githubWatchPins.repos;
-    });
-    void loadApiKeysStatus();
   });
+
+  // Primitive, so it only invalidates when it actually flips — reactive
+  // blocks keyed on it don't re-run on every 15s health poll. Same signal
+  // backendReady() waits on: never set by the startup grace running out.
+  $: backendUp = $health.ever_ok;
 
   // Corpus/chat-history staleness — fetched once on mount and again after a
   // re-embed completes, so the badges reflect the server's current
@@ -207,9 +218,21 @@
     if (token === modelsFetchToken) availableModels = models;
   }
 
-  $: if (selectedUiBackend) refreshModelsForSelected();
+  $: if (selectedUiBackend && backendUp) refreshModelsForSelected();
+
+  // selectedUiBackend starts from $modelConfig.backend, which before the
+  // first health response is only the browser's last-remembered backend —
+  // wrong if the backend was switched outside this UI (curl, or a restart
+  // reverting to .env). Re-sync once to the real active backend when health
+  // first lands, unless the user has already picked one.
+  let selectedUiBackendSynced = false;
+  $: if ($health.ever_ok && !selectedUiBackendSynced) {
+    selectedUiBackendSynced = true;
+    selectedUiBackend = $modelConfig.backend as RuntimeBackend;
+  }
 
   async function selectRuntimeBackend(backend: RuntimeBackend) {
+    selectedUiBackendSynced = true;
     selectedUiBackend = backend;
     if (backend === $modelConfig.backend) return; // already active — nothing to switch
 
@@ -257,7 +280,7 @@
     if (token === embeddingModelsFetchToken) embeddingModels = models;
   }
 
-  $: if ($modelConfig.backend) refreshEmbeddingModels();
+  $: if ($modelConfig.backend && backendUp) refreshEmbeddingModels();
 
   async function handleEmbeddingModelPick(value: string) {
     embeddingModelResult = null;
@@ -491,6 +514,18 @@
 
 <div class="settings-page">
   <div class="settings-inner">
+
+    {#if !backendUp}
+      <p class="backend-waiting" class:backend-waiting-late={$health.startup_grace_over} role="status">
+        <span class="spinner" aria-hidden="true" />
+        {#if $health.startup_grace_over}
+          The Localist backend still hasn't answered — settings will load as soon as it does.
+          If this persists, check that the backend is running.
+        {:else}
+          Waiting for the Localist backend to start… settings will load as soon as it answers.
+        {/if}
+      </p>
+    {/if}
 
     <!-- Runtime backend -->
     <section class="settings-card">
@@ -1102,6 +1137,18 @@
   .card-title .badge {
     margin-left: var(--sp-2);
     vertical-align: middle;
+  }
+
+  .backend-waiting {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    margin: 0;
+    color: var(--text-secondary);
+  }
+
+  .backend-waiting-late {
+    color: var(--warning);
   }
 
   .stale-badges {

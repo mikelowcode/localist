@@ -450,6 +450,49 @@ card's error paragraph.
 - `reembedCorpus.ts` gained `ReembedStoreCounts`. The response's new fields are optional, so an
   older backend's corpus-only response still parses.
 
+**Settings startup race (2026-10-18).**
+
+*Problem.* The packaged app opens its window at the same time as it starts the backend sidecar.
+The Settings page's six loaders (retention, memory stats, news preferences, assistant name, GitHub
+pins, API key status) fetch once when the page mounts, with no retry. When Settings opened before
+the sidecar was listening, every fetch failed silently. The cards kept their defaults ("Not set" on
+every API key, empty news and GitHub fields), which looked like the `.env` had been wiped, until
+the page was reopened. Seen live on the rebuilt v0.1.2 app. The chat-model and embedding-model
+dropdowns fetch the same way, and so does the root layout's assistant name.
+
+*Fix.*
+- `stores/server.ts` gains `backendReady()`, a promise that resolves once `health.ever_ok` is set,
+  i.e. once `GET /api/health` has succeeded. It resolves immediately after that, so later
+  navigation costs nothing.
+- The Settings loaders, both model-dropdown fetches (keyed on a primitive `backendUp`, so they
+  don't re-run on every 15s poll) and the layout's `loadAssistantName()` all wait on it.
+- On the first health response, Settings also syncs the previewed backend (`selectedUiBackend`) to
+  the real active one. This is skipped if the user has already picked one.
+- While waiting, the page shows "Waiting for the Localist backend to start…". Once
+  `startup_grace_over` is set, the note turns into a `var(--warning)` "still hasn't answered — check
+  that the backend is running" message, and the page keeps waiting.
+
+*Two live-test corrections.* Both were caught in dev with Safari against a backend started late,
+not by `npm run check`:
+1. The first version also released `backendReady()` when the 20s grace ran out. A backend that
+   answered at about 25s then got every fetch-once loader firing at it while it was still down, which
+   is the original bug, only later. Fixed so it releases on `ever_ok` only.
+2. After the grace, health polling dropped to 15s, so loading lagged up to 15s behind a slow
+   backend. The 2s startup polling now continues until the first answer (§16.21 updated).
+
+*Verified live.*
+- Dev UI, backend down: the waiting note is shown.
+- Backend started about 25s later, no reload: the warning variant is shown, then every card filled
+  in within about 4s of the backend coming up. That covers all three API keys "(configured)",
+  retention, assistant name, news (us / Oceanside / 3 topics), GitHub pins and the chat-model list.
+- There's no frontend test runner, so this is a manual check. `npm run check` is clean.
+
+*Open items.*
+- The Episodes page's `loadEpisodeTurns()` has the same fetch-once shape and isn't gated.
+- The chat-model dropdown shows "Select a model…" instead of the pinned model. `chatModel` is read
+  from `modelConfig.chat_model`, which nothing ever populates from health, since only `backend` is
+  synced. This predates this change.
+
 **Embedding Model (2026-09-05, §16.14).** New card directly below Chat Model, shown only when
 `$modelConfig.backend === 'ollama'` (the real active backend, not the Chat Model card's preview-only
 `selectedUiBackend` — an embedding-model switch always targets whichever backend is actually live).

@@ -1456,6 +1456,10 @@ explicitly configured model can still go missing (unloaded, renamed, or a stale 
       "Can't reach the Localist backend. Try restarting Localist…".
     - Verified live with the dev UI against a backend started late: no banner at about 4s, banner
       after 20s, cleared on the next check once the backend came up.
+  - **Updated 2026-10-18 (§7, Settings startup race):** the 2s polling now continues until the
+    backend first answers, rather than stopping when the 20s grace runs out. The new
+    `backendReady()` gates the UI's fetch-once loaders on that first answer, so a slow cold launch
+    shouldn't add up to a full 15s interval on top. The banner's grace behavior is unchanged.
 
 **Known gap (closed in §16.22):** §16.20's auto-pick runs only at startup and on a backend switch. If a
 new user launches Localist before starting oMLX/Ollama, startup sees an unreachable backend and

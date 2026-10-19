@@ -6,7 +6,7 @@
   import StatusBar from '$lib/components/StatusBar.svelte';
   import PreviewsPanel from '$lib/components/PreviewsPanel.svelte';
   import ComposeDocumentPanel from '$lib/components/ComposeDocumentPanel.svelte';
-  import { startHealthPolling, stopHealthPolling } from '$lib/stores/server';
+  import { startHealthPolling, stopHealthPolling, backendReady } from '$lib/stores/server';
   import { theme } from '$lib/stores/theme';
   import { fontSize } from '$lib/stores/fontSize';
   import { sidebarWidth, sidebarCollapsed } from '$lib/stores/sidebar';
@@ -38,7 +38,9 @@
       document.documentElement.setAttribute('data-font-size', $fontSize);
     }
     startHealthPolling();
-    loadAssistantName();
+    // Fetches once — wait for the backend sidecar, or the sidebar keeps the
+    // default name until a reload (§7).
+    void backendReady().then(loadAssistantName);
   });
 
   onDestroy(() => {
