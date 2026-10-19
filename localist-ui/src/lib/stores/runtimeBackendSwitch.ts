@@ -18,6 +18,10 @@ import { apiUrl } from '$lib/api';
 
 export const runtimeBackendSwitchLoading: Writable<boolean> = writable(false);
 export const runtimeBackendSwitchError: Writable<string | null> = writable(null);
+// Non-fatal notes from the last successful switch: the response's
+// embedding_warning (target's embedding pin unusable, previous embedder
+// kept — §16.25) and/or its .env-write warning.
+export const runtimeBackendSwitchWarning: Writable<string | null> = writable(null);
 
 export async function switchRuntimeBackend(
   backend: RuntimeBackend,
@@ -25,6 +29,7 @@ export async function switchRuntimeBackend(
 ): Promise<boolean> {
   runtimeBackendSwitchLoading.set(true);
   runtimeBackendSwitchError.set(null);
+  runtimeBackendSwitchWarning.set(null);
   try {
     const res = await fetch(apiUrl('/api/settings/runtime-backend'), {
       method:  'POST',
@@ -35,6 +40,9 @@ export async function switchRuntimeBackend(
       const detail = await res.json().catch(() => null);
       throw new Error(detail?.detail ?? `HTTP ${res.status}`);
     }
+    const data = await res.json().catch(() => null);
+    const notes = [data?.embedding_warning, data?.warning].filter(Boolean);
+    runtimeBackendSwitchWarning.set(notes.length ? notes.join(' ') : null);
     // Mirrors what a subsequent health poll would confirm anyway — updating
     // here just avoids a UI flicker while waiting for the next 15s tick.
     modelConfig.update((s) => ({ ...s, backend }));
@@ -47,14 +55,29 @@ export async function switchRuntimeBackend(
   }
 }
 
-export async function fetchBackendModels(backend: RuntimeBackend): Promise<string[]> {
+/** Which step of the backend's chat-model precedence chose `chatModel`. */
+export type ChatModelSource = 'override' | 'pin' | 'default';
+
+export interface BackendModels {
+  models: string[];
+  /** The chat model this backend runs, or would run once switched to ('' if none). */
+  chatModel: string;
+  chatModelSource: ChatModelSource;
+}
+
+export async function fetchBackendModels(backend: RuntimeBackend): Promise<BackendModels> {
+  const empty: BackendModels = { models: [], chatModel: '', chatModelSource: 'default' };
   try {
     const res = await fetch(apiUrl(`/api/settings/runtime-backend/${backend}/models`));
-    if (!res.ok) return [];
+    if (!res.ok) return empty;
     const data = await res.json();
-    return data.models ?? [];
+    return {
+      models: data.models ?? [],
+      chatModel: data.chat_model ?? '',
+      chatModelSource: data.chat_model_source ?? 'default'
+    };
   } catch {
-    return [];
+    return empty;
   }
 }
 

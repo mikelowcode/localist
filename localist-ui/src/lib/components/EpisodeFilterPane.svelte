@@ -9,6 +9,7 @@
     loadEpisodeTurns,
     type SearchMode
   } from '$lib/stores/episodeBrowser';
+  import { backendReady } from '$lib/stores/server';
 
   let searchInput = '';
   let debounceTimer: ReturnType<typeof setTimeout>;
@@ -72,7 +73,7 @@
   }
 
   onMount(() => {
-    loadConversationsList();
+    void backendReady().then(loadConversationsList);
   });
 
   onDestroy(() => clearTimeout(debounceTimer));

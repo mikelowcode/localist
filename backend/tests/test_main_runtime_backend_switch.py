@@ -60,6 +60,8 @@ def _fake_create_runtime(*, reachable=True, base_url="http://fake", models=None,
             "chat_model_found":  chat_model_found,
             "embed_model_found": False,
             "error":             error,
+            # Echo the resolved chat model, as both real clients' health_check() do (§16.21).
+            "chat_model":        kwargs.get("chat_model") or "",
         }
         return client
 
@@ -283,11 +285,46 @@ class TestGetRuntimeBackendModels:
             "reachable":        True,
             "base_url":         "http://ollama:9999",
             "models":           ["m1", "m2"],
+            "chat_model":        "",
+            "chat_model_source": "default",
             "chat_model_found": True,
             "error":            None,
         }
         assert main._state.runtime is initial_runtime
         assert main._state.controller is prev_controller
+
+    def test_reports_the_inactive_backends_pin(self, client, monkeypatch):
+        test_client, _ = client
+        main._state.settings.chat_model_ollama = "llama3:8b"
+        monkeypatch.setattr(main, "create_runtime", _fake_create_runtime(models=["llama3:8b"]))
+
+        body = test_client.get("/settings/runtime-backend/ollama/models").json()
+
+        assert body["chat_model"] == "llama3:8b"
+        assert body["chat_model_source"] == "pin"
+
+    def test_global_override_beats_the_pin_and_says_so(self, client, monkeypatch):
+        test_client, _ = client
+        main._state.settings.chat_model        = "gemma4:31b-cloud"
+        main._state.settings.chat_model_ollama = "llama3:8b"
+        monkeypatch.setattr(main, "create_runtime", _fake_create_runtime(models=["llama3:8b"]))
+
+        body = test_client.get("/settings/runtime-backend/ollama/models").json()
+
+        assert body["chat_model"] == "gemma4:31b-cloud"
+        assert body["chat_model_source"] == "override"
+
+
+class TestChatModelSource:
+    @pytest.mark.parametrize("overrides, backend, expected", [
+        ({},                                                   "omlx",   "default"),
+        ({"chat_model_omlx": "gemma-4-e4b-it-4bit"},           "omlx",   "pin"),
+        ({"chat_model_omlx": "gemma-4-e4b-it-4bit"},           "ollama", "default"),
+        ({"chat_model": "x", "chat_model_ollama": "llama3:8b"}, "ollama", "override"),
+        ({"chat_model_ollama": "llama3:8b"},                   " Ollama ", "pin"),
+    ])
+    def test_source(self, overrides, backend, expected):
+        assert main._chat_model_source(_settings(**overrides), backend) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -889,3 +926,50 @@ class TestHealthPollRecoversChatModel:
         assert result is health_in
         assert main._state.runtime is current
         assert main._state.settings.chat_model_omlx is None
+
+
+# ---------------------------------------------------------------------------
+# Unconfigured Ollama, end to end through the real factory and client
+# ---------------------------------------------------------------------------
+
+class TestUnconfiguredOllamaReachesAutopick:
+    """
+    Regression: OllamaRuntimeClient used to raise ValueError on an empty
+    chat_model at construction, so startup crashed and a live switch 500'd
+    before §16.20's auto-pick could run. Real create_runtime() and
+    OllamaRuntimeClient here — only Ollama's HTTP API is faked.
+    """
+
+    _TAGS = ["gemma4:31b-cloud", "nomic-embed-text:latest", "gemma4:e4b-mlx"]
+
+    def _fake_ollama_tags(self, monkeypatch):
+        from localist import ollama_runtime_client
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"models": [{"model": m} for m in self._TAGS]}
+        monkeypatch.setattr(ollama_runtime_client.requests, "get", MagicMock(return_value=resp))
+
+    def test_startup_path_constructs_then_autopicks_a_local_model(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(main, "_PROJECT_ROOT", tmp_path)
+        self._fake_ollama_tags(monkeypatch)
+        settings = _settings(runtime_backend="ollama")
+
+        runtime, health = main._create_and_check_backend(settings, "ollama")
+        assert health["reachable"] is True
+        assert health["chat_model_found"] is False
+
+        runtime, health = main._recover_missing_chat_model(settings, "ollama", runtime, health)
+
+        assert settings.chat_model_ollama == "gemma4:e4b-mlx"
+        assert health["chat_model_found"] is True
+        assert health["chat_model"] == "gemma4:e4b-mlx"
+        assert "LOCALIST_CHAT_MODEL_OLLAMA=gemma4:e4b-mlx" in (tmp_path / ".env").read_text()
+
+    def test_live_switch_to_unconfigured_ollama_autopicks(self, client, monkeypatch, tmp_path):
+        test_client, _ = client
+        self._fake_ollama_tags(monkeypatch)
+
+        resp = test_client.post("/settings/runtime-backend", json={"backend": "ollama"})
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["chat_model"] == "gemma4:e4b-mlx"
+        assert main._state.settings.chat_model_ollama == "gemma4:e4b-mlx"

@@ -101,10 +101,14 @@ can be overridden via environment variables or a .env file:
   LOCALIST_REQUEST_TIMEOUT             Non-streaming timeout in seconds (float)
   LOCALIST_MEMORY_DB                   Absolute path to the SQLite memory DB file.
                                        Defaults to <project_root>/localist_memory.db
-  LOCALIST_EMBEDDING_MODEL             Runtime-backend embedding model ID (ollama
-                                       only; omlx does not yet wire this through). Empty
-                                       string (default) = not configured, MemoryManager
-                                       runs in keyword-only (BM25) retrieval mode.
+  LOCALIST_EMBEDDING_MODEL_OMLX        Per-backend embedding model IDs. Empty (default)
+  LOCALIST_EMBEDDING_MODEL_OLLAMA      = not configured for that backend; with no
+                                       embedding model at all, MemoryManager runs in
+                                       keyword-only (BM25) retrieval mode.
+  LOCALIST_EMBEDDING_MODEL             Legacy single embedding model ID, used by any
+                                       backend without its own pin. Migrated into the
+                                       pin of the backend that serves it at startup
+                                       (_migrate_legacy_embedding_model()).
 """
 
 from __future__ import annotations
@@ -189,8 +193,16 @@ class Settings(BaseSettings):
     chat_model_omlx:    str | None = None
     chat_model_ollama:  str | None = None
 
-    # Runtime-backend embedding model ID (ollama only; empty string =
-    # not configured, MemoryManager runs keyword-only (BM25)).
+    # Per-backend embedding-model pins (LOCALIST_EMBEDDING_MODEL_OMLX /
+    # _OLLAMA), resolved by _resolve_embedding_model(). Empty string = not
+    # configured for that backend.
+    embedding_model_omlx:    str = ""
+    embedding_model_ollama:  str = ""
+
+    # Legacy single embedding model ID (LOCALIST_EMBEDDING_MODEL), from
+    # before per-backend pins. Only a fallback for a backend with no pin of
+    # its own; migrated into a pin at startup when the active backend
+    # serves it, and retired by any explicit per-backend choice.
     embedding_model:  str = ""
 
     # oMLX network (omlx backend only)
@@ -246,6 +258,11 @@ class AppState:
         # (resolve_gate_tiers()). None means keyword-only mode (no embedding
         # source at all).
         self.active_embedding_model_name: str | None = None
+        # Which runtime backend's embed() backs MemoryManager.embed_fn. Can
+        # differ from settings.runtime_backend: a switch to a backend with
+        # no usable embedding pin keeps the previous embedder (§16.25).
+        # None in keyword-only mode.
+        self.active_embedding_backend: str | None = None
         # Resolved at startup by lifespan()
         self.wiki_dir:          Path | None = None
         self.raw_dir:           Path | None = None
@@ -271,7 +288,8 @@ def _configure_embedding_source(
     precedence order:
 
       1. The active runtime backend's own embed() — used when
-         settings.embedding_model is set AND health["embed_model_found"]
+         the backend's resolved embedding model (_resolve_embedding_model())
+         is set AND health["embed_model_found"]
          (from the health check already run in lifespan()) is truthy.
          Platform-agnostic.
       2. Neither — MemoryManager falls back to keyword-only (BM25)
@@ -287,10 +305,11 @@ def _configure_embedding_source(
     sequence (real runtime construction, directory indexing, graph build,
     etc.) — lifespan() itself is not exercised by the test suite.
     """
-    if settings.embedding_model and health.get("embed_model_found"):
+    model = _resolve_embedding_model(settings, settings.runtime_backend)
+    if model and health.get("embed_model_found"):
         logger.info(
             "Runtime-backend embeddings ready — backend=%s model=%s.",
-            settings.runtime_backend.upper(), settings.embedding_model,
+            settings.runtime_backend.upper(), model,
         )
         return runtime.embed
 
@@ -304,12 +323,14 @@ def _configure_embedding_source(
 def _derive_active_embedding_model_name(
     settings: Settings,
     embed_fn: Any,
+    backend:  str | None = None,
 ) -> str | None:
     """
     Name the embedding model actually backing `embed_fn`, mirroring
     _configure_embedding_source()'s two-tier precedence:
 
-      1. Runtime-backend embed (embed_fn is not None) -> settings.embedding_model.
+      1. Runtime-backend embed (embed_fn is not None) -> `backend`'s resolved
+         embedding model (default: the active backend).
       2. Keyword-only (embed_fn is None) -> None.
 
     Consumed by Planner's per-gate threshold resolution (resolve_gate_tiers())
@@ -317,7 +338,7 @@ def _derive_active_embedding_model_name(
     instead of silently producing thresholds with no validated meaning.
     """
     if embed_fn is not None:
-        return settings.embedding_model
+        return _resolve_embedding_model(settings, backend or settings.runtime_backend)
     return None
 
 
@@ -425,6 +446,91 @@ def _resolve_chat_model(settings: Settings, backend: str) -> str | None:
         return settings.chat_model
     field = _CHAT_MODEL_SETTINGS_FIELD.get(backend.strip().lower())
     return getattr(settings, field) if field else None
+
+
+def _chat_model_source(settings: Settings, backend: str) -> str:
+    """
+    Which step of _resolve_chat_model()'s precedence decides `backend`'s chat
+    model: "override" (global LOCALIST_CHAT_MODEL), "pin" (the per-backend
+    pin) or "default" (runtime_factory.py's hardcoded fallback). Lets the
+    Settings UI explain why a per-backend pick didn't take while the global
+    override is set.
+    """
+    if settings.chat_model:
+        return "override"
+    field = _CHAT_MODEL_SETTINGS_FIELD.get(backend.strip().lower())
+    return "pin" if field and getattr(settings, field) else "default"
+
+
+_EMBEDDING_MODEL_SETTINGS_FIELD: dict[str, str] = {
+    "omlx":    "embedding_model_omlx",
+    "ollama":  "embedding_model_ollama",
+}
+
+_EMBEDDING_MODEL_ENV_KEY: dict[str, str] = {
+    "omlx":    "LOCALIST_EMBEDDING_MODEL_OMLX",
+    "ollama":  "LOCALIST_EMBEDDING_MODEL_OLLAMA",
+}
+
+
+def _resolve_embedding_model(settings: Settings, backend: str) -> str:
+    """
+    Resolve the embedding model ID for `backend` ("" = none). Precedence is
+    the reverse of the chat model's: the per-backend pin wins, and the
+    legacy global settings.embedding_model is only a fallback for a backend
+    with no pin — a global that beat the pin would carry one backend's
+    embedding model ID into the other, the problem pins exist to fix.
+    """
+    field = _EMBEDDING_MODEL_SETTINGS_FIELD.get(backend.strip().lower())
+    pin = getattr(settings, field) if field else ""
+    return pin or settings.embedding_model
+
+
+def _retire_legacy_embedding_model(settings: Settings) -> None:
+    """
+    Clear the legacy global embedding model, in-process and in .env (written
+    empty rather than removed — _write_env_var() only replaces lines).
+    Raises OSError if .env can't be written; the in-process clear stands.
+    """
+    if not settings.embedding_model:
+        return
+    settings.embedding_model = ""
+    _write_env_var(_PROJECT_ROOT, "LOCALIST_EMBEDDING_MODEL", "")
+
+
+def _migrate_legacy_embedding_model(settings: Settings, backend: str, health: dict) -> None:
+    """
+    One-time move of the legacy LOCALIST_EMBEDDING_MODEL into `backend`'s
+    pin, run by lifespan() after the startup health check. Only when that
+    backend has no pin of its own and actually serves the model
+    (health["embed_model_found"], from a client built with the resolved —
+    here, legacy — model): the value was evidently configured for this
+    backend. Otherwise nothing changes, and the legacy value keeps working
+    as a fallback until a startup on the backend that serves it.
+    Persisted to .env (unlike §16.22's in-process-only chat-model demotion)
+    so the pin survives switching backends and restarting on the other one.
+    """
+    normalized = backend.strip().lower()
+    field = _EMBEDDING_MODEL_SETTINGS_FIELD.get(normalized)
+    legacy = settings.embedding_model
+    if not field or not legacy or getattr(settings, field) or not health.get("embed_model_found"):
+        return
+
+    setattr(settings, field, legacy)
+    try:
+        _write_env_var(_PROJECT_ROOT, _EMBEDDING_MODEL_ENV_KEY[normalized], legacy)
+        _retire_legacy_embedding_model(settings)
+    except OSError as exc:
+        logger.warning(
+            "%s: using LOCALIST_EMBEDDING_MODEL=%r as this backend's embedding model, but "
+            "writing .env failed (%s) — the migration will be retried on next restart.",
+            backend.upper(), legacy, exc,
+        )
+        return
+    logger.info(
+        "%s: migrated LOCALIST_EMBEDDING_MODEL=%r to %s in .env.",
+        backend.upper(), legacy, _EMBEDDING_MODEL_ENV_KEY[normalized],
+    )
 
 
 # Substrings (lowercased) marking a listed model as not chat-capable — oMLX
@@ -624,7 +730,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     runtime = create_runtime(
         backend         = settings.runtime_backend,
         chat_model      = _resolve_chat_model(settings, settings.runtime_backend),
-        embedding_model = settings.embedding_model,
+        embedding_model = _resolve_embedding_model(settings, settings.runtime_backend),
         omlx_url        = settings.omlx_url,
         ollama_url      = settings.ollama_url,
         request_timeout = settings.request_timeout,
@@ -634,6 +740,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     runtime, health = _recover_missing_chat_model(
         settings, settings.runtime_backend, runtime, health,
     )
+    _migrate_legacy_embedding_model(settings, settings.runtime_backend, health)
     _state.runtime = runtime
 
     if health["reachable"]:
@@ -712,6 +819,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _state.active_embedding_model_name = _derive_active_embedding_model_name(
         settings, embed_fn,
     )
+    _state.active_embedding_backend = settings.runtime_backend if embed_fn is not None else None
 
     memory_manager = MemoryManager(
         db_path               = memory_db,
@@ -925,6 +1033,9 @@ class HealthResponse(BaseModel):
     # resolve_gate_tiers(), the same function Planner.__init__ uses, so the
     # two can never disagree.
     active_embedding_model_name: str | None = None
+    # Which backend's embed() is in use (_state.active_embedding_backend) —
+    # differs from `backend` after a switch that kept the previous embedder.
+    active_embedding_backend: str | None = None
     gate_tiers: dict[str, str] = Field(default_factory=dict)
 
 
@@ -955,6 +1066,14 @@ class RuntimeBackendSwitchResponse(BaseModel):
     chat_model_found: bool       = False
     error:            str | None = None
     warning:          str | None = None
+    # Embedding source after the switch (§16.25): the model and backend
+    # backing MemoryManager.embed_fn (None = keyword-only), a warning when
+    # the target's pin couldn't be used and the previous embedder was kept,
+    # and a first-time calibration result if the new model needed one.
+    embedding_model:   str | None = None
+    embedding_backend: str | None = None
+    embedding_warning: str | None = None
+    calibration:       "CalibrationResponse | None" = None
 
 
 class RuntimeBackendModelsResponse(BaseModel):
@@ -962,6 +1081,11 @@ class RuntimeBackendModelsResponse(BaseModel):
     reachable:        bool
     base_url:         str
     models:           list[str]  = Field(default_factory=list)
+    # The chat model this backend runs (or would run, if inactive) — same
+    # value GET /health reports as chat_model for the active backend — and
+    # which precedence step chose it (_chat_model_source()).
+    chat_model:        str       = ""
+    chat_model_source: str       = "default"
     chat_model_found: bool       = False
     error:            str | None = None
 
@@ -1098,13 +1222,16 @@ class MemoryStatsResponse(BaseModel):
 class ReembedStoreCounts(BaseModel):
     """
     Per-store result for one store re-embedded by POST /memory/reembed.
-    `failed_ids` lists every row left on its previous embedding after
-    retries; non-empty means the store wasn't advanced to the active model
-    (still stale if it was on a different one) and the call can be re-run.
+    Re-embedding only fills rows with no vector for the active model
+    (§16.26): `total` is how many needed one, `reembedded` how many got one,
+    `already_current` how many already had one. `failed_ids` lists every
+    row still without one after retries; non-empty means the store may
+    still be stale, and the call can be re-run.
     """
-    reembedded: int
-    total:      int
-    failed_ids: list[int] = []
+    reembedded:      int
+    total:           int
+    already_current: int = 0
+    failed_ids:      list[int] = []
 
 
 class ReembedCorpusResponse(BaseModel):
@@ -1127,11 +1254,12 @@ class ReembedCorpusResponse(BaseModel):
     calibrate with (defensive — the endpoint itself already 409s in that
     case before reaching this response).
     """
-    reembedded:  int
-    total:       int
-    model:       str | None
-    failed_ids:  list[int] = []
-    chat_turns:  ReembedStoreCounts | None = None
+    reembedded:      int
+    total:           int
+    already_current: int = 0
+    model:           str | None
+    failed_ids:      list[int] = []
+    chat_turns:      ReembedStoreCounts | None = None
     episodes:    ReembedStoreCounts | None = None
     calibration: CalibrationResponse | None = None
 
@@ -1143,10 +1271,11 @@ class ReembedChatTurnsResponse(BaseModel):
     can grow arbitrarily large under the "forever" eviction preset, so a
     detected embedding-model mismatch never re-embeds it automatically.
     """
-    reembedded: int
-    total:      int
-    model:      str | None
-    failed_ids: list[int] = []
+    reembedded:      int
+    total:           int
+    already_current: int = 0
+    model:           str | None
+    failed_ids:      list[int] = []
 
 
 class EpisodeItem(BaseModel):
@@ -1737,12 +1866,21 @@ async def get_health() -> HealthResponse:
 
     # Mirrors the embed_fn precedence lifespan() establishes at startup: the
     # runtime backend's own embed() is the only embedding source — active
-    # when an embedding_model is configured and the health check confirms
-    # it's actually present, else MemoryManager runs keyword-only.
+    # when an embedding model is configured and the health check confirms
+    # it's actually present, else MemoryManager runs keyword-only. When the
+    # embedder was kept from another backend across a switch (§16.25), the
+    # active client's own check says nothing about it; report it as in use.
     settings = _state.settings
-    embed_available = bool(
-        settings is not None and settings.embedding_model and raw.get("embed_model_found")
+    embedding_model = (
+        _resolve_embedding_model(settings, settings.runtime_backend) if settings is not None else ""
     )
+    embedding_backend = _state.active_embedding_backend
+    if embedding_backend is None:
+        embed_available = False
+    elif settings is not None and embedding_backend != settings.runtime_backend:
+        embed_available = True
+    else:
+        embed_available = bool(embedding_model and raw.get("embed_model_found"))
 
     active_embedding_model_name = _state.active_embedding_model_name
     calibrated_thresholds = _derive_calibrated_thresholds(_state.memory_manager, active_embedding_model_name)
@@ -1757,9 +1895,10 @@ async def get_health() -> HealthResponse:
         chat_model        = str(raw.get("chat_model") or ""),
         chat_model_found  = bool(raw.get("chat_model_found", False)),
         embed_model_found = embed_available,
-        embedding_model   = settings.embedding_model if settings is not None else "",
+        embedding_model   = embedding_model,
         error             = raw.get("error"),
         active_embedding_model_name = active_embedding_model_name,
+        active_embedding_backend    = embedding_backend,
         gate_tiers                  = gate_tiers,
     )
 
@@ -1795,13 +1934,71 @@ def _require_settings() -> Settings:
     return _state.settings
 
 
+def _plan_embedding_for_switch(
+    settings: Settings, backend: str, candidate_runtime: BaseRuntimeClient, health: dict,
+) -> tuple[Any, str | None, str | None]:
+    """
+    Decide the embedding source for a switch to `backend`. Pure — no side
+    effects. Returns (embed_fn, model_name, warning):
+
+      - the target's resolved embedding model is served there ->
+        (candidate_runtime.embed, model, None): the embedder follows the
+        backend, so each backend uses its own pin;
+      - otherwise -> (None, None, warning-or-None): keep the current
+        embedder. §16.5's original rule, kept for this case so a switch to a
+        backend with no usable embedding model never silently drops a
+        working one. The warning is set only when a pin exists but isn't
+        served.
+    """
+    model = _resolve_embedding_model(settings, backend)
+    if model and health.get("embed_model_found"):
+        return candidate_runtime.embed, model, None
+    if not model:
+        return None, None, None
+    current = _state.active_embedding_model_name
+    kept = (
+        f"keeping {current!r} from {_state.active_embedding_backend}" if current
+        else "staying keyword-only"
+    )
+    return None, None, (
+        f"{backend} doesn't serve embedding model {model!r} — {kept}. "
+        f"Pick an embedding model for {backend} in Settings."
+    )
+
+
+async def _apply_embedding_source(
+    memory_manager: MemoryManager, embed_fn: Any, model_name: str | None, backend: str,
+) -> "CalibrationResponse | None":
+    """
+    Commit a new embedding source: MemoryManager (whose provenance check
+    re-embeds episodes in place and flags corpus/chat_turns stale on a model
+    change), _state's active model/backend, and — for a model with neither
+    validated nor previously calibrated thresholds — first-time calibration
+    (PLAN_semantic_gating_calibration.md §5). Call under
+    _runtime_switch_lock, before _build_controller, so the new Planner
+    resolves the freshly-persisted thresholds.
+    """
+    await asyncio.to_thread(memory_manager.set_embedding_source, embed_fn, model_name)
+    _state.active_embedding_model_name = model_name
+    _state.active_embedding_backend    = backend if embed_fn is not None else None
+
+    if embed_fn is None or not _needs_first_time_calibration(memory_manager, model_name):
+        return None
+    logger.info(
+        "%r has no validated or prior calibrated threshold set — running "
+        "first-time calibration before rebuilding the controller.", model_name,
+    )
+    result = await asyncio.to_thread(_calibrate_and_persist, memory_manager, model_name, embed_fn)
+    return _calibration_result_to_response(model_name, result)
+
+
 def _create_and_check_backend(settings: Settings, backend: str) -> tuple[BaseRuntimeClient, dict]:
     """Build a runtime client for `backend` and health-check it. Blocking — run via asyncio.to_thread."""
     chat_model = _resolve_chat_model(settings, backend)
     candidate_runtime = create_runtime(
         backend         = backend,
         chat_model      = chat_model,
-        embedding_model = settings.embedding_model,
+        embedding_model = _resolve_embedding_model(settings, backend),
         omlx_url        = settings.omlx_url,
         ollama_url      = settings.ollama_url,
         request_timeout = settings.request_timeout,
@@ -1815,7 +2012,7 @@ def _create_and_check_embedding_candidate(
 ) -> tuple[BaseRuntimeClient, dict]:
     """
     Build a runtime client for `backend` with `embedding_model` set (instead
-    of settings.embedding_model) and health-check it. Blocking — run via
+    of its resolved embedding model) and health-check it. Blocking — run via
     asyncio.to_thread. Mirrors _create_and_check_backend() above, but
     overrides embedding_model instead of backend — used by
     POST /settings/embedding-model to validate a candidate embedding model
@@ -1877,16 +2074,22 @@ async def switch_runtime_backend(request: RuntimeBackendSwitchRequest) -> Runtim
         chat_model = _resolve_chat_model(settings, backend)
 
         memory_manager = _require_memory_manager()
-        # Deliberately NOT re-derived from candidate_runtime — a chat-backend switch changes
-        # inference only, never the embedding source. Re-coupling this would risk silently
-        # dropping a working embedder when switching to a backend that doesn't wire embeddings
-        # (oMLX today, per §16.4's open gap), even though nothing about embeddings was supposed
-        # to change. See docs/architecture/16-runtime-backend-layer.md §16.5.
+        # The embedder follows the target backend's own embedding pin when
+        # that backend serves it; otherwise the current one is kept, never
+        # silently dropped (§16.25, revising §16.5's never-re-derive rule).
+        new_embed_fn, new_embedding_model, embedding_warning = _plan_embedding_for_switch(
+            settings, backend, candidate_runtime, health,
+        )
+        calibration: CalibrationResponse | None = None
+        if new_embed_fn is not None:
+            calibration = await _apply_embedding_source(
+                memory_manager, new_embed_fn, new_embedding_model, backend,
+            )
+        elif embedding_warning:
+            logger.warning("switch_runtime_backend: %s", embedding_warning)
+        # Read fresh from _state, not captured once — same "always resolve
+        # from _state at request time" rule as _state.runtime.
         embed_fn = memory_manager.embed_fn
-        # Read fresh from _state, not captured once — the embedding source
-        # itself isn't re-derived here either (see comment above), but this
-        # follows the same "always resolve from _state at request time" rule
-        # as _state.runtime, in case that ever changes.
         embedding_model_name = _state.active_embedding_model_name
 
         wiki_agent, _conversational_agent, controller = await asyncio.to_thread(
@@ -1919,6 +2122,10 @@ async def switch_runtime_backend(request: RuntimeBackendSwitchRequest) -> Runtim
         base_url         = str(health.get("base_url", "")),
         models           = health.get("models", []),
         chat_model_found = bool(health.get("chat_model_found", False)),
+        embedding_model   = embedding_model_name,
+        embedding_backend = _state.active_embedding_backend,
+        embedding_warning = embedding_warning,
+        calibration       = calibration,
         error            = health.get("error"),
         warning          = warning,
     )
@@ -1944,11 +2151,13 @@ async def get_runtime_backend_models(backend: str) -> RuntimeBackendModelsRespon
     )
 
     return RuntimeBackendModelsResponse(
-        reachable        = bool(health.get("reachable", False)),
-        base_url         = str(health.get("base_url", "")),
-        models           = health.get("models", []),
-        chat_model_found = bool(health.get("chat_model_found", False)),
-        error            = health.get("error"),
+        reachable         = bool(health.get("reachable", False)),
+        base_url          = str(health.get("base_url", "")),
+        models            = health.get("models", []),
+        chat_model        = str(health.get("chat_model") or ""),
+        chat_model_source = _chat_model_source(settings, normalized),
+        chat_model_found  = bool(health.get("chat_model_found", False)),
+        error             = health.get("error"),
     )
 
 
@@ -2034,10 +2243,10 @@ async def set_embedding_model(request: EmbeddingModelRequest) -> EmbeddingModelR
     falling back to keyword-only — mirrors what an unset
     LOCALIST_EMBEDDING_MODEL does at startup.
 
-    oMLX is rejected up front — runtime_factory._make_omlx() hardcodes
-    embedding_model="" regardless of what's requested here (a known,
-    separately-tracked gap, §16.4), so a health-check-based "model not
-    found" error would be misleading about the actual cause.
+    Works for either backend: both runtime clients take a configured
+    embedding model and report embed_model_found from their model list
+    (oMLX was refused with a 409 until §16.27, a leftover from when
+    runtime_factory._make_omlx() dropped the embedding model).
 
     Health-checks the candidate model against the currently active backend
     before committing anything — an unreachable backend or a model it
@@ -2052,16 +2261,6 @@ async def set_embedding_model(request: EmbeddingModelRequest) -> EmbeddingModelR
     memory_manager = _require_memory_manager()
     backend        = settings.runtime_backend.strip().lower()
     model          = request.model.strip()
-
-    if backend == "omlx":
-        raise HTTPException(
-            status_code = 409,
-            detail      = (
-                "oMLX does not support a configurable embedding model yet "
-                "(docs/architecture/16-runtime-backend-layer.md §16.4) — "
-                "switch to Ollama first."
-            ),
-        )
 
     async with _runtime_switch_lock:
         candidate_runtime, health = await asyncio.to_thread(
@@ -2086,33 +2285,21 @@ async def set_embedding_model(request: EmbeddingModelRequest) -> EmbeddingModelR
                 ),
             )
 
-        settings.embedding_model = model
+        # An explicit choice sets this backend's own pin (empty = none, not
+        # "fall back to the legacy global") and retires the legacy global,
+        # so it can't carry this model ID into the other backend (§16.25).
+        setattr(settings, _EMBEDDING_MODEL_SETTINGS_FIELD[backend], model)
+        legacy_retired = bool(settings.embedding_model)
+        settings.embedding_model = ""
         # Tier 1 (runtime-backend embed) engaged only when a model is given;
         # clearing it drops straight to keyword-only — no second embedding
         # tier left to fall back to.
         embed_fn = candidate_runtime.embed if model else None
 
         embedding_model_name = _derive_active_embedding_model_name(settings, embed_fn)
-        memory_manager.set_embedding_source(embed_fn, embedding_model_name)
-        _state.active_embedding_model_name = embedding_model_name
-
-        # Automatic first-time calibration (PLAN_semantic_gating_calibration.md
-        # §5): a brand-new model choice with neither a hand-reviewed nor a
-        # previously-attempted persisted threshold set is never silently left
-        # fully disabled without at least trying to do better — zero extra
-        # clicks. Runs BEFORE _build_controller so the freshly-persisted
-        # thresholds are what the new Planner instance actually resolves.
-        calibration: CalibrationResponse | None = None
-        if embed_fn is not None and _needs_first_time_calibration(memory_manager, embedding_model_name):
-            logger.info(
-                "set_embedding_model: %r has no validated or prior calibrated "
-                "threshold set — running first-time calibration before "
-                "rebuilding the controller.", embedding_model_name,
-            )
-            calibration_result = await asyncio.to_thread(
-                _calibrate_and_persist, memory_manager, embedding_model_name, embed_fn,
-            )
-            calibration = _calibration_result_to_response(embedding_model_name, calibration_result)
+        calibration = await _apply_embedding_source(
+            memory_manager, embed_fn, embedding_model_name, backend,
+        )
 
         wiki_agent, _conversational_agent, controller = await asyncio.to_thread(
             _build_controller,
@@ -2127,7 +2314,9 @@ async def set_embedding_model(request: EmbeddingModelRequest) -> EmbeddingModelR
         persisted: bool = True
         error: str | None = None
         try:
-            _write_env_var(_PROJECT_ROOT, "LOCALIST_EMBEDDING_MODEL", model)
+            _write_env_var(_PROJECT_ROOT, _EMBEDDING_MODEL_ENV_KEY[backend], model)
+            if legacy_retired:
+                _write_env_var(_PROJECT_ROOT, "LOCALIST_EMBEDDING_MODEL", "")
         except OSError as exc:
             persisted = False
             error = (
@@ -2263,10 +2452,12 @@ async def reembed_corpus() -> ReembedCorpusResponse:
         calibration = calibration,
         chat_turns  = ReembedStoreCounts(
             reembedded=chat_turns["reembedded"], total=chat_turns["total"],
+            already_current=chat_turns["already_current"],
             failed_ids=chat_turns["failed_ids"],
         ),
         episodes    = ReembedStoreCounts(
             reembedded=episodes["reembedded"], total=episodes["total"],
+            already_current=episodes["already_current"],
             failed_ids=episodes["failed_ids"],
         ),
         **result,

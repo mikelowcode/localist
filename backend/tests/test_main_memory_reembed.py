@@ -33,13 +33,14 @@ def _embed_fn():
 class TestReembedEndpoint:
     def test_reembeds_all_documents_and_returns_counts(self, client):
         test_client, tmp_path = client
-        embed_fn = _embed_fn()
         mm = MemoryManager(
-            db_path=tmp_path / "reembed.db", embed_fn=embed_fn,
-            embedding_model_name="some-embedding-model:latest",
+            db_path=tmp_path / "reembed.db", embed_fn=_embed_fn(),
+            embedding_model_name="old-embedding-model:latest",
         )
         mm.index_document(path=tmp_path / "a.md", doc_type="wiki", content="alpha", embed=True)
         mm.index_document(path=tmp_path / "b.md", doc_type="wiki", content="beta", embed=True)
+        # A model change leaves both documents without a vector for the new model.
+        mm.set_embedding_source(_embed_fn(), "some-embedding-model:latest")
         main._state.memory_manager = mm
 
         resp = test_client.post("/memory/reembed")
@@ -49,10 +50,11 @@ class TestReembedEndpoint:
         assert body == {
             "reembedded": 2,
             "total": 2,
+            "already_current": 0,
             "model": "some-embedding-model:latest",
             "failed_ids": [],
-            "chat_turns": {"reembedded": 0, "total": 0, "failed_ids": []},
-            "episodes": {"reembedded": 0, "total": 0, "failed_ids": []},
+            "chat_turns": {"reembedded": 0, "total": 0, "already_current": 0, "failed_ids": []},
+            "episodes": {"reembedded": 0, "total": 0, "already_current": 0, "failed_ids": []},
             "calibration": None,
         }
 
@@ -62,19 +64,21 @@ class TestReembedEndpoint:
         test_client, tmp_path = client
         mm = MemoryManager(
             db_path=tmp_path / "reembed_chat.db", embed_fn=_embed_fn(),
-            embedding_model_name="some-embedding-model:latest",
+            embedding_model_name="old-embedding-model:latest",
         )
         mm.add_chat_turn(task_id="t", role="user", content="hello", conversation_id="c")
         mm.add_chat_turn(task_id="t", role="assistant", content="hi there", conversation_id="c")
-        mm._chat_turns_stale = True
         new_embed_fn = MagicMock(side_effect=lambda text: [0.3] * _EMBEDDING_DIM)
-        mm._embed_fn = new_embed_fn
+        mm.set_embedding_source(new_embed_fn, "some-embedding-model:latest")
+        assert mm._chat_turns_stale is True
         main._state.memory_manager = mm
 
         resp = test_client.post("/memory/reembed")
 
         assert resp.status_code == 200
-        assert resp.json()["chat_turns"] == {"reembedded": 2, "total": 2, "failed_ids": []}
+        assert resp.json()["chat_turns"] == {
+            "reembedded": 2, "total": 2, "already_current": 0, "failed_ids": [],
+        }
         new_embed_fn.assert_any_call("hello")
         new_embed_fn.assert_any_call("hi there")
         assert test_client.get("/memory/stats").json()["chat_turns_stale"] is False
@@ -103,7 +107,9 @@ class TestReembedEndpoint:
         resp = test_client.post("/memory/reembed")
 
         assert resp.status_code == 200
-        assert resp.json()["episodes"] == {"reembedded": 1, "total": 1, "failed_ids": []}
+        assert resp.json()["episodes"] == {
+            "reembedded": 1, "total": 1, "already_current": 0, "failed_ids": [],
+        }
         new_embed_fn.assert_any_call("dark-mode. The user prefers dark mode.")
 
     def test_partial_failure_surfaces_failed_ids_and_keeps_chat_turns_stale(self, client, monkeypatch):
@@ -115,15 +121,14 @@ class TestReembedEndpoint:
         )
         mm.add_chat_turn(task_id="t", role="user", content="hello", conversation_id="c")
         mm.add_chat_turn(task_id="t", role="assistant", content="boom", conversation_id="c")
-        mm._embedding_model_name = "some-embedding-model:latest"
-        mm._chat_turns_stale = True
 
         def flaky_embed(text):
             if text == "boom":
                 raise RuntimeError("embed down")
             return [0.3] * _EMBEDDING_DIM
 
-        mm._embed_fn = flaky_embed
+        mm.set_embedding_source(flaky_embed, "some-embedding-model:latest")
+        assert mm._chat_turns_stale is True
         main._state.memory_manager = mm
 
         resp = test_client.post("/memory/reembed")

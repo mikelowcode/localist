@@ -81,6 +81,7 @@ def client(tmp_path, monkeypatch):
     prev_memory            = main._state.memory_manager
     prev_templates         = main._state.templates_dir
     prev_active_model_name = main._state.active_embedding_model_name
+    prev_active_backend    = main._state.active_embedding_backend
 
     main._state.settings          = _settings()
     main._state.memory_manager    = MemoryManager(db_path=tmp_path / "main_embedding_switch.db")
@@ -100,22 +101,63 @@ def client(tmp_path, monkeypatch):
     main._state.memory_manager            = prev_memory
     main._state.templates_dir             = prev_templates
     main._state.active_embedding_model_name = prev_active_model_name
+    main._state.active_embedding_backend    = prev_active_backend
 
 
-class TestOmlxRejectedUpFront:
-    def test_omlx_backend_rejected_without_touching_anything(self, client, monkeypatch, tmp_path):
+class TestOmlxSupported:
+    """
+    oMLX was refused with a 409 until §16.27 — a leftover from when
+    runtime_factory._make_omlx() dropped the embedding model. It now works
+    like Ollama: the oMLX pin is set and a never-calibrated model is
+    calibrated before the controller is rebuilt.
+    """
+
+    def test_omlx_model_is_set_pinned_and_calibrated(self, client, monkeypatch, tmp_path):
+        test_client, initial_runtime = client
+        main._state.settings.runtime_backend = "omlx"
+        env_path = tmp_path / ".env"
+        env_path.write_text("LOCALIST_RUNTIME_BACKEND=omlx\n")
+        calls: list = []
+
+        def _create(backend, **kwargs):
+            calls.append((backend, kwargs.get("embedding_model")))
+            return _fake_create_runtime(
+                embed_model_found=True, models=["embeddinggemma-300m-4bit"],
+            )(backend, **kwargs)
+
+        monkeypatch.setattr(main, "create_runtime", _create)
+        calibrate = MagicMock(return_value=_fake_calibration_result())
+        monkeypatch.setattr(main, "calibrate_thresholds", calibrate)
+
+        resp = test_client.post("/settings/embedding-model", json={"model": "embeddinggemma-300m-4bit"})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["backend"] == "omlx"
+        assert body["active"] is True
+        assert body["calibration"]["model"] == "embeddinggemma-300m-4bit"
+        assert calls == [("omlx", "embeddinggemma-300m-4bit")]
+        calibrate.assert_called_once()
+        assert main._state.runtime is not initial_runtime
+        assert main._state.memory_manager.embed_fn is main._state.runtime.embed
+        assert main._state.settings.embedding_model_omlx == "embeddinggemma-300m-4bit"
+        assert main._state.settings.embedding_model_ollama == ""
+        assert main._state.active_embedding_backend == "omlx"
+        assert "LOCALIST_EMBEDDING_MODEL_OMLX=embeddinggemma-300m-4bit\n" in env_path.read_text()
+
+    def test_omlx_model_not_served_is_rejected_without_changes(self, client, monkeypatch):
         test_client, initial_runtime = client
         main._state.settings.runtime_backend = "omlx"
         monkeypatch.setattr(
             main, "create_runtime",
-            MagicMock(side_effect=AssertionError("create_runtime must not be called")),
+            _fake_create_runtime(embed_model_found=False, models=["gemma-4-e4b-it-4bit"]),
         )
 
-        resp = test_client.post("/settings/embedding-model", json={"model": "nomic-embed-text"})
+        resp = test_client.post("/settings/embedding-model", json={"model": "embeddinggemma-300m-4bit"})
 
-        assert resp.status_code == 409
+        assert resp.status_code == 422
         assert main._state.runtime is initial_runtime
-        assert main._state.memory_manager.embed_fn is None
+        assert main._state.settings.embedding_model_omlx == ""
 
 
 class TestUnreachableBackend:
@@ -183,11 +225,12 @@ class TestSuccessfulSwitch:
         assert main._state.runtime is not initial_runtime
         assert main._state.wiki_agent is not prev_wiki_agent
         assert main._state.controller is not prev_controller
-        assert main._state.settings.embedding_model == "nomic-embed-text"
+        assert main._state.settings.embedding_model_ollama == "nomic-embed-text"
+        assert main._state.settings.embedding_model == ""
         assert main._state.memory_manager.embed_fn is main._state.runtime.embed
         assert main._state.active_embedding_model_name == "nomic-embed-text"
 
-        assert "LOCALIST_EMBEDDING_MODEL=nomic-embed-text" in env_path.read_text()
+        assert "LOCALIST_EMBEDDING_MODEL_OLLAMA=nomic-embed-text" in env_path.read_text()
 
     def test_clearing_the_model_disables_embed_fn(self, client, monkeypatch, tmp_path):
         test_client, _initial_runtime = client
@@ -211,6 +254,8 @@ class TestSuccessfulSwitch:
         assert main._state.memory_manager.embed_fn is None
         assert main._state.active_embedding_model_name is None
         assert "LOCALIST_EMBEDDING_MODEL=\n" in env_path.read_text()
+        assert "LOCALIST_EMBEDDING_MODEL_OLLAMA=\n" in env_path.read_text()
+        assert main._state.settings.embedding_model_ollama == ""
 
     def test_write_env_failure_reports_persisted_false_but_keeps_live_swap(
         self, client, monkeypatch, tmp_path,

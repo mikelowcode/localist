@@ -1,16 +1,18 @@
 <script lang="ts">
   import { isTauri } from '@tauri-apps/api/core';
   import { APP_VERSION } from '$lib/version';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { health, checkHealth, backendReady } from '$lib/stores/server';
   import { apiUrl } from '$lib/api';
   import { modelConfig, RUNTIME_BACKENDS, RUNTIME_BACKEND_LABELS, type RuntimeBackend } from '$lib/stores/model';
   import {
     runtimeBackendSwitchLoading,
     runtimeBackendSwitchError,
+    runtimeBackendSwitchWarning,
     switchRuntimeBackend,
     fetchBackendModels,
-    pinChatModel
+    pinChatModel,
+    type ChatModelSource
   } from '$lib/stores/runtimeBackendSwitch';
   import {
     embeddingModelSwitchLoading,
@@ -18,6 +20,7 @@
     setEmbeddingModel
   } from '$lib/stores/embeddingModelSwitch';
   import { confirmDialog } from '$lib/confirmDialog';
+  import BackendWaitingNote from '$lib/components/BackendWaitingNote.svelte';
   import { theme } from '$lib/stores/theme';
   import { fontSize, FONT_SIZES } from '$lib/stores/fontSize';
   import { browser } from '$app/environment';
@@ -147,14 +150,23 @@
 
   function formatReembedResult(result: ReembedCorpusResponse): { summary: string; warning: string | null } {
     const stores: [string, ReembedStoreCounts][] = [
-      ['Documents', { reembedded: result.reembedded, total: result.total, failed_ids: result.failed_ids ?? [] }]
+      ['Documents', {
+        reembedded: result.reembedded, total: result.total,
+        already_current: result.already_current, failed_ids: result.failed_ids ?? []
+      }]
     ];
     if (result.chat_turns) stores.push(['Chat history', result.chat_turns]);
     if (result.episodes) stores.push(['Episodes', result.episodes]);
 
-    const summary = 'Re-embedded ' + stores
-      .map(([label, s]) => `${label} ${s.reembedded}/${s.total}`)
-      .join(' · ') + '.';
+    // Only items without a vector for the active model are embedded (§16.26),
+    // so "3 new, 38 already current" rather than "3/3".
+    const describe = (s: ReembedStoreCounts) => {
+      if (s.already_current === undefined) return `${s.reembedded}/${s.total}`;
+      if (s.total === 0) return 'up to date';
+      return `${s.reembedded} of ${s.total} embedded` +
+        (s.already_current ? `, ${s.already_current} already current` : '');
+    };
+    const summary = stores.map(([label, s]) => `${label}: ${describe(s)}`).join(' · ') + '.';
 
     const failures = stores.filter(([, s]) => s.failed_ids.length > 0);
     if (!failures.length) return { summary, warning: null };
@@ -162,17 +174,16 @@
     const detail = failures.map(([label, s]) => `${label.toLowerCase()}: ${s.failed_ids.length}`).join(', ');
     return {
       summary,
-      warning: `${failedCount} item(s) couldn't be re-embedded (${detail}) and still use the previous ` +
-        'embeddings. Check that the embedding model is loaded, then run Re-embed Memory again — ' +
-        'only the remaining items are redone.'
+      warning: `${failedCount} item(s) couldn't be embedded (${detail}). Check that the embedding ` +
+        'model is loaded, then run Re-embed Memory again — only the remaining items are redone.'
     };
   }
 
   async function handleReembedCorpus() {
     const proceed = await confirmDialog(
-      'Re-embed all memory now with the active embedding model? This covers ' +
-      'wiki/raw documents, chat history and episodes, and blocks until every ' +
-      'item has been re-embedded, which can take a while for a large corpus. ' +
+      'Embed any memory that has no vector for the active embedding model yet? This covers ' +
+      'wiki/raw documents, chat history and episodes. Items already embedded with this model ' +
+      'are kept, so it can take a while only the first time a model is used on a large corpus. ' +
       'This also re-runs semantic-gating threshold calibration for the active model.'
     );
     if (!proceed) return;
@@ -191,12 +202,10 @@
 
   // Local form state — mirrors store, saved on blur/change
   let backendUrl = '';
-  let chatModel  = '';
 
   // Initialize from store
   $: if (browser) {
     backendUrl = localStorage.getItem('localist-backend-url') ?? 'http://127.0.0.1:8000';
-    chatModel  = $modelConfig.chat_model;
   }
 
   function saveBackendUrl() {
@@ -210,13 +219,29 @@
   // without) confirming an actual switch to it.
   let selectedUiBackend: RuntimeBackend = $modelConfig.backend as RuntimeBackend;
   let availableModels: string[] = [];
+  let previewChatModel = '';
+  let chatModelSource: ChatModelSource = 'default';
   let modelsFetchToken = 0;
 
   async function refreshModelsForSelected() {
     const token = ++modelsFetchToken;
-    const models = await fetchBackendModels(selectedUiBackend);
-    if (token === modelsFetchToken) availableModels = models;
+    const result = await fetchBackendModels(selectedUiBackend);
+    if (token !== modelsFetchToken) return;
+    availableModels  = result.models;
+    previewChatModel = result.chatModel;
+    chatModelSource  = result.chatModelSource;
   }
+
+  // The model the dropdown shows as selected. For the active backend this
+  // is GET /health's chat_model, refreshed on every poll, so a poll-time
+  // recovery (§16.22) shows up without reopening Settings. A previewed
+  // backend has no health of its own, so it uses what the models endpoint
+  // says it would run.
+  $: chatModel =
+    selectedUiBackend === $modelConfig.backend && $health.chat_model
+      ? $health.chat_model
+      : previewChatModel;
+  $: chatModelMissing = !!chatModel && availableModels.length > 0 && !availableModels.includes(chatModel);
 
   $: if (selectedUiBackend && backendUp) refreshModelsForSelected();
 
@@ -246,39 +271,54 @@
     void switchRuntimeBackend(backend);
   }
 
-  async function handleChatModelPick(value: string) {
-    if (!value) return;
-    chatModel = value;
-    modelConfig.update((s) => ({ ...s, chat_model: value }));
-    await pinChatModel(selectedUiBackend, value);
+  // No optimistic update: after the pin, re-read what the backend actually
+  // resolves (a global override still wins over the pin), and on failure put
+  // the <select> back on the model still in use.
+  async function onChatModelSelectChange(e: Event) {
+    const select = e.target as HTMLSelectElement;
+    if (!select.value) return;
+    const ok = await pinChatModel(selectedUiBackend, select.value);
+    if (ok && selectedUiBackend === $modelConfig.backend) await checkHealth();
+    await refreshModelsForSelected();
+    await tick(); // let chatModel/chatModelMissing recompute
+    select.value = chatModelMissing ? '' : chatModel;
   }
 
-  function onChatModelSelectChange(e: Event) {
-    const value = (e.target as HTMLSelectElement).value;
-    void handleChatModelPick(value);
-  }
+  // After a switch that kept the previous embedder (§16.25), name the
+  // backend the embeddings still come from.
+  $: embeddingViaOtherBackend =
+    $health.active_embedding_backend && $health.active_embedding_backend !== $health.backend
+      ? ` via ${RUNTIME_BACKEND_LABELS[$health.active_embedding_backend as RuntimeBackend] ?? $health.active_embedding_backend}`
+      : '';
 
-  // Embedding model — Ollama-only for now. oMLX has no configurable
-  // embedding model (runtime_factory._make_omlx() hardcodes it; see
-  // docs/architecture/16-runtime-backend-layer.md §16.4) and is the only
-  // backend scoped out of the embedding-model UI, even though the backend
-  // endpoint itself is backend-agnostic. Always scoped to the real active backend
+  // Embedding model — for whichever backend is actually live
   // ($modelConfig.backend), never the Chat Model card's preview-only
-  // selectedUiBackend — setting an embedding model always applies to
-  // whichever backend is actually live right now.
-  let embeddingModels: string[] = [];
+  // selectedUiBackend: POST /settings/embedding-model sets the active
+  // backend's own embedding pin (§16.25; oMLX supported since §16.27).
+  // Both backends list chat and embedding models in one catalog, so ids
+  // containing "embed" are offered first, the rest after.
+  let embeddingCandidates: string[] = [];
+  let otherModels: string[] = [];
   let embeddingModelsFetchToken = 0;
   let embeddingModelResult: string | null = null;
 
   async function refreshEmbeddingModels() {
-    if ($modelConfig.backend !== 'ollama') {
-      embeddingModels = [];
-      return;
-    }
+    const backend = $modelConfig.backend as RuntimeBackend;
     const token = ++embeddingModelsFetchToken;
-    const models = await fetchBackendModels('ollama');
-    if (token === embeddingModelsFetchToken) embeddingModels = models;
+    const { models } = await fetchBackendModels(backend);
+    if (token !== embeddingModelsFetchToken) return;
+    embeddingCandidates = models.filter((m) => m.toLowerCase().includes('embed'));
+    otherModels = models.filter((m) => !m.toLowerCase().includes('embed'));
   }
+
+  $: activeBackendLabel =
+    RUNTIME_BACKEND_LABELS[$modelConfig.backend as RuntimeBackend] ?? $modelConfig.backend;
+  // Embeddings kept from the other backend after a switch (§16.25): this
+  // backend has no usable embedding model of its own yet.
+  $: embeddingsFromOtherBackend =
+    $health.active_embedding_backend && $health.active_embedding_backend !== $modelConfig.backend
+      ? (RUNTIME_BACKEND_LABELS[$health.active_embedding_backend as RuntimeBackend] ?? $health.active_embedding_backend)
+      : null;
 
   $: if ($modelConfig.backend && backendUp) refreshEmbeddingModels();
 
@@ -515,17 +555,7 @@
 <div class="settings-page">
   <div class="settings-inner">
 
-    {#if !backendUp}
-      <p class="backend-waiting" class:backend-waiting-late={$health.startup_grace_over} role="status">
-        <span class="spinner" aria-hidden="true" />
-        {#if $health.startup_grace_over}
-          The Localist backend still hasn't answered — settings will load as soon as it does.
-          If this persists, check that the backend is running.
-        {:else}
-          Waiting for the Localist backend to start… settings will load as soon as it answers.
-        {/if}
-      </p>
-    {/if}
+    <BackendWaitingNote subject="settings" />
 
     <!-- Runtime backend -->
     <section class="settings-card">
@@ -552,6 +582,9 @@
         few seconds (mostly model-load time on the new backend); in-flight requests keep running
         on the backend that was active when they started.
       </p>
+      {#if $runtimeBackendSwitchWarning}
+        <p class="card-hint" style="color:var(--warning)">{$runtimeBackendSwitchWarning}</p>
+      {/if}
       {#if $runtimeBackendSwitchError}
         <p class="card-hint" style="color:var(--error)">{$runtimeBackendSwitchError}</p>
       {/if}
@@ -561,10 +594,11 @@
     <section class="settings-card">
       <div class="card-title">Re-embed Memory</div>
       <p class="card-hint">
-        Re-embeds wiki/raw documents, chat history and episodes with the active embedding
-        model via <code>POST /memory/reembed</code> (docs/architecture/16-runtime-backend-layer.md §16.4).
-        Needed after switching embedding models or embed sources — until then, document
-        retrieval and chat-history search fall back to keyword-only ranking. Items that fail
+        Embeds wiki/raw documents, chat history and episodes that have no vector for the active
+        embedding model yet, via <code>POST /memory/reembed</code> (docs/architecture/16-runtime-backend-layer.md §16.26).
+        Vectors are kept per model, so switching back to a model you've used before needs nothing;
+        this is only needed when switching to a model that hasn't embedded everything yet — until
+        then, document retrieval and chat-history search fall back to keyword-only ranking. Items that fail
         are retried automatically; any still failing are reported below, and running it again
         redoes only those. Also re-runs semantic-gating threshold calibration for the active
         model (see the Embedding Model card's trust badge below) — useful to retry a model that
@@ -621,13 +655,23 @@
           disabled={$runtimeBackendSwitchLoading || availableModels.length === 0}
           on:change={onChatModelSelectChange}
         >
-          <option value="" disabled selected={!chatModel || !availableModels.includes(chatModel)}>
-            {availableModels.length ? 'Select a model…' : 'No models reported by this backend'}
-          </option>
+          {#if chatModelMissing}
+            <option value="" disabled selected>{chatModel} (not found on this backend)</option>
+          {:else}
+            <option value="" disabled selected={!chatModel}>
+              {availableModels.length ? 'Select a model…' : 'No models reported by this backend'}
+            </option>
+          {/if}
           {#each availableModels as m}
             <option value={m} selected={m === chatModel}>{m}</option>
           {/each}
         </select>
+        {#if chatModelSource === 'override'}
+          <p class="field-hint" style="color:var(--warning)">
+            <code>LOCALIST_CHAT_MODEL</code> in <code>.env</code> overrides the model picked here for every
+            backend. Remove that line and restart to use per-backend choices.
+          </p>
+        {/if}
         {#if selectedUiBackend === $modelConfig.backend}
           <p class="field-hint">Applies immediately — {RUNTIME_BACKEND_LABELS[selectedUiBackend]} is the active backend.</p>
         {:else}
@@ -636,58 +680,74 @@
       </div>
     </section>
 
-    {#if $modelConfig.backend === 'ollama'}
-      <!-- Embedding model (Ollama only — see docs/architecture/16-runtime-backend-layer.md §16.4) -->
-      <section class="settings-card">
-        <div class="card-title">
-          Embedding Model — Ollama
-          {#if worstGateTier}
-            <span
-              class="badge {GATE_TIER_BADGE_CLASS[worstGateTier]}"
-              title={gateTierTooltip}
-            >
-              {GATE_TIER_LABEL[worstGateTier]}
-            </span>
-          {/if}
-        </div>
-        <div class="field-group">
-          <select
-            id="embedding-model"
-            aria-label="Embedding model for Ollama"
-            class="settings-input"
-            disabled={$embeddingModelSwitchLoading}
-            on:change={onEmbeddingModelSelectChange}
+    <!-- Embedding model, for the active backend (§16.25, §16.27) -->
+    <section class="settings-card">
+      <div class="card-title">
+        Embedding Model — {activeBackendLabel}
+        {#if worstGateTier}
+          <span
+            class="badge {GATE_TIER_BADGE_CLASS[worstGateTier]}"
+            title={gateTierTooltip}
           >
-            <option value="" selected={!$health.embedding_model}>
-              None — keyword-only fallback
-            </option>
-            {#each embeddingModels as m}
-              <option value={m} selected={m === $health.embedding_model}>{m}</option>
-            {/each}
-          </select>
-          <p class="field-hint">
-            Routes local embeddings through Ollama's <code>/api/embed</code> via
-            <code>POST /settings/embedding-model</code> — the only local embedding
-            source; leave it unset to run in keyword-only (BM25) mode instead.
-            Applies immediately; switching models flags the wiki/raw corpus and chat
-            history stale for re-embedding (see the Re-embed Memory card above) —
-            episodic memory re-embeds itself automatically. Switching to a new model
-            also triggers automatic first-time semantic-gating calibration; "Re-embed
-            Memory Now" re-runs it on demand. The badge above shows the least-trusted
-            tier across the four gates it drives — hover for the per-gate breakdown.
+            {GATE_TIER_LABEL[worstGateTier]}
+          </span>
+        {/if}
+      </div>
+      <div class="field-group">
+        <select
+          id="embedding-model"
+          aria-label={`Embedding model for ${activeBackendLabel}`}
+          class="settings-input"
+          disabled={$embeddingModelSwitchLoading}
+          on:change={onEmbeddingModelSelectChange}
+        >
+          <option value="" selected={!$health.embedding_model}>
+            None — keyword-only fallback
+          </option>
+          {#if embeddingCandidates.length}
+            <optgroup label="Embedding models">
+              {#each embeddingCandidates as m}
+                <option value={m} selected={m === $health.embedding_model}>{m}</option>
+              {/each}
+            </optgroup>
+          {/if}
+          {#if otherModels.length}
+            <optgroup label="Other models">
+              {#each otherModels as m}
+                <option value={m} selected={m === $health.embedding_model}>{m}</option>
+              {/each}
+            </optgroup>
+          {/if}
+        </select>
+        {#if embeddingsFromOtherBackend}
+          <p class="field-hint" style="color:var(--warning)">
+            Embeddings still come from {embeddingsFromOtherBackend}
+            ({$health.active_embedding_model_name}) — pick a model here to use {activeBackendLabel}'s own.
           </p>
-        </div>
-        {#if $embeddingModelSwitchLoading}
-          <span class="spinner" aria-hidden="true" />
         {/if}
-        {#if embeddingModelResult}
-          <p class="card-hint">{embeddingModelResult}</p>
-        {/if}
-        {#if $embeddingModelSwitchError}
-          <p class="card-hint" style="color:var(--error)">{$embeddingModelSwitchError}</p>
-        {/if}
-      </section>
-    {/if}
+        <p class="field-hint">
+          Routes embeddings through {activeBackendLabel}'s
+          <code>{$modelConfig.backend === 'omlx' ? '/v1/embeddings' : '/api/embed'}</code> via
+          <code>POST /settings/embedding-model</code>; leave it unset to run in keyword-only (BM25)
+          mode instead. Saved for {activeBackendLabel} only — each backend keeps its own choice, and
+          switching backends switches to it. Vectors are kept per model, so going back to a model
+          that has already embedded everything needs no re-embed; a model that hasn't leaves
+          documents and chat history keyword-only until "Re-embed Memory Now" fills the gaps
+          (episodes fill themselves). A model used for the first time is calibrated for semantic
+          gating automatically. The badge shows the least-trusted tier across the four gates it
+          drives — hover for the per-gate breakdown.
+        </p>
+      </div>
+      {#if $embeddingModelSwitchLoading}
+        <span class="spinner" aria-hidden="true" />
+      {/if}
+      {#if embeddingModelResult}
+        <p class="card-hint">{embeddingModelResult}</p>
+      {/if}
+      {#if $embeddingModelSwitchError}
+        <p class="card-hint" style="color:var(--error)">{$embeddingModelSwitchError}</p>
+      {/if}
+    </section>
 
     <!-- Streaming / episodic approval toggles -->
     <section class="settings-card row">
@@ -795,7 +855,7 @@
               class:badge-success={$health.embed_model_found}
               class:badge-warning={!$health.embed_model_found}
               title={$health.embed_model_found
-                ? `Cosine-similarity retrieval active (${$health.active_embedding_model_name ?? $health.embedding_model}).`
+                ? `Cosine-similarity retrieval active (${$health.active_embedding_model_name ?? $health.embedding_model}${embeddingViaOtherBackend}).`
                 : 'Running in keyword-only fallback — check backend logs for the load error.'}
             >
               {$health.embed_model_found ? 'ready' : 'keyword-only fallback'}
@@ -1137,18 +1197,6 @@
   .card-title .badge {
     margin-left: var(--sp-2);
     vertical-align: middle;
-  }
-
-  .backend-waiting {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-2);
-    margin: 0;
-    color: var(--text-secondary);
-  }
-
-  .backend-waiting-late {
-    color: var(--warning);
   }
 
   .stale-badges {

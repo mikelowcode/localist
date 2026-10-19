@@ -488,10 +488,94 @@ not by `npm run check`:
 - There's no frontend test runner, so this is a manual check. `npm run check` is clean.
 
 *Open items.*
-- The Episodes page's `loadEpisodeTurns()` has the same fetch-once shape and isn't gated.
-- The chat-model dropdown shows "Select a model…" instead of the pinned model. `chatModel` is read
-  from `modelConfig.chat_model`, which nothing ever populates from health, since only `backend` is
-  synced. This predates this change.
+- **Closed 2026-10-19 (below):** the Episodes page's `loadEpisodeTurns()` has the same fetch-once
+  shape and isn't gated.
+- **Closed 2026-10-19 (Chat Model dropdown, below):** the chat-model dropdown shows "Select a
+  model…" instead of the pinned model. `chatModel` is read from `modelConfig.chat_model`, which
+  nothing ever populates from health, since only `backend` is synced. This predates this change.
+
+**Episodes, Memory and layout startup race (2026-10-19).**
+
+*Problem.* The Settings fix above left other fetch-once loaders ungated. A live check (dev UI with
+the backend started about 25s late) listed every proxied request that failed while the backend was
+down. Besides the Episodes page, it found loaders mounted in the root layout, so they misfire on
+every launch whatever page opens first:
+- `/episodes`: `loadEpisodeTurns()` (page) and `loadConversationsList()` (`EpisodeFilterPane`).
+- `/memory`: `EpisodesPanel`'s `loadEpisodes()`, `refreshPendingCount()` and
+  `refreshAllEpisodesTotal()`.
+- Sidebar: `refreshPendingCount()`, the Memory nav badge.
+- `PreviewsPanel`: the three Live Feed previews (news brief, GitHub watch, Hacker News). In the
+  packaged app this left the Live Feed empty after a cold launch.
+
+The sidebar's file lists already go through `loadWithRetry()` and recover on their own, so they're
+unchanged. `/agents` is polled, so it recovers too.
+
+*Fix.*
+- Each loader above now waits on `backendReady()`.
+- The waiting note is now a shared `BackendWaitingNote.svelte` (`subject` prop for the noun, and
+  `padded` for pages without a padded content column). Settings uses it in place of its inline
+  copy. `/episodes` and `/memory` show it above their content.
+
+*Verified live.* Dev UI on a second Vite, proxied to a port that a TCP forwarder to the backend
+opened only after the 20s grace. With the backend down, the note showed, then the warning variant.
+After a reload, the Vite proxy log showed no Episodes, Memory badge or preview requests, only
+`/health`, `/agents` and the retried file lists. Once the forwarder opened, with no reload, the
+`/episodes` list and filter, the Live Feed, the Memory badge, and `/memory`'s list and total all
+filled in (checked by hand in Safari). `npm run check` is clean.
+
+**Chat Model dropdown shows the model in use (2026-10-19, §16.24).**
+- The selected value is `$health.chat_model` for the active backend, so a poll-time recovery
+  (§16.22) shows without reopening Settings. A previewed backend uses the `chat_model` returned by
+  `GET /settings/runtime-backend/{backend}/models`.
+- `fetchBackendModels()` now returns `{models, chatModel, chatModelSource}`. The Embedding Model
+  card takes only `models`.
+- A model the backend doesn't list shows as "<id> (not found on this backend)" rather than "Select a
+  model…".
+- When `chat_model_source` is `override`, a `var(--warning)` hint says `LOCALIST_CHAT_MODEL` in
+  `.env` overrides the pick for every backend. Without it, a per-backend pick just snapped back.
+- A pick is not optimistic. After `pinChatModel()`, the card calls `checkHealth()` if the backend is
+  active, re-reads the models endpoint, and puts the `<select>` back on whatever the backend now
+  resolves. That also covers a failed pin.
+- Removed as dead code: `ModelState.chat_model`/`embedding_model` and the unused
+  `activeModelName`/`modelLabel` stores. `activeModelName` was the first listed model, not the one
+  in use.
+- Verified live: see §16.24.
+
+**Embedder after a backend switch (2026-10-19, §16.25).**
+- The runtime switch can now move, or keep, the embedding source. A non-fatal note from the switch
+  (`embedding_warning` when the target's embedding pin isn't served, or the `.env`-write `warning`)
+  shows in `var(--warning)` under the Runtime Backend control, from a new
+  `runtimeBackendSwitchWarning` store. It's cleared at the start of each switch.
+- `HealthState` gains `active_embedding_backend`. The Embeddings health badge's tooltip appends
+  "via <backend>" when embeddings still come from the backend that was active before the switch.
+- Verified live in Safari: see §16.25.
+
+**Re-embed Memory with per-model vectors (2026-10-19, §16.26).** Re-embedding now fills only items
+with no vector for the active model, and vectors are kept per model.
+- The result line reads e.g. "Documents: 3 of 3 embedded, 38 already current · Chat history: up to
+  date · Episodes: up to date." It falls back to the old "X/Y" when an older backend omits
+  `already_current`.
+- `ReembedStoreCounts` and `ReembedCorpusResponse` (`reembedCorpus.ts`) gain an optional
+  `already_current`.
+- The card copy and confirm dialog say that switching back to a model you've used before needs
+  nothing, and that the button is only needed after switching to a model that hasn't embedded
+  everything yet.
+- The failure warning drops "still use the previous embeddings", since failed items are now empty
+  rather than holding another model's vector.
+- Not checked visually in a browser this pass. The backend responses it formats were verified live
+  (§16.26), and `npm run check` is clean.
+
+**Embedding Model card for both backends (2026-10-19, §16.27).** This supersedes the Ollama-only
+scoping from 2026-09-05 (below).
+- The card shows for the active backend (`$modelConfig.backend`) and is titled "Embedding Model —
+  oMLX" or "— Ollama".
+- `refreshEmbeddingModels()` fetches that backend's models and splits them into "Embedding models"
+  (ids containing `embed`) and "Other models" `<optgroup>`s.
+- The hint names the backend's endpoint and explains per-backend choices and per-model vectors.
+- A `var(--warning)` note says when embeddings still come from the other backend
+  (`active_embedding_backend` ≠ the active backend).
+- Verified live in Safari (§16.27): picking embeddinggemma on oMLX calibrated it and moved the
+  badge off "keyword fallback"; switching to Ollama retitled the card with nomic selected.
 
 **Embedding Model (2026-09-05, §16.14).** New card directly below Chat Model, shown only when
 `$modelConfig.backend === 'ollama'` (the real active backend, not the Chat Model card's preview-only

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import BackendWaitingNote from '$lib/components/BackendWaitingNote.svelte';
   import EpisodesPanel from '$lib/components/EpisodesPanel.svelte';
 </script>
 
@@ -7,6 +8,7 @@
 </svelte:head>
 
 <div class="page-inner">
+  <BackendWaitingNote subject="episodes" padded />
   <EpisodesPanel />
 </div>
 

@@ -230,6 +230,11 @@ particular spans model sizes from tiny local quantizations to 700B-parameter clo
 is no safe default to assume. Live-verified 2026-07-14: unsetting `LOCALIST_CHAT_MODEL` produces a
 clean startup crash with the expected `ValueError` message; restoring it produces normal startup.
 
+> **Superseded in part (2026-10-19, §16.24).** There is still no default model, but the check moved
+> from the constructor to `infer()`/`infer_stream()`, which raise `RuntimeError`. The
+> construction-time `ValueError` crashed startup and 500'd a live switch before §16.20's first-run
+> auto-pick could run.
+
 **Embedding source precedence (all backends) — current as of the 2026-09 MLX retirement, see
 §16.18:**
 
@@ -443,6 +448,9 @@ interaction, oMLX's memory ceiling, and `chmod`'s inability to trigger the `pers
 via POSIX rename semantics) are in `sessions-log.md` §36.
 
 **Open items:**
+- *Revised 2026-10-19 (§16.25):* a switch now moves `embed_fn` to the target backend when that
+  backend's own embedding pin is set and served. The "never re-derive" rule below still applies
+  when it isn't, so a switch never drops a working embedder.
 - **`embed_fn` staleness across a switch — confirmed already-correct behavior, now hardened.**
   A follow-up code review found that neither `switch_runtime_backend()` nor
   `set_runtime_backend_chat_model()` ever re-derives or reassigns the embedding function from the
@@ -1414,6 +1422,10 @@ Wired into `lifespan()` (before `_state.runtime` is set) and `POST /settings/run
 resolved after the auto-pick). Deliberately **not** wired into `GET .../models`, which must never
 mutate state, or into `POST .../chat-model`, where the pin is explicit by definition.
 
+**Corrected 2026-10-19 (§16.24):** for Ollama, the hardcoded default `""` never reached the auto-pick.
+`OllamaRuntimeClient` raised `ValueError` on an empty `chat_model` at construction (§16.4), so
+startup crashed and a live switch returned a 500. Until §16.24 the auto-pick only ever worked on oMLX.
+
 **Not addressed here (planned follow-ups):** a chat-view banner when the backend is reachable but no
 usable chat model is found (phase 2); a missing explicit global override shadowing a valid
 per-backend pin (phase 3).
@@ -1577,16 +1589,301 @@ the next build. Verify there by re-embedding once after an embedding-model switc
 all three provenance rows advance.
 
 **Open items:**
-- Episodes still have no stale flag. After a partial failure their provenance stays on the old
-  model (retried at next boot), but episodic retrieval keeps using the mixed vectors until then.
-  Adding the flag would change retrieval behavior, so it was left out of this change.
-- `settings.embedding_model` is still one global value rather than per-backend pins (cf. the chat
-  model's §16.20/§16.22). Switching backends carries an embedding model ID the other backend doesn't
-  serve, and every switch back and forth needs another full re-embed.
-- `POST /settings/embedding-model` still refuses oMLX with a 409, and the Embedding Model card is
+- **Closed 2026-10-19 (§16.26):** episodes still have no stale flag. After a partial failure
+  their provenance stays on the old model (retried at next boot), but episodic retrieval keeps
+  using the mixed vectors until then. Adding the flag would change retrieval behavior, so it was
+  left out of this change. *Resolution:* with per-model storage a store can no longer hold two
+  models' vectors. A failed row is empty, falls back to keyword scoring on its own, and is retried
+  on the next model check or re-embed. Episodes still need no flag.
+- **Closed 2026-10-19 (§16.25), except the re-embed cost:** `settings.embedding_model` is still
+  one global value rather than per-backend pins (cf. the chat model's §16.20/§16.22). Switching
+  backends carries an embedding model ID the other backend doesn't serve, and every switch back and
+  forth needs another full re-embed. Pins are in place. The re-embed cost on a switch between
+  different models remains, and is the next phase (per-model vector storage).
+- **Closed 2026-10-19 (§16.27), except the recall-floor measurement:** `POST
+  /settings/embedding-model` still refuses oMLX with a 409, and the Embedding Model card is
   Ollama-only. On oMLX the model can only be set via `.env` plus a restart, and first-time
   semantic-gating calibration (which only that endpoint triggers) never runs, so all four gates
-  stay `lexical-fallback`. Separately, the `min_score=0.45` episodic recall floor was set for nomic.
+  stay `lexical-fallback`. *Still open, separately:* the `min_score=0.45` episodic recall floor was set for nomic.
   EmbeddingGemma scored the right episode 0.387 on a live turn, below the floor. It also gets no
   task-prefix formatting (`task: … | query: …`), which the model was trained to expect. Measure
   both before changing the floor.
+
+### §16.24 — Settings shows the chat model in use; an unconfigured Ollama reaches the auto-pick (2026-10-19)
+
+**Problems.**
+- **The Chat Model dropdown showed "Select a model…"** instead of the model in use (§7's open item
+  from the Settings startup race). It read `modelConfig.chat_model`, which nothing ever set. A
+  previewed (inactive) backend had no source for its model at all, since `GET /health` only
+  describes the active backend.
+- **An unconfigured Ollama crashed startup.** Found during this change's live check, after removing a
+  stale `LOCALIST_CHAT_MODEL` and an unserved `LOCALIST_CHAT_MODEL_OLLAMA` from the dev `.env`.
+  `OllamaRuntimeClient.__init__` raised `ValueError` on an empty `chat_model` (§16.4), so
+  `lifespan()` died in `create_runtime()` before §16.20's auto-pick could run. A live switch to an
+  unconfigured Ollama took the same path and returned a 500.
+
+**Fix.**
+- **`GET /settings/runtime-backend/{backend}/models`** gains:
+  - `chat_model`: the id the candidate client was built with, taken from its `health_check()`. This
+    is the model the backend runs, or would run once switched to, after `_resolve_chat_model()` and
+    `runtime_factory.py`'s fallback. For the active backend it matches `GET /health`'s `chat_model`.
+  - `chat_model_source`: `"override"`, `"pin"` or `"default"`, from the new
+    `_chat_model_source(settings, backend)`. It names the `_resolve_chat_model()` precedence step that
+    decided the model.
+  - The endpoint still never reads `_state`.
+- **`OllamaRuntimeClient`** constructs with an empty `chat_model`. `health_check()` then reports
+  `chat_model_found: false`, so the auto-pick (startup, live switch and poll-time, §16.22) can pick
+  and pin a served model. `infer_stream()`, and so `infer()`, raise `RuntimeError` before sending
+  anything while no model is set. There is still no default model, so §16.4's reason for the check
+  (never silently pull a multi-gigabyte model) still holds.
+- Frontend changes are in §7 (Chat Model dropdown, 2026-10-19).
+
+**Verified live (2026-10-19).** Dev backend on a spare port with a second Vite, the packaged app
+untouched:
+- With the stale override still in `.env`: the dropdown showed `gemma4:31b-cloud` plus the override
+  note. An oMLX preview (backend down) read "No models reported by this backend". Switching back
+  restored the model.
+- With both lines removed: the backend started (before the fix it exited with the `ValueError`),
+  auto-picked `gemma4:e4b-mlx` and wrote `LOCALIST_CHAT_MODEL_OLLAMA=gemma4:e4b-mlx`.
+- Picking `gemma4:31b-cloud` in the dropdown applied live. `.env` and `GET /health` both followed,
+  and no other `.env` line changed.
+
+**Tests.**
+- `TestGetRuntimeBackendModels`: the inactive backend's pin, and the override beating the pin.
+  `TestChatModelSource` covers the precedence.
+- `test_ollama_runtime_client_construction.py` is rewritten. An empty model now constructs, `infer()`
+  and `infer_stream()` raise before any request, and `health_check()` reports not found.
+- `TestUnconfiguredOllamaReachesAutopick` runs the real factory and client, with only Ollama's HTTP
+  calls faked: the startup path auto-picks a local model, and a live switch returns 200.
+- Two tests expecting the construction-time `ValueError` were removed by design. Full suite 1652
+  passed. `localist-ui` `npm run check` clean.
+
+### §16.25 — Per-backend embedding-model pins; the embedder follows the backend (2026-10-19)
+
+**Problem.** §16.23's open item. `settings.embedding_model` was one value for both backends:
+- A live switch kept the previous backend's `embed_fn` (§16.5), so embeddings kept working
+  in-process. But a restart on the other backend built that client with an embedding model ID it
+  doesn't serve, and fell back to keyword-only.
+- The only way to give each backend its own model was editing `.env` on every switch.
+- `GET /health` reported `embed_model_found` from the active client alone. After a switch that kept
+  the old embedder, it read "keyword-only" while embeddings were working.
+
+**Fix.**
+- **Pins.** `embedding_model_omlx` / `embedding_model_ollama` (`LOCALIST_EMBEDDING_MODEL_OMLX` /
+  `_OLLAMA`), resolved by `_resolve_embedding_model(settings, backend)`. The precedence is the
+  reverse of the chat model's: the pin wins, and the legacy `LOCALIST_EMBEDDING_MODEL` is only a
+  fallback for a backend with no pin. A global that beat the pin would carry one backend's ID into
+  the other, the bug being fixed. Startup, `_create_and_check_backend()`,
+  `_configure_embedding_source()` and `_derive_active_embedding_model_name()` (new optional
+  `backend` argument) all resolve through it.
+- **One-time legacy migration, persisted.** `_migrate_legacy_embedding_model()` runs in `lifespan()`
+  after the startup health check. When the active backend has no pin and serves the legacy value,
+  it writes `LOCALIST_EMBEDDING_MODEL_<BACKEND>` and blanks `LOCALIST_EMBEDDING_MODEL` in `.env`.
+  - This deliberately differs from §16.22's in-process-only chat demotion. Handled in-process only,
+    nothing records which backend the value belonged to, so a restart on the other backend would
+    apply it there again.
+  - Otherwise nothing changes, and the legacy value stays a fallback.
+  - If the `.env` write fails, the pin applies in-process, the legacy value is kept, and the next
+    start retries.
+- **Switching backends** (`_plan_embedding_for_switch()`, which has no side effects, then
+  `_apply_embedding_source()`):
+  - **Follow:** the target's resolved model is served there. `embed_fn` moves to the new client.
+    `MemoryManager.set_embedding_source()` runs, so episodes re-embed in place and corpus/chat_turns
+    go stale on a model change. A model with no thresholds gets first-time calibration. This
+    happens under `_runtime_switch_lock`, before `_build_controller`.
+  - **Keep:** there's no pin, or a pin the target doesn't serve. The current embedder stays, per
+    §16.5's original rule. A pin that isn't served produces `embedding_warning`.
+  - `RuntimeBackendSwitchResponse` gains `embedding_model`, `embedding_backend`,
+    `embedding_warning` and `calibration`.
+- **`_state.active_embedding_backend`** records which backend's `embed()` is in use. `GET /health`
+  reports it as `active_embedding_backend`. `embed_model_found` is `true` for an embedder kept from
+  another backend. `embedding_model` is now the active backend's own resolved choice.
+- **`POST /settings/embedding-model`** writes the active backend's pin. Clearing it means "none for
+  this backend", not "use the legacy fallback". Any explicit choice retires the legacy global
+  (in-process, and written empty in `.env`). It shares `_apply_embedding_source()` with the switch,
+  and now runs `set_embedding_source()` off the event loop. The oMLX 409 is unchanged; that's the
+  next phase.
+- **Switching back clears stale (`memory_manager.py`), a bug found live.**
+  `_check_embedding_provenance()` did nothing on a provenance match. So after a switch away and
+  back, corpus/chat_turns stayed stale (keyword-only) while every vector was in the active model's
+  space. It now clears that store's in-process flag on a match and invalidates the corpus cache.
+  - Exception: a store in the new `_mixed_vector_stores`. That's one whose last re-embed into a
+    different model failed partway, so its provenance names the old model but some rows hold the
+    new model's vectors (§16.23).
+  - A completed re-embed lifts that guard.
+  - A restart already starts with clean flags, so the in-process guard is no looser than the
+    existing behavior. Per-model vector storage removes the mix entirely.
+
+**UI (§7).** The switch shows `embedding_warning` and `warning` in `var(--warning)` under the
+Runtime Backend control (`runtimeBackendSwitchWarning`). The Embeddings health badge's tooltip adds
+"via <backend>" when the embedder is kept from the other backend. `HealthState` gains
+`active_embedding_backend`.
+
+**Verified live (2026-10-19).** Real oMLX (`embeddinggemma-300m-4bit`) and Ollama
+(`nomic-embed-text:latest`). The backend ran in a sandbox (`LOCALIST_BACKEND_ROOT` set to a scratch
+directory holding copies of the dev `.env`, a snapshot of the 69-episode / 92-turn / 41-document
+database, and `wiki/`/`raw/`). The dev `.env`'s `LOCALIST_MEMORY_DB` points at the packaged app's
+own database, so running in place would have mutated it.
+1. The legacy value migrated to `LOCALIST_EMBEDDING_MODEL_OLLAMA` at startup.
+2. Switching to oMLX with no oMLX pin kept nomic via Ollama, and nothing went stale.
+3. An unserved oMLX pin kept nomic and returned the warning naming both models.
+4. The embeddinggemma pin: the embedder followed, 69 episodes re-embedded in about 3s, corpus and
+   chat_turns went stale, and three gates resolved `auto-calibrated` from embeddinggemma's
+   already-persisted thresholds, so no calibration ran.
+5. Switching back to Ollama re-embedded the episodes to nomic, cleared both stale flags (after the
+   fix above), and semantic chat search worked immediately.
+6. In Safari: the amber switch warning, and "… via Ollama" on the Embeddings tooltip.
+
+**Tests.**
+- New `test_main_embedding_per_backend.py` (20 tests): resolution, migration (served, unserved,
+  existing pin, write failure), the follow/keep/warn switch cases including calibration, legacy not
+  leaking, switching back, `/health` for a kept embedder and for keyword-only, and the endpoint
+  writing the pin and retiring the legacy value.
+- `TestSwitchBackClearsStale` (4 tests) in `test_embedding_provenance.py`.
+- Existing tests updated by design: the endpoint now writes `embedding_model_ollama` /
+  `LOCALIST_EMBEDDING_MODEL_OLLAMA`, and the source-selection fixture has the pin fields.
+- Full suite 1676 passed. `npm run check` clean.
+
+**Open items:**
+- **Closed 2026-10-19 (§16.26):** the re-embed cost on a switch between different models is still
+  there. Each direction re-embeds episodes and leaves corpus/chat_turns needing a manual re-embed.
+  That's the next phase: per-model vector storage, schema v18, Option A.
+- **Closed 2026-10-19 (§16.27):** oMLX still can't be pinned from the UI (the 409, §16.14). In
+  the meantime the oMLX pin is set via `.env` plus a restart. That's the phase after.
+- The switch response's `chat_model` is the configured value (`None` when the factory default
+  applies), unlike the models endpoint's resolved `chat_model` (§16.24). Seen live on oMLX. Cosmetic;
+  the UI doesn't read it.
+
+### §16.26 — Per-model vector storage: switching back costs nothing (2026-10-19)
+
+**Problem.** §16.25 made the embedder follow the backend, but each store kept one vector per row.
+Every switch between two different embedding models (Ollama `nomic-embed-text:latest` ↔ oMLX
+`embeddinggemma-300m-4bit`) therefore re-embedded every episode, and left documents and chat
+history stale (keyword-only) until a manual full re-embed, in both directions. The user chose
+Option A: keep each model's vectors.
+
+**Design.** Each table's `embedding` column still holds the active model's vectors, so every
+existing read and write path is unchanged: `query_corpus()`, chat-history semantic search, episode
+similarity, `index_document()`, `add_chat_turn()` and `EpisodicMemoryWriter`. Other models' vectors
+live in a new archive. This avoided threading a model name through the roughly ten
+`EpisodicMemoryReader`/`EpisodicMemoryWriter` construction sites across four modules, which a
+design reading straight from a model-keyed table would have needed.
+- **Schema v18** (`_ensure_embedding_archive_schema()`, called from the fresh-DB path, the v17→v18
+  migration and the self-heal pass):
+  - `embedding_archive(store, row_id, model, vector)`, primary key `(store, row_id, model)`.
+  - `trg_archive_drop_<table>` AFTER DELETE triggers, so a deleted document, episode or chat turn
+    takes its archived vectors with it. Each is created only if its table exists, since tests'
+    minimal old-version fixtures lack some tables.
+  - `embedding_provenance.complete` (default 1).
+- **Model change** (`_check_embedding_provenance()` → `_swap_store_vectors_locked()`, at
+  construction and on every `set_embedding_source()`), when provenance names a different model:
+  1. Archive the column under that model.
+  2. Load each row's archived vector for the active model (NULL if none).
+  3. Point provenance at the active model, with `complete = 0` if there were gaps.
+  - A gap is a row that had a vector and has none archived for the new model. A row with no vector
+    before (an embed that failed at write time) isn't a gap; as before, it's scored by keyword on
+    its own.
+  - On a corpus model change the retrieval cache is invalidated.
+- **Staleness = `complete`, persisted.** `_corpus_stale` / `_chat_turns_stale` mirror
+  `complete = 0`, now across restarts. Before, a restart reset them and depended on the provenance
+  mismatch being re-detected. Stale still means keyword-only for the whole store: raw BM25 scores are
+  unbounded and would outrank every cosine-scored row in a partly embedded store. Episode gaps are
+  filled immediately, as episodes always were.
+- **Re-embed fills gaps only.** `reembed_corpus()` / `reembed_chat_turns()` / `reembed_episodes()`
+  (via `_rows_needing_vectors_locked()`) embed only rows whose column is NULL, and never overwrite
+  an existing vector. Results add `already_current`. `total` is now the rows that needed a vector.
+  - `_finish_store_reembed_locked()`: with no failures, provenance is set complete. With failures,
+    it's left as it was: still stale if there were gaps, not stale if the failed rows were only
+    write-time failures.
+- **Content changes.** `index_document()` deletes a changed document's archived vectors for every
+  model before updating it. Chat turns and episodes have no content-update path.
+- **Removed:** §16.25's in-process `_mixed_vector_stores` guard. A store can no longer hold two
+  models' vectors, because a re-embed only writes the active model into empty rows.
+- **API and UI.** `ReembedStoreCounts`, `ReembedCorpusResponse` and `ReembedChatTurnsResponse` gain
+  `already_current`. The Settings result line reads "Documents: 3 of 3 embedded, 38 already current
+  · Chat history: up to date · …". The Re-embed Memory card copy and confirm dialog say vectors are
+  kept per model (§7).
+
+**Verified live (2026-10-19).** Real oMLX and Ollama, run in the §16.25 sandbox
+(`LOCALIST_BACKEND_ROOT` set to scratch copies) against a fresh snapshot of the packaged app's
+schema-v17 database: 69 episodes, 92 chat turns, and 57 documents once the sandbox wiki/raw were
+indexed.
+1. **Startup:** migrated v17→v18. Archive empty, all stores complete, nothing stale.
+2. **Switch to oMLX (first use of embeddinggemma), 7.0s:** archived 57/92/69 nomic vectors.
+   Episodes filled (69 embeds). Corpus and chat_turns `complete = 0`, stale.
+3. **`POST /memory/reembed`, 5.3s:** documents 57 of 57, chat history 92 of 92, episodes 0 needed
+   (69 already current). Everything complete, nothing stale.
+4. **Switch to Ollama, 1.2s, and back to oMLX, 1.3s:** every store logged "0 row(s) have no archived
+   … vector". No embeds at all, and nothing stale either way.
+5. **Spot check:** two rows per store compared with fresh embeddings, cosine 1.0000 in every case.
+   The column held fresh embeddinggemma vectors and the archive held fresh nomic vectors.
+
+**Tests.**
+- `test_embedding_provenance.py`:
+  - Rewritten to the archive contract: mismatch archives and marks incomplete; episode gaps fill
+    automatically; re-embed fills only empty rows; partial failure leaves the store incomplete; a
+    write-time-failed row on a complete store isn't stale.
+  - New: round trip with no embeds once filled; rows added since are the only gaps; stale survives a
+    restart; delete trigger; changed content drops every model's vectors; `TestSchemaV18Migration`
+    (v17 DB migrates complete, and the first model change archives v17 vectors and switches back).
+- The chat_turns and endpoint re-embed tests now build a real post-switch gap state instead of
+  re-embedding already-current rows, and their exact dicts include `already_current`.
+- `test_retention_sweep.py`'s v17 test no longer pins the version number.
+- Full suite 1681 passed. `npm run check` clean.
+
+**Open items:**
+- The archive grows by one vector per row per model used (3 KB at 768 dimensions). Nothing prunes a
+  model that's never coming back. Negligible at current sizes; a "forget model X" control would be
+  the fix if it matters.
+- Re-embed never refreshes an existing vector, so a model re-pulled under the same tag with
+  different weights keeps its old vectors. Clearing that model's archive rows and column would
+  force a refresh. No UI for this.
+- `_EMBEDDING_DIM` is still one fixed value (768) for every model. Both models in use are 768. A
+  different-dimension model's vectors fail the existing dimension check and become gaps.
+
+### §16.27 — oMLX embedding model and calibration from Settings (2026-10-19)
+
+**Problem.** §16.23's third open item. `POST /settings/embedding-model` refused oMLX with a 409, so
+the Embedding Model card was Ollama-only. On oMLX the embedding model could only be set in `.env`
+followed by a restart. First-time semantic-gating calibration, which only that endpoint triggers,
+never ran, so all four gates stayed `lexical-fallback`. The 409's stated reason, "`_make_omlx()`
+hardcodes `embedding_model=""`", stopped being true some time ago: the factory passes the model
+through, `OMLXRuntimeClient.embed()` calls `/v1/embeddings`, and its `health_check()` reports
+`embed_model_found` from `/v1/models`. §16.25 used it live.
+
+**Fix.**
+- **Backend:** the 409 and its stale docstring are removed. oMLX now goes through the same path as
+  Ollama: health-check the candidate, set the active backend's pin (`LOCALIST_EMBEDDING_MODEL_OMLX`,
+  §16.25), `_apply_embedding_source()`, then first-time calibration for a model with no
+  thresholds, all before the controller rebuild.
+- **UI (§7):** the Embedding Model card shows for the active backend ("Embedding Model —
+  oMLX/Ollama"). The dropdown groups ids containing `embed` under "Embedding models", then "Other
+  models", since both backends list chat and embedding models together. The hint names that
+  backend's endpoint (`/v1/embeddings` or `/api/embed`) and explains per-backend choices and
+  per-model vectors. A `var(--warning)` note appears when embeddings still come from the other
+  backend (§16.25's kept embedder).
+
+**Verified live (2026-10-19).** Real oMLX, run in the §16.25 sandbox. Starting state: oMLX active
+with no oMLX embedding pin (keyword-only, all four gates `lexical-fallback`, the §16.23 symptom),
+and embeddinggemma's thresholds deleted from the sandbox database so calibration would really run.
+Checked in Safari:
+- The card read "Embedding Model — oMLX", with `embeddinggemma-300m-4bit` under "Embedding models".
+- Picking it ran first-time calibration: 3 of 4 gates calibrated cleanly (`explicit_search_action`
+  degenerate). The thresholds 0.50/0.52/0.48 match the set stored earlier from the packaged app, so
+  calibration is reproducible. The badge left "keyword fallback". `LOCALIST_EMBEDDING_MODEL_OMLX`
+  was written.
+- Nothing went stale: provenance already named embeddinggemma, whose vectors were archived in
+  §16.26's run.
+- Switching to Ollama retitled the card "Embedding Model — Ollama" with nomic selected. Every store
+  restored from the archive with 0 gaps.
+
+**Tests.** `TestOmlxRejectedUpFront` is replaced by `TestOmlxSupported` in
+`test_main_embedding_model_switch.py`: an oMLX model is set, pinned to `embedding_model_omlx` only,
+calibrated, and written to `.env`; an oMLX model that isn't served returns 422 and changes nothing.
+Full suite 1682 passed. `npm run check` clean.
+
+**Open items:**
+- *Carried from §16.23, not built (optional Phase 6):* the `min_score=0.45` episodic recall floor was
+  tuned for nomic. EmbeddingGemma scored the right episode 0.387 on a live turn, below the floor, and
+  gets no `task: … | query: …` prefix formatting, which the model was trained to expect. Measure both
+  with a read-only `diagnostics/` script before changing either.

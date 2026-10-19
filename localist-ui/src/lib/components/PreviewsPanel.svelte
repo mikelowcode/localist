@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { backendReady } from '$lib/stores/server';
   import { get } from 'svelte/store';
   import { goto } from '$app/navigation';
   import { previewsPanelCollapsed, togglePreviewsPanel } from '$lib/stores/previewsPanel';
@@ -42,10 +43,14 @@
   // already populated the moment the user expands the tab — this replaces
   // StatusBar's old hover-triggered fetch (docs/daily-news-brief-plan.md §8),
   // which only had room to show one truncated line per section.
+  // Each preview fetches once — wait for the backend's first answer (§7,
+  // Settings startup race).
   onMount(() => {
-    void fetchNewsBriefPreview();
-    void fetchGithubWatchPreview();
-    void fetchHackerNewsPreview();
+    void backendReady().then(() => {
+      void fetchNewsBriefPreview();
+      void fetchGithubWatchPreview();
+      void fetchHackerNewsPreview();
+    });
   });
 
   async function handleOpenBrief(): Promise<void> {

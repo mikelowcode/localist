@@ -1,6 +1,7 @@
 <script lang="ts">
   import { APP_VERSION } from '$lib/version';
   import { onMount, onDestroy } from 'svelte';
+  import { backendReady } from '$lib/stores/server';
   import { get, type Writable } from 'svelte/store';
   import { browser } from '$app/environment';
   import { apiUrl } from '$lib/api';
@@ -323,7 +324,9 @@
   onMount(() => {
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
-    refreshPendingCount();
+    // Fetches once, unlike the retried file lists below — wait for the
+    // backend's first answer (§7, Settings startup race).
+    void backendReady().then(refreshPendingCount);
     loadWithRetry(loadWikiFiles,      wikiError);
     loadWithRetry(loadRawFiles,       rawError);
     loadWithRetry(loadGeneratedFiles, generatedError);

@@ -20,9 +20,14 @@ from unittest.mock import MagicMock
 from localist import main
 
 
-def _settings(*, embedding_model="", runtime_backend="ollama"):
+def _settings(*, embedding_model="", runtime_backend="ollama",
+              embedding_model_omlx="", embedding_model_ollama=""):
+    # embedding_model is the legacy global, a fallback for a backend with no
+    # pin of its own (main._resolve_embedding_model()).
     return SimpleNamespace(
         embedding_model=embedding_model,
+        embedding_model_omlx=embedding_model_omlx,
+        embedding_model_ollama=embedding_model_ollama,
         runtime_backend=runtime_backend,
     )
 

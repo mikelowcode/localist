@@ -196,10 +196,13 @@ class OllamaRuntimeClient:
     Parameters
     ----------
     chat_model:
-        Ollama model name for chat completions. Required — there is no
-        default. Construction raises ValueError if left empty, since
+        Ollama model name for chat completions. There is no default:
         silently falling back to some specific local model would risk
-        pulling in a multi-gigabyte model the caller never asked for.
+        pulling in a multi-gigabyte model the caller never asked for. An
+        empty value still constructs, so health_check() can report
+        chat_model_found=False and main.py's first-run auto-pick (§16.20)
+        can choose a served model; infer()/infer_stream() raise until one
+        is set.
     embedding_model:
         Ollama model name for embedding generation. Empty string (default)
         means no embedding model is configured — embed() raises
@@ -211,10 +214,6 @@ class OllamaRuntimeClient:
     stream_timeout:
         Seconds before the first byte of a streaming response must arrive.
 
-    Raises
-    ------
-    ValueError
-        If chat_model is empty — no default chat model is assumed.
     """
 
     def __init__(
@@ -225,13 +224,6 @@ class OllamaRuntimeClient:
         request_timeout: float = 30.0,
         stream_timeout:  float = 60.0,
     ) -> None:
-        if not chat_model:
-            raise ValueError(
-                "OllamaRuntimeClient requires an explicit chat_model — no default "
-                "is assumed. Set LOCALIST_CHAT_MODEL (or pass chat_model explicitly) "
-                "to a model name confirmed present via GET /api/tags."
-            )
-
         self._chat_model      = chat_model
         self._embedding_model = embedding_model
         self._base_url        = base_url.rstrip("/")
@@ -291,10 +283,10 @@ class OllamaRuntimeClient:
         Raises
         ------
         RuntimeError
-            On any network error, non-200 status, NDJSON decode failure, a
-            mid-stream {"error": ...} line from Ollama, or a stream that
-            closes without ever sending "done": true (see
-            _iter_ndjson_chunks).
+            When no chat model is configured, or on any network error,
+            non-200 status, NDJSON decode failure, a mid-stream
+            {"error": ...} line from Ollama, or a stream that closes without
+            ever sending "done": true (see _iter_ndjson_chunks).
         """
         chunks = list(self.infer_stream(
             prompt      = prompt,
@@ -423,11 +415,18 @@ class OllamaRuntimeClient:
         Raises
         ------
         RuntimeError
-            On any network error, non-200 status, NDJSON decode failure, a
-            mid-stream {"error": ...} line from Ollama, or a stream that
-            closes without ever sending "done": true (see
-            _iter_ndjson_chunks).
+            When no chat model is configured, or on any network error,
+            non-200 status, NDJSON decode failure, a mid-stream
+            {"error": ...} line from Ollama, or a stream that closes without
+            ever sending "done": true (see _iter_ndjson_chunks).
         """
+        if not self._chat_model:
+            raise RuntimeError(
+                "No Ollama chat model is configured — no default is assumed. Pick one "
+                "in Settings → Chat Model, or set LOCALIST_CHAT_MODEL_OLLAMA to a model "
+                "name listed by GET /api/tags."
+            )
+
         messages = []
         if system:
             messages.append({"role": "system", "content": system})

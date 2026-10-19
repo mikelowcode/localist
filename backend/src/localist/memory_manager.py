@@ -152,7 +152,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION   = 17         # increment when schema changes require migration
+_SCHEMA_VERSION   = 18         # increment when schema changes require migration
 _EMBEDDING_DIM    = 768        # EmbeddingGemma-300M-4bit output dimension
 _EMBEDDING_FORMAT = ">768f"    # big-endian float32 × 768
 
@@ -162,6 +162,13 @@ _CONV_LOG_CAP_PER_TASK = 200
 
 # embedding_provenance store keys — see _check_embedding_provenance().
 _PROVENANCE_STORES: tuple[str, ...] = ("corpus", "episodes", "chat_turns")
+
+# The table each provenance store's vectors live in (its `embedding` column).
+_STORE_TABLE: dict[str, str] = {
+    "corpus":     "document_index",
+    "episodes":   "episodes",
+    "chat_turns": "chat_turns",
+}
 
 # Episodes are expected to stay small enough to re-embed synchronously at
 # startup with no bounding/pagination (docs/architecture/
@@ -358,6 +365,57 @@ class GraphEdgeResult:
 # ---------------------------------------------------------------------------
 # MemoryManager
 # ---------------------------------------------------------------------------
+
+def _ensure_embedding_archive_schema(conn: sqlite3.Connection) -> None:
+    """
+    Create (idempotently) the per-model vector storage added in schema v18
+    (docs/architecture/16-runtime-backend-layer.md §16.26):
+
+      - embedding_archive: every model's vector per (store, row_id, model),
+        other than the active one held in each table's `embedding` column.
+      - AFTER DELETE triggers (trg_archive_drop_<table>) so a deleted
+        document/episode/chat turn takes its archived vectors with it (row
+        ids can be reused).
+      - embedding_provenance.complete: 0 while a store has gaps left by a
+        model change, so its stale state survives restarts.
+
+    Called from the fresh-DB path, the v18 migration and the self-heal pass.
+    Doesn't commit.
+    """
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS embedding_provenance (
+            store    TEXT    NOT NULL PRIMARY KEY,
+            model    TEXT    NOT NULL,
+            complete INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS embedding_archive (
+            store   TEXT    NOT NULL,
+            row_id  INTEGER NOT NULL,
+            model   TEXT    NOT NULL,
+            vector  BLOB    NOT NULL,
+            PRIMARY KEY (store, row_id, model)
+        );
+    """)
+    # One trigger per store table — only for tables that exist, since a
+    # partially built DB (tests' minimal old-version fixtures) may lack some.
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).fetchall()}
+    for store, table in _STORE_TABLE.items():
+        if table in tables:
+            conn.execute(f"""
+                CREATE TRIGGER IF NOT EXISTS trg_archive_drop_{table}
+                    AFTER DELETE ON {table} BEGIN
+                        DELETE FROM embedding_archive WHERE store = '{store}' AND row_id = OLD.id;
+                    END
+            """)
+    cols = {c[1] for c in conn.execute("PRAGMA table_info(embedding_provenance)").fetchall()}
+    if "complete" not in cols:
+        conn.execute(
+            "ALTER TABLE embedding_provenance ADD COLUMN complete INTEGER NOT NULL DEFAULT 1"
+        )
+
 
 class MemoryManager:
     """
@@ -728,6 +786,7 @@ class MemoryManager:
                         );
                     """)
 
+                    _ensure_embedding_archive_schema(conn)
                     conn.execute(
                         "INSERT INTO schema_version (version) VALUES (?)",
                         (_SCHEMA_VERSION,),
@@ -877,6 +936,11 @@ class MemoryManager:
                         calibrated_at           REAL NOT NULL
                     );
                 """)
+                conn.commit()
+
+                # Same self-heal, same rationale, for the per-model vector
+                # archive (schema v18) — idempotent table/trigger/column checks.
+                _ensure_embedding_archive_schema(conn)
                 conn.commit()
 
             finally:
@@ -1194,6 +1258,15 @@ class MemoryManager:
                 );
             """)
 
+        if from_version < 18:
+            logger.info(
+                "Applying migration v17→v18: creating embedding_archive (per-model "
+                "vector storage, docs/architecture/16-runtime-backend-layer.md "
+                "§16.26) and embedding_provenance.complete. Empty on migration — "
+                "the archive fills on the first embedding-model change."
+            )
+            _ensure_embedding_archive_schema(conn)
+
         conn.execute(
             "UPDATE schema_version SET version = ?", (_SCHEMA_VERSION,)
         )
@@ -1215,61 +1288,52 @@ class MemoryManager:
 
     def _check_embedding_provenance(self) -> None:
         """
-        Called once at construction time (only when embedding_model_name is
-        not None — no embedding source configured means nothing to check).
+        Bring every store's `embedding` column onto the active model and set
+        the stale flags. Runs at construction (when embedding_model_name is
+        not None) and on every set_embedding_source() with a model.
 
-        For each store in _PROVENANCE_STORES, compares the stored
-        embedding_provenance row (if any) against self._embedding_model_name:
+        The `embedding` column always holds the vectors of the model named
+        in that store's embedding_provenance row; other models' vectors live
+        in embedding_archive (schema v18, §16.26). For each store in
+        _PROVENANCE_STORES:
 
           - No row, and the store has zero embedded rows: nothing to compare
-            against yet — defer. 'corpus' seeds its own row the first time
-            index_document() actually writes an embedding (see
-            _maybe_seed_corpus_provenance()); 'episodes' seeds on the next
-            process restart that finds embedded rows present (or whenever
-            episode-embedding provenance tracking is added to the writer
-            path — not yet, so it seeds one boot later than corpus, at worst);
-            'chat_turns' seeds the first time add_chat_turn() writes an
-            embedding.
-          - No row, but the store already has embedded rows: the pre-
-            existing-database migration case — provenance tracking shipped
-            after data was already embedded under whatever model was active
-            at the time. Seeded silently, no warning, no re-embed. Treating
-            this as a mismatch would trigger a surprise re-embed for every
-            existing user on their very next boot.
-          - Row present and it matches: no-op.
-          - Row present and it disagrees: a genuine mismatch. Handled per-
-            store below — 'corpus' and 'chat_turns' are flagged stale
-            (manual refresh via reembed_corpus()/reembed_chat_turns()); both
-            can grow arbitrarily large, so neither is ever re-embedded
-            automatically. 'episodes' is auto-corrected immediately (small,
-            bounded cost).
+            against yet — defer. 'corpus' and 'chat_turns' seed their row the
+            first time they write an embedding (_maybe_seed_*_provenance());
+            'episodes' seeds on the next construction that finds embedded rows.
+          - No row, but the store already has embedded rows: the
+            pre-provenance migration case. Seeded silently as the active
+            model, no re-embed — treating it as a mismatch would trigger a
+            surprise re-embed for every existing user on their next boot.
+          - Row names a different model: _swap_store_vectors_locked()
+            archives the column under that model and loads each row's
+            archived vector for the active model. Rows that had a vector but
+            have none archived for the active model are gaps, recorded as
+            complete = 0 so the state survives restarts.
+          - Then the row's `complete` decides staleness. 'corpus' and
+            'chat_turns' are flagged stale (keyword-only — a partly embedded
+            store would rank its raw-BM25 rows above every cosine-scored row)
+            until reembed_corpus()/reembed_chat_turns() fills the gaps; both
+            can grow arbitrarily large, so neither is filled automatically.
+            'episodes' gaps are filled immediately (small, bounded cost).
+            A complete store clears its flag — switching back to a model
+            whose vectors are archived costs nothing.
         """
         with self._lock:
             conn = self._connect()
             try:
                 # Self-heal: a DB can report schema_version == _SCHEMA_VERSION
-                # while missing this table if an earlier buggy migration run
-                # bumped the version without actually creating it — _init_db's
+                # while missing these if an earlier buggy migration run bumped
+                # the version without creating them — _init_db's
                 # `row["version"] < _SCHEMA_VERSION` gate never re-triggers
-                # _migrate() in that state, so this guard is the only recovery
-                # path. IF NOT EXISTS makes it a no-op on a healthy DB.
-                conn.executescript("""
-                    CREATE TABLE IF NOT EXISTS embedding_provenance (
-                        store TEXT NOT NULL PRIMARY KEY,
-                        model TEXT NOT NULL
-                    );
-                """)
+                # _migrate() in that state. Idempotent on a healthy DB.
+                _ensure_embedding_archive_schema(conn)
                 conn.commit()
 
                 for store in _PROVENANCE_STORES:
-                    if store == "corpus":
-                        table = "document_index"
-                    elif store == "chat_turns":
-                        table = "chat_turns"
-                    else:
-                        table = "episodes"
+                    table = _STORE_TABLE[store]
                     row = conn.execute(
-                        "SELECT model FROM embedding_provenance WHERE store = ?",
+                        "SELECT model, complete FROM embedding_provenance WHERE store = ?",
                         (store,),
                     ).fetchone()
 
@@ -1292,40 +1356,94 @@ class MemoryManager:
                             )
                         continue
 
-                    stored_model = row["model"]
-                    if stored_model == self._embedding_model_name:
-                        continue
+                    complete = bool(row["complete"])
+                    if row["model"] != self._embedding_model_name:
+                        gaps = self._swap_store_vectors_locked(
+                            conn, store, row["model"], self._embedding_model_name,
+                        )
+                        if store == "corpus":
+                            self._invalidate_cache(conn)
+                        conn.commit()
+                        complete = gaps == 0
+                        logger.info(
+                            "MemoryManager: %r store switched from %r to %r vectors — "
+                            "%d row(s) have no archived %r vector%s.",
+                            store, row["model"], self._embedding_model_name, gaps,
+                            self._embedding_model_name,
+                            "" if complete else (
+                                " (filling now)" if store == "episodes"
+                                else " — keyword-only until POST /memory/reembed fills them"
+                            ),
+                        )
 
                     if store == "corpus":
-                        logger.warning(
-                            "MemoryManager: corpus embeddings were produced by %r, but "
-                            "the active embedding model is now %r — disabling "
-                            "embedding-based corpus re-ranking (falling back to "
-                            "keyword-only scoring) until POST /memory/reembed is run. "
-                            "Cosine similarity is not portable across embedding models; "
-                            "see docs/architecture/16-runtime-backend-layer.md §16.4.",
-                            stored_model, self._embedding_model_name,
-                        )
-                        self._corpus_stale = True
-                        self._invalidate_cache(conn)
-                        conn.commit()
+                        if self._corpus_stale != (not complete):
+                            self._corpus_stale = not complete
+                            self._invalidate_cache(conn)
+                            conn.commit()
                     elif store == "chat_turns":
-                        logger.warning(
-                            "MemoryManager: chat_turns embeddings were produced by %r, "
-                            "but the active embedding model is now %r — disabling "
-                            "embedding-based chat history search (falling back to "
-                            "keyword/FTS scoring) until POST /memory/reembed-chat-turns "
-                            "is run. Cosine similarity is not portable across embedding "
-                            "models; see docs/architecture/16-runtime-backend-layer.md "
-                            "§16.4.",
-                            stored_model, self._embedding_model_name,
-                        )
-                        self._chat_turns_stale = True
-                        conn.commit()
-                    else:
-                        self._reembed_episodes_locked(conn, stored_model)
+                        self._chat_turns_stale = not complete
+                    elif not complete:
+                        self._reembed_episodes_locked(conn)
             finally:
                 conn.close()
+
+    def _swap_store_vectors_locked(
+        self,
+        conn:       sqlite3.Connection,
+        store:      str,
+        from_model: str,
+        to_model:   str,
+    ) -> int:
+        """
+        Move `store` from `from_model`'s vectors to `to_model`'s: archive the
+        `embedding` column under `from_model` (the model provenance says
+        produced it), load each row's archived `to_model` vector (NULL when
+        there is none), and point provenance at `to_model`. Must be called
+        with self._lock held; the caller commits.
+
+        Returns the gap count: rows that had a vector before and have none
+        for `to_model`. Rows that had none before (an embed that failed at
+        write time) aren't gaps — the same as before per-model storage,
+        where such rows simply fall back to keyword scoring per row.
+        provenance.complete records whether there were any gaps.
+        """
+        table = _STORE_TABLE[store]
+        conn.execute(
+            f"""
+            INSERT INTO embedding_archive (store, row_id, model, vector)
+            SELECT ?, id, ?, embedding FROM {table} WHERE embedding IS NOT NULL
+            ON CONFLICT(store, row_id, model) DO UPDATE SET vector = excluded.vector
+            """,
+            (store, from_model),
+        )
+        gaps = conn.execute(
+            f"""
+            SELECT COUNT(*) FROM {table} t
+            WHERE t.embedding IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM embedding_archive a
+                WHERE a.store = ? AND a.row_id = t.id AND a.model = ?
+            )
+            """,
+            (store, to_model),
+        ).fetchone()[0]
+        conn.execute(
+            f"""
+            UPDATE {table} SET embedding = (
+                SELECT vector FROM embedding_archive a
+                WHERE a.store = ? AND a.row_id = {table}.id AND a.model = ?
+            )
+            """,
+            (store, to_model),
+        )
+        conn.execute(
+            """
+            INSERT INTO embedding_provenance (store, model, complete) VALUES (?, ?, ?)
+            ON CONFLICT(store) DO UPDATE SET model = excluded.model, complete = excluded.complete
+            """,
+            (store, to_model, 0 if gaps else 1),
+        )
+        return gaps
 
     def _embed_with_retry(self, text: str, store: str, row_id: int) -> list[float] | None:
         """
@@ -1410,59 +1528,51 @@ class MemoryManager:
         failed: list[int],
     ) -> bool:
         """
-        Settle `store`'s embedding_provenance row after a manual re-embed and
-        return whether the store must be treated as stale. Must be called
-        with self._lock held; the caller commits.
+        Settle `store`'s embedding_provenance row after a gap-filling
+        re-embed and return whether the store must be treated as stale. Must
+        be called with self._lock held; the caller commits.
 
-        Provenance advances to the active model only when no row failed —
-        the same all-rows rule _reembed_episodes_locked() already applied.
-        On a partial failure the store holds a mix of new vectors and
-        whatever the failed rows had before, so it stays stale unless its
-        provenance already names the active model (a same-model refresh,
-        where the failed rows' old vectors are still the right space).
-        Rows that did succeed keep their new vectors, so a retry only has
-        the failures left to fix.
+        No failures: provenance names the active model and is complete.
+        Failures: provenance is left alone — the failed rows are still empty
+        (a gap-filling re-embed never overwrites an existing vector), so the
+        store is exactly as stale as it was: stale if it had gaps from a
+        model change (complete = 0), not stale if the failed rows were only
+        ever-failed writes. Rows that did succeed keep their new vectors, so
+        a retry only has the failures left to fix.
         """
         if not failed:
             conn.execute(
                 """
-                INSERT INTO embedding_provenance (store, model) VALUES (?, ?)
-                ON CONFLICT(store) DO UPDATE SET model = excluded.model
+                INSERT INTO embedding_provenance (store, model, complete) VALUES (?, ?, 1)
+                ON CONFLICT(store) DO UPDATE SET model = excluded.model, complete = 1
                 """,
                 (store, self._embedding_model_name),
             )
             return False
 
         row = conn.execute(
-            "SELECT model FROM embedding_provenance WHERE store = ?", (store,),
+            "SELECT model, complete FROM embedding_provenance WHERE store = ?", (store,),
         ).fetchone()
-        return row is None or row["model"] != self._embedding_model_name
+        return row is not None and (
+            row["model"] != self._embedding_model_name or not row["complete"]
+        )
 
-    def _reembed_episodes_locked(
-        self,
-        conn:         sqlite3.Connection,
-        stored_model: str | None,
-        *,
-        manual:       bool = False,
-    ) -> dict[str, int]:
+    def _reembed_episodes_locked(self, conn: sqlite3.Connection) -> dict[str, Any]:
         """
-        Re-embed every episodes row in place with the currently active
-        embed_fn, then update the 'episodes' provenance row.
+        Embed every episodes row that has no vector for the active model,
+        then settle the 'episodes' provenance row via
+        _finish_store_reembed_locked(). Commits.
 
         Must be called with self._lock already held (callers:
-        _check_embedding_provenance()'s startup auto-correct, and
-        reembed_episodes() with manual=True) — threading.Lock is not
-        reentrant.
+        _check_embedding_provenance()'s automatic gap fill after a model
+        change, and reembed_episodes()) — threading.Lock is not reentrant.
 
-        Provenance is only advanced to the new model if every row succeeded;
-        a partial failure leaves both the surviving stale rows and the old
-        provenance value in place (so the mismatch is detected again, and
-        retried, on the next boot) rather than claiming a clean re-embed
-        that didn't fully happen.
-
-        Returns {"reembedded": n, "total": m, "failed_ids": [...]}.
+        Returns {"reembedded": n, "total": m, "already_current": k,
+        "failed_ids": [...]}: m rows needed a vector, k already had one.
         """
-        rows = conn.execute("SELECT id, subject, content FROM episodes").fetchall()
+        rows, already_current = self._rows_needing_vectors_locked(
+            conn, "episodes", "SELECT id, subject, content FROM episodes",
+        )
         if len(rows) > _EPISODES_REEMBED_WARN_ROW_COUNT:
             logger.warning(
                 "MemoryManager: episodes re-embed triggered for %d rows — episodes "
@@ -1470,44 +1580,47 @@ class MemoryManager:
                 "startup with no bounding/pagination; that assumption may need "
                 "revisiting.", len(rows),
             )
-        if not manual:
-            logger.warning(
-                "MemoryManager: episodes embeddings were produced by %r, but the "
-                "active embedding model is now %r — auto re-embedding %d episode "
-                "row(s) now (small, bounded cost; see docs/architecture/"
-                "16-runtime-backend-layer.md §16.4).",
-                stored_model, self._embedding_model_name, len(rows),
-            )
 
         failed = self._reembed_rows_locked(
             conn, rows, store="episodes", table="episodes",
             text_of=lambda row: f"{row['subject']}. {row['content']}",
         )
-        reembedded = len(rows) - len(failed)
+        self._finish_store_reembed_locked(conn, "episodes", failed)
+        conn.commit()
 
-        counts = {"reembedded": reembedded, "total": len(rows), "failed_ids": failed}
+        reembedded = len(rows) - len(failed)
         if failed:
             logger.warning(
-                "MemoryManager: episodes re-embed incomplete (%d/%d succeeded) — "
-                "leaving 'episodes' provenance at %r; will retry on next boot.",
-                reembedded, len(rows), stored_model,
+                "MemoryManager: episodes re-embed incomplete (%d/%d succeeded) — the "
+                "rest stay empty and are retried on the next model check or re-embed.",
+                reembedded, len(rows),
             )
-            conn.commit()
-            return counts
+        elif rows:
+            logger.info(
+                "MemoryManager: episodes re-embed complete — %d row(s) embedded with %r.",
+                reembedded, self._embedding_model_name,
+            )
+        return {
+            "reembedded":      reembedded,
+            "total":           len(rows),
+            "already_current": already_current,
+            "failed_ids":      failed,
+        }
 
-        conn.execute(
-            """
-            INSERT INTO embedding_provenance (store, model) VALUES ('episodes', ?)
-            ON CONFLICT(store) DO UPDATE SET model = excluded.model
-            """,
-            (self._embedding_model_name,),
-        )
-        conn.commit()
-        return counts
-        logger.info(
-            "MemoryManager: episodes re-embed complete — %d/%d row(s) updated to %r.",
-            reembedded, len(rows), self._embedding_model_name,
-        )
+    def _rows_needing_vectors_locked(
+        self, conn: sqlite3.Connection, store: str, select_sql: str,
+    ) -> tuple[list[sqlite3.Row], int]:
+        """
+        Split `store`'s rows into those with no vector (to embed) and a count
+        of those that already have one. `select_sql` selects the columns the
+        caller's text_of needs, from that store's table, with no WHERE.
+        """
+        table = _STORE_TABLE[store]
+        rows = conn.execute(f"{select_sql} WHERE embedding IS NULL").fetchall()
+        already_current = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE embedding IS NOT NULL"
+        ).fetchone()[0]
+        return rows, already_current
 
     def _maybe_seed_corpus_provenance(self, conn: sqlite3.Connection) -> None:
         """
@@ -1570,7 +1683,9 @@ class MemoryManager:
         with self._lock:
             conn = self._connect()
             try:
-                rows = conn.execute("SELECT id, content FROM document_index").fetchall()
+                rows, already_current = self._rows_needing_vectors_locked(
+                    conn, "corpus", "SELECT id, content FROM document_index",
+                )
                 failed = self._reembed_rows_locked(
                     conn, rows, store="corpus", table="document_index",
                     text_of=lambda row: row["content"][:500],
@@ -1595,10 +1710,11 @@ class MemoryManager:
                 reembedded, len(rows), self._embedding_model_name,
             )
         return {
-            "reembedded": reembedded,
-            "total":      len(rows),
-            "model":      self._embedding_model_name,
-            "failed_ids": failed,
+            "reembedded":      reembedded,
+            "total":           len(rows),
+            "already_current": already_current,
+            "model":           self._embedding_model_name,
+            "failed_ids":      failed,
         }
 
     def reembed_episodes(self) -> dict[str, Any]:
@@ -1627,20 +1743,9 @@ class MemoryManager:
         with self._lock:
             conn = self._connect()
             try:
-                row = conn.execute(
-                    "SELECT model FROM embedding_provenance WHERE store = 'episodes'"
-                ).fetchone()
-                counts = self._reembed_episodes_locked(
-                    conn, row["model"] if row else None, manual=True,
-                )
+                counts = self._reembed_episodes_locked(conn)
             finally:
                 conn.close()
-
-        if not counts["failed_ids"]:
-            logger.info(
-                "reembed_episodes: complete — %d/%d episode(s) re-embedded to %r.",
-                counts["reembedded"], counts["total"], self._embedding_model_name,
-            )
         return {**counts, "model": self._embedding_model_name}
 
     def reembed_chat_turns(self) -> dict[str, Any]:
@@ -1668,7 +1773,9 @@ class MemoryManager:
         with self._lock:
             conn = self._connect()
             try:
-                rows = conn.execute("SELECT id, content FROM chat_turns").fetchall()
+                rows, already_current = self._rows_needing_vectors_locked(
+                    conn, "chat_turns", "SELECT id, content FROM chat_turns",
+                )
                 failed = self._reembed_rows_locked(
                     conn, rows, store="chat_turns", table="chat_turns",
                     text_of=lambda row: row["content"][:500],
@@ -1692,10 +1799,11 @@ class MemoryManager:
                 reembedded, len(rows), self._embedding_model_name,
             )
         return {
-            "reembedded": reembedded,
-            "total":      len(rows),
-            "model":      self._embedding_model_name,
-            "failed_ids": failed,
+            "reembedded":      reembedded,
+            "total":           len(rows),
+            "already_current": already_current,
+            "model":           self._embedding_model_name,
+            "failed_ids":      failed,
         }
 
     # -----------------------------------------------------------------------
@@ -3188,7 +3296,12 @@ class MemoryManager:
                             path.name,
                         )
                         return
-                    # Content changed — update and invalidate cache.
+                    # Content changed — update and invalidate cache. Every
+                    # archived vector (any model) describes the old content.
+                    conn.execute(
+                        "DELETE FROM embedding_archive WHERE store = 'corpus' AND row_id = ?",
+                        (existing["id"],),
+                    )
                     conn.execute(
                         """
                         UPDATE document_index

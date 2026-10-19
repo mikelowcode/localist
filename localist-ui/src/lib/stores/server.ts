@@ -33,6 +33,9 @@ export interface HealthState {
   // "auto-calibrated"/"disabled") for the Settings page's trust badge —
   // refreshed on every health poll, not just after a switch/reembed.
   active_embedding_model_name: string | null;
+  // The backend whose embed() is in use; differs from `backend` after a
+  // switch that kept the previous embedder (§16.25). null = keyword-only.
+  active_embedding_backend: string | null;
   gate_tiers: Record<string, string>;
 }
 
@@ -57,6 +60,7 @@ const initialHealth: HealthState = {
   ever_ok: false,
   startup_grace_over: false,
   active_embedding_model_name: null,
+  active_embedding_backend: null,
   gate_tiers: {}
 };
 

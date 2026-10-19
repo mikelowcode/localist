@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { backendReady } from '$lib/stores/server';
   import {
     episodesStore,
     loadEpisodes,
@@ -125,9 +126,11 @@
   const handleReactivate = (ep: EpisodeItem) => runAction(ep, 'reactivate', reactivateEpisode);
 
   onMount(() => {
-    loadEpisodes({ typeFilter: '' });
-    refreshPendingCount();
-    refreshAllEpisodesTotal();
+    void backendReady().then(() => {
+      loadEpisodes({ typeFilter: '' });
+      refreshPendingCount();
+      refreshAllEpisodesTotal();
+    });
   });
 </script>
 

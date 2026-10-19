@@ -33,23 +33,27 @@ export interface CalibrationResponse {
   gates: Record<string, GateCalibrationResponse>;
 }
 
-// One store's outcome — mirrors main.py's ReembedStoreCounts. A non-empty
-// failed_ids means rows were left on their previous embedding after retries
-// (§16.4); the store wasn't advanced to the active model, and re-running
-// the re-embed retries just those rows.
+// One store's outcome — mirrors main.py's ReembedStoreCounts. Re-embedding
+// only fills items with no vector for the active model (§16.26): `total`
+// needed one, `reembedded` got one, `already_current` already had one. A
+// non-empty failed_ids means items still have none after retries; running
+// the re-embed again retries just those. already_current is optional only
+// so an older backend's response still parses.
 export interface ReembedStoreCounts {
-  reembedded: number;
-  total:      number;
-  failed_ids: number[];
+  reembedded:       number;
+  total:            number;
+  already_current?: number;
+  failed_ids:       number[];
 }
 
 // POST /memory/reembed re-embeds every store: the top-level counts are the
 // wiki/raw corpus, chat_turns/episodes the other two. Those two are optional
 // only so an older backend's corpus-only response still parses.
 export interface ReembedCorpusResponse {
-  reembedded:  number;
-  total:       number;
-  model:       string | null;
+  reembedded:       number;
+  total:            number;
+  already_current?: number;
+  model:            string | null;
   failed_ids?: number[];
   chat_turns?: ReembedStoreCounts | null;
   episodes?:   ReembedStoreCounts | null;

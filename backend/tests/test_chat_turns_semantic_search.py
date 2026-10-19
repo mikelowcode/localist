@@ -313,17 +313,18 @@ class TestChatTurnsProvenanceMismatch:
         _insert_chat_turn_raw(path, content="hello", embedded=True)
         _set_provenance(path, "chat_turns", _OTHER)
 
-        with caplog.at_level(logging.WARNING, logger="localist.memory_manager"):
+        with caplog.at_level(logging.INFO, logger="localist.memory_manager"):
             mm = MemoryManager(
                 db_path=path, embed_fn=_stub_embed_fn(), embedding_model_name=_MODEL_A,
             )
 
         assert mm._chat_turns_stale is True
-        assert "chat_turns embeddings were produced by" in caplog.text
+        assert "'chat_turns' store switched from" in caplog.text
         assert _OTHER in caplog.text
         assert _MODEL_A in caplog.text
-        # Provenance still describes what's on disk until reembed_chat_turns() runs.
-        assert _get_provenance(path, "chat_turns") == _OTHER
+        # The column now describes _MODEL_A (§16.26): the turn's _OTHER vector
+        # is archived and it has a gap until reembed_chat_turns() fills it.
+        assert _get_provenance(path, "chat_turns") == _MODEL_A
 
     def test_no_reembed_triggered_automatically_unlike_episodes(self, tmp_path):
         path = tmp_path / "mismatch.db"
@@ -389,7 +390,10 @@ class TestReembedChatTurns:
 
         result = mm.reembed_chat_turns()
 
-        assert result == {"reembedded": 2, "total": 2, "model": _MODEL_A, "failed_ids": []}
+        assert result == {
+            "reembedded": 2, "total": 2, "already_current": 0,
+            "model": _MODEL_A, "failed_ids": [],
+        }
         assert mm._chat_turns_stale is False
         assert _get_provenance(path, "chat_turns") == _MODEL_A
 
@@ -414,7 +418,9 @@ class TestReembedChatTurns:
 
         result = mm.reembed_chat_turns()
 
-        assert result["reembedded"] == 1
+        # Nothing to fill (§16.26: re-embed only fills rows without a vector).
+        assert result["reembedded"] == 0
+        assert result["already_current"] == 1
         assert mm._chat_turns_stale is False
 
 

@@ -34,10 +34,12 @@ class TestReembedChatTurnsEndpoint:
         embed_fn = _embed_fn()
         mm = MemoryManager(
             db_path=tmp_path / "reembed.db", embed_fn=embed_fn,
-            embedding_model_name="some-embedding-model:latest",
+            embedding_model_name="old-embedding-model:latest",
         )
         mm.add_chat_turn(task_id="t1", role="user", content="alpha", conversation_id="c1")
         mm.add_chat_turn(task_id="t2", role="user", content="beta", conversation_id="c1")
+        # A model change leaves both turns without a vector for the new model.
+        mm.set_embedding_source(_embed_fn(), "some-embedding-model:latest")
         main._state.memory_manager = mm
 
         resp = test_client.post("/memory/reembed-chat-turns")
@@ -46,6 +48,7 @@ class TestReembedChatTurnsEndpoint:
         assert resp.json() == {
             "reembedded": 2,
             "total": 2,
+            "already_current": 0,
             "model": "some-embedding-model:latest",
             "failed_ids": [],
         }

@@ -3,16 +3,23 @@
   import EpisodeFilterPane from '$lib/components/EpisodeFilterPane.svelte';
   import EpisodeList from '$lib/components/EpisodeList.svelte';
   import EpisodeDetailPane from '$lib/components/EpisodeDetailPane.svelte';
+  import BackendWaitingNote from '$lib/components/BackendWaitingNote.svelte';
   import { loadEpisodeTurns } from '$lib/stores/episodeBrowser';
+  import { backendReady } from '$lib/stores/server';
 
+  // Fetches once — wait for the backend's first answer so a page opened
+  // before the packaged sidecar is listening doesn't stay empty (§7,
+  // Settings startup race).
   onMount(() => {
-    loadEpisodeTurns();
+    void backendReady().then(loadEpisodeTurns);
   });
 </script>
 
 <svelte:head>
   <title>Episodes — Localist</title>
 </svelte:head>
+
+<BackendWaitingNote subject="episodes" padded />
 
 <div class="episodes-page">
   <div class="pane pane-filters">

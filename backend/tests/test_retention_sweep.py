@@ -365,7 +365,7 @@ class TestSchemaV17Migration:
         conn.close()
 
         from localist.memory_manager import _SCHEMA_VERSION
-        assert version == _SCHEMA_VERSION == 17
+        assert version == _SCHEMA_VERSION
         assert cols == {
             "model", "explicit_search_action", "lookup_request",
             "research_intent", "episodic_relevance", "calibrated_at",
