@@ -45,7 +45,7 @@ reached via `MCPToolDispatcher`'s normal chat-turn dispatch; see Attachments bel
 
 - Python 3.13, Node.js
 - One runtime backend: oMLX (chat model on :8000, macOS Apple Silicon only), or [Ollama](https://ollama.com) (local or Ollama Cloud, :11434, any OS)
-- Local embeddings (optional): set `LOCALIST_EMBEDDING_MODEL` to an embedding model your active backend already serves — any OS with Ollama (e.g. `nomic-embed-text`), or macOS Apple Silicon with oMLX (e.g. `embeddinggemma-300m-4bit`) — no separate extra or download to install. Without it, retrieval runs keyword-only (BM25), automatically, with no configuration at all
+- Local embeddings (optional): pick an embedding model your active backend already serves in Settings → Embedding Model — any OS with Ollama (e.g. `nomic-embed-text`), or macOS Apple Silicon with oMLX (e.g. `embeddinggemma-300m-4bit`) — no separate extra or download to install. Without one, retrieval runs keyword-only (BM25), automatically, with no configuration at all
 - OCR'd PDF chat uploads (see Attachments below) require macOS on Apple Silicon (Apple Vision framework + pypdfium2); on other platforms those uploads are cleanly rejected with an explanatory error, everything else in the app is unaffected. Image uploads work everywhere: Apple Silicon uses Vision framework, other platforms fall back to a configured Ollama vision-capable chat model (`LOCALIST_OLLAMA_VISION_MODEL`)
 
 ## Installation
@@ -65,22 +65,28 @@ backend has no copyleft dependencies.
 Embeddings need no separate extra or download at all — there is no bundled local embedding model.
 Three supported configurations:
 
-- **Ollama-served embeddings**: set `LOCALIST_EMBEDDING_MODEL` to any embedding model already
-  pulled in your Ollama daemon (e.g. `nomic-embed-text`) — see the Configuration table below, or
-  switch it live from the Settings UI with no restart.
+- **Ollama-served embeddings**: pick any embedding model already pulled in your Ollama daemon
+  (e.g. `nomic-embed-text`) in Settings → Embedding Model, live with no restart — or set
+  `LOCALIST_EMBEDDING_MODEL_OLLAMA` (see the Configuration table below).
 - **oMLX-served embeddings** (macOS Apple Silicon): pull an embedding model such as
   `embeddinggemma-300m-4bit` from the oMLX model library and load it alongside your chat model
-  (tested dual-loaded with Gemma 4 12B 4-bit). Set `LOCALIST_EMBEDDING_MODEL` to its ID in
-  `backend/.env` and restart; you then get full RAG on oMLX — semantic retrieval over wiki/raw
-  documents, chat history and episodes. (The Settings embedding-model picker is Ollama-only for now.)
+  (tested dual-loaded with Gemma 4 12B 4-bit), then pick it in Settings → Embedding Model (or set
+  `LOCALIST_EMBEDDING_MODEL_OMLX`). You get full RAG on oMLX — semantic retrieval over wiki/raw
+  documents, chat history and episodes.
+
+Each backend keeps its own embedding model, so switching the runtime backend switches embeddings
+too. A model used for the first time is calibrated automatically for semantic gating and for how
+closely a memory must match before it's recalled.
 - **Keyword-only (BM25) retrieval**: the zero-config default when no embedding model is set.
   Episodic memory and RAG retrieval both fall back to hand-rolled Okapi BM25 keyword scoring, and
   semantic-gating (search-intent classification, episodic-relevance detection) resolves to its own
   BM25-calibrated fallback thresholds rather than being silently disabled — this is a fully
   supported mode, not a degraded stopgap.
 
-**Switching embedding models** — after you change `LOCALIST_EMBEDDING_MODEL` (on either backend), Settings → **Re-embed Memory**
-(`POST /memory/reembed`) re-embeds everything with the active embedding model in one click: your documents, chat history and episodes. Each item gets up to three
+**Switching embedding models** — vectors are kept per model, so switching back to a model that has
+already embedded everything needs nothing at all. After switching to a model that hasn't, documents and
+chat history use keyword search until you run Settings → **Re-embed Memory** (`POST /memory/reembed`),
+which embeds only what that model is missing (episodes fill in by themselves). Each item gets up to three
 attempts; anything that still fails is listed in a warning, and that part of your memory stays on keyword
 search rather than mixing two models' embeddings. Run Re-embed Memory again and only the failed items are redone.
 
@@ -125,9 +131,10 @@ Copy `backend/.env.example` to `backend/.env`. Only an API key for the active `w
 | Variable | Default | Description |
 |---|---|---|
 | `LOCALIST_RUNTIME_BACKEND` | `omlx` | `omlx` or `ollama` — also swappable live at runtime, see below |
-| `LOCALIST_CHAT_MODEL` | *(none)* | Chat model ID override — wins over any per-backend pin below; required for `ollama` if no pin is set either (fails fast at startup if unset) |
+| `LOCALIST_CHAT_MODEL` | *(none)* | Chat model ID override — wins over any per-backend pin below. If neither is set, Localist picks a served chat model on first run and saves it as that backend's pin |
 | `LOCALIST_CHAT_MODEL_OLLAMA` / `_OMLX` | *(none)* | Per-backend chat model pin, used when `LOCALIST_CHAT_MODEL` is unset — lets each backend remember its own model choice independently, including across a live runtime-backend switch |
-| `LOCALIST_EMBEDDING_MODEL` | *(none)* | Embedding model ID served by the active backend (`ollama` or `omlx`); if set and found, this is used instead of the zero-config keyword-only (BM25) retrieval default |
+| `LOCALIST_EMBEDDING_MODEL_OLLAMA` / `_OMLX` | *(none)* | Per-backend embedding model ID (set for you by Settings → Embedding Model); if set and served, it's used instead of the zero-config keyword-only (BM25) retrieval default |
+| `LOCALIST_EMBEDDING_MODEL` | *(none)* | Legacy single embedding model, used only by a backend with no per-backend value; moved into the matching per-backend key automatically the first time the backend that serves it starts |
 | `SEARCH_PROVIDER` | `langsearch` | `web_search` provider: `langsearch` or `brave` |
 | `LANGSEARCH_API_KEY` | *(none)* | Required when `SEARCH_PROVIDER=langsearch`; without it, `web_search` fails and falls back to corpus |
 | `BRAVE_API_KEY` | *(none)* | Required when `SEARCH_PROVIDER=brave`; without it, `web_search` fails and falls back to corpus |
@@ -246,6 +253,10 @@ Tests are organized by phase (memory substrate, routing, controller dispatch, ex
 - ✅ **oMLX embeddings** — load an embedding model (e.g. `embeddinggemma-300m-4bit`) alongside the chat model on oMLX for full RAG; verified dual-loaded with Gemma 4 12B 4-bit
 - ✅ **Re-embed Memory** — one Settings button re-embeds documents, chat history and episodes after an embedding-model switch; partial failures are reported, not hidden
 - ✅ Fixes (v0.1.3): Settings no longer opens blank at launch (it now waits for the backend, with a short "Waiting for the Localist backend to start…" note, then fills in by itself); chat history is now re-embedded along with everything else, where before its search quietly stayed on keyword matching
+- ✅ **Embedding model per backend** (v0.1.4) — Ollama and oMLX each keep their own, chosen in Settings for either backend; switching the runtime backend switches embeddings with it
+- ✅ **Vectors kept per model** (v0.1.4) — switching back to an embedding model you've used before needs no re-embed; Re-embed Memory only fills in what the active model is missing
+- ✅ **Memory recall tuned per embedding model** (v0.1.4) — how closely a memory must match to be recalled is set per model (measured, then calibrated automatically for new models), so EmbeddingGemma stops dropping half its right matches and nomic stops pulling unrelated memories into answers
+- ✅ Fixes (v0.1.4): facts recalled for your question are no longer crowded out by recent preferences; the Chat Model dropdown shows the model actually in use; Episodes, Memory, the Live Feed and the Memory badge load once the backend is up instead of staying empty after a slow start; Ollama with no chat model set no longer crashes at startup
 
 **Open**
 - ⬜ Native `.app`: first-run config UX (a fresh app defaults to unreachable `omlx`), code signing/notarization, `tauri build` auto-triggering the PyInstaller build
