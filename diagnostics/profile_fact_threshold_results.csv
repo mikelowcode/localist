@@ -1,0 +1,139 @@
+model,kind,query,relevant,best_relevant_score,best_relevant_rank,top1,top1_score
+nomic-embed-text:latest,positive,What's my name?,name,0.4952,1,name,0.4952
+nomic-embed-text:latest,positive,What does my job involve day to day?,role,0.4703,4,proj_dashboard,0.497
+nomic-embed-text:latest,positive,Suggest a weekend day trip near where I live.,location,0.5381,1,location,0.5381
+nomic-embed-text:latest,positive,What pets do I have at home?,location,0.6372,1,location,0.6372
+nomic-embed-text:latest,positive,What's a good time to schedule a call with me?,timezone,0.6198,1,timezone,0.6198
+nomic-embed-text:latest,positive,Help me practise a few phrases in my second language.,languages,0.5943,1,languages,0.5943
+nomic-embed-text:latest,positive,Give me ideas to speed up my delivery route planning service.,proj_routes,0.6798,1,proj_routes,0.6798
+nomic-embed-text:latest,positive,How should I add a filter by shipment status to the operations app I'm building?,proj_dashboard,0.7514,1,proj_dashboard,0.7514
+nomic-embed-text:latest,positive,My soil sensors keep dropping off Wi-Fi. Any ideas?,proj_garden,0.6608,1,proj_garden,0.6608
+nomic-embed-text:latest,positive,Help me outline the talk I'm preparing.,proj_talk,0.597,1,proj_talk,0.597
+nomic-embed-text:latest,positive,Which database should I pick for a new internal tool?,val_reliability tech_kafka,0.4799,5,val_privacy,0.5211
+nomic-embed-text:latest,positive,Is it worth writing a README before I ship this feature?,val_docs,0.4407,6,proj_dashboard,0.5313
+nomic-embed-text:latest,positive,How can I help the new junior on my team ramp up?,val_mentoring,0.6928,1,val_mentoring,0.6928
+nomic-embed-text:latest,positive,Is this third-party analytics SDK okay to add to our app?,val_privacy,0.5332,2,proj_dashboard,0.5552
+nomic-embed-text:latest,positive,How should you format your answers for me?,cs_bullets cs_tone cs_no_emoji,0.6113,1,cs_bullets,0.6113
+nomic-embed-text:latest,positive,What language should your code samples be in when you help me?,tech_rust cs_examples,0.6018,1,cs_examples,0.6018
+nomic-embed-text:latest,positive,Where should I look to verify what you tell me?,cs_sources,0.4916,2,val_privacy,0.5036
+nomic-embed-text:latest,positive,Should I use a queue or a database table for this job system? Help me decide.,cog_tradeoffs tech_kafka,0.4291,14,role,0.5502
+nomic-embed-text:latest,positive,What kind of diagram would help me understand the order service flow?,cog_visual,0.6242,1,cog_visual,0.6242
+nomic-embed-text:latest,positive,Explain things to me the way I like them explained.,cog_first_principles cs_bullets,0.599,1,cog_first_principles,0.599
+nomic-embed-text:latest,positive,What do I use to provision our infrastructure?,tech_cloud,0.511,4,val_reliability,0.5923
+nomic-embed-text:latest,positive,Recommend a plugin for my text editor.,tech_editor,0.4597,2,tech_css,0.4617
+nomic-embed-text:latest,positive,Help me centre this div and fix my flexbox layout.,tech_css,0.5978,1,tech_css,0.5978
+nomic-embed-text:latest,positive,Plan a strength routine that complements my climbing.,int_climbing,0.5741,1,int_climbing,0.5741
+nomic-embed-text:latest,positive,Suggest a dinner recipe for me this weekend.,int_cooking,0.5025,1,int_cooking,0.5025
+nomic-embed-text:latest,positive,Recommend a novel I'd enjoy.,int_scifi,0.5399,1,int_scifi,0.5399
+nomic-embed-text:latest,positive,What should I wear on my ride to work when it rains?,int_cycling,0.5225,1,int_cycling,0.5225
+nomic-embed-text:latest,positive,Which message broker do we run in production?,tech_kafka,0.5083,5,proj_dashboard,0.5759
+nomic-embed-text:latest,positive,Should I write this data cleanup script in Rust or Python?,tech_rust,0.7672,1,tech_rust,0.7672
+nomic-embed-text:latest,positive,What should my conference slides focus on?,proj_talk,0.6049,1,proj_talk,0.6049
+nomic-embed-text:latest,negative,What year did the Berlin Wall fall?,,,,int_cycling,0.4281
+nomic-embed-text:latest,negative,Explain compound interest with an example.,,,,cs_examples,0.5187
+nomic-embed-text:latest,negative,What is photosynthesis?,,,,proj_garden,0.4961
+nomic-embed-text:latest,negative,List three famous paintings by Monet.,,,,location,0.464
+nomic-embed-text:latest,negative,How far is the Moon from Earth?,,,,location,0.4079
+nomic-embed-text:latest,negative,Who wrote Pride and Prejudice?,,,,location,0.4521
+nomic-embed-text:latest,negative,Why does water boil at a lower temperature at high altitude?,,,,proj_garden,0.4507
+nomic-embed-text:latest,negative,Summarise the causes of the First World War.,,,,cog_first_principles,0.5445
+nomic-embed-text:latest,negative,How do vaccines train the immune system?,,,,int_cooking,0.5137
+nomic-embed-text:latest,negative,What is the capital of Canada?,,,,name,0.4236
+nomic-embed-text:latest,negative,Translate 'good morning' into German.,,,,languages,0.4833
+nomic-embed-text:latest,negative,How many players are on a soccer team?,,,,proj_dashboard,0.4597
+nomic-embed-text:latest,negative,Explain how a CPU cache works.,,,,tech_rust,0.4719
+nomic-embed-text:latest,negative,What is the difference between a virus and a bacterium?,,,,int_cooking,0.4436
+nomic-embed-text:latest,negative,Who painted the Sistine Chapel ceiling?,,,,int_scifi,0.4417
+nomic-embed-text:latest,negative,What causes the seasons on Earth?,,,,int_cycling,0.5321
+embeddinggemma:latest,positive,What's my name?,name,0.4941,1,name,0.4941
+embeddinggemma:latest,positive,What does my job involve day to day?,role,0.5058,1,role,0.5058
+embeddinggemma:latest,positive,Suggest a weekend day trip near where I live.,location,0.3797,3,cog_tradeoffs,0.3965
+embeddinggemma:latest,positive,What pets do I have at home?,location,0.466,1,location,0.466
+embeddinggemma:latest,positive,What's a good time to schedule a call with me?,timezone,0.3633,2,proj_talk,0.3743
+embeddinggemma:latest,positive,Help me practise a few phrases in my second language.,languages,0.4443,1,languages,0.4443
+embeddinggemma:latest,positive,Give me ideas to speed up my delivery route planning service.,proj_routes,0.592,1,proj_routes,0.592
+embeddinggemma:latest,positive,How should I add a filter by shipment status to the operations app I'm building?,proj_dashboard,0.6616,1,proj_dashboard,0.6616
+embeddinggemma:latest,positive,My soil sensors keep dropping off Wi-Fi. Any ideas?,proj_garden,0.589,1,proj_garden,0.589
+embeddinggemma:latest,positive,Help me outline the talk I'm preparing.,proj_talk,0.5657,1,proj_talk,0.5657
+embeddinggemma:latest,positive,Which database should I pick for a new internal tool?,val_reliability tech_kafka,0.4214,1,val_reliability,0.4214
+embeddinggemma:latest,positive,Is it worth writing a README before I ship this feature?,val_docs,0.5282,1,val_docs,0.5282
+embeddinggemma:latest,positive,How can I help the new junior on my team ramp up?,val_mentoring,0.5701,1,val_mentoring,0.5701
+embeddinggemma:latest,positive,Is this third-party analytics SDK okay to add to our app?,val_privacy,0.4406,1,val_privacy,0.4406
+embeddinggemma:latest,positive,How should you format your answers for me?,cs_bullets cs_tone cs_no_emoji,0.6414,1,cs_bullets,0.6414
+embeddinggemma:latest,positive,What language should your code samples be in when you help me?,tech_rust cs_examples,0.586,1,cs_examples,0.586
+embeddinggemma:latest,positive,Where should I look to verify what you tell me?,cs_sources,0.4357,1,cs_sources,0.4357
+embeddinggemma:latest,positive,Should I use a queue or a database table for this job system? Help me decide.,cog_tradeoffs tech_kafka,0.3789,6,role,0.452
+embeddinggemma:latest,positive,What kind of diagram would help me understand the order service flow?,cog_visual,0.5425,1,cog_visual,0.5425
+embeddinggemma:latest,positive,Explain things to me the way I like them explained.,cog_first_principles cs_bullets,0.7056,1,cog_first_principles,0.7056
+embeddinggemma:latest,positive,What do I use to provision our infrastructure?,tech_cloud,0.5317,1,tech_cloud,0.5317
+embeddinggemma:latest,positive,Recommend a plugin for my text editor.,tech_editor,0.46,1,tech_editor,0.46
+embeddinggemma:latest,positive,Help me centre this div and fix my flexbox layout.,tech_css,0.5944,1,tech_css,0.5944
+embeddinggemma:latest,positive,Plan a strength routine that complements my climbing.,int_climbing,0.5066,1,int_climbing,0.5066
+embeddinggemma:latest,positive,Suggest a dinner recipe for me this weekend.,int_cooking,0.4927,1,int_cooking,0.4927
+embeddinggemma:latest,positive,Recommend a novel I'd enjoy.,int_scifi,0.5132,1,int_scifi,0.5132
+embeddinggemma:latest,positive,What should I wear on my ride to work when it rains?,int_cycling,0.4042,1,int_cycling,0.4042
+embeddinggemma:latest,positive,Which message broker do we run in production?,tech_kafka,0.6545,1,tech_kafka,0.6545
+embeddinggemma:latest,positive,Should I write this data cleanup script in Rust or Python?,tech_rust,0.6875,1,tech_rust,0.6875
+embeddinggemma:latest,positive,What should my conference slides focus on?,proj_talk,0.517,1,proj_talk,0.517
+embeddinggemma:latest,negative,What year did the Berlin Wall fall?,,,,int_cycling,0.2931
+embeddinggemma:latest,negative,Explain compound interest with an example.,,,,cs_examples,0.4796
+embeddinggemma:latest,negative,What is photosynthesis?,,,,int_climbing,0.3594
+embeddinggemma:latest,negative,List three famous paintings by Monet.,,,,location,0.2637
+embeddinggemma:latest,negative,How far is the Moon from Earth?,,,,location,0.2711
+embeddinggemma:latest,negative,Who wrote Pride and Prejudice?,,,,tech_rust,0.3925
+embeddinggemma:latest,negative,Why does water boil at a lower temperature at high altitude?,,,,cog_first_principles,0.387
+embeddinggemma:latest,negative,Summarise the causes of the First World War.,,,,cog_first_principles,0.3786
+embeddinggemma:latest,negative,How do vaccines train the immune system?,,,,val_reliability,0.265
+embeddinggemma:latest,negative,What is the capital of Canada?,,,,int_cycling,0.3603
+embeddinggemma:latest,negative,Translate 'good morning' into German.,,,,languages,0.3564
+embeddinggemma:latest,negative,How many players are on a soccer team?,,,,role,0.3332
+embeddinggemma:latest,negative,Explain how a CPU cache works.,,,,cog_first_principles,0.4218
+embeddinggemma:latest,negative,What is the difference between a virus and a bacterium?,,,,cs_bullets,0.296
+embeddinggemma:latest,negative,Who painted the Sistine Chapel ceiling?,,,,int_scifi,0.2934
+embeddinggemma:latest,negative,What causes the seasons on Earth?,,,,int_cycling,0.3974
+embeddinggemma-2:latest,positive,What's my name?,name,0.767,1,name,0.767
+embeddinggemma-2:latest,positive,What does my job involve day to day?,role,0.7393,1,role,0.7393
+embeddinggemma-2:latest,positive,Suggest a weekend day trip near where I live.,location,0.6923,2,int_cycling,0.699
+embeddinggemma-2:latest,positive,What pets do I have at home?,location,0.7954,1,location,0.7954
+embeddinggemma-2:latest,positive,What's a good time to schedule a call with me?,timezone,0.7654,1,timezone,0.7654
+embeddinggemma-2:latest,positive,Help me practise a few phrases in my second language.,languages,0.7321,1,languages,0.7321
+embeddinggemma-2:latest,positive,Give me ideas to speed up my delivery route planning service.,proj_routes,0.77,1,proj_routes,0.77
+embeddinggemma-2:latest,positive,How should I add a filter by shipment status to the operations app I'm building?,proj_dashboard,0.8286,1,proj_dashboard,0.8286
+embeddinggemma-2:latest,positive,My soil sensors keep dropping off Wi-Fi. Any ideas?,proj_garden,0.8321,1,proj_garden,0.8321
+embeddinggemma-2:latest,positive,Help me outline the talk I'm preparing.,proj_talk,0.7628,1,proj_talk,0.7628
+embeddinggemma-2:latest,positive,Which database should I pick for a new internal tool?,val_reliability tech_kafka,0.7493,1,val_reliability,0.7493
+embeddinggemma-2:latest,positive,Is it worth writing a README before I ship this feature?,val_docs,0.7562,1,val_docs,0.7562
+embeddinggemma-2:latest,positive,How can I help the new junior on my team ramp up?,val_mentoring,0.8048,1,val_mentoring,0.8048
+embeddinggemma-2:latest,positive,Is this third-party analytics SDK okay to add to our app?,val_privacy,0.734,1,val_privacy,0.734
+embeddinggemma-2:latest,positive,How should you format your answers for me?,cs_bullets cs_tone cs_no_emoji,0.8306,1,cs_bullets,0.8306
+embeddinggemma-2:latest,positive,What language should your code samples be in when you help me?,tech_rust cs_examples,0.7912,1,cs_examples,0.7912
+embeddinggemma-2:latest,positive,Where should I look to verify what you tell me?,cs_sources,0.7738,1,cs_sources,0.7738
+embeddinggemma-2:latest,positive,Should I use a queue or a database table for this job system? Help me decide.,cog_tradeoffs tech_kafka,0.725,3,role,0.7362
+embeddinggemma-2:latest,positive,What kind of diagram would help me understand the order service flow?,cog_visual,0.7709,1,cog_visual,0.7709
+embeddinggemma-2:latest,positive,Explain things to me the way I like them explained.,cog_first_principles cs_bullets,0.7989,1,cog_first_principles,0.7989
+embeddinggemma-2:latest,positive,What do I use to provision our infrastructure?,tech_cloud,0.7506,2,val_reliability,0.7876
+embeddinggemma-2:latest,positive,Recommend a plugin for my text editor.,tech_editor,0.7209,1,tech_editor,0.7209
+embeddinggemma-2:latest,positive,Help me centre this div and fix my flexbox layout.,tech_css,0.7771,1,tech_css,0.7771
+embeddinggemma-2:latest,positive,Plan a strength routine that complements my climbing.,int_climbing,0.8025,1,int_climbing,0.8025
+embeddinggemma-2:latest,positive,Suggest a dinner recipe for me this weekend.,int_cooking,0.7275,1,int_cooking,0.7275
+embeddinggemma-2:latest,positive,Recommend a novel I'd enjoy.,int_scifi,0.7497,1,int_scifi,0.7497
+embeddinggemma-2:latest,positive,What should I wear on my ride to work when it rains?,int_cycling,0.7295,1,int_cycling,0.7295
+embeddinggemma-2:latest,positive,Which message broker do we run in production?,tech_kafka,0.7747,1,tech_kafka,0.7747
+embeddinggemma-2:latest,positive,Should I write this data cleanup script in Rust or Python?,tech_rust,0.8457,1,tech_rust,0.8457
+embeddinggemma-2:latest,positive,What should my conference slides focus on?,proj_talk,0.7599,1,proj_talk,0.7599
+embeddinggemma-2:latest,negative,What year did the Berlin Wall fall?,,,,int_cycling,0.6552
+embeddinggemma-2:latest,negative,Explain compound interest with an example.,,,,cog_first_principles,0.6994
+embeddinggemma-2:latest,negative,What is photosynthesis?,,,,cog_first_principles,0.6857
+embeddinggemma-2:latest,negative,List three famous paintings by Monet.,,,,int_cycling,0.651
+embeddinggemma-2:latest,negative,How far is the Moon from Earth?,,,,cs_bullets,0.6658
+embeddinggemma-2:latest,negative,Who wrote Pride and Prejudice?,,,,int_scifi,0.7009
+embeddinggemma-2:latest,negative,Why does water boil at a lower temperature at high altitude?,,,,cog_first_principles,0.653
+embeddinggemma-2:latest,negative,Summarise the causes of the First World War.,,,,cog_first_principles,0.668
+embeddinggemma-2:latest,negative,How do vaccines train the immune system?,,,,cog_first_principles,0.6639
+embeddinggemma-2:latest,negative,What is the capital of Canada?,,,,location,0.6761
+embeddinggemma-2:latest,negative,Translate 'good morning' into German.,,,,languages,0.7123
+embeddinggemma-2:latest,negative,How many players are on a soccer team?,,,,role,0.6745
+embeddinggemma-2:latest,negative,Explain how a CPU cache works.,,,,cog_visual,0.7373
+embeddinggemma-2:latest,negative,What is the difference between a virus and a bacterium?,,,,cog_first_principles,0.6846
+embeddinggemma-2:latest,negative,Who painted the Sistine Chapel ceiling?,,,,cs_sources,0.6379
+embeddinggemma-2:latest,negative,What causes the seasons on Earth?,,,,int_cycling,0.6918

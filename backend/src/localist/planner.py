@@ -871,6 +871,50 @@ def resolve_episodic_recall_floor(
 
 
 # ---------------------------------------------------------------------------
+# Profile-fact threshold — the min cosine ControllerAgent._score_profile_facts()
+# needs before a user-profile line goes into Slot 3b (03-unified-prompt-
+# contract §3.6). Profile injection runs on every route, P6 included, so this
+# threshold is its only gate.
+#
+# Per model, measured 2026-10-20 (diagnostics/reports/
+# profile_fact_threshold_assessment_2026-10-20.md) on the synthetic
+# threshold_calibration_fixtures.PROFILE_* battery and checked against the
+# real profile. The old single 0.45 put profile lines into 70% of off-topic
+# questions under nomic (0.52: 20%, same recall), and the maximum 5 lines
+# into every off-topic question under embeddinggemma-2 (its calibrated
+# 0.72: 20%, same recall). For EmbeddingGemma 300M 0.45 is already right:
+# calibration picks 0.40, which on the real profile raised off-topic
+# injection from 10% to 50% with no recall gain — hence hand-validated here
+# under both the oMLX and the Ollama name, so calibration can't move it.
+# Other models use their calibrated threshold
+# (threshold_calibration.calibrate_profile_threshold(), persisted with the
+# gate thresholds) when it calibrated cleanly, else 0.45.
+_PROFILE_FACT_THRESHOLDS: dict[str, float] = {
+    "nomic-embed-text:latest":  0.52,
+    "embeddinggemma-300m-4bit": 0.45,
+    "embeddinggemma:latest":    0.45,
+}
+_DEFAULT_PROFILE_FACT_THRESHOLD = 0.45
+
+
+def resolve_profile_fact_threshold(
+    embedding_model_name:  str | None,
+    calibrated_thresholds: dict[str, float] | None = None,
+) -> float:
+    """The profile-fact min cosine for `embedding_model_name`, with the same
+    precedence as the episodic recall floor: hand-validated
+    (_PROFILE_FACT_THRESHOLDS), then this model's calibrated threshold
+    (calibrated_thresholds["profile_fact_threshold"]), then 0.45 — also for
+    keyword-only (None), where no profile line is embedded anyway."""
+    if embedding_model_name is None:
+        return _DEFAULT_PROFILE_FACT_THRESHOLD
+    if embedding_model_name in _PROFILE_FACT_THRESHOLDS:
+        return _PROFILE_FACT_THRESHOLDS[embedding_model_name]
+    calibrated = (calibrated_thresholds or {}).get("profile_fact_threshold")
+    return calibrated if calibrated is not None else _DEFAULT_PROFILE_FACT_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
 # Lexical/BM25 fallback tier — the fifth, model-independent threshold tier
 # (PLAN_semantic_gating_calibration.md §9), sitting below "auto-calibrated"
 # and above "disabled" in resolve_gate_tiers()'s per-gate resolution.

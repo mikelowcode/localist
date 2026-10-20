@@ -263,3 +263,105 @@ RECALL_NEGATIVES: list[str] = [
     "What is photosynthesis?",
     "List three famous paintings by Monet.",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Profile-fact threshold — the min cosine for ControllerAgent._score_profile_facts()
+# (docs/architecture/03-unified-prompt-contract.md §3.6). SYNTHETIC: a made-up
+# person, shaped like wiki/users/<name>.md (bare fact lines under the same
+# kinds of section; embedded raw, one line at a time, exactly as
+# _load_user_profile() does), with near-miss distractors. The real profile is
+# personal data and never belongs here. Positives are full user instructions
+# with one or more relevant lines; negatives are general questions where no
+# profile line is relevant — §3.6 asks for "only the top relevant facts for
+# the current instruction", so a style line injected on a general question
+# counts as a false positive.
+# ---------------------------------------------------------------------------
+
+PROFILE_LINES: dict[str, tuple[str, str]] = {
+    # key: (section, line)
+    "name":                 ("Identity", "Name: Dana Okafor"),
+    "role":                 ("Identity", "Role: Staff data engineer at a logistics startup"),
+    "location":             ("Identity", "Lives in Portland, Oregon, with a partner and two cats"),
+    "timezone":             ("Identity", "Works on Pacific Time and avoids meetings before 9am"),
+    "languages":            ("Identity", "Speaks English and conversational Portuguese"),
+    "proj_routes":          ("Active Projects", "Route Optimizer: a Rust service that plans delivery routes from live traffic data"),
+    "proj_dashboard":       ("Active Projects", "Freight Dashboard: a React app showing shipment status for operations staff"),
+    "proj_garden":          ("Active Projects", "Side project: a Raspberry Pi sensor network that monitors soil moisture in a backyard garden"),
+    "proj_talk":            ("Active Projects", "Preparing a conference talk on streaming data quality for next spring"),
+    "val_reliability":      ("Values", "Values reliability over novelty when choosing infrastructure"),
+    "val_docs":             ("Values", "Believes good documentation is part of the definition of done"),
+    "val_mentoring":        ("Values", "Spends time mentoring junior engineers and cares about their growth"),
+    "val_privacy":          ("Values", "Cares about data privacy and avoids tools that sell user data"),
+    "cs_bullets":           ("Communication Style", "Prefers concise answers with bullet points over long paragraphs"),
+    "cs_examples":          ("Communication Style", "Prefers concrete code examples to abstract descriptions"),
+    "cs_tone":              ("Communication Style", "Tone should be direct and informal, without corporate jargon"),
+    "cs_no_emoji":          ("Communication Style", "Dislikes emoji in technical answers"),
+    "cs_sources":           ("Communication Style", "Appreciates links to primary sources and official documentation"),
+    "cog_tradeoffs":        ("Cognitive Preferences", "Wants trade-offs laid out explicitly before a recommendation"),
+    "cog_first_principles": ("Cognitive Preferences", "Prefers first-principles explanations to analogies"),
+    "cog_visual":           ("Cognitive Preferences", "Thinks visually and likes sequence diagrams for distributed systems"),
+    "tech_rust":            ("Technical Orientation", "Writes most backend code in Rust and some Python for data scripts"),
+    "tech_kafka":           ("Technical Orientation", "Runs Kafka and Postgres in production"),
+    "tech_cloud":           ("Technical Orientation", "Deploys on AWS with Terraform"),
+    "tech_editor":          ("Technical Orientation", "Uses Neovim with a heavily customised config"),
+    "tech_css":             ("Technical Orientation", "Less comfortable with frontend CSS layout and asks for help with it"),
+    "int_climbing":         ("Interests", "Goes bouldering twice a week"),
+    "int_cooking":          ("Interests", "Cooks vegetarian food and is learning to bake sourdough"),
+    "int_scifi":            ("Interests", "Reads hard science fiction, especially Kim Stanley Robinson"),
+    "int_cycling":          ("Interests", "Commutes by bike year-round"),
+}
+
+# (query, keys of the relevant lines). Paraphrased full user instructions,
+# never copying a line's wording.
+PROFILE_POSITIVES: list[tuple[str, tuple[str, ...]]] = [
+    ("What's my name?", ("name",)),
+    ("What does my job involve day to day?", ("role",)),
+    ("Suggest a weekend day trip near where I live.", ("location",)),
+    ("What pets do I have at home?", ("location",)),
+    ("What's a good time to schedule a call with me?", ("timezone",)),
+    ("Help me practise a few phrases in my second language.", ("languages",)),
+    ("Give me ideas to speed up my delivery route planning service.", ("proj_routes",)),
+    ("How should I add a filter by shipment status to the operations app I'm building?", ("proj_dashboard",)),
+    ("My soil sensors keep dropping off Wi-Fi. Any ideas?", ("proj_garden",)),
+    ("Help me outline the talk I'm preparing.", ("proj_talk",)),
+    ("Which database should I pick for a new internal tool?", ("val_reliability", "tech_kafka")),
+    ("Is it worth writing a README before I ship this feature?", ("val_docs",)),
+    ("How can I help the new junior on my team ramp up?", ("val_mentoring",)),
+    ("Is this third-party analytics SDK okay to add to our app?", ("val_privacy",)),
+    ("How should you format your answers for me?", ("cs_bullets", "cs_tone", "cs_no_emoji")),
+    ("What language should your code samples be in when you help me?", ("tech_rust", "cs_examples")),
+    ("Where should I look to verify what you tell me?", ("cs_sources",)),
+    ("Should I use a queue or a database table for this job system? Help me decide.", ("cog_tradeoffs", "tech_kafka")),
+    ("What kind of diagram would help me understand the order service flow?", ("cog_visual",)),
+    ("Explain things to me the way I like them explained.", ("cog_first_principles", "cs_bullets")),
+    ("What do I use to provision our infrastructure?", ("tech_cloud",)),
+    ("Recommend a plugin for my text editor.", ("tech_editor",)),
+    ("Help me centre this div and fix my flexbox layout.", ("tech_css",)),
+    ("Plan a strength routine that complements my climbing.", ("int_climbing",)),
+    ("Suggest a dinner recipe for me this weekend.", ("int_cooking",)),
+    ("Recommend a novel I'd enjoy.", ("int_scifi",)),
+    ("What should I wear on my ride to work when it rains?", ("int_cycling",)),
+    ("Which message broker do we run in production?", ("tech_kafka",)),
+    ("Should I write this data cleanup script in Rust or Python?", ("tech_rust",)),
+    ("What should my conference slides focus on?", ("proj_talk",)),
+]
+
+PROFILE_NEGATIVES: list[str] = [
+    "What year did the Berlin Wall fall?",
+    "Explain compound interest with an example.",
+    "What is photosynthesis?",
+    "List three famous paintings by Monet.",
+    "How far is the Moon from Earth?",
+    "Who wrote Pride and Prejudice?",
+    "Why does water boil at a lower temperature at high altitude?",
+    "Summarise the causes of the First World War.",
+    "How do vaccines train the immune system?",
+    "What is the capital of Canada?",
+    "Translate 'good morning' into German.",
+    "How many players are on a soccer team?",
+    "Explain how a CPU cache works.",
+    "What is the difference between a virus and a bacterium?",
+    "Who painted the Sistine Chapel ceiling?",
+    "What causes the seasons on Earth?",
+]

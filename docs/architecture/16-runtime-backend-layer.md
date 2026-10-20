@@ -2003,8 +2003,179 @@ tests updated by design for the new column and version. Full suite 1710 passed. 
 clean.
 
 **Open items.**
-- An absolute floor stays blunt for nomic, whose right and off-topic scores overlap (0.50–0.57). A
+- ~~An absolute floor stays blunt for nomic, whose right and off-topic scores overlap (0.50–0.57). A
   relative cut (margin over the next episode, or rank) is the next lever if nomic's 68% recall
-  matters in practice.
-- The profile-facts threshold (`_score_profile_facts`, 0.45) is still single and unmeasured.
+  matters in practice.~~ Measured 2026-10-20 and not built: no recall gain on real episodes (§16.29).
+- ~~The profile-facts threshold (`_score_profile_facts`, 0.45) is still single and unmeasured.~~
+  Measured and made per model 2026-10-20 (§16.29).
+- The live test of a model with no hand-validated floor (see "Verified live (option B)" above) was
+  done 2026-10-20 with `embeddinggemma-2:latest` (§16.29).
+- EmbeddingGemma task prefixes (option C) are not built.
+
+### §16.29 — Calibration for every model: unlisted models, relative recall cut, profile threshold, versioned rows (2026-10-20)
+
+Three of §16.28's open items, worked in phases. Each measurement phase was read-only, came before any
+build, and checked synthetic-fixture results against real data before deciding.
+
+**Phase 1 — calibration on a model no table lists.**
+- *Method.* `diagnostics/diag_unlisted_model_calibration.py` runs the production
+  `calibrate_thresholds()` against real Ollama. Report:
+  `diagnostics/reports/unlisted_model_calibration_assessment_2026-10-20.md`.
+  - Test model: `embeddinggemma-2:latest` (744M parameters, nvfp4; 768-dimension unit vectors,
+    although `ollama show` reports `embedding length 512`).
+  - Control: `embeddinggemma:latest`, the EmbeddingGemma 300M weights behind the hand-validated
+    oMLX `embeddinggemma-300m-4bit`, under a name no table lists.
+  - Then an end-to-end check in a sandbox (`LOCALIST_BACKEND_ROOT` pointed at a copy of the live
+    DB, `.env`, wiki/ and raw/).
+- *Findings.*
+  - `embeddinggemma-2` scores high, unlike its predecessor. At the 0.45 default it put memory into
+    100% of off-topic questions, with about 4 wrong episodes per real question. Calibration picked
+    0.71: 84% recall, 0% false positives, 0.5 wrong per question. That is 0.005 above its worst
+    off-topic score, the same thin margin as the 300M model's 0.37.
+  - Two gates (`explicit_search_action`, `lookup_request`) were inconclusive and fall back to the
+    lexical tier.
+  - The control calibrated to 0.36 (hand-validated: 0.37), and nomic reproduced its 0.55, so live
+    calibration matches the hand-validated values.
+  - In the sandbox the full path worked: model switch → calibration → v19 row → resolver → the
+    controller's `floor 0.71` log line. Live turns behaved as expected: the right episode was
+    recalled for a personal question, and nothing for an off-topic one.
+- *Decision.* `embeddinggemma-2` stays out of the hand-validated tables, so it remains the live test
+  case for unlisted models.
+
+**Phase 2 — relative recall cut (measured; not built, by decision).**
+- *Method.* `diagnostics/diag_relative_recall_cut.py` compared five ways of cutting on the shared
+  `RECALL_*` battery, with leave-one-out cross-validation (LOOCV). Report:
+  `relative_recall_cut_assessment_2026-10-20.md`.
+  - A: absolute floor (today's behaviour).
+  - B: floor plus a margin below the top score.
+  - C: floor plus a cut at the first big score gap.
+  - D: floor plus a rank cap.
+  - E: a gated cut — inject anything only if the top score clears a high floor, or stands out from
+    the background (s₁ − mean(s₂..s₁₀)).
+- *Findings on the battery.*
+  - B–D always keep the top episode once it passes the floor, so they can't lower off-topic false
+    positives. Their reduction in wrong extras is an artefact: every battery question has exactly one
+    right episode.
+  - The simplest E (floor + prominence) lifted nomic's LOOCV J from 0.25 to 0.70, and helped neither
+    EmbeddingGemma model.
+- *Findings on real data.* The sandbox's 21 real episodes, with 16 labelled personal and 10
+  off-topic questions, using battery parameters without retuning:
+  - nomic's 0.55 already recalls a relevant episode for 94% of real questions with 0% off-topic
+    false positives.
+  - The gate added no recall and doubled wrong episodes, 1.2 → 2.4 per question.
+- *Decision (user).* Skip the build. The cheap follow-up, if the question returns, is to log the
+  top-5 scores and prominence on live turns.
+
+**Phase 4 — profile-fact threshold measured.**
+- *Method.*
+  - New synthetic battery `threshold_calibration_fixtures.PROFILE_*`: 30 lines in profile-style
+    sections; 30 positive questions, some with several relevant lines; 16 general-knowledge
+    negatives.
+  - Following §3.6, any line injected on a general question counts as a false positive, style
+    lines included.
+  - `diagnostics/diag_profile_fact_threshold.py` selects with `_recall_floor_from_scores()` and
+    reports LOOCV. Report: `profile_fact_threshold_assessment_2026-10-20.md`.
+  - Out-of-sample check against the real 88-line profile.
+- *Findings.* Recall and off-topic injection on the real profile:
+
+  | Model | At 0.45 | Change | Recall |
+  |---|---|---|---|
+  | `embeddinggemma-2` | the maximum 5 lines on every off-topic question | 0.72 → 20% of off-topic questions, 0.4 lines | unchanged |
+  | nomic | lines on 70% of off-topic questions | 0.52 → 20% | unchanged |
+  | EmbeddingGemma 300M | already right: 10% | its calibrated 0.40 → **50%** | no gain |
+
+  - The real profile is about 80% style/meta lines, and those are what leak.
+  - Spec drift found: §3.6 said P6 turns don't get profile facts, but Step 5b runs on every route,
+    so this threshold is the only gate.
+- *Decisions (user).*
+  - Hand-validated values where measured, calibration for every other model, 0.45 default.
+  - P6 keeps getting profile facts, bounded by the threshold. §3.6 was updated to match the code.
+
+**Phase 5 — per-model profile threshold, built.**
+- `planner._PROFILE_FACT_THRESHOLDS` (hand-validated values):
+
+  | Model | Threshold |
+  |---|---|
+  | `nomic-embed-text:latest` | 0.52 |
+  | `embeddinggemma-300m-4bit` | 0.45 |
+  | `embeddinggemma:latest` | 0.45 |
+
+  EmbeddingGemma 300M is listed under both names, so calibration can't move it to the worse 0.40.
+- `resolve_profile_fact_threshold()` returns the hand-validated value, then the calibrated one, then
+  0.45.
+- `threshold_calibration.calibrate_profile_threshold()` runs inside `calibrate_thresholds()` as
+  `CalibrationResult.profile_threshold`. It is persisted as `profile_fact_threshold` (schema v20)
+  when it calibrates cleanly.
+- `ControllerAgent` resolves the threshold once in `__init__`, passes it to `_score_profile_facts()`
+  and logs it.
+- `CalibrationResponse` gains `profile_threshold` and `profile_threshold_in_use`. The Settings
+  calibration summary adds "Profile threshold 0.72.", formatted by the same helper as the recall
+  floor.
+
+**Calibration versioning; every model calibrates; startup calibrates (built).** Phase 5 left two gaps.
+A row calibrated before v20 has no profile threshold and kept 0.45 indefinitely. And a model with
+hand-validated *gates* was never calibrated at all, so any value it lacked a hand-validated entry for
+would run on an unmeasured default.
+- *Version stamp.* `threshold_calibration.CALIBRATION_VERSION` (currently 1: four gates, recall
+  floor, profile threshold) is stamped on every row `main._calibrate_and_persist()` writes, in
+  `embedding_model_thresholds.calibration_version`.
+  - It's folded into the same v20 migration, since v20 was never released.
+  - Bump it whenever calibration starts measuring something new or changes method.
+- *Trigger.* `main._needs_calibration()` (formerly `_needs_first_time_calibration()`) fires when a
+  model has no row, or a row whose version is missing or older than `CALIBRATION_VERSION`.
+  - It no longer exempts `_VALIDATED_MODEL_THRESHOLDS` models. Hand-validated values still win at
+    resolve time, so calibration only fills in what has no hand-validated value.
+  - A current-version row is never retried automatically, inconclusive or not. Re-embed Memory
+    retries it, as before.
+- *Where it runs.*
+  - When a model becomes active through `POST /settings/embedding-model` or
+    `POST /settings/runtime-backend`, via `_apply_embedding_source()`.
+  - **At startup**, which never calibrated before: `_calibrate_if_needed_at_startup()` runs in
+    `lifespan()` before the controller is built. It is non-fatal.
+  - Cost: about 2–3 s per model per calibration version.
+- *Settings.* `CalibrationResponse.gate_tiers` (from `resolve_gate_tiers()`) lets the summary name
+  hand-validated gates rather than present measured values that are overridden. For nomic it reads
+  "Semantic gating for nomic-embed-text:latest uses hand-validated thresholds (ESA, LR, RI,
+  episodic)".
+- The "Calibration for …" log now counts gates only, plus the recall floor and the profile
+  threshold. It had reported "4/4 gates" when only 2 calibrated.
+
+**Verified live (sandbox).**
+- Snapshot migrated v19 → v20, with the self-heal adding the new columns.
+- `embeddinggemma-2`:
+  - Re-embed calibrated profile threshold 0.72, stored next to recall floor 0.71.
+  - Live turns: "Where do I live?" got 2 profile facts and the right answer. The photosynthesis
+    question (P6) got **0** facts; it got 5 at 0.45. "What tone do I want from you?" got 5 style
+    lines.
+- nomic: the hand-validated 0.52 was used, giving 1 fact for "Where do I live?" and 0 for
+  photosynthesis.
+- Startup with a stale `embeddinggemma-2` row recalibrated it in about 2 s and stamped version 1. A
+  second start didn't calibrate.
+- Startup with nomic's unversioned row calibrated it once. It measured 0.55 / 0.52, matching the
+  hand-validated values, and the live turn used them. A second start didn't calibrate.
+
+**Tests.**
+- New `test_profile_fact_threshold_calibration.py` (25): fixture integrity, calibration on perfect,
+  inseparable and failing embedders, the persisted key, storage, v19→v20 migration (rows start
+  stale), precedence, the controller passing the resolved threshold (P6 included), and the
+  response's in-use value.
+- `test_main_embedding_model_switch.py` adds stale-row recalibration (unversioned and older), no
+  retry for current-version inconclusive rows, hand-validated models calibrating once while keeping
+  their values, `gate_tiers` in the response, and every startup case including failure.
+- Updated by design:
+  - The "already calibrated" switch test now seeds a current-version row.
+  - The v16 migration test's column set.
+  - The validated-model test now asserts one calibration rather than none.
+- Full suite 1746 passed. `npm run check` clean.
+
+**Upgrade effect.** Every model calibrated before v20 recalibrates once, the next time it's active.
+On the packaged app that's nomic and oMLX EmbeddingGemma.
+
+**Open items.**
+- About 80% of the real profile is style/meta lines. Similarity gating surfaces them only when a
+  question happens to be about style. If they're meant to shape every answer, they belong in a
+  static slot (persona), not behind a threshold. That's a design question; not scoped.
+- Both EmbeddingGemma recall floors sit within 0.005 of their worst off-topic score on the synthetic
+  battery. They held 0% off-topic false positives on real episodes; worth re-measuring as the
+  episode bank grows.
 - EmbeddingGemma task prefixes (option C) are not built.

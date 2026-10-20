@@ -366,11 +366,12 @@ class TestSchemaV17Migration:
 
         from localist.memory_manager import _SCHEMA_VERSION
         assert version == _SCHEMA_VERSION
-        # Migrating to the latest version also adds v19's episodic_recall_floor.
+        # Migrating to the latest version also adds v19's episodic_recall_floor
+        # and v20's profile_fact_threshold and calibration_version.
         assert cols == {
             "model", "explicit_search_action", "lookup_request",
             "research_intent", "episodic_relevance", "calibrated_at",
-            "episodic_recall_floor",
+            "episodic_recall_floor", "profile_fact_threshold", "calibration_version",
         }
         # Empty on migration — no row exists until a calibration actually runs.
         assert mm.get_calibrated_thresholds("any-model") is None

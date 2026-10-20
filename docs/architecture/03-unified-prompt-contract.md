@@ -337,8 +337,9 @@ user profile facts).
 - This slot is **conditional**. It is omitted entirely when both sub-blocks
   are empty. No empty label, no placeholder.
 - Slot 3a (episodic): relevance determined by Priority 5. See §4.
-- Slot 3b (profile): injected on P4, P5 routes and any turn where
-  episodic bullets fire. See §3.6.
+- Slot 3b (profile): scored on every turn, P6 included; a line is
+  injected only when it clears the active embedding model's
+  profile-fact threshold. See §3.6.
 - When episodic bullets injected: 3–5 bullets, confidence ≥ 0.7, type-ordered per §2.7.
 - Both `[EPISODIC MEMORY]` and `[USER PROFILE]` labels are mandatory when
   their respective sub-block is present.
@@ -771,48 +772,151 @@ This exception is intentional and permanent.
 
 ### 3.6 User Profile
 
-`ControllerAgent` maintains a per-session user profile sourced from
-`backend/wiki/users/michael.md`. This file is hand-authored (not produced
-by WikiAgent) and contains structured fact lines in five sections: Identity,
-Active Projects, Preferences, Working Patterns, and Decisions.
+`ControllerAgent` maintains a user profile sourced from
+`<backend root>/wiki/users/michael.md`: `backend/wiki/users/michael.md` in
+a source checkout, `~/Library/Application Support/Localist/wiki/users/michael.md`
+in the packaged app (`paths.get_backend_root()`). The filename is hardcoded
+in `_load_user_profile()`. The file is hand-maintained. No code path writes
+it: WikiAgent doesn't produce it, and there is no Settings editor or API for
+it.
 
-Each section has a maximum of 5 lines to enforce minimalism and prevent
-prompt bloat. The ideal injection returns only the top relevant facts
-for the current instruction, not the entire profile.
+#### What the profile actually contains
 
-#### Embedding and scoring
+The profile is a plain Markdown file: `#` section headers, each followed
+by bullet lines. There is no front matter. Section names and line counts
+are not enforced; any `#` header and any non-blank line are accepted.
 
-On first request after startup, `ControllerAgent._load_user_profile()`
-reads the file, strips section headers and blank lines, and embeds each
-remaining fact line using `ControllerAgent._embed()` — which delegates
-to `MemoryManager._embed_fn` (the EmbeddingEngine callable). Embeddings
-are stored in parallel lists (`_profile_lines`, `_profile_embeddings`)
-and cached for the session.
+As of 2026-10-20 the live profile has 88 lines in 10 sections, well
+beyond the five sections of at most five lines this section once
+described. Only about a fifth of the lines are facts about the user, such
+as identity, projects and interests. The rest are interaction-style and
+meta guidance: how answers should be structured, the tone to use, and
+what to avoid.
 
-Per-turn scoring: `_score_profile_facts(instruction_embedding, top_n=5,
-threshold=0.45)` computes cosine similarity between the instruction
-embedding and each cached fact embedding. Lines scoring ≥ 0.45 are
-returned as `UserProfileFact` objects, sorted by score descending,
-capped at 5.
+This matters for injection. Lines are retrieved by similarity to the
+current instruction (below), so style lines surface mainly when a question
+is about style. They do not shape every answer, which is presumably what
+most of them are written for. Whether they belong in a static slot, such as
+the persona (Slot 1), instead is an open design question (§16.29).
 
-The 0.45 threshold is lower than the 0.55 RAG corpus threshold because
-profile fact lines are short and produce lower raw cosine similarity
-against full instruction embeddings even when semantically relevant.
+#### Loading and embedding
+
+`ControllerAgent._load_user_profile()` loads the profile lazily, on the
+first request a given controller handles. It reads the file with
+`load_wiki_doc()`, drops `#` headers and blank lines, and strips each
+remaining line's leading `- `.
+
+Each line is embedded with `ControllerAgent._embed()`, which delegates to
+`MemoryManager._embed_fn`: the active runtime backend's `embed()`, under
+the active embedding model. A line that fails to embed is skipped. Lines
+and vectors are cached in parallel lists (`_profile_lines`,
+`_profile_embeddings`) for that controller's lifetime.
+
+The controller is rebuilt, and the profile therefore re-read and
+re-embedded, on:
+
+- a backend restart;
+- an embedding-model switch;
+- a runtime-backend switch;
+- Re-embed Memory.
+
+Editing the file takes effect on the next of these.
+
+**Keyword-only mode** (no embedding model): `_embed()` raises, so every
+line is skipped and no profile facts are injected. Because nothing gets
+cached, the load is retried and fails again on every turn. Profile
+injection exists only when an embedding model is configured.
+
+#### Scoring
+
+Per turn, Step 5b of `_execute_plan` embeds `task.instruction` and calls
+`_score_profile_facts(instruction_embedding, top_n=5, threshold=…)`. This
+computes the cosine similarity between the instruction and each cached
+line. Lines at or above the threshold are returned as `UserProfileFact`
+objects, sorted by score descending and capped at 5.
+
+`PromptBuilder._slot3_combined()` then renders them under
+`[USER PROFILE]` within the 100-token sub-budget (`_CEIL_PROFILE`, about
+400 characters), in score order. A line that would overflow the budget
+ends the block.
+
+**The threshold is per embedding model** (updated 2026-10-20, §16.29).
+Cosine scales differ by model, so the single hand-set 0.45 put profile
+lines into most off-topic questions under nomic, and the maximum 5 lines
+into every off-topic question under `embeddinggemma-2`.
+`ControllerAgent` resolves the threshold once in `__init__` via
+`planner.resolve_profile_fact_threshold()`:
+
+1. a hand-validated value (`planner._PROFILE_FACT_THRESHOLDS`: nomic
+   0.52; EmbeddingGemma 300M 0.45 under both its oMLX and Ollama names);
+2. else this model's calibrated value
+   (`threshold_calibration.calibrate_profile_threshold()`, on the
+   synthetic `PROFILE_*` battery, persisted as
+   `embedding_model_thresholds.profile_fact_threshold`);
+3. else 0.45.
+
+Calibration runs automatically whenever a model without a current
+calibration becomes active, including at startup. Measurements:
+`diagnostics/reports/profile_fact_threshold_assessment_2026-10-20.md`.
 
 #### Injection trigger
 
-Profile facts are injected into Slot 3b on any turn where:
-- `plan.fetch_rag` is True (P4 route)
-- `plan.fetch_episodic` is True (P5 routes)
-- Episodic bullets fired in the same turn
+Profile facts are scored on every turn, whatever the route, P6
+direct-answer turns included (`_execute_plan` Step 5b has no route
+check). The per-model threshold is the only gate: a line goes into Slot
+3b only when it clears it.
 
-P6 direct-answer turns do not inject profile facts.
+Corrected 2026-10-20: this section previously said injection happened
+only on P4/P5 turns and turns where episodic bullets fired, and that P6
+turns did not inject profile facts. The code never had that route check.
+Keeping P6 injection, bounded by the threshold, was a deliberate choice
+when the drift was found (§16.29).
+
+#### Kept out of RAG
+
+The profile reaches the prompt only through Slot 3b, line by line and
+gated by the threshold. It is not a RAG source (updated 2026-10-20).
+
+The live corpus (`document_index`) does contain `wiki/users/michael.md`,
+embedded. The startup seed (`index_directory()`) doesn't recurse into
+`wiki/users/`, and the path that indexed it was not identified. Without a
+filter, a RAG turn could retrieve the whole file as a Slot 4 chunk,
+regardless of the profile-fact threshold.
+
+`controller_agent._excluded_from_rag()` now drops it, alongside
+`persona.md` (Slot 1b), at both RAG sites:
+
+- the Step 3b corpus fallback when web search fails;
+- the Step 4 RAG fetch.
+
+The profile is matched on the path's last three parts,
+`wiki/users/michael.md` (`_USER_PROFILE_PARTS`, which
+`_load_user_profile()` also reads from). The full path isn't used because
+`document_index` can hold paths under another backend root: a source
+checkout sharing the packaged app's database.
+
+As with `persona.md`, the filter runs after `query_corpus(max_results=3)`,
+so an excluded document still takes one of the three candidate slots.
+
+Not covered: `raw/michael.md`, an older prose version of the profile in
+`raw/`, is still a RAG source. Because a source checkout and the packaged
+app share one database, it is indexed once per backend root. On 2026-10-20
+those copies took all three RAG slots for questions about the user.
+
+Decision (2026-10-20): no code rule. The file is being removed from
+`raw/` by hand. Deleting a file directly (for example in Finder) leaves its
+`document_index` row, because only `wiki/` rows are pruned when their file
+disappears (`reconcile_wiki()`). Delete through the app's file sidebar
+instead: `DELETE /files` removes the file and its row. That works only for
+files under the running backend's own `raw/`, so each copy must be deleted
+from the backend whose root holds it.
 
 #### Update path
 
-Manual for now: edit `wiki/users/michael.md` directly and restart the
-backend to reload the cache. Automatic promotion from episodic memory
-is planned as part of the graph retrieval layer (future session).
+Edit `wiki/users/michael.md` by hand. The change takes effect on the next
+controller rebuild (see Loading and embedding). Automatic promotion of
+episodic facts into the profile, once planned as part of the graph
+retrieval layer, has not been built.
 
 ---
 

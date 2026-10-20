@@ -75,8 +75,11 @@ Three supported configurations:
   documents, chat history and episodes.
 
 Each backend keeps its own embedding model, so switching the runtime backend switches embeddings
-too. A model used for the first time is calibrated automatically for semantic gating and for how
-closely a memory must match before it's recalled.
+too. Every embedding model is calibrated automatically the first time it's active, and again after an
+update changes what calibration measures. Calibration covers semantic gating, how closely a memory must
+match before it's recalled, and how closely a user-profile line must match before it's added to the
+prompt. It takes a few seconds, at startup or when you switch models. Where a model has hand-picked
+values (nomic, EmbeddingGemma), those still win.
 - **Keyword-only (BM25) retrieval**: the zero-config default when no embedding model is set.
   Episodic memory and RAG retrieval both fall back to hand-rolled Okapi BM25 keyword scoring, and
   semantic-gating (search-intent classification, episodic-relevance detection) resolves to its own
@@ -257,6 +260,7 @@ Tests are organized by phase (memory substrate, routing, controller dispatch, ex
 - ✅ **Vectors kept per model** (v0.1.4) — switching back to an embedding model you've used before needs no re-embed; Re-embed Memory only fills in what the active model is missing
 - ✅ **Memory recall tuned per embedding model** (v0.1.4) — how closely a memory must match to be recalled is set per model (measured, then calibrated automatically for new models), so EmbeddingGemma stops dropping half its right matches and nomic stops pulling unrelated memories into answers
 - ✅ Fixes (v0.1.4): facts recalled for your question are no longer crowded out by recent preferences; the Chat Model dropdown shows the model actually in use; Episodes, Memory, the Live Feed and the Memory badge load once the backend is up instead of staying empty after a slow start; Ollama with no chat model set no longer crashes at startup
+- ✅ **User-profile matching tuned per embedding model** (unreleased) — how closely a profile line must match before it's added to the prompt is now set per model, like memory recall, so off-topic questions stop picking up unrelated profile lines; every embedding model is calibrated automatically when it becomes active, at startup too, and again after an update that changes calibration
 
 **Open**
 - ⬜ Native `.app`: first-run config UX (a fresh app defaults to unreachable `omlx`), code signing/notarization, `tauri build` auto-triggering the PyInstaller build

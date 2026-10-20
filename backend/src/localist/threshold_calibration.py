@@ -56,6 +56,9 @@ from .threshold_calibration_fixtures import (
     RECALL_EPISODES,
     RECALL_NEGATIVES,
     RECALL_POSITIVES,
+    PROFILE_LINES,
+    PROFILE_NEGATIVES,
+    PROFILE_POSITIVES,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,6 +87,15 @@ _MIN_ACCEPTABLE_J: float = 0.5
 _RECALL_FLOOR_GRID: list[float] = [x / 100 for x in range(10, 91)]
 _RECALL_TOP_N: int = 5
 
+# What calibrate_thresholds() measures, stamped on every row it persists
+# (embedding_model_thresholds.calibration_version, schema v20). A row with an
+# older or missing stamp predates something calibration now measures — e.g.
+# a v19-era row has no profile_fact_threshold — so main.py recalibrates that
+# model the next time it becomes active. Bump this whenever calibration
+# starts measuring something new or its method changes.
+#   1 — the four gates, the episodic recall floor, the profile-fact threshold.
+CALIBRATION_VERSION: int = 1
+
 
 @dataclass
 class GateCalibration:
@@ -103,24 +115,27 @@ class GateCalibration:
 @dataclass
 class CalibrationResult:
     """Per-gate calibration outcomes for one embed_fn/model, plus the
-    episodic recall floor (not a Planner gate — see calibrate_recall_floor();
-    kept out of `gates` so the four-gate tiers and badges are unaffected)."""
+    episodic recall floor and the profile-fact threshold (not Planner gates —
+    see calibrate_recall_floor() / calibrate_profile_threshold(); kept out of
+    `gates` so the four-gate tiers and badges are unaffected)."""
 
     gates: dict[str, GateCalibration] = field(default_factory=dict)
     recall_floor: GateCalibration | None = None
+    profile_threshold: GateCalibration | None = None
 
     @property
     def thresholds(self) -> dict[str, float]:
         """Only what calibrated cleanly -- what a caller persists. Includes
-        "episodic_recall_floor" when the recall floor did."""
+        "episodic_recall_floor" / "profile_fact_threshold" when those did."""
         clean = {
             name: gate.threshold
             for name, gate in self.gates.items()
             if not gate.degenerate and gate.threshold is not None
         }
-        floor = self.recall_floor
-        if floor is not None and not floor.degenerate and floor.threshold is not None:
-            clean["episodic_recall_floor"] = floor.threshold
+        for key, extra in (("episodic_recall_floor", self.recall_floor),
+                           ("profile_fact_threshold", self.profile_threshold)):
+            if extra is not None and not extra.degenerate and extra.threshold is not None:
+                clean[key] = extra.threshold
         return clean
 
     @property
@@ -377,6 +392,52 @@ def calibrate_recall_floor(embed_fn: EmbedFn) -> GateCalibration:
     return floor
 
 
+def calibrate_profile_threshold(embed_fn: EmbedFn) -> GateCalibration:
+    """
+    Measure the profile-fact threshold (ControllerAgent._score_profile_facts())
+    for the model behind embed_fn on the shared PROFILE_* battery — the same
+    scoring as diagnostics/diag_profile_fact_threshold.py: lines embedded raw,
+    one at a time, as _load_user_profile() does. A positive query counts when
+    its best relevant line is in the top 5 and at or above the threshold (most
+    have one relevant line, a few several); a negative counts as a false
+    positive when any line is. Selected by _recall_floor_from_scores(), the
+    recall floor's objective. Never raises on an embed_fn failure: a failed
+    line or query is dropped, thinning the pool toward a degenerate verdict.
+    """
+    line_vecs: dict[str, list[float]] = {}
+    for key, (_section, line) in PROFILE_LINES.items():
+        try:
+            line_vecs[key] = embed_fn(line)
+        except Exception as exc:
+            logger.warning("threshold_calibration: profile line %r embed failed (%s)", key, exc)
+
+    def ranked(query: str) -> list[tuple[float, str]] | None:
+        try:
+            qv = embed_fn(query)
+        except Exception as exc:
+            logger.warning("threshold_calibration: profile query embed failed (%s)", exc)
+            return None
+        return sorted(((_cosine_similarity(qv, v), k) for k, v in line_vecs.items()), reverse=True)
+
+    positives: list[tuple[float, int]] = []
+    for query, relevant in PROFILE_POSITIVES:
+        scores = ranked(query) if any(k in line_vecs for k in relevant) else None
+        if scores:
+            rank, score = next((i, s) for i, (s, k) in enumerate(scores, 1) if k in relevant)
+            positives.append((score, rank))
+    negatives = [scores[0][0] for q in PROFILE_NEGATIVES if (scores := ranked(q))]
+
+    threshold = _recall_floor_from_scores(positives, negatives)
+    logger.info(
+        "threshold_calibration: profile_fact_threshold degenerate=%s threshold=%s "
+        "recall=%s fp=%s pos_n=%d neg_n=%d reason=%s",
+        threshold.degenerate, threshold.threshold, threshold.tpr_at_threshold,
+        threshold.fpr_at_threshold, threshold.positive_count, threshold.negative_count,
+        threshold.reason,
+    )
+    return threshold
+
+
 def calibrate_thresholds(embed_fn: EmbedFn) -> CalibrationResult:
     """
     Measure Youden's-J-optimal semantic-gating thresholds for the currently
@@ -429,6 +490,7 @@ def calibrate_thresholds(embed_fn: EmbedFn) -> CalibrationResult:
         )
 
     result.recall_floor = calibrate_recall_floor(embed_fn)
+    result.profile_threshold = calibrate_profile_threshold(embed_fn)
     return result
 
 

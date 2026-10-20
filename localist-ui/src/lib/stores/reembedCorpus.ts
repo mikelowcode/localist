@@ -36,6 +36,13 @@ export interface CalibrationResponse {
   // backend's response still parses.
   recall_floor?: GateCalibrationResponse | null;
   recall_floor_in_use?: number | null;
+  // Profile-fact threshold (§3.6), same shape and same precedence.
+  profile_threshold?: GateCalibrationResponse | null;
+  profile_threshold_in_use?: number | null;
+  // Per-gate trust tier in use (validated / auto-calibrated /
+  // lexical-fallback / disabled). `gates` is what calibration measured; a
+  // hand-validated gate overrides it.
+  gate_tiers?: Record<string, string> | null;
 }
 
 // One store's outcome — mirrors main.py's ReembedStoreCounts. Re-embedding

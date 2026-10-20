@@ -152,7 +152,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION   = 19         # increment when schema changes require migration
+_SCHEMA_VERSION   = 20         # increment when schema changes require migration
 _EMBEDDING_DIM    = 768        # EmbeddingGemma-300M-4bit output dimension
 _EMBEDDING_FORMAT = ">768f"    # big-endian float32 × 768
 
@@ -164,10 +164,11 @@ _CONV_LOG_CAP_PER_TASK = 200
 _PROVENANCE_STORES: tuple[str, ...] = ("corpus", "episodes", "chat_turns")
 
 # embedding_model_thresholds' calibrated columns — the four Planner gates,
-# plus the episodic recall floor (schema v19), which isn't a gate.
+# plus the episodic recall floor (schema v19) and the profile-fact threshold
+# (schema v20), which aren't gates.
 _CALIBRATED_THRESHOLD_KEYS: tuple[str, ...] = (
     "explicit_search_action", "lookup_request", "research_intent",
-    "episodic_relevance", "episodic_recall_floor",
+    "episodic_relevance", "episodic_recall_floor", "profile_fact_threshold",
 )
 
 # The table each provenance store's vectors live in (its `embedding` column).
@@ -435,6 +436,22 @@ def _ensure_recall_floor_column(conn: sqlite3.Connection) -> None:
     cols = {c[1] for c in conn.execute("PRAGMA table_info(embedding_model_thresholds)").fetchall()}
     if "episodic_recall_floor" not in cols:
         conn.execute("ALTER TABLE embedding_model_thresholds ADD COLUMN episodic_recall_floor REAL")
+
+
+def _ensure_v20_calibration_columns(conn: sqlite3.Connection) -> None:
+    """Add embedding_model_thresholds.profile_fact_threshold and
+    calibration_version (schema v20) if the table exists without them.
+    Idempotent; doesn't commit."""
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).fetchall()}
+    if "embedding_model_thresholds" not in tables:
+        return
+    cols = {c[1] for c in conn.execute("PRAGMA table_info(embedding_model_thresholds)").fetchall()}
+    if "profile_fact_threshold" not in cols:
+        conn.execute("ALTER TABLE embedding_model_thresholds ADD COLUMN profile_fact_threshold REAL")
+    if "calibration_version" not in cols:
+        conn.execute("ALTER TABLE embedding_model_thresholds ADD COLUMN calibration_version INTEGER")
 
 
 class MemoryManager:
@@ -803,7 +820,9 @@ class MemoryManager:
                             research_intent         REAL,
                             episodic_relevance      REAL,
                             calibrated_at           REAL NOT NULL,
-                            episodic_recall_floor   REAL
+                            episodic_recall_floor   REAL,
+                            profile_fact_threshold  REAL,
+                            calibration_version     INTEGER
                         );
                     """)
 
@@ -967,6 +986,12 @@ class MemoryManager:
                 # Same self-heal, same rationale, for
                 # embedding_model_thresholds.episodic_recall_floor (schema v19).
                 _ensure_recall_floor_column(conn)
+                conn.commit()
+
+                # Same self-heal, same rationale, for
+                # embedding_model_thresholds.profile_fact_threshold and
+                # calibration_version (schema v20).
+                _ensure_v20_calibration_columns(conn)
                 conn.commit()
 
             finally:
@@ -1302,6 +1327,17 @@ class MemoryManager:
                 "(an embedding-model switch to a new model, or Re-embed Memory)."
             )
             _ensure_recall_floor_column(conn)
+
+        if from_version < 20:
+            logger.info(
+                "Applying migration v19→v20: adding embedding_model_thresholds."
+                "profile_fact_threshold (per-model profile-fact threshold "
+                "calibration, docs/architecture/03-unified-prompt-contract.md "
+                "§3.6) and calibration_version. NULL for existing rows, which "
+                "marks them stale: each such model recalibrates the next time "
+                "it becomes active."
+            )
+            _ensure_v20_calibration_columns(conn)
 
         conn.execute(
             "UPDATE schema_version SET version = ?", (_SCHEMA_VERSION,)
@@ -2729,8 +2765,9 @@ class MemoryManager:
         calibrated as degenerate — callers must resolve any missing gate
         against a lower trust tier (see Planner's per-gate resolution),
         never assume all four keys are present. It also carries
-        "episodic_recall_floor" when that calibrated cleanly (schema v19;
-        see planner.resolve_episodic_recall_floor()).
+        "episodic_recall_floor" (schema v19) and "profile_fact_threshold"
+        (schema v20) when those calibrated cleanly (see planner.
+        resolve_episodic_recall_floor() / resolve_profile_fact_threshold()).
         """
         conn = self._connect()
         try:
@@ -2746,7 +2783,25 @@ class MemoryManager:
             return None
         return {key: row[key] for key in _CALIBRATED_THRESHOLD_KEYS if row[key] is not None}
 
-    def set_calibrated_thresholds(self, model_name: str, thresholds: dict[str, float]) -> None:
+    def get_calibration_version(self, model_name: str) -> int | None:
+        """The calibration_version stamped on `model_name`'s row (schema v20),
+        or None when there is no row or the row predates versioning."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT calibration_version FROM embedding_model_thresholds WHERE model = ?",
+                (model_name,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return None if row is None else row["calibration_version"]
+
+    def set_calibrated_thresholds(
+        self,
+        model_name:          str,
+        thresholds:          dict[str, float],
+        calibration_version: int | None = None,
+    ) -> None:
         """
         Insert or replace the calibrated thresholds for `model_name`.
 
@@ -2755,13 +2810,18 @@ class MemoryManager:
         thresholds :
             Typically `CalibrationResult.thresholds` — may contain any
             subset of (explicit_search_action, lookup_request,
-            research_intent, episodic_relevance, episodic_recall_floor).
+            research_intent, episodic_relevance, episodic_recall_floor,
+            profile_fact_threshold).
             A key omitted here (a
             gate that calibrated as degenerate) is stored as SQL NULL, not
             skipped — this call always writes/replaces the full row for
             `model_name`, so re-running calibration after a methodology
             change correctly clears a gate that used to calibrate cleanly
             but no longer does, rather than leaving a stale value behind.
+        calibration_version :
+            threshold_calibration.CALIBRATION_VERSION for a row written by a
+            real calibration (main._calibrate_and_persist). None leaves the
+            row unversioned, which main.py treats as stale.
         """
         allowed = set(_CALIBRATED_THRESHOLD_KEYS)
         unknown = set(thresholds) - allowed
@@ -2776,14 +2836,16 @@ class MemoryManager:
                     INSERT INTO embedding_model_thresholds
                         (model, explicit_search_action, lookup_request,
                          research_intent, episodic_relevance, episodic_recall_floor,
-                         calibrated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                         profile_fact_threshold, calibration_version, calibrated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(model) DO UPDATE SET
                         explicit_search_action = excluded.explicit_search_action,
                         lookup_request         = excluded.lookup_request,
                         research_intent        = excluded.research_intent,
                         episodic_relevance      = excluded.episodic_relevance,
                         episodic_recall_floor   = excluded.episodic_recall_floor,
+                        profile_fact_threshold  = excluded.profile_fact_threshold,
+                        calibration_version     = excluded.calibration_version,
                         calibrated_at           = excluded.calibrated_at
                     """,
                     (
@@ -2793,19 +2855,23 @@ class MemoryManager:
                         thresholds.get("research_intent"),
                         thresholds.get("episodic_relevance"),
                         thresholds.get("episodic_recall_floor"),
+                        thresholds.get("profile_fact_threshold"),
+                        calibration_version,
                         time.time(),
                     ),
                 )
                 conn.commit()
                 logger.info(
                     "set_calibrated_thresholds: model=%r ESA=%s LR=%s RI=%s episodic=%s "
-                    "recall_floor=%s",
+                    "recall_floor=%s profile_threshold=%s version=%s",
                     model_name,
                     thresholds.get("explicit_search_action"),
                     thresholds.get("lookup_request"),
                     thresholds.get("research_intent"),
                     thresholds.get("episodic_relevance"),
                     thresholds.get("episodic_recall_floor"),
+                    thresholds.get("profile_fact_threshold"),
+                    calibration_version,
                 )
             finally:
                 conn.close()
@@ -3369,9 +3435,11 @@ class MemoryManager:
                 if embedding_blob is not None:
                     self._maybe_seed_corpus_provenance(conn)
 
-                conn.commit()
-                # Invalidate retrieval cache on any index mutation.
+                # Invalidate retrieval cache on any index mutation — inside
+                # this transaction, so it commits with the change (run after
+                # the commit, it was rolled back when the connection closed).
                 self._invalidate_cache(conn)
+                conn.commit()
             finally:
                 conn.close()
 
@@ -3442,8 +3510,9 @@ class MemoryManager:
                 conn.execute(
                     "DELETE FROM document_index WHERE path = ?", (str(path),)
                 )
-                conn.commit()
+                # Inside the transaction, so it commits with the delete.
                 self._invalidate_cache(conn)
+                conn.commit()
                 logger.info("remove_document: removed %s.", path.name)
             finally:
                 conn.close()

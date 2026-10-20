@@ -359,7 +359,9 @@ class TestAutomaticFirstTimeCalibration:
     def test_already_calibrated_model_does_not_recalibrate_on_switch(
         self, client, monkeypatch, tmp_path,
     ):
-        main._state.memory_manager.set_calibrated_thresholds("mystery-model", {"lookup_request": 0.5})
+        main._state.memory_manager.set_calibrated_thresholds(
+            "mystery-model", {"lookup_request": 0.5}, calibration_version=main.CALIBRATION_VERSION,
+        )
         test_client, _initial_runtime = client
         monkeypatch.setattr(
             main, "create_runtime",
@@ -374,20 +376,94 @@ class TestAutomaticFirstTimeCalibration:
         assert resp.json()["calibration"] is None
         fake_calibrate.assert_not_called()
 
-    def test_validated_model_never_triggers_calibration(self, client, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("stored_version", [None, main.CALIBRATION_VERSION - 1])
+    def test_stale_calibration_recalibrates_on_switch(
+        self, client, monkeypatch, tmp_path, stored_version,
+    ):
+        # A row written before calibration_version existed (None), or by an
+        # older calibration, lacks something calibration now measures (e.g. a
+        # v19-era row has no profile_fact_threshold) — recalibrate on activation.
+        main._state.memory_manager.set_calibrated_thresholds(
+            "mystery-model", {"lookup_request": 0.5}, calibration_version=stored_version,
+        )
+        test_client, _initial_runtime = client
+        monkeypatch.setattr(
+            main, "create_runtime",
+            _fake_create_runtime(embed_model_found=True, models=["mystery-model"]),
+        )
+        monkeypatch.setattr(main, "calibrate_thresholds", MagicMock(return_value=_fake_calibration_result()))
+
+        resp = test_client.post("/settings/embedding-model", json={"model": "mystery-model"})
+
+        assert resp.status_code == 200
+        assert resp.json()["calibration"]["model"] == "mystery-model"
+        mm = main._state.memory_manager
+        assert mm.get_calibration_version("mystery-model") == main.CALIBRATION_VERSION
+        assert mm.get_calibrated_thresholds("mystery-model") == {"explicit_search_action": 0.70, "lookup_request": 0.60}
+
+    def test_current_degenerate_calibration_does_not_recalibrate_on_switch(
+        self, client, monkeypatch, tmp_path,
+    ):
+        # Current version, nothing calibrated cleanly: still "already
+        # attempted" — only Re-embed Memory retries it.
+        main._state.memory_manager.set_calibrated_thresholds(
+            "mystery-model", {}, calibration_version=main.CALIBRATION_VERSION,
+        )
+        test_client, _initial_runtime = client
+        monkeypatch.setattr(
+            main, "create_runtime",
+            _fake_create_runtime(embed_model_found=True, models=["mystery-model"]),
+        )
+        fake_calibrate = MagicMock(side_effect=AssertionError("must not recalibrate a current-version row"))
+        monkeypatch.setattr(main, "calibrate_thresholds", fake_calibrate)
+
+        resp = test_client.post("/settings/embedding-model", json={"model": "mystery-model"})
+
+        assert resp.status_code == 200
+        assert resp.json()["calibration"] is None
+
+    def test_validated_model_calibrates_once_but_keeps_its_hand_validated_values(
+        self, client, monkeypatch, tmp_path,
+    ):
+        # A model with hand-validated values calibrates too, so anything it
+        # has no hand-validated value for is measured rather than left on a
+        # 0.45 default; hand-validated values still win where they exist.
         test_client, _initial_runtime = client
         monkeypatch.setattr(
             main, "create_runtime",
             _fake_create_runtime(embed_model_found=True, models=["nomic-embed-text:latest"]),
         )
-        fake_calibrate = MagicMock(side_effect=AssertionError("must not calibrate an already-validated model"))
+        fake_calibrate = MagicMock(return_value=_fake_calibration_result())
         monkeypatch.setattr(main, "calibrate_thresholds", fake_calibrate)
 
         resp = test_client.post("/settings/embedding-model", json={"model": "nomic-embed-text:latest"})
 
         assert resp.status_code == 200
+        calibration = resp.json()["calibration"]
+        assert calibration["model"] == "nomic-embed-text:latest"
+        assert set(calibration["gate_tiers"].values()) == {"validated"}
+        assert calibration["recall_floor_in_use"] == 0.55
+        assert calibration["profile_threshold_in_use"] == 0.52
+        assert main._state.memory_manager.get_calibration_version("nomic-embed-text:latest") == main.CALIBRATION_VERSION
+
+        # Already current: a second switch doesn't recalibrate.
+        fake_calibrate.reset_mock()
+        resp = test_client.post("/settings/embedding-model", json={"model": "nomic-embed-text:latest"})
         assert resp.json()["calibration"] is None
         fake_calibrate.assert_not_called()
+
+    def test_unlisted_model_response_reports_auto_calibrated_tiers(self, client, monkeypatch, tmp_path):
+        test_client, _initial_runtime = client
+        monkeypatch.setattr(
+            main, "create_runtime",
+            _fake_create_runtime(embed_model_found=True, models=["mystery-model"]),
+        )
+        monkeypatch.setattr(main, "calibrate_thresholds", MagicMock(return_value=_fake_calibration_result()))
+
+        tiers = test_client.post("/settings/embedding-model", json={"model": "mystery-model"}).json()["calibration"]["gate_tiers"]
+
+        assert tiers["lookup_request"] == "auto-calibrated"
+        assert tiers["research_intent"] in {"lexical-fallback", "disabled"}
 
 
 class TestReembedRecalibration:
@@ -480,3 +556,51 @@ class TestReembedRecalibration:
 
         assert resp.status_code == 409
         fake_calibrate.assert_not_called()
+
+
+class TestStartupCalibration:
+    """main._calibrate_if_needed_at_startup — the model active at startup
+    counts as becoming active, so a never-calibrated or stale row is
+    calibrated before lifespan() builds the controller."""
+
+    @pytest.fixture()
+    def mm(self, tmp_path):
+        return MemoryManager(db_path=tmp_path / "startup.db")
+
+    def test_stale_row_is_recalibrated_and_stamped(self, mm, monkeypatch):
+        mm.set_calibrated_thresholds("mystery-model", {"lookup_request": 0.5})   # pre-v20: unversioned
+        monkeypatch.setattr(main, "calibrate_thresholds", MagicMock(return_value=_fake_calibration_result()))
+
+        result = main._calibrate_if_needed_at_startup(mm, "mystery-model", MagicMock(name="embed"))
+
+        assert result is not None
+        assert mm.get_calibration_version("mystery-model") == main.CALIBRATION_VERSION
+        assert mm.get_calibrated_thresholds("mystery-model") == {"explicit_search_action": 0.70, "lookup_request": 0.60}
+
+    def test_never_calibrated_model_is_calibrated(self, mm, monkeypatch):
+        monkeypatch.setattr(main, "calibrate_thresholds", MagicMock(return_value=_fake_calibration_result()))
+        assert main._calibrate_if_needed_at_startup(mm, "mystery-model", MagicMock()) is not None
+        assert mm.get_calibration_version("mystery-model") == main.CALIBRATION_VERSION
+
+    @pytest.mark.parametrize("model, embed_fn", [
+        ("mystery-model",           MagicMock()),   # current-version row
+        ("nomic-embed-text:latest", MagicMock()),   # hand-validated, current-version row
+        (None,                      None),          # keyword-only
+    ])
+    def test_nothing_to_do(self, mm, monkeypatch, model, embed_fn):
+        for name in ("mystery-model", "nomic-embed-text:latest"):
+            mm.set_calibrated_thresholds(name, {}, calibration_version=main.CALIBRATION_VERSION)
+        fake_calibrate = MagicMock()
+        monkeypatch.setattr(main, "calibrate_thresholds", fake_calibrate)
+        assert main._calibrate_if_needed_at_startup(mm, model, embed_fn) is None
+        fake_calibrate.assert_not_called()
+
+    def test_hand_validated_model_without_a_row_is_calibrated(self, mm, monkeypatch):
+        monkeypatch.setattr(main, "calibrate_thresholds", MagicMock(return_value=_fake_calibration_result()))
+        assert main._calibrate_if_needed_at_startup(mm, "nomic-embed-text:latest", MagicMock()) is not None
+        assert mm.get_calibration_version("nomic-embed-text:latest") == main.CALIBRATION_VERSION
+
+    def test_failure_is_non_fatal(self, mm, monkeypatch):
+        monkeypatch.setattr(main, "calibrate_thresholds", MagicMock(side_effect=RuntimeError("embedder down")))
+        assert main._calibrate_if_needed_at_startup(mm, "mystery-model", MagicMock()) is None
+        assert mm.get_calibrated_thresholds("mystery-model") is None

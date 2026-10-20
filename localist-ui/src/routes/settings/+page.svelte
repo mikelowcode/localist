@@ -38,6 +38,7 @@
     reembedError,
     reembedCorpus,
     type CalibrationResponse,
+    type GateCalibrationResponse,
     type ReembedCorpusResponse,
     type ReembedStoreCounts
   } from '$lib/stores/reembedCorpus';
@@ -139,30 +140,44 @@
 
   function formatCalibrationSummary(calibration: CalibrationResponse | null): string {
     if (!calibration) return '';
+    // A hand-validated gate overrides whatever calibration measured for it.
+    const validated = Object.keys(calibration.gates)
+      .filter((name) => calibration.gate_tiers?.[name] === 'validated')
+      .map((name) => GATE_ABBREV[name] ?? name);
     const clean = Object.entries(calibration.gates)
-      .filter(([, g]) => !g.degenerate && g.threshold !== null)
+      .filter(([name, g]) => !g.degenerate && g.threshold !== null && calibration.gate_tiers?.[name] !== 'validated')
       .map(([name, g]) => `${GATE_ABBREV[name] ?? name}=${g.threshold!.toFixed(2)}`);
-    const recall = formatRecallFloor(calibration);
-    if (!clean.length) {
-      return ` No gate calibrated cleanly for ${calibration.model} — semantic gating stays disabled for it.${recall}`;
+    const recall =
+      formatMeasuredThreshold('Memory recall floor', calibration.recall_floor_in_use, calibration.recall_floor) +
+      formatMeasuredThreshold('Profile threshold', calibration.profile_threshold_in_use, calibration.profile_threshold);
+    const handPicked = validated.length ? ` Hand-validated: ${validated.join(', ')}.` : '';
+    if (clean.length) {
+      return ` Recalibrated semantic gating for ${calibration.model} (${clean.join(', ')}).${handPicked}${recall}`;
     }
-    return ` Recalibrated semantic gating for ${calibration.model} (${clean.join(', ')}).${recall}`;
+    if (validated.length) {
+      return ` Semantic gating for ${calibration.model} uses hand-validated thresholds (${validated.join(', ')}).${recall}`;
+    }
+    return ` No gate calibrated cleanly for ${calibration.model} — semantic gating stays disabled for it.${recall}`;
   }
 
-  // Episodic recall floor (§16.28) — the min score for recalling a memory.
-  // Says so when a hand-validated floor overrides the calibrated one.
-  function formatRecallFloor(calibration: CalibrationResponse): string {
-    const inUse = calibration.recall_floor_in_use;
+  // A per-model threshold that isn't a gate — the episodic recall floor
+  // (§16.28, min score for recalling a memory) or the profile-fact threshold
+  // (§3.6, min score for a profile line). Says so when a hand-validated
+  // value overrides the calibrated one.
+  function formatMeasuredThreshold(
+    label: string,
+    inUse: number | null | undefined,
+    cal: GateCalibrationResponse | null | undefined
+  ): string {
     if (inUse == null) return '';
-    const cal = calibration.recall_floor;
     const calibrated = cal && !cal.degenerate && cal.threshold !== null ? cal.threshold : null;
     if (calibrated !== null && Math.abs(calibrated - inUse) < 1e-9) {
-      return ` Memory recall floor ${inUse.toFixed(2)}.`;
+      return ` ${label} ${inUse.toFixed(2)}.`;
     }
     if (calibrated !== null) {
-      return ` Memory recall floor ${inUse.toFixed(2)} (hand-validated; calibration measured ${calibrated.toFixed(2)}).`;
+      return ` ${label} ${inUse.toFixed(2)} (hand-validated; calibration measured ${calibrated.toFixed(2)}).`;
     }
-    return ` Memory recall floor ${inUse.toFixed(2)} (calibration inconclusive).`;
+    return ` ${label} ${inUse.toFixed(2)} (calibration inconclusive).`;
   }
 
   function formatReembedResult(result: ReembedCorpusResponse): { summary: string; warning: string | null } {

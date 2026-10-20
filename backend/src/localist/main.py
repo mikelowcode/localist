@@ -158,9 +158,13 @@ from .mcp_server.file_ops import set_project_root as _set_generated_file_root
 from .mcp_tool_dispatcher import MCPToolDispatcher
 from .memory_manager import MemoryManager, EpisodicMemoryWriter, EpisodicMemoryReader
 from . import news_brief
-from .planner import _VALIDATED_MODEL_THRESHOLDS, resolve_episodic_recall_floor, resolve_gate_tiers
+from .planner import (
+    resolve_episodic_recall_floor,
+    resolve_gate_tiers,
+    resolve_profile_fact_threshold,
+)
 from .runtime_factory import available_backends, create_runtime
-from .threshold_calibration import calibrate_thresholds, CalibrationResult
+from .threshold_calibration import CALIBRATION_VERSION, calibrate_thresholds, CalibrationResult
 from . import session_files
 from . import wiki_maintenance_log
 from .warmup import run_cache_warmup as _run_cache_warmup
@@ -922,6 +926,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # env vars are configured to point elsewhere.
     _set_generated_file_root(generated_dir)
 
+    # -- Calibration for the active embedding model ----------------------------
+    # The model active at startup "becomes active" too: one never calibrated,
+    # or calibrated by an older CALIBRATION_VERSION (e.g. before the profile-
+    # fact threshold existed), is calibrated now, before the controller is
+    # built, so it resolves fresh thresholds. Non-fatal.
+    await asyncio.to_thread(
+        _calibrate_if_needed_at_startup, memory_manager, _state.active_embedding_model_name, embed_fn,
+    )
+
     # -- Agents + Controller --------------------------------------------------
 
     logger.info(
@@ -1141,6 +1154,16 @@ class CalibrationResponse(BaseModel):
     # degenerate calibration falls back to 0.45.
     recall_floor:        GateCalibrationResponse | None = None
     recall_floor_in_use: float | None = None
+    # Profile-fact threshold (03-unified-prompt-contract §3.6), same shape:
+    # this calibration's outcome, and what ControllerAgent will use (a
+    # hand-validated planner._PROFILE_FACT_THRESHOLDS entry wins; a
+    # degenerate calibration falls back to 0.45).
+    profile_threshold:        GateCalibrationResponse | None = None
+    profile_threshold_in_use: float | None = None
+    # Per-gate trust tier now in use for this model (resolve_gate_tiers():
+    # validated / auto-calibrated / lexical-fallback / disabled) — `gates`
+    # is what calibration measured, which a hand-validated gate overrides.
+    gate_tiers: dict[str, str] | None = None
 
 
 def _gate_calibration_response(gate: Any) -> GateCalibrationResponse:
@@ -1161,6 +1184,12 @@ def _calibration_result_to_response(model: str, result: CalibrationResult) -> Ca
             _gate_calibration_response(result.recall_floor) if result.recall_floor is not None else None
         ),
         recall_floor_in_use = resolve_episodic_recall_floor(model, result.thresholds),
+        profile_threshold = (
+            _gate_calibration_response(result.profile_threshold)
+            if result.profile_threshold is not None else None
+        ),
+        profile_threshold_in_use = resolve_profile_fact_threshold(model, result.thresholds),
+        gate_tiers = resolve_gate_tiers(model, result.thresholds),
     )
 
 
@@ -1174,35 +1203,77 @@ def _calibrate_and_persist(memory_manager: MemoryManager, embedding_model_name: 
     the full ~60-utterance battery); callers run this via asyncio.to_thread.
     """
     result = calibrate_thresholds(embed_fn)
-    memory_manager.set_calibrated_thresholds(embedding_model_name, result.thresholds)
+    memory_manager.set_calibrated_thresholds(
+        embedding_model_name, result.thresholds, calibration_version=CALIBRATION_VERSION,
+    )
+    clean_gates = sorted(name for name in result.gates if name in result.thresholds)
     logger.info(
-        "Calibration for %r: %d/%d gates cleanly calibrated (%s).",
-        embedding_model_name, len(result.thresholds), len(result.gates),
-        ", ".join(sorted(result.thresholds)) or "none",
+        "Calibration for %r: %d/%d gates cleanly calibrated (%s); recall floor %s, profile threshold %s.",
+        embedding_model_name, len(clean_gates), len(result.gates), ", ".join(clean_gates) or "none",
+        result.thresholds.get("episodic_recall_floor", "inconclusive"),
+        result.thresholds.get("profile_fact_threshold", "inconclusive"),
     )
     return result
 
 
-def _needs_first_time_calibration(memory_manager: MemoryManager, embedding_model_name: str | None) -> bool:
+def _needs_calibration(memory_manager: MemoryManager, embedding_model_name: str | None) -> bool:
     """
-    True when `embedding_model_name` has neither a hand-reviewed entry
-    (_VALIDATED_MODEL_THRESHOLDS) nor an existing persisted calibration row
-    — the trigger condition for POST /settings/embedding-model's automatic,
-    zero-extra-clicks first-time calibration (PLAN_semantic_gating_
-    calibration.md §5). False for None (keyword-only — nothing to
-    calibrate).
+    True when `embedding_model_name` has either no persisted calibration row
+    or a stale one — the trigger for automatic, zero-extra-clicks calibration
+    whenever a model becomes active: at startup, on POST
+    /settings/embedding-model, and on a runtime-backend switch
+    (PLAN_semantic_gating_calibration.md §5). False for None (keyword-only —
+    nothing to calibrate).
 
-    Deliberately does NOT re-trigger for a model calibrated before, even if
-    every gate came back degenerate that time — get_calibrated_thresholds()
-    returning {} (row exists, all NULL) still counts as "already attempted",
-    distinct from None ("never attempted"). Re-attempting a fully-degenerate
-    model is what the manual "Re-embed Corpus Now" re-trigger is for.
+    Stale means the row's calibration_version is missing or older than
+    threshold_calibration.CALIBRATION_VERSION: it predates something
+    calibration now measures (a v19-era row has no profile_fact_threshold),
+    so the model would otherwise run on the 0.45 default indefinitely.
+
+    Models with hand-validated values calibrate too. Hand-validated values
+    still win wherever they exist (resolve_gate_tiers(),
+    resolve_episodic_recall_floor(), resolve_profile_fact_threshold()), so
+    calibration only fills in what a model has no hand-validated value for —
+    a model added to one table but not another can never fall through to a
+    0.45 default it was never measured against.
+
+    Deliberately does NOT re-trigger for a current-version row, even if
+    everything came back degenerate that time — a row that exists still
+    counts as "already attempted", distinct from "never attempted" or
+    "attempted by an older calibration". Re-attempting a fully-degenerate
+    model is what the manual Re-embed Memory re-trigger is for.
     """
     if embedding_model_name is None:
         return False
-    if embedding_model_name in _VALIDATED_MODEL_THRESHOLDS:
-        return False
-    return memory_manager.get_calibrated_thresholds(embedding_model_name) is None
+    if memory_manager.get_calibrated_thresholds(embedding_model_name) is None:
+        return True
+    version = memory_manager.get_calibration_version(embedding_model_name)
+    return version is None or version < CALIBRATION_VERSION
+
+
+def _calibrate_if_needed_at_startup(
+    memory_manager: MemoryManager, embedding_model_name: str | None, embed_fn: Any,
+) -> CalibrationResult | None:
+    """
+    Startup's half of "calibrate when a model becomes active": calibrate and
+    persist the model active at startup when _needs_calibration() says so
+    (never calibrated, or calibrated by an older CALIBRATION_VERSION), before
+    lifespan() builds the controller. Returns the result, or None when
+    nothing ran. Never raises — a failure is logged and startup continues on
+    whatever thresholds are already stored. Blocking; run via
+    asyncio.to_thread.
+    """
+    if embed_fn is None or not _needs_calibration(memory_manager, embedding_model_name):
+        return None
+    logger.info(
+        "Startup: %r has no current calibration — calibrating.",
+        embedding_model_name,
+    )
+    try:
+        return _calibrate_and_persist(memory_manager, embedding_model_name, embed_fn)
+    except Exception as exc:
+        logger.warning("Startup calibration failed (non-fatal): %s", exc)
+        return None
 
 
 class EmbeddingModelResponse(BaseModel):
@@ -1984,8 +2055,8 @@ async def _apply_embedding_source(
     """
     Commit a new embedding source: MemoryManager (whose provenance check
     re-embeds episodes in place and flags corpus/chat_turns stale on a model
-    change), _state's active model/backend, and — for a model with neither
-    validated nor previously calibrated thresholds — first-time calibration
+    change), _state's active model/backend, and — for a model with no
+    current calibration (_needs_calibration()) — calibration
     (PLAN_semantic_gating_calibration.md §5). Call under
     _runtime_switch_lock, before _build_controller, so the new Planner
     resolves the freshly-persisted thresholds.
@@ -1994,11 +2065,11 @@ async def _apply_embedding_source(
     _state.active_embedding_model_name = model_name
     _state.active_embedding_backend    = backend if embed_fn is not None else None
 
-    if embed_fn is None or not _needs_first_time_calibration(memory_manager, model_name):
+    if embed_fn is None or not _needs_calibration(memory_manager, model_name):
         return None
     logger.info(
-        "%r has no validated or prior calibrated threshold set — running "
-        "first-time calibration before rebuilding the controller.", model_name,
+        "%r has no current calibration — calibrating before rebuilding "
+        "the controller.", model_name,
     )
     result = await asyncio.to_thread(_calibrate_and_persist, memory_manager, model_name, embed_fn)
     return _calibration_result_to_response(model_name, result)
