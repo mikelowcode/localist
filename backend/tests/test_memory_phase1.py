@@ -2040,6 +2040,7 @@ class TestReconcileWiki:
             "reindexed": 0,
             "orphans_removed": 0,
             "orphan_names": [],
+            "housekeeping_removed": [],
         }
         assert not self.log_path.exists()
 

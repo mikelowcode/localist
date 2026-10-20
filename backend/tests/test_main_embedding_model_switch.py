@@ -29,6 +29,10 @@ def _settings(**overrides):
         chat_model_omlx=None,
         chat_model_ollama=None,
         embedding_model="",
+        # Pinned so backend/.env's per-backend embedding pins (read by
+        # Settings' env_file) can't leak into these tests.
+        embedding_model_omlx="",
+        embedding_model_ollama="",
         omlx_url="http://localhost:8000",
         ollama_url="http://localhost:11434",
         request_timeout=30.0,

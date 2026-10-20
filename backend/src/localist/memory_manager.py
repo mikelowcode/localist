@@ -283,8 +283,10 @@ def _content_hash(text: str) -> str:
 
 
 def _query_hash(query: str, top_n: int, doc_type: str | None) -> str:
-    """Cache key for the retrieval_cache table."""
-    raw = f"{query}||{top_n}||{doc_type}"
+    """Cache key for the retrieval_cache table. The trailing version tag
+    retires entries cached before query_corpus() started collapsing identical
+    documents (2026-10-20), which could still list the same content twice."""
+    raw = f"{query}||{top_n}||{doc_type}||dedupe-v1"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
@@ -3576,17 +3578,41 @@ class MemoryManager:
         )
 
         orphan_names: list[str] = []
+        housekeeping_names: list[str] = []
         for doc in self.get_all_documents(doc_type="wiki"):
             if not Path(doc.path).exists():
                 self.remove_document(doc.path)
                 orphan_names.append(doc.name)
                 wiki_maintenance_log.log_orphan_removed(doc.name, str(doc.path))
+            elif Path(doc.path).name in META_WIKI_FILENAMES:
+                # Generated housekeeping files are never corpus documents —
+                # index_directory() skips them, but another indexing path can
+                # still add one (2026-10-20: three were found indexed).
+                self.remove_document(doc.path)
+                housekeeping_names.append(doc.name)
 
         return {
-            "reindexed":       reindexed,
-            "orphans_removed": len(orphan_names),
-            "orphan_names":    orphan_names,
+            "reindexed":            reindexed,
+            "orphans_removed":      len(orphan_names),
+            "orphan_names":         orphan_names,
+            "housekeeping_removed": housekeeping_names,
         }
+
+    def prune_missing_documents(self, doc_type: str) -> list[str]:
+        """
+        Remove `doc_type` index rows whose file no longer exists on disk and
+        return their names. reconcile_wiki() does this for wiki pages; raw
+        files had no equivalent, so a raw file deleted outside the app kept
+        its row — and kept being retrieved — indefinitely (2026-10-20). A row
+        under another backend root that shares this database is left alone
+        as long as its file exists.
+        """
+        removed: list[str] = []
+        for doc in self.get_all_documents(doc_type=doc_type):
+            if not Path(doc.path).exists():
+                self.remove_document(doc.path)
+                removed.append(doc.name)
+        return removed
 
     # -----------------------------------------------------------------------
     # Link graph  (build_graph.py API)
@@ -4002,7 +4028,7 @@ class MemoryManager:
             params       = (doc_type,) if doc_type else ()
             rows = conn.execute(
                 f"""
-                SELECT id, name, path, doc_type, content, token_set, embedding
+                SELECT id, name, path, doc_type, content, token_set, embedding, content_hash
                 FROM   document_index
                 {where_clause}
                 """,
@@ -4037,6 +4063,19 @@ class MemoryManager:
             (bm25_scores[row["id"]], row, False) for row in rows
         ]
         scored.sort(key=lambda x: x[0], reverse=True)
+        # Identical documents indexed under different paths (the same file in
+        # two backend roots sharing one DB, or a copy saved twice) would
+        # otherwise take several of the few re-rank and result slots with one
+        # piece of content. Keep the first of each content_hash (2026-10-20).
+        seen_hashes: set[str] = set()
+        unique: list[tuple[float, sqlite3.Row, bool]] = []
+        for item in scored:
+            content_hash = item[1]["content_hash"]
+            if content_hash in seen_hashes:
+                continue
+            seen_hashes.add(content_hash)
+            unique.append(item)
+        scored = unique
 
         # Embedding re-rank on top-2N candidates. self._corpus_stale is the
         # same fail-safe-to-keyword-only posture as self._embed_fn being

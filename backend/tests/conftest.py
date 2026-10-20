@@ -62,5 +62,13 @@ def _clean_search_provider_env(monkeypatch):
         "SEARCH_PROVIDER", "BRAVE_API_KEY", "LANGSEARCH_API_KEY",
         "LOCALIST_RESEARCH_LOOP_ENABLED", "OLLAMA_API_KEY",
         "WEB_SEARCH_PROVIDER",
+        # 2026-10-20: a confirmed leak — backend/.env's per-backend embedding
+        # pin (written by the dev backend's one-time legacy-key migration)
+        # reached test_main_embedding_model_switch's Settings. The _OMLX
+        # sibling leaks the same way. LOCALIST_WIKI_DIR / LOCALIST_RAW_DIR
+        # are cleared too, proactively: backend/.env now points them at the
+        # packaged app's real folders, and no test should ever index those.
+        "LOCALIST_EMBEDDING_MODEL_OLLAMA", "LOCALIST_EMBEDDING_MODEL_OMLX",
+        "LOCALIST_WIKI_DIR", "LOCALIST_RAW_DIR",
     ):
         monkeypatch.delenv(var, raising=False)

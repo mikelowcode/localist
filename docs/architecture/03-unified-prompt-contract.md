@@ -385,6 +385,8 @@ Source: wiki/WikiAgent Architecture.md
     (about 0.72), and at 0.55 it gave every question documents
     (`diagnostics/reports/rag_cutoff_assessment_2026-10-20.md`, §16.30).
 - Maximum 3 sources. Wiki sources are preferred over raw doc sources.
+- Identical documents count once (2026-10-20, §16.31). `query_corpus()` keeps the first document
+  per content hash, so the same file indexed under two paths can't fill several sources.
 - When a source is truncated to fit the budget, the truncated content is suffixed
   with `… [truncated]` at the cut point (sentence boundary if possible, otherwise
   mid-content). This signals to the model that the source was incomplete so it can

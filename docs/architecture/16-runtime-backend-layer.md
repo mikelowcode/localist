@@ -2264,9 +2264,71 @@ are recorded).
 
 **Open items.**
 
-- **Duplicate document rows.** A source checkout and the packaged app share one database, and each
-  backend root indexes its own copy of every file, so duplicates can take RAG slots. The live check
-  returned three copies of one page.
+- ~~**Duplicate document rows.**~~ Resolved 2026-10-20 (§16.31).
 - **embeddinggemma-2's episodic gate stays loose** (7 / 32 real false alarms).
 - **`EpisodicMemoryReader.best_match()`** (retraction matching) still uses a fixed 0.55, with the same
   cross-model risk.
+
+### §16.31 — Duplicate documents: one set of files, startup pruning, de-duplicated search (2026-10-20)
+
+**Problem.** A source checkout whose `.env` pointed `LOCALIST_MEMORY_DB` at the packaged app's
+database still indexed its own `backend/wiki` and `backend/raw`. Both backends therefore indexed
+separate copies of the same files into one `document_index`.
+
+- **What the user's live database held:**
+  - 15 identical-content duplicate pairs;
+  - 4 rows for raw files deleted outside the app;
+  - 3 rows for generated wiki housekeeping files (`index.md`, `logs.md`, `MEMORY.md`).
+- **Effect.** RAG could fill all three Slot 4 sources with copies of one page.
+- **Scope.** Only a setup running two backends against one database produces cross-root duplicates.
+  Dead raw rows and indexed housekeeping files can happen to anyone.
+
+**Data fix (user's machine, option A: one set of files).**
+
+- The dev `.env` now points `LOCALIST_WIKI_DIR` and `LOCALIST_RAW_DIR` at the packaged app's folders.
+- The repo copies were moved, not deleted, to
+  `~/Library/Application Support/Localist/backups/repo-wiki-raw-2026-10-20/`.
+  - All pages and raw files were byte-identical.
+  - Only the generated `MEMORY.md`, `index.md` and `logs.md` differed; the repo's `logs.md` was a
+    subset of the packaged one.
+- The 23 repo-path rows were deleted and the retrieval cache invalidated, after a `.backup` of the
+  database. The live index now has 16 documents and no duplicates.
+
+**Code fixes.**
+
+- **Configured wiki folder honoured.** `ControllerAgent` read the user profile and wrote `MEMORY.md`
+  under `<backend root>/wiki` even when `LOCALIST_WIKI_DIR` pointed elsewhere, which would have left
+  a dev backend with no profile. A new `wiki_dir` parameter, fed from `_state.wiki_dir` by
+  `_build_controller()`, now decides both. `main._memory_md_path()` does the same for the startup
+  retention sweep and the memory endpoints.
+- **Search de-duplication.** `query_corpus()` keeps the first document per `content_hash` before the
+  cosine re-rank, so identical copies can't take re-rank or result slots, whatever the setup. The
+  retrieval-cache key gained a version tag (`dedupe-v1`) so results cached before the change aren't
+  served.
+- **Raw pruning at startup.** `MemoryManager.prune_missing_documents(doc_type)` removes rows whose
+  file no longer exists. Startup runs it for raw after seeding; `reconcile_wiki()` already did this
+  for wiki. Rows under another backend root are kept while their files exist.
+- **Housekeeping purge.** `reconcile_wiki()` removes indexed housekeeping files (new summary key
+  `housekeeping_removed`). `index_directory()` already skipped them; other indexing paths could
+  still add them.
+
+**Test isolation found on the way.**
+
+- The dev backend's first start ran its intended one-time `.env` migration
+  (`LOCALIST_EMBEDDING_MODEL` → `LOCALIST_EMBEDDING_MODEL_OLLAMA`), and that value leaked into a
+  model-switch test.
+- `conftest.py` now clears `LOCALIST_EMBEDDING_MODEL_OLLAMA` / `_OMLX` and, preventively,
+  `LOCALIST_WIKI_DIR` / `LOCALIST_RAW_DIR`, so no test indexes real folders.
+- That test's `_settings()` pins both embedding pins, because `Settings` reads `backend/.env` through
+  `env_file`, bypassing `os.environ`.
+- `test_actual_persona_prefix_byte_identical` now reads `persona.md` from the configured wiki folder
+  and skips when there is none, instead of failing on any checkout without local wiki data.
+
+**Verified.**
+
+- Live (shared database, dev backend): indexing the packaged folders added no rows; the profile
+  loaded from the packaged wiki (88/88 lines).
+- Sandbox with copies from three roots: startup pruned 13 raw and 11 wiki rows for missing files
+  (57 → 32), and a RAG question returned three distinct documents where it had returned three copies
+  of one page.
+- Tests: `test_wiki_dir_paths.py` (4), `test_duplicate_documents.py` (5). Full suite 1817 passed.

@@ -49,7 +49,7 @@ python -m pytest tests/test_planner_phase3.py -v    # one file
 python -m pytest tests/test_planner_phase3.py -k test_whats_up_with_question_mark_filtered -v   # one test
 ```
 All tests mock inference and SQLite — no live oMLX/Ollama server or API keys required to run them.
-Verified clean as of 2026-10-20: 1808 passed, 0 failed.
+Verified clean as of 2026-10-20: 1817 passed, 0 failed.
 
 ### Frontend
 ```bash

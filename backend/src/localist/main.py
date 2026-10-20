@@ -371,6 +371,13 @@ def _derive_calibrated_thresholds(
 # switch share one code path — see _build_controller() below).
 # ---------------------------------------------------------------------------
 
+def _memory_md_path() -> Path:
+    """MEMORY.md in the configured wiki folder (LOCALIST_WIKI_DIR, resolved at
+    startup into _state.wiki_dir), else the default <backend root>/wiki —
+    the same location ControllerAgent writes to (its wiki_dir)."""
+    return _state.wiki_dir / "MEMORY.md" if _state.wiki_dir is not None else _MEMORY_MD_PATH
+
+
 def _build_controller(
     settings:              Settings,
     runtime:               BaseRuntimeClient,
@@ -407,6 +414,7 @@ def _build_controller(
         embedding_model_name    = embedding_model_name,
         calibrated_thresholds   = calibrated_thresholds,
         episodic_write_approval = settings.episodic_write_approval,
+        wiki_dir                = _state.wiki_dir,
     )
     _run_cache_warmup(controller, runtime, templates_dir)
     return wiki_agent, conversational_agent, controller
@@ -848,6 +856,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if raw_dir.exists():
         n_raw = memory_manager.index_directory(raw_dir, doc_type="raw", embed=bool(embed_fn))
         logger.info("MemoryManager: indexed %d raw files from %s.", n_raw, raw_dir)
+        # Raw files deleted outside the app (Finder, git) keep their index rows
+        # otherwise; reconcile_wiki() covers the wiki side below.
+        try:
+            pruned = memory_manager.prune_missing_documents("raw")
+            if pruned:
+                logger.info("MemoryManager: removed %d raw row(s) for deleted files (%s).",
+                            len(pruned), ", ".join(pruned))
+        except Exception as exc:
+            logger.warning("Raw pruning failed at startup (non-fatal): %s", exc)
     else:
         logger.info("MemoryManager: raw_dir does not exist yet (%s) — skipping seed.", raw_dir)
 
@@ -875,11 +892,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
             reconcile_summary = memory_manager.reconcile_wiki(wiki_dir)
             logger.info(
-                "Wiki reconciled at startup — reindexed=%d orphans_removed=%d%s",
+                "Wiki reconciled at startup — reindexed=%d orphans_removed=%d%s housekeeping_removed=%d",
                 reconcile_summary["reindexed"],
                 reconcile_summary["orphans_removed"],
                 f" ({', '.join(reconcile_summary['orphan_names'])})"
                     if reconcile_summary["orphan_names"] else "",
+                len(reconcile_summary.get("housekeeping_removed", [])),
             )
         except Exception as exc:
             logger.warning("Wiki reconciliation failed at startup (non-fatal): %s", exc)
@@ -905,7 +923,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         if sweep_result["episodes_retracted"] > 0:
             writer = EpisodicMemoryWriter(
-                db_path=memory_manager._db_path, memory_md_path=_MEMORY_MD_PATH,
+                db_path=memory_manager._db_path, memory_md_path=_memory_md_path(),
             )
             await asyncio.to_thread(writer.regenerate_memory_md)
     except Exception as exc:
@@ -2723,7 +2741,7 @@ async def approve_memory_episode(episode_id: int) -> EpisodeApprovalResponse:
         raise HTTPException(status_code=503, detail="MemoryManager not initialised.")
 
     writer = EpisodicMemoryWriter(
-        db_path=getattr(mm, "_db_path", None), memory_md_path=_MEMORY_MD_PATH,
+        db_path=getattr(mm, "_db_path", None), memory_md_path=_memory_md_path(),
     )
     count = await asyncio.to_thread(writer.approve, episode_id)
     if count > 0:
@@ -2764,7 +2782,7 @@ async def reject_memory_episode(episode_id: int) -> EpisodeApprovalResponse:
         raise HTTPException(status_code=503, detail="MemoryManager not initialised.")
 
     writer = EpisodicMemoryWriter(
-        db_path=getattr(mm, "_db_path", None), memory_md_path=_MEMORY_MD_PATH,
+        db_path=getattr(mm, "_db_path", None), memory_md_path=_memory_md_path(),
     )
     count = await asyncio.to_thread(writer.reject, episode_id)
     return EpisodeApprovalResponse(
@@ -2799,7 +2817,7 @@ async def reactivate_memory_episode(episode_id: int) -> EpisodeApprovalResponse:
         raise HTTPException(status_code=503, detail="MemoryManager not initialised.")
 
     writer = EpisodicMemoryWriter(
-        db_path=getattr(mm, "_db_path", None), memory_md_path=_MEMORY_MD_PATH,
+        db_path=getattr(mm, "_db_path", None), memory_md_path=_memory_md_path(),
     )
     count = await asyncio.to_thread(writer.reactivate, episode_id)
     if count > 0:

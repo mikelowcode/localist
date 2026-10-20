@@ -267,6 +267,7 @@ Tests are organized by phase (memory substrate, routing, controller dispatch, ex
 - ✅ **Web-search detection works the same for every embedding model** (v0.1.5) — whether a request needs a web search is now decided by keyword scoring on short command-style phrasings ("look up …", "search github for …", "research …"), not by embedding similarity, which didn't separate search requests from other messages on any model; long pasted messages and "look at this image" no longer trigger searches
 - ✅ **Document matching tuned per embedding model** (v0.1.5) — how closely a document must match before it's used as a source is set per model, like memory recall, so EmbeddingGemma stops dropping half of its right documents and embeddinggemma-2 stops pulling documents into every answer
 - ✅ Fixes (v0.1.5): the "episodic" chip under a reply now appears when memories were actually used, not only when the question sounded personal; questions like "what's wrong with this regex" no longer count as memory questions
+- ✅ Fixes (unreleased): the same document no longer fills several answer sources when it was indexed under two paths; index entries for raw files deleted outside the app are removed at startup; a backend pointed at another wiki folder (`LOCALIST_WIKI_DIR`) now reads the user profile and writes `MEMORY.md` there
 
 **Open**
 - ⬜ Native `.app`: first-run config UX (a fresh app defaults to unreachable `omlx`), code signing/notarization, `tauri build` auto-triggering the PyInstaller build
