@@ -694,9 +694,13 @@ _SEARCH_NEGATIVE_FILTER: frozenset[str] = frozenset({
 # early-return blocks.
 _ALL_SEARCH_NEGATIVE_FILTERS: frozenset[str] = _SEARCH_NEGATIVE_FILTER | _RESEARCH_NEGATIVE_FILTER
 
-# Relevance threshold for Priority 4 corpus scoring
+# Default document RAG cutoff — the cosine score a corpus document needs to
+# count as relevant: Priority 4 Path B routes to RAG on it, Priority 3b treats
+# the corpus as a miss below it, and ControllerAgent keeps Slot 4 sources at
+# or above it. Per embedding model since 2026-10-20 — see
+# resolve_rag_floor(); this is the fallback for a model with neither a
+# hand-validated nor a calibrated value.
 _CORPUS_SCORE_THRESHOLD: float = 0.55
-
 # Slot [Fix 1] — semantic search-intent gating thresholds.
 # knowledge_request_open and freshness_request are deliberately
 # excluded from gating — see Diagnostic 2 findings: a non-search
@@ -936,6 +940,41 @@ _PROFILE_FACT_THRESHOLDS: dict[str, float] = {
     "embeddinggemma:latest":    0.45,
 }
 _DEFAULT_PROFILE_FACT_THRESHOLD = 0.45
+
+
+# ---------------------------------------------------------------------------
+# Document RAG cutoff, per model (2026-10-20, diagnostics/reports/
+# rag_cutoff_assessment_2026-10-20.md). The fixed 0.55 was right for nomic
+# and wrong both ways for EmbeddingGemma: EmbeddingGemma 300M scores low and
+# kept only half the right documents on the user's real corpus (calibrated
+# 0.42: all of them, 0% general off-topic), while embeddinggemma-2 scores
+# high and gave every question — off-topic included — documents and a RAG
+# route (calibrated 0.76: all right documents, 0–4% off-topic). Measured
+# through the real query_corpus() on the synthetic RAG_* battery and checked
+# on the user's documents. nomic keeps 0.55 by hand (its calibration lands
+# one grid step away, 0.56). Other models use their calibrated floor
+# (threshold_calibration.calibrate_rag_floor(), persisted with the gate
+# thresholds), else _CORPUS_SCORE_THRESHOLD.
+_RAG_SOURCE_FLOORS: dict[str, float] = {
+    "nomic-embed-text:latest": 0.55,
+}
+
+
+def resolve_rag_floor(
+    embedding_model_name:  str | None,
+    calibrated_thresholds: dict[str, float] | None = None,
+) -> float:
+    """The document RAG cutoff for `embedding_model_name`: hand-validated
+    (_RAG_SOURCE_FLOORS), then calibrated (calibrated_thresholds
+    ["rag_source_floor"]), then _CORPUS_SCORE_THRESHOLD — also for
+    keyword-only (None), where documents are BM25-scored and the source
+    filter doesn't apply to them anyway."""
+    if embedding_model_name is None:
+        return _CORPUS_SCORE_THRESHOLD
+    if embedding_model_name in _RAG_SOURCE_FLOORS:
+        return _RAG_SOURCE_FLOORS[embedding_model_name]
+    calibrated = (calibrated_thresholds or {}).get("rag_source_floor")
+    return calibrated if calibrated is not None else _CORPUS_SCORE_THRESHOLD
 
 
 def resolve_profile_fact_threshold(
@@ -1460,6 +1499,8 @@ class Planner:
         # entry for any gate, so it resolves the same way any other
         # unmeasured model would — see resolve_gate_tiers().
         self._embedding_model_name  = embedding_model_name
+        # Per-model document RAG cutoff for Priority 4 Path B / Priority 3b.
+        self._rag_floor: float = resolve_rag_floor(embedding_model_name, calibrated_thresholds)
         # Defaults: no gate cosine-scored until resolved below.
         self._semantic_gate_thresholds:     dict[str, float] = {}
         self._research_intent_threshold:    float | None = None
@@ -2907,7 +2948,8 @@ class Planner:
     def _priority3b_factual(self, instruction: str, lowered: str) -> RoutingPlan | None:
         """
         Match condition: instruction contains a factual query keyword AND
-        corpus query returns no result above _CORPUS_SCORE_THRESHOLD.
+        corpus query returns no result at or above this model's document
+        cutoff (self._rag_floor, resolve_rag_floor()).
 
         When no MemoryManager is available, this priority is skipped entirely
         (returns None) — corpus cannot be checked.
@@ -2931,7 +2973,7 @@ class Planner:
 
         top_score = results[0].relevance_score if results else 0.0
 
-        if top_score >= _CORPUS_SCORE_THRESHOLD:
+        if top_score >= self._rag_floor:
             logger.debug(
                 "Planner: Priority 3b — corpus hit (score=%.3f), "
                 "deferring to Priority 4.", top_score,
@@ -2961,7 +3003,8 @@ class Planner:
         Match condition (either sufficient):
           A) instruction contains an explicit wiki/vault trigger keyword, OR
           B) MemoryManager is available AND query_corpus() returns a top result
-             with relevance_score >= _CORPUS_SCORE_THRESHOLD.
+             with relevance_score >= this model's document cutoff
+             (self._rag_floor, resolve_rag_floor()).
 
         Path A keeps routing deterministic for explicit wiki requests.
         Path B restores score-based RAG injection for natural-language corpus
@@ -3001,10 +3044,10 @@ class Planner:
 
         top_score = results[0].relevance_score if results else 0.0
 
-        if top_score >= _CORPUS_SCORE_THRESHOLD:
+        if top_score >= self._rag_floor:
             logger.debug(
                 "Planner: Priority 4 matched via corpus score (%.3f >= %.3f).",
-                top_score, _CORPUS_SCORE_THRESHOLD,
+                top_score, self._rag_floor,
             )
             return RoutingPlan(
                 agent          = "conversational_agent",

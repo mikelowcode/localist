@@ -162,6 +162,7 @@ from .planner import (
     resolve_episodic_recall_floor,
     resolve_gate_tiers,
     resolve_profile_fact_threshold,
+    resolve_rag_floor,
 )
 from .runtime_factory import available_backends, create_runtime
 from .threshold_calibration import CALIBRATION_VERSION, calibrate_thresholds, CalibrationResult
@@ -1160,6 +1161,11 @@ class CalibrationResponse(BaseModel):
     # degenerate calibration falls back to 0.45).
     profile_threshold:        GateCalibrationResponse | None = None
     profile_threshold_in_use: float | None = None
+    # Document RAG cutoff (rag_cutoff_assessment_2026-10-20.md), same shape:
+    # this calibration's outcome, and what Planner/ControllerAgent use (a
+    # hand-validated planner._RAG_SOURCE_FLOORS entry wins; degenerate -> 0.55).
+    rag_floor:        GateCalibrationResponse | None = None
+    rag_floor_in_use: float | None = None
     # Per-gate trust tier now in use for this model (resolve_gate_tiers():
     # validated / auto-calibrated / lexical-fallback / disabled) — `gates`
     # is what calibration measured, which a hand-validated gate overrides.
@@ -1189,6 +1195,10 @@ def _calibration_result_to_response(model: str, result: CalibrationResult) -> Ca
             if result.profile_threshold is not None else None
         ),
         profile_threshold_in_use = resolve_profile_fact_threshold(model, result.thresholds),
+        rag_floor = (
+            _gate_calibration_response(result.rag_floor) if result.rag_floor is not None else None
+        ),
+        rag_floor_in_use = resolve_rag_floor(model, result.thresholds),
         gate_tiers = resolve_gate_tiers(model, result.thresholds),
     )
 
@@ -1208,10 +1218,12 @@ def _calibrate_and_persist(memory_manager: MemoryManager, embedding_model_name: 
     )
     clean_gates = sorted(name for name in result.gates if name in result.thresholds)
     logger.info(
-        "Calibration for %r: %d/%d gates cleanly calibrated (%s); recall floor %s, profile threshold %s.",
+        "Calibration for %r: %d/%d gates cleanly calibrated (%s); recall floor %s, "
+        "profile threshold %s, document cutoff %s.",
         embedding_model_name, len(clean_gates), len(result.gates), ", ".join(clean_gates) or "none",
         result.thresholds.get("episodic_recall_floor", "inconclusive"),
         result.thresholds.get("profile_fact_threshold", "inconclusive"),
+        result.thresholds.get("rag_source_floor", "inconclusive"),
     )
     return result
 

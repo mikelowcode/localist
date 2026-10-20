@@ -28,10 +28,12 @@ not use the numeric threshold field, which is None in that case.
 from __future__ import annotations
 
 import logging
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
-
 from . import bm25
+from .memory_manager import MemoryManager
 from .planner import (
     _ALL_SEARCH_NEGATIVE_FILTERS,
     _KEYWORD_SCORED_GATES,
@@ -62,6 +64,9 @@ from .threshold_calibration_fixtures import (
     LR_POSITIVES_V2,
     SEARCH_NEGATIVES_V2,
     heldout_split,
+    RAG_DOCS,
+    RAG_NEGATIVES,
+    RAG_POSITIVES,
     PROFILE_LINES,
     PROFILE_NEGATIVES,
     PROFILE_POSITIVES,
@@ -104,7 +109,8 @@ _RECALL_TOP_N: int = 5
 #       scores the request; explicit_search_action / lookup_request no longer
 #       measured (keyword-coverage scored for every model, see
 #       planner._KEYWORD_SCORED_GATES).
-CALIBRATION_VERSION: int = 2
+#   3 — 2026-10-20: the document RAG cutoff (calibrate_rag_floor()).
+CALIBRATION_VERSION: int = 3
 
 # Gates calibrate_thresholds() measures per model by cosine. The other two
 # (_KEYWORD_SCORED_GATES) are keyword-coverage scored for every model.
@@ -136,18 +142,21 @@ class CalibrationResult:
     gates: dict[str, GateCalibration] = field(default_factory=dict)
     recall_floor: GateCalibration | None = None
     profile_threshold: GateCalibration | None = None
+    rag_floor: GateCalibration | None = None
 
     @property
     def thresholds(self) -> dict[str, float]:
         """Only what calibrated cleanly -- what a caller persists. Includes
-        "episodic_recall_floor" / "profile_fact_threshold" when those did."""
+        "episodic_recall_floor" / "profile_fact_threshold" / "rag_source_floor"
+        when those did."""
         clean = {
             name: gate.threshold
             for name, gate in self.gates.items()
             if not gate.degenerate and gate.threshold is not None
         }
         for key, extra in (("episodic_recall_floor", self.recall_floor),
-                           ("profile_fact_threshold", self.profile_threshold)):
+                           ("profile_fact_threshold", self.profile_threshold),
+                           ("rag_source_floor", self.rag_floor)):
             if extra is not None and not extra.degenerate and extra.threshold is not None:
                 clean[key] = extra.threshold
         return clean
@@ -452,6 +461,65 @@ def calibrate_profile_threshold(embed_fn: EmbedFn) -> GateCalibration:
     return threshold
 
 
+def calibrate_rag_floor(embed_fn: EmbedFn) -> GateCalibration:
+    """
+    Measure the document RAG cutoff (planner.resolve_rag_floor()) for the
+    model behind embed_fn, the way diagnostics/diag_rag_cutoff.py measured it:
+    the synthetic RAG_* corpus is indexed into a temporary MemoryManager with
+    embed_fn (index_document(): first 500 characters, front matter included)
+    and queried through the real query_corpus(q, max_results=3) — BM25
+    prefilter, then cosine re-rank — as ControllerAgent's Slot 4 fetch does.
+
+    A positive counts when a document that answers it is among the three
+    cosine-scored results at or above the cutoff; a negative counts as a
+    false positive when any result is. Selected by _recall_floor_from_scores(),
+    the recall floor's objective. Never raises: an embed_fn failure leaves
+    documents or queries keyword-scored, which are excluded here, thinning
+    the pools toward a degenerate verdict.
+    """
+    positives: list[tuple[float, int]] = []
+    negatives: list[float] = []
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            mm = MemoryManager(
+                db_path=root / "rag_floor_calibration.db", embed_fn=embed_fn,
+                embedding_model_name="rag-floor-calibration",
+            )
+            key_by_path: dict[str, str] = {}
+            for key, (doc_type, content) in RAG_DOCS.items():
+                path = root / doc_type / f"{key}.md"
+                mm.index_document(path=path, doc_type=doc_type, content=content)
+                key_by_path[str(path)] = key
+
+            def cosine_top3(query: str) -> list[tuple[float, str]]:
+                return [
+                    (d.relevance_score, key_by_path.get(str(d.path), ""))
+                    for d in mm.query_corpus(query, max_results=3, use_embeddings=True)
+                    if d.scored_by_embedding
+                ]
+
+            for query, answers in RAG_POSITIVES:
+                right = [score for score, key in cosine_top3(query) if key in answers]
+                # rank 1 = kept-if-above-the-floor; a miss can never count.
+                positives.append((max(right), 1) if right else (0.0, 99))
+            for query in RAG_NEGATIVES:
+                top3 = cosine_top3(query)
+                negatives.append(max(score for score, _ in top3) if top3 else 0.0)
+    except Exception as exc:
+        logger.warning("threshold_calibration: rag_source_floor measurement failed (%s)", exc)
+        positives, negatives = [], []
+
+    floor = _recall_floor_from_scores(positives, negatives)
+    logger.info(
+        "threshold_calibration: rag_source_floor degenerate=%s floor=%s recall=%s fp=%s "
+        "pos_n=%d neg_n=%d reason=%s",
+        floor.degenerate, floor.threshold, floor.tpr_at_threshold, floor.fpr_at_threshold,
+        floor.positive_count, floor.negative_count, floor.reason,
+    )
+    return floor
+
+
 def calibrate_thresholds(embed_fn: EmbedFn) -> CalibrationResult:
     """
     Measure Youden's-J-optimal semantic-gating thresholds for the currently
@@ -497,6 +565,7 @@ def calibrate_thresholds(embed_fn: EmbedFn) -> CalibrationResult:
 
     result.recall_floor = calibrate_recall_floor(embed_fn)
     result.profile_threshold = calibrate_profile_threshold(embed_fn)
+    result.rag_floor = calibrate_rag_floor(embed_fn)
     return result
 
 

@@ -49,6 +49,7 @@ from .planner import (
     RoutingPlan,
     resolve_episodic_recall_floor,
     resolve_profile_fact_threshold,
+    resolve_rag_floor,
     resolve_graph_target,
 )
 from pathlib import Path
@@ -837,6 +838,9 @@ class ControllerAgent:
         self._profile_fact_threshold = resolve_profile_fact_threshold(
             embedding_model_name, calibrated_thresholds,
         )
+        # Per-model document RAG cutoff for Slot 4 sources (planner.
+        # resolve_rag_floor(); the Planner resolves the same value for routing).
+        self._rag_floor = resolve_rag_floor(embedding_model_name, calibrated_thresholds)
         # IntentClassifier retired — routing is now handled by _RulePlanner
         self._memory_manager = memory_manager   # None → use ephemeral shim per request
         self._persona_cache: str | None = None
@@ -1476,7 +1480,8 @@ class ControllerAgent:
         # -- Step 3b: Corpus fallback when web_search fails -----------------
         # Runs only when the P3 tool path was taken and every web_search
         # result came back failed. Queries the corpus with the original
-        # instruction using the same threshold (_priority4_corpus reuses 0.55)
+        # instruction using the same per-model cutoff as _priority4_corpus
+        # (self._rag_floor, planner.resolve_rag_floor())
         # so the answer can be grounded in vault content even when live
         # search is unavailable.
         #
@@ -1531,7 +1536,7 @@ class ControllerAgent:
                         content = parse_wiki_doc(doc.content).body[:2000],
                     )
                     for doc in _fallback_docs
-                    if (not doc.scored_by_embedding or doc.relevance_score >= 0.55)
+                    if (not doc.scored_by_embedding or doc.relevance_score >= self._rag_floor)
                     and not _excluded_from_rag(doc.path)
                 ]
                 if rag_sources:
@@ -1564,7 +1569,8 @@ class ControllerAgent:
                     max_results    = 3,
                     use_embeddings = True,
                 )
-                # relevance_score >= 0.55 only applies when the score is a
+                # relevance_score >= self._rag_floor (the model's document
+                # cutoff) only applies when the score is a
                 # cosine similarity (doc.scored_by_embedding) — a document
                 # scored via BM25 keyword fallback instead (no embed_fn, a
                 # stale corpus, or this doc simply lacking a stored
@@ -1581,7 +1587,7 @@ class ControllerAgent:
                         content = parse_wiki_doc(doc.content).body[:2000],
                     )
                     for doc in docs
-                    if (not doc.scored_by_embedding or doc.relevance_score >= 0.55)
+                    if (not doc.scored_by_embedding or doc.relevance_score >= self._rag_floor)
                     and not _excluded_from_rag(doc.path)
                 ]
                 logger.info(
@@ -1600,7 +1606,7 @@ class ControllerAgent:
         # snippet. Deliberately narrow — only the single top doc, only when
         # it's doc_type=="wiki" (raw/ docs were never made graph nodes),
         # gated by the same relevance floor already used for rag_sources
-        # (0.55 for a cosine-scored top doc, no floor — rank alone — for a
+        # (self._rag_floor for a cosine-scored top doc, no floor — rank alone — for a
         # BM25-scored one; see that gate's own comment) — and silently
         # absent otherwise (no logging noise for
         # the common "top hit isn't a graph node" case). Never runs on a
@@ -1610,7 +1616,7 @@ class ControllerAgent:
         if docs and self._memory_manager is not None:
             top_doc = docs[0]
             if top_doc.doc_type == "wiki" and (
-                not top_doc.scored_by_embedding or top_doc.relevance_score >= 0.55
+                not top_doc.scored_by_embedding or top_doc.relevance_score >= self._rag_floor
             ):
                 try:
                     node = self._memory_manager.get_graph_node_by_doc_path(top_doc.path)

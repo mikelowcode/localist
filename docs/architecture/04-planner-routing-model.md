@@ -105,10 +105,10 @@ gate missed.
 
 | | |
 |---|---|
-| **Condition** | Instruction contains a factual query keyword (`"when did"`, `"what year"`, `"who founded"`, `"who invented"`, `"who created"`, `"where was"`, `"how many"`, `"what is the"`, `"which company"`, `"who was the first"`, `"what was the first"`) AND `MemoryManager.query_corpus()` returns no result with `relevance_score >= 0.55`. |
+| **Condition** | Instruction contains a factual query keyword (`"when did"`, `"what year"`, `"who founded"`, `"who invented"`, `"who created"`, `"where was"`, `"how many"`, `"what is the"`, `"which company"`, `"who was the first"`, `"what was the first"`) AND `MemoryManager.query_corpus()` returns no result at or above the active embedding model's document cutoff (`resolve_rag_floor()`: hand-validated, else calibrated, else 0.55; per model since 2026-10-20, §16.30). |
 | **Action** | Schedule `web_search` via `tools_to_call`. Route to `ConversationalAgent`. |
 | **Rationale** | Factual queries about the external world should go to web search when the corpus has no strong hit. Corpus is checked first to avoid unnecessary API calls when the answer is already in the vault. |
-| **Notes** | Requires `MemoryManager` to be available. Skipped entirely when no MemoryManager is present. When corpus returns a hit (score ≥ 0.55), Priority 3b returns `None` and evaluation falls through to Priority 4. |
+| **Notes** | Requires `MemoryManager` to be available. Skipped entirely when no MemoryManager is present. When corpus returns a hit (score at or above the cutoff), Priority 3b returns `None` and evaluation falls through to Priority 4. |
 
 ---
 
@@ -116,7 +116,7 @@ gate missed.
 
 | | |
 |---|---|
-| **Condition** | **Path A:** Instruction contains an explicit wiki/vault trigger keyword (`"check the wiki"`, `"search the wiki"`, `"from the wiki"`, `"in the wiki"`, `"vault"`, etc.). **Path B:** `MemoryManager.query_corpus()` returns a top result with `relevance_score >= 0.55`. Either path is sufficient to match. |
+| **Condition** | **Path A:** Instruction contains an explicit wiki/vault trigger keyword (`"check the wiki"`, `"search the wiki"`, `"from the wiki"`, `"in the wiki"`, `"vault"`, etc.). **Path B:** `MemoryManager.query_corpus()` returns a top result at or above the active embedding model's document cutoff (`Planner._rag_floor`, from `resolve_rag_floor()`; was a fixed 0.55 until 2026-10-20, §16.30). Either path is sufficient to match. |
 | **Action** | Run RAG retrieval. Set `fetch_rag = True`. Snippets populate slot 4. Path A also sets `fetch_episodic = True`. Path B sets `fetch_episodic = False` (episodic is evaluated independently at P5). |
 | **Rationale** | Path A keeps routing deterministic for explicit wiki requests. Path B restores score-based RAG injection for natural-language corpus queries that carry no trigger keyword (e.g. "summarize the Localist Master Project Outline"). Without Path B, ingested documents are unreachable unless the user knows to say "check the wiki". |
 
@@ -314,8 +314,10 @@ class RoutingPlan:
 2. If `write_episode`: run `EpisodicMemoryWriter`, wait for completion.
 3. If `tools_to_call`: dispatch tools in listed order, collect results.
 4. If `fetch_rag`: run `MemoryManager.query_corpus()`, collect snippets for Slot 4.
-   RAG results are filtered by `relevance_score >= 0.55` unconditionally (still filtered
-   for `lora-persona.md` exclusion). Maximum 3 sources.
+   RAG results are filtered by the active model's document cutoff
+   (`ControllerAgent._rag_floor`, same value as the Planner's; cosine-scored
+   documents only), and `persona.md` and the user profile are excluded.
+   Maximum 3 sources.
 5. If `fetch_episodic`: run episodic retrieval, collect bullets for Slot 3.
 6. Call `PromptBuilder.build()` with all collected content; persona is loaded
    from `_load_persona()` (cached) and passed as `persona=` for Slot 1b.

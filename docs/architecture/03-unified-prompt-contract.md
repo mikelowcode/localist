@@ -351,8 +351,7 @@ user profile facts).
 
 #### Slot 4 — RAG Snippets
 
-**Purpose:** Relevant content from the wiki corpus and document index,
-retrieved only when the user explicitly requests it.
+**Purpose:** Relevant content from the wiki corpus and document index.
 
 **Token ceiling:** 800 tokens (800-token hard limit)
 
@@ -367,9 +366,24 @@ Source: wiki/WikiAgent Architecture.md
 ```
 
 **Rules:**
-- This slot is **conditional**. Omitted entirely when Priority 4 does not fire.
-- Priority 4 fires **only on explicit wiki/vault trigger keywords** — never
-  on corpus scoring alone. See §4.2.
+- This slot is **conditional**. Omitted entirely when Priority 4 does not fire
+  (and the Step 3b web-search-failure fallback finds nothing).
+- Priority 4 fires on an explicit wiki/vault trigger keyword (Path A) or when
+  the top corpus document scores at or above the active embedding model's
+  document cutoff (Path B). See §4.2.
+  - *Corrected 2026-10-20:* this rule previously said Priority 4 fires only on
+    trigger keywords, never on corpus scoring alone. Path B has existed since
+    the 2026-06 P4 rework.
+- **Sources are kept at or above the same per-model cutoff** (2026-10-20):
+  `planner.resolve_rag_floor()` resolves a hand-validated value (nomic 0.55),
+  then this model's calibrated value (`rag_source_floor`), then 0.55. A
+  BM25-scored document (keyword-only, or no vector for the active model) is
+  kept on rank alone. `persona.md` and the user profile are never sources
+  (§3.6).
+  - *Why per model:* EmbeddingGemma 300M scores low (calibrated about 0.40),
+    and at 0.55 it dropped half the right documents. embeddinggemma-2 scores high
+    (about 0.72), and at 0.55 it gave every question documents
+    (`diagnostics/reports/rag_cutoff_assessment_2026-10-20.md`, §16.30).
 - Maximum 3 sources. Wiki sources are preferred over raw doc sources.
 - When a source is truncated to fit the budget, the truncated content is suffixed
   with `… [truncated]` at the cut point (sentence boundary if possible, otherwise

@@ -152,7 +152,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION   = 20         # increment when schema changes require migration
+_SCHEMA_VERSION   = 21         # increment when schema changes require migration
 _EMBEDDING_DIM    = 768        # EmbeddingGemma-300M-4bit output dimension
 _EMBEDDING_FORMAT = ">768f"    # big-endian float32 × 768
 
@@ -164,11 +164,12 @@ _CONV_LOG_CAP_PER_TASK = 200
 _PROVENANCE_STORES: tuple[str, ...] = ("corpus", "episodes", "chat_turns")
 
 # embedding_model_thresholds' calibrated columns — the four Planner gates,
-# plus the episodic recall floor (schema v19) and the profile-fact threshold
-# (schema v20), which aren't gates.
+# plus the episodic recall floor (schema v19), the profile-fact threshold
+# (schema v20) and the document RAG cutoff (schema v21), which aren't gates.
 _CALIBRATED_THRESHOLD_KEYS: tuple[str, ...] = (
     "explicit_search_action", "lookup_request", "research_intent",
     "episodic_relevance", "episodic_recall_floor", "profile_fact_threshold",
+    "rag_source_floor",
 )
 
 # The table each provenance store's vectors live in (its `embedding` column).
@@ -454,6 +455,17 @@ def _ensure_v20_calibration_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE embedding_model_thresholds ADD COLUMN calibration_version INTEGER")
 
 
+def _ensure_rag_floor_column(conn: sqlite3.Connection) -> None:
+    """Add embedding_model_thresholds.rag_source_floor (schema v21) if the
+    table exists without it. Idempotent; doesn't commit."""
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).fetchall()}
+    if "embedding_model_thresholds" not in tables:
+        return
+    cols = {c[1] for c in conn.execute("PRAGMA table_info(embedding_model_thresholds)").fetchall()}
+    if "rag_source_floor" not in cols:
+        conn.execute("ALTER TABLE embedding_model_thresholds ADD COLUMN rag_source_floor REAL")
 class MemoryManager:
     """
     SQLite-backed persistent memory for Localist.
@@ -822,7 +834,8 @@ class MemoryManager:
                             calibrated_at           REAL NOT NULL,
                             episodic_recall_floor   REAL,
                             profile_fact_threshold  REAL,
-                            calibration_version     INTEGER
+                            calibration_version     INTEGER,
+                            rag_source_floor        REAL
                         );
                     """)
 
@@ -994,6 +1007,10 @@ class MemoryManager:
                 _ensure_v20_calibration_columns(conn)
                 conn.commit()
 
+                # Same self-heal, same rationale, for
+                # embedding_model_thresholds.rag_source_floor (schema v21).
+                _ensure_rag_floor_column(conn)
+                conn.commit()
             finally:
                 conn.close()
 
@@ -1338,6 +1355,16 @@ class MemoryManager:
                 "it becomes active."
             )
             _ensure_v20_calibration_columns(conn)
+
+        if from_version < 21:
+            logger.info(
+                "Applying migration v20→v21: adding embedding_model_thresholds."
+                "rag_source_floor (per-model document RAG cutoff, diagnostics/"
+                "reports/rag_cutoff_assessment_2026-10-20.md). NULL for existing "
+                "rows; CALIBRATION_VERSION 3 recalibrates each model the next "
+                "time it becomes active."
+            )
+            _ensure_rag_floor_column(conn)
 
         conn.execute(
             "UPDATE schema_version SET version = ?", (_SCHEMA_VERSION,)
@@ -2811,7 +2838,7 @@ class MemoryManager:
             Typically `CalibrationResult.thresholds` — may contain any
             subset of (explicit_search_action, lookup_request,
             research_intent, episodic_relevance, episodic_recall_floor,
-            profile_fact_threshold).
+            profile_fact_threshold, rag_source_floor).
             A key omitted here (a
             gate that calibrated as degenerate) is stored as SQL NULL, not
             skipped — this call always writes/replaces the full row for
@@ -2836,8 +2863,9 @@ class MemoryManager:
                     INSERT INTO embedding_model_thresholds
                         (model, explicit_search_action, lookup_request,
                          research_intent, episodic_relevance, episodic_recall_floor,
-                         profile_fact_threshold, calibration_version, calibrated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         profile_fact_threshold, rag_source_floor, calibration_version,
+                         calibrated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(model) DO UPDATE SET
                         explicit_search_action = excluded.explicit_search_action,
                         lookup_request         = excluded.lookup_request,
@@ -2845,6 +2873,7 @@ class MemoryManager:
                         episodic_relevance      = excluded.episodic_relevance,
                         episodic_recall_floor   = excluded.episodic_recall_floor,
                         profile_fact_threshold  = excluded.profile_fact_threshold,
+                        rag_source_floor        = excluded.rag_source_floor,
                         calibration_version     = excluded.calibration_version,
                         calibrated_at           = excluded.calibrated_at
                     """,
@@ -2856,6 +2885,7 @@ class MemoryManager:
                         thresholds.get("episodic_relevance"),
                         thresholds.get("episodic_recall_floor"),
                         thresholds.get("profile_fact_threshold"),
+                        thresholds.get("rag_source_floor"),
                         calibration_version,
                         time.time(),
                     ),
@@ -2863,7 +2893,7 @@ class MemoryManager:
                 conn.commit()
                 logger.info(
                     "set_calibrated_thresholds: model=%r ESA=%s LR=%s RI=%s episodic=%s "
-                    "recall_floor=%s profile_threshold=%s version=%s",
+                    "recall_floor=%s profile_threshold=%s rag_floor=%s version=%s",
                     model_name,
                     thresholds.get("explicit_search_action"),
                     thresholds.get("lookup_request"),
@@ -2871,6 +2901,7 @@ class MemoryManager:
                     thresholds.get("episodic_relevance"),
                     thresholds.get("episodic_recall_floor"),
                     thresholds.get("profile_fact_threshold"),
+                    thresholds.get("rag_source_floor"),
                     calibration_version,
                 )
             finally:

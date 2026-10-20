@@ -76,10 +76,12 @@ Three supported configurations:
 
 Each backend keeps its own embedding model, so switching the runtime backend switches embeddings
 too. Every embedding model is calibrated automatically the first time it's active, and again after an
-update changes what calibration measures. Calibration covers semantic gating, how closely a memory must
-match before it's recalled, and how closely a user-profile line must match before it's added to the
-prompt. It takes a few seconds, at startup or when you switch models. Where a model has hand-picked
-values (nomic, EmbeddingGemma), those still win.
+update changes what calibration measures. Calibration covers research and memory-relevance gating, how
+closely a memory must match before it's recalled, how closely a user-profile line must match before it's
+added to the prompt, and how closely a document must match before it's used as a source. It takes a few
+seconds, at startup or when you switch models. Where a model has hand-picked values (nomic,
+EmbeddingGemma), those still win. Deciding whether a request needs a web search doesn't depend on the
+embedding model at all; it uses keyword scoring that works the same for every model.
 - **Keyword-only (BM25) retrieval**: the zero-config default when no embedding model is set.
   Episodic memory and RAG retrieval both fall back to hand-rolled Okapi BM25 keyword scoring, and
   semantic-gating (search-intent classification, episodic-relevance detection) resolves to its own
@@ -262,6 +264,9 @@ Tests are organized by phase (memory substrate, routing, controller dispatch, ex
 - ✅ Fixes (v0.1.4): facts recalled for your question are no longer crowded out by recent preferences; the Chat Model dropdown shows the model actually in use; Episodes, Memory, the Live Feed and the Memory badge load once the backend is up instead of staying empty after a slow start; Ollama with no chat model set no longer crashes at startup
 - ✅ **User-profile matching tuned per embedding model** (v0.1.5) — how closely a profile line must match before it's added to the prompt is now set per model, like memory recall, so off-topic questions stop picking up unrelated profile lines; every embedding model is calibrated automatically when it becomes active, at startup too, and again after an update that changes calibration
 - ✅ Fixes (v0.1.5): new or edited documents now show up in answers to questions you'd already asked (cached document-search results were never cleared); your user profile no longer comes back whole as a document-search result, only as the individual lines that match your question
+- ✅ **Web-search detection works the same for every embedding model** (unreleased) — whether a request needs a web search is now decided by keyword scoring on short command-style phrasings ("look up …", "search github for …", "research …"), not by embedding similarity, which didn't separate search requests from other messages on any model; long pasted messages and "look at this image" no longer trigger searches
+- ✅ **Document matching tuned per embedding model** (unreleased) — how closely a document must match before it's used as a source is set per model, like memory recall, so EmbeddingGemma stops dropping half of its right documents and embeddinggemma-2 stops pulling documents into every answer
+- ✅ Fixes (unreleased): the "episodic" chip under a reply now appears when memories were actually used, not only when the question sounded personal; questions like "what's wrong with this regex" no longer count as memory questions
 
 **Open**
 - ⬜ Native `.app`: first-run config UX (a fresh app defaults to unreachable `omlx`), code signing/notarization, `tauri build` auto-triggering the PyInstaller build

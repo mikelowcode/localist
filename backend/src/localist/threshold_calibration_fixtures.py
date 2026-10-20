@@ -614,3 +614,194 @@ RECALL_ADJACENT_NEGATIVES: list[str] = [
     "Tell me more about this news story: Vercel changes its hobby plan limits",
     "Tell me more about this news story: Italy sets a new tourism record",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Document RAG cutoff — the min cosine a corpus document needs to become a
+# Slot 4 source and for Priority 4 Path B to route a turn to RAG (today one
+# fixed 0.55 for every model). SYNTHETIC: a made-up developer's knowledge
+# base, shaped like real wiki/raw corpora — wiki pages carry OKF front matter
+# (type, title, description, tags, timestamp, status, dates; index_document()
+# embeds only the first 500 characters, so front matter is most of what's
+# embedded), raw files are plain text, and some topics exist as both. Real
+# documents are personal data and never belong here. Each positive lists
+# every document that answers it. Negatives are general off-topic questions
+# and near-topic ones (same domain as a document, different subject).
+# Written before any scoring (2026-10-20); data only until wired in.
+# ---------------------------------------------------------------------------
+
+def _wiki(title: str, description: str, tags: str, summary: str, detail: str) -> str:
+    return (f"---\ntype: RESEARCH_NOTE\ntitle: {title}\ndescription: {description}\n"
+            f"resource: {title}.md\ntags: [{tags}]\ntimestamp: 2026-05-14\nstatus: draft\n"
+            f"created: 2026-05-14\nupdated: 2026-05-14\n---\n\n# {title}\n\n## Summary\n\n{summary}\n\n"
+            f"## Detail\n\n{detail}\n")
+
+
+RAG_DOCS: dict[str, tuple[str, str]] = {
+    # key: (doc_type, content)
+    "homelab-backup": ("wiki", _wiki(
+        "Homelab Backup Plan", "How the home server's data is backed up offsite every night.",
+        "backup, restic, homelab, offsite",
+        "All homelab data is backed up nightly with restic to a Backblaze B2 bucket. Snapshots are "
+        "kept for 7 days, 4 weeks and 12 months.",
+        "A cron job on the server runs restic at 02:30. Photos, the Nextcloud data directory and "
+        "database dumps are included; the media library is excluded because it can be re-ripped. "
+        "A monthly restore test pulls one random file back and checks its hash.")),
+    "garden-sensors": ("wiki", _wiki(
+        "Garden Sensor Network", "Raspberry Pi soil-moisture sensors that report to Grafana.",
+        "raspberry-pi, mqtt, grafana, garden, sensors",
+        "Four capacitive soil-moisture probes in the raised beds report through an ESP32 to a "
+        "Raspberry Pi running Mosquitto, Telegraf and Grafana.",
+        "Readings are published every ten minutes over MQTT. A Grafana alert fires when a bed drops "
+        "below 30% moisture for two hours, and the drip valve can be opened from the dashboard.")),
+    "route-optimizer": ("wiki", _wiki(
+        "Route Optimizer Service", "Design notes for the Rust service that plans delivery routes.",
+        "rust, routing, logistics, service-design",
+        "The route optimizer is a Rust service that turns a day's delivery stops into driver routes, "
+        "using live traffic times and a vehicle-capacity constraint.",
+        "It solves a capacitated vehicle routing problem with a savings heuristic followed by 2-opt "
+        "improvement. Traffic times come from a cached matrix refreshed every 15 minutes. P95 "
+        "planning time for 400 stops is 1.8 seconds.")),
+    "recipe-app": ("wiki", _wiki(
+        "Recipe App", "A SvelteKit app for saving and scaling family recipes.",
+        "sveltekit, supabase, side-project, recipes",
+        "The recipe app stores family recipes in Supabase and scales ingredient quantities for any "
+        "number of servings.",
+        "Recipes are parsed from pasted text into ingredients and steps. Unit conversion handles "
+        "cups, grams and spoons. Sharing uses a read-only link per recipe.")),
+    "japan-trip": ("wiki", _wiki(
+        "Japan Trip Itinerary", "Day-by-day plan for the October trip to Kyoto and Osaka.",
+        "travel, japan, itinerary, kyoto, osaka",
+        "Ten days in October: four nights in Kyoto, three in Osaka and a day trip to Nara, with a "
+        "JR pass for the Shinkansen legs.",
+        "Kyoto days cover Fushimi Inari early in the morning, Arashiyama and a tea ceremony. Osaka "
+        "is food-focused around Dotonbori. Hotels are booked; restaurant reservations open 30 days "
+        "ahead.")),
+    "marathon-plan": ("wiki", _wiki(
+        "Half Marathon Training Plan", "Sixteen-week plan for the spring half marathon.",
+        "running, training, half-marathon, fitness",
+        "A 16-week build to a spring half marathon, running four days a week with one long run, one "
+        "tempo run and two easy runs.",
+        "The long run grows from 8 km to 19 km, with a cutback every fourth week. Tempo runs are at "
+        "goal pace of 5:20 per km. The last two weeks taper to 60% of peak volume.")),
+    "home-network": ("wiki", _wiki(
+        "Home Network Setup", "VLANs, Wi-Fi and DNS filtering for the home network.",
+        "networking, unifi, vlan, pi-hole, dns",
+        "The home network runs on UniFi gear with three VLANs: trusted devices, IoT devices and "
+        "guests. Pi-hole provides DNS filtering for all of them.",
+        "IoT devices can't reach the trusted VLAN. The guest network is rate-limited to 50 Mbps. "
+        "The Pi-hole runs on the homelab server with a fallback to the router's DNS.")),
+    "pragmatic-notes": ("wiki", _wiki(
+        "Reading Notes: The Pragmatic Programmer", "Key takeaways from The Pragmatic Programmer.",
+        "books, reading-notes, software-craft",
+        "Notes on The Pragmatic Programmer, focusing on tracer bullets, the DRY principle and "
+        "orthogonality.",
+        "Tracer bullets: build a thin end-to-end slice first. DRY is about knowledge, not code text. "
+        "Orthogonal components reduce the blast radius of change. Keep a personal knowledge "
+        "portfolio and invest in it regularly.")),
+    "llm-eval-harness": ("wiki", _wiki(
+        "Local LLM Eval Harness", "A small harness for comparing local language models on my own tasks.",
+        "llm, evaluation, local-models, benchmarking",
+        "The eval harness runs a fixed set of 120 prompts from my own work against several local "
+        "models and scores the answers with a rubric.",
+        "Prompts cover summarizing, SQL generation and email rewriting. Each answer is scored by a "
+        "rubric model and spot-checked by hand. Results are stored per model and quantization in a "
+        "SQLite file for side-by-side comparison.")),
+    "budget-tracker": ("wiki", _wiki(
+        "Budget Tracker", "How the monthly household budget is tracked and reviewed.",
+        "finance, budget, spreadsheet, household",
+        "Household spending is exported from the bank monthly, categorized by a script and reviewed "
+        "in a spreadsheet against category budgets.",
+        "Categories include groceries, utilities, transport and fun money. The script tags 90% of "
+        "transactions automatically; the rest are tagged by hand. Surplus goes to the house fund.")),
+    "petg-printing": ("wiki", _wiki(
+        "PETG Print Settings", "Tuned slicer settings for printing PETG on the Prusa printer.",
+        "3d-printing, petg, prusa, slicer",
+        "PETG prints best on the Prusa at 240 °C nozzle and 85 °C bed, with cooling at 40% and "
+        "retraction reduced to 0.8 mm.",
+        "A textured PEI sheet avoids PETG bonding too strongly. The first layer is printed slower at "
+        "20 mm/s. Stringing was fixed by drying the filament for four hours at 65 °C.")),
+    "kitchen-remodel": ("wiki", _wiki(
+        "Kitchen Remodel", "Quotes, scope and timeline for the kitchen remodel.",
+        "home, remodel, kitchen, contractors",
+        "The kitchen remodel replaces cabinets and countertops and moves the sink to the island. "
+        "Three contractor quotes came in between $38k and $52k.",
+        "The chosen contractor starts in March with a six-week timeline. Quartz countertops were "
+        "picked over butcher block. The permit for moving the plumbing is pending.")),
+    # Raw versions of some topics: plain text, no front matter.
+    "homelab-backup-raw": ("raw",
+        "Backup notes. Every night at 2:30 the server runs restic and pushes to a Backblaze B2 "
+        "bucket. Keep 7 daily, 4 weekly, 12 monthly snapshots. Included: photos, Nextcloud data, DB "
+        "dumps. Excluded: media library. Once a month restore one random file and compare hashes."),
+    "route-optimizer-raw": ("raw",
+        "Route optimizer brain dump. Rust. Capacitated VRP: savings heuristic then 2-opt. Traffic "
+        "matrix cached, refresh every 15 min. 400 stops plans in about 1.8 s at p95. Next: time "
+        "windows for business customers."),
+    "home-network-raw": ("raw",
+        "Network: UniFi gateway and two APs. VLAN 10 trusted, VLAN 20 IoT, VLAN 30 guest. IoT blocked "
+        "from trusted. Guest capped at 50 Mbps. Pi-hole on the homelab box for DNS, router DNS as "
+        "fallback."),
+    "llm-eval-harness-raw": ("raw",
+        "Eval harness todo. 120 prompts from real work: summaries, SQL, email rewrites. Rubric model "
+        "scores each answer, I spot-check 10%. Store results by model and quant in SQLite. Compare "
+        "side by side before switching my default local model."),
+    "petg-printing-raw": ("raw",
+        "PETG on the Prusa: nozzle 240, bed 85, fan 40%, retraction 0.8 mm. Use the textured sheet. "
+        "First layer 20 mm/s. Dry the spool 4 h at 65 C if it strings."),
+    "kitchen-remodel-raw": ("raw",
+        "Kitchen quotes: 38k, 44k, 52k. Going with the 44k contractor, start March, six weeks. Quartz "
+        "tops. Sink moves to the island, plumbing permit still pending."),
+}
+
+# (query, keys of every document that answers it). Paraphrased.
+RAG_POSITIVES: list[tuple[str, tuple[str, ...]]] = [
+    ("How often does the homelab back up and where do the backups go?", ("homelab-backup", "homelab-backup-raw")),
+    ("Is the media library included in my offsite backups?", ("homelab-backup", "homelab-backup-raw")),
+    ("When does the garden alert fire for dry beds?", ("garden-sensors",)),
+    ("What hardware do the soil moisture probes report through?", ("garden-sensors",)),
+    ("Which algorithm does the delivery route planner use?", ("route-optimizer", "route-optimizer-raw")),
+    ("How fast does the route service plan 400 stops?", ("route-optimizer", "route-optimizer-raw")),
+    ("Where does the recipe app store its data?", ("recipe-app",)),
+    ("Can the recipe app scale ingredient amounts?", ("recipe-app",)),
+    ("How many nights are we spending in Kyoto?", ("japan-trip",)),
+    ("When do restaurant reservations open for the Japan trip?", ("japan-trip",)),
+    ("What's my goal pace for the half marathon tempo runs?", ("marathon-plan",)),
+    ("How long is the taper before race day?", ("marathon-plan",)),
+    ("How are the IoT devices separated on my network?", ("home-network", "home-network-raw")),
+    ("What's the guest Wi-Fi speed limit?", ("home-network", "home-network-raw")),
+    ("What did I note about tracer bullets?", ("pragmatic-notes",)),
+    ("What's my takeaway on DRY from that programming book?", ("pragmatic-notes",)),
+    ("How many prompts are in my model evaluation set?", ("llm-eval-harness", "llm-eval-harness-raw")),
+    ("How do I score answers when comparing local models?", ("llm-eval-harness", "llm-eval-harness-raw")),
+    ("How does the budget script categorize transactions?", ("budget-tracker",)),
+    ("Where does the monthly budget surplus go?", ("budget-tracker",)),
+    ("What nozzle temperature do I use for PETG?", ("petg-printing", "petg-printing-raw")),
+    ("How did I fix stringing on my prints?", ("petg-printing", "petg-printing-raw")),
+    ("Which contractor quote did we pick for the kitchen?", ("kitchen-remodel", "kitchen-remodel-raw")),
+    ("Is the plumbing permit for the kitchen approved yet?", ("kitchen-remodel", "kitchen-remodel-raw")),
+]
+
+RAG_NEGATIVES: list[str] = [
+    # general
+    "What is the capital of Canada?",
+    "Explain how photosynthesis works.",
+    "Write a haiku about winter.",
+    "Who painted the Mona Lisa?",
+    "What's the derivative of x cubed?",
+    "Translate 'thank you' into German.",
+    "How do vaccines work?",
+    "What year did the Berlin Wall fall?",
+    # near-topic: same domain as a document, different subject
+    "How do I back up my iPhone to iCloud?",
+    "What's the best soil pH for growing tomatoes?",
+    "Explain Dijkstra's shortest path algorithm.",
+    "How do I deploy a Next.js app to Vercel?",
+    "What's the weather like in Tokyo in April?",
+    "How many calories does a 10 km run burn?",
+    "What's the difference between WPA2 and WPA3?",
+    "Who wrote The Mythical Man-Month?",
+    "What does the MMLU benchmark measure?",
+    "How do credit scores work?",
+    "What's the difference between PLA and ABS filament?",
+    "How long does it take to tile a bathroom floor?",
+]

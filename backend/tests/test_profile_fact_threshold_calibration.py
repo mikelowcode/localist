@@ -147,7 +147,8 @@ class TestStorage:
         conn = sqlite3.connect(str(path))
         version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
         conn.close()
-        assert version == 20
+        from localist.memory_manager import _SCHEMA_VERSION
+        assert version == _SCHEMA_VERSION   # migrates through v20 to the latest
         assert mm.get_calibrated_thresholds("m") == {"lookup_request": 0.6, "episodic_recall_floor": 0.41}
         assert mm.get_calibration_version("m") is None   # stale: recalibrates when next active
         mm.set_calibrated_thresholds("m", {"profile_fact_threshold": 0.72})

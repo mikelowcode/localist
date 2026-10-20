@@ -39,6 +39,9 @@ export interface CalibrationResponse {
   // Profile-fact threshold (§3.6), same shape and same precedence.
   profile_threshold?: GateCalibrationResponse | null;
   profile_threshold_in_use?: number | null;
+  // Document RAG cutoff, same shape and precedence (2026-10-20).
+  rag_floor?: GateCalibrationResponse | null;
+  rag_floor_in_use?: number | null;
   // Per-gate trust tier in use (validated / auto-calibrated /
   // lexical-fallback / disabled; "keyword" for the two search gates). `gates` is what calibration measured; a
   // hand-validated gate overrides it.

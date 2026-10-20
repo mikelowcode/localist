@@ -2179,3 +2179,94 @@ On the packaged app that's nomic and oMLX EmbeddingGemma.
   battery. They held 0% off-topic false positives on real episodes; worth re-measuring as the
   episode bank grows.
 - EmbeddingGemma task prefixes (option C) are not built.
+
+### §16.30 — Memory check tightened, honest episodic chip, per-model document RAG cutoff (2026-10-20)
+
+Follows the search-intent work (§10.6). Each part was measured read-only first, on synthetic
+fixtures and then on the user's real data (personal data, kept out of the repo; only aggregates
+are recorded).
+
+**Part 1 — memory check and the "episodic" chip.** Report:
+`diagnostics/reports/memory_check_assessment_2026-10-20.md`.
+
+- **What the check does now.** Priority 5 (`_priority5_episodic`) no longer decides whether memory is
+  recalled: Step 5 recall runs on every turn (§4.3a). It only sets `fetch_episodic`, which drove the
+  chat's "◎ episodic" chip and makes a turn P5 instead of P6.
+- **Keyword list (built).** The substring list's generic words ("before", "wrong", "decided",
+  "previously", …) fired on 4 of the user's 32 real requests needing no memory, and on 4 of 14
+  held-out negatives. It is replaced by `_EPISODIC_RECALL_RE`: recall phrases matched on word
+  boundaries, plus "my <up to two words> preference / setup / workflow / …". This fires on none of
+  them and catches the same positives. Existing routing tests caught "what is my workflow
+  preference?" during the build, which led to the "my …" pattern.
+- **Embedding gate (unchanged).** Revised templates and a keyword-coverage gate both measured worse,
+  so the gate is unchanged. embeddinggemma-2's gate remains loose: 7 of 32 real requests.
+- **Chip (built).** A replay of 55 stored turns found the `fetch_episodic` chip shown once with no
+  relevant memory recalled, and silent on 34 turns where memory was injected.
+  - New `RoutingPlan.episodic_recalled`, set by `ControllerAgent` after Step 5, counts the
+    relevance-selected episodes (semantic hits, graph neighbours — not recency priming) that reached
+    the prompt.
+  - It goes into response metadata, and the chip now follows it. Older stored replies keep their
+    chip.
+- **Recall floor vs. near-topic questions (measured; not changed — user chose to accept).** Report:
+  `recall_floor_adjacent_assessment_2026-10-20.md`.
+  - On real tech-news traffic, about half the episodes clearing nomic's 0.55 floor were only loosely
+    related.
+  - With `RECALL_ADJACENT_NEGATIVES` (same domain as an episode, different subject), near-topic
+    questions score inside the right-episode range on every model. Floors don't move when
+    re-selected.
+  - On real data, memory is injected into 41–56% of typed requests needing none. The prominence gate
+    helps only nomic: news-button turns drop from 17 to 11 of 23.
+  - Injection is bounded (5 bullets, 150 tokens, relevance first) and is now visible through the
+    chip.
+
+**Part 2 — per-model document RAG cutoff.** Report: `rag_cutoff_assessment_2026-10-20.md`.
+
+- **What the cutoff controls.** One fixed 0.55 decided three things:
+  - Priority 4 Path B routing;
+  - Priority 3b's corpus-miss check;
+  - the controller's Slot 4 source filters (Step 4, Step 3b fallback, Step 4b graph assist).
+- **Measurement.** The synthetic `RAG_*` battery has 12 wiki pages with OKF front matter plus 6 raw
+  copies, 24 positives, and 20 general and near-topic negatives. It was indexed into a temporary
+  `MemoryManager` and queried through the real `query_corpus()`, then checked on the user's 14 real
+  documents.
+  - nomic: 0.55 is right (calibration lands at 0.56–0.57).
+  - EmbeddingGemma 300M scores low: at 0.55 it kept half the right documents on real questions.
+  - embeddinggemma-2 scores high: at 0.55 every question, off-topic included, got documents and a RAG
+    route.
+- **Built — thresholds and calibration.**
+  - `planner._RAG_SOURCE_FLOORS` (hand-validated: `nomic-embed-text:latest` 0.55, by user decision)
+    and `resolve_rag_floor()`: hand-validated, then calibrated, then `_CORPUS_SCORE_THRESHOLD` (0.55).
+  - `threshold_calibration.calibrate_rag_floor()` measures through the real code path, as above. It
+    is persisted as `embedding_model_thresholds.rag_source_floor` (schema v21).
+  - `CALIBRATION_VERSION` is 3.
+- **Built — wiring and UI.**
+  - The Planner resolves the cutoff in `__init__` (`_rag_floor`) for both Path B and Priority 3b.
+  - `ControllerAgent._rag_floor` serves the three source filters.
+  - `CalibrationResponse` gains `rag_floor` / `rag_floor_in_use`, and Settings shows "Document
+    cutoff 0.xx".
+- **Shipped values (whole-battery calibration):** embeddinggemma 0.40, embeddinggemma-2 0.72.
+  - On real documents, both keep every right document with 0% general off-topic. 22% of news-button
+    turns draw documents, against 17% and 4% at the Phase 2A calibration-split values. The single
+    procedure is kept over per-model tuning.
+  - Live in a sandbox, under embeddinggemma-2: a Localist question routed to RAG (0.869 ≥ 0.72), and
+    "How does photosynthesis work?" got no documents.
+
+**Tests.**
+
+- `test_memory_check.py` (31): the phrase match, and `episodic_recalled` counting.
+- `test_rag_floor_calibration.py` (17): precedence; calibration on perfect, inseparable and failing
+  768-dimension embedders; storage; v20→v21 migration; Planner P4 / P3b and controller filters
+  using the floor; the response.
+- Migration and column tests updated for v21.
+- Full suite 1808 passed; `npm run check` clean.
+
+**Upgrade effect.** Every model recalibrates once on its next activation (`CALIBRATION_VERSION` 3).
+
+**Open items.**
+
+- **Duplicate document rows.** A source checkout and the packaged app share one database, and each
+  backend root indexes its own copy of every file, so duplicates can take RAG slots. The live check
+  returned three copies of one page.
+- **embeddinggemma-2's episodic gate stays loose** (7 / 32 real false alarms).
+- **`EpisodicMemoryReader.best_match()`** (retraction matching) still uses a fixed 0.55, with the same
+  cross-model risk.

@@ -149,7 +149,8 @@
       .map(([name, g]) => `${GATE_ABBREV[name] ?? name}=${g.threshold!.toFixed(2)}`);
     const recall =
       formatMeasuredThreshold('Memory recall floor', calibration.recall_floor_in_use, calibration.recall_floor) +
-      formatMeasuredThreshold('Profile threshold', calibration.profile_threshold_in_use, calibration.profile_threshold);
+      formatMeasuredThreshold('Profile threshold', calibration.profile_threshold_in_use, calibration.profile_threshold) +
+      formatMeasuredThreshold('Document cutoff', calibration.rag_floor_in_use, calibration.rag_floor);
     const handPicked = validated.length ? ` Hand-validated: ${validated.join(', ')}.` : '';
     if (clean.length) {
       return ` Recalibrated semantic gating for ${calibration.model} (${clean.join(', ')}).${handPicked}${recall}`;
