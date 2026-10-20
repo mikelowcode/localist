@@ -449,8 +449,17 @@
                     {#if p.file_op_deferred && !(p.tools_fired && p.tools_fired.includes('file_op'))}
                       <span class="prov-chip prov-tool">⚙ file_op</span>
                     {/if}
-                    {#if p.fetch_episodic}
-                      <span class="prov-chip prov-episodic-mem">◎ episodic</span>
+                    <!-- Shown when recall actually put a relevant memory in the
+                         prompt (episodic_recalled), not when the Planner's
+                         memory check fired. Replies stored before that field
+                         existed keep their original fetch_episodic chip. -->
+                    {#if p.episodic_recalled !== undefined ? p.episodic_recalled > 0 : p.fetch_episodic}
+                      <span
+                        class="prov-chip prov-episodic-mem"
+                        title={p.episodic_recalled !== undefined
+                          ? `${p.episodic_recalled} relevant ${p.episodic_recalled === 1 ? 'memory' : 'memories'} used`
+                          : undefined}
+                      >◎ episodic</span>
                     {/if}
                     {#if p.grounded}
                       <span class="prov-chip prov-grounded">◈ grounded</span>

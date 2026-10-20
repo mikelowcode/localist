@@ -78,7 +78,11 @@ class RoutingPlan:
     agent :
         "wiki_agent" | "conversational_agent"
     fetch_episodic :
-        True → retrieve from episodes table and inject into slot 4.
+        True when the instruction reads as needing the user's stored memory
+        (Priority 5). Routing only: Step 5 recall runs on every
+        conversational turn regardless (04-planner-routing-model.md §4.3a),
+        so this does not decide whether memories reach the prompt — see
+        episodic_recalled.
     fetch_rag :
         True → query_corpus() before responding; results populate slot 5.
     tools_to_call :
@@ -158,8 +162,13 @@ class RoutingPlan:
     file_op_action:   str | None = None
     diff_target:      str | None = None
     diff_target_source: str | None = None
-
-
+    # Set by ControllerAgent after Step 5 recall, not by the Planner: how
+    # many relevance-selected episodes (semantic hits or graph neighbours,
+    # not recency priming) reached the prompt. Drives the chat's "episodic"
+    # provenance chip, which used to follow fetch_episodic and so stayed
+    # silent on most turns that really did use memory (memory_check_
+    # assessment_2026-10-20.md).
+    episodic_recalled: int = 0
 # ---------------------------------------------------------------------------
 # Keyword sets  (§4.2)
 # ---------------------------------------------------------------------------
@@ -737,6 +746,34 @@ _CORPUS_SCORE_THRESHOLD: float = 0.55
 # model. Small-N, not a large formal corpus — ship to observe, revisit if
 # live behavior disagrees, same posture already used for
 # explicit_search_action's threshold history above.
+# Priority 5's deterministic signal: phrases that refer to what the user
+# told the assistant or to the user's own stored context, matched on word
+# boundaries. Replaced a substring-matched list (2026-10-20) whose generic
+# words — "before", "wrong", "decided", "previously", "what do you know",
+# "preference", "workflow", "correction" — fired on requests needing no
+# memory ("what's wrong with this regex", "what happened before the french
+# revolution"): 4 of 32 real typed requests and 4 of 14 held-out negatives,
+# against 0 and 0 for this list, with the same positives caught
+# (diagnostics/reports/memory_check_assessment_2026-10-20.md).
+_EPISODIC_RECALL_PHRASES: tuple[str, ...] = (
+    "do you remember", "you remember", "what do you know about me", "you know about me",
+    "what did i tell you", "what have i told you", "did i tell you", "did i mention",
+    "i told you", "as i mentioned", "remind me what", "who am i", "my name",
+    "my project", "my setup", "my environment", "my preference", "my preferences",
+    "my usual", "last time we", "we discussed", "we decided", "we talked about",
+    "we planned", "what we decided",
+)
+# "my <up to two words> <context noun>" — "my formatting preferences",
+# "my dev setup" — which the fixed phrases above would miss (existing routing
+# tests caught "what is my workflow preference?" during the 2026-10-20 build).
+_EPISODIC_CONTEXT_NOUNS: tuple[str, ...] = (
+    "preference", "preferences", "workflow", "workflows", "setup", "environment", "usual",
+)
+_EPISODIC_RECALL_RE: re.Pattern[str] = re.compile(
+    r"\b(" + "|".join(re.escape(p) for p in _EPISODIC_RECALL_PHRASES) + r")\b"
+    r"|\b(my(?: [a-z0-9'-]+){0,2} (?:" + "|".join(_EPISODIC_CONTEXT_NOUNS) + r"))\b"
+)
+
 _EPISODIC_RELEVANCE_TEMPLATES: tuple[str, ...] = (
     "help me prepare for my upcoming event",
     "what do I have coming up on my calendar",
@@ -3026,7 +3063,8 @@ class Planner:
         Priority 5 — Episodic relevance (§4.2, §4.3).
 
         Two independent signals, either sufficient:
-          1. Deterministic keyword check (_EPISODIC_KEYWORDS) — replaced an
+          1. Deterministic phrase check (_EPISODIC_RECALL_PHRASES, word
+             boundaries; tightened 2026-10-20) — replaced an
              inference call for Gemma 4B compatibility (the model requires
              max_tokens=300 to produce binary classifier output, making
              inference-based routing too expensive for a per-turn call).
@@ -3053,25 +3091,10 @@ class Planner:
                 "does not skip evaluation — see __init__ comment)."
             )
 
-        # Deterministic keyword check
-        _EPISODIC_KEYWORDS: frozenset[str] = frozenset({
-            "preference", "preferences", "remember", "remembered",
-            "you know about me", "what do you know",
-            "decision", "decisions", "decided",
-            "correction", "corrections", "wrong",
-            "workflow", "workflows",
-            "last time", "previously", "before",
-            "my project", "my setup", "my environment",
-            # Personal reference signals (unambiguous — always fetch episodic)
-            "my name", "do you remember", "who am i",
-            "what do you know about me", "my preference",
-            "what did i tell you", "what have i told you",
-        })
-
+        # Deterministic phrase check (word boundaries — see _EPISODIC_RECALL_PHRASES)
         lowered = instruction.lower()
-        matched = next(
-            (kw for kw in _EPISODIC_KEYWORDS if kw in lowered), None
-        )
+        found = _EPISODIC_RECALL_RE.search(lowered)
+        matched = found.group(0) if found else None
 
         if matched:
             logger.debug(

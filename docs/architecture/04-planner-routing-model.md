@@ -153,9 +153,14 @@ Priority 5 fires on either of two independent signals — a deterministic
 keyword check, or (2026-07-23) a semantic cosine-similarity gate. Neither
 makes an inference call.
 
-**Signal 1 — keyword check.** Scan the lowercased instruction for membership
-in `_EPISODIC_KEYWORDS` (defined in `planner.py`). Returns
-`fetch_episodic=True` on first match.
+> **Updated 2026-10-20.** Signal 1 is now a word-boundary phrase match, and
+> `fetch_episodic` no longer drives the chat's "episodic" chip. Both changes are
+> described after the caching rule below.
+
+**Signal 1 — keyword check.** Scan the lowercased instruction for
+`_EPISODIC_RECALL_RE` (`planner.py`). Returns `fetch_episodic=True` on the
+first match. It replaces the original substring-matched `_EPISODIC_KEYWORDS`;
+see "Tightened phrase check" below.
 
 **Signal 2 — semantic gate (added 2026-07-23).** Live bug: "Help me prepare
 for the upcoming Claude Impact Lab on August 6th." matched no keyword, so
@@ -191,6 +196,41 @@ this session, "all subsequent turns return `fetch_episodic=True` without
 never done that since Priority 5 moved off inference to the deterministic
 keyword check; it's now vestigial except as a log-suppression signal. Every
 turn always evaluates both signals above.
+
+**Tightened phrase check (2026-10-20).**
+
+- **Why.** The original `_EPISODIC_KEYWORDS` matched substrings and included
+  generic words — "before", "wrong", "decided", "previously", "what do you know",
+  "preference", "workflow", "correction". It fired on requests needing no
+  memory ("what's wrong with this regex", "what happened before the french
+  revolution"): 4 of the user's 32 real typed requests and 4 of 14 held-out
+  negatives (`diagnostics/reports/memory_check_assessment_2026-10-20.md`).
+- **What replaced it.** `_EPISODIC_RECALL_RE` matches, on word boundaries:
+  - `_EPISODIC_RECALL_PHRASES`, phrases that refer to what the user told the
+    assistant or to the user's own context ("do you remember", "what did i tell
+    you", "we decided", "my setup", …);
+  - "my" followed by up to two words and a context noun
+    (`_EPISODIC_CONTEXT_NOUNS`: "my formatting preferences", "my dev setup").
+- **Results.** It catches the same held-out positives with 0 false alarms on
+  the 44-phrase battery's negatives and on the 32 real requests.
+- **The semantic gate (Signal 2) is unchanged.** Revised templates and a keyword-coverage gate were measured
+  and both raised real false alarms. Its false alarms on `embeddinggemma-2`
+  (7 of 32 real requests at its calibrated 0.74) remain.
+
+**What `fetch_episodic` controls now.** Since §4.3a, recall runs on every
+conversational turn whatever Priority 5 decides, so `fetch_episodic` only
+routes: it makes the turn P5 rather than P6, which pre-empts the optional P6
+tool-fallback classifier (§15), and it is reported in metadata.
+
+- **The chat's "◎ episodic" chip** now follows `RoutingPlan.episodic_recalled`,
+  set by `ControllerAgent` after Step 5. It counts the relevance-selected
+  episodes (semantic hits and graph neighbours, not recency priming) that
+  reached the prompt.
+- **Why the chip moved.** Replaying the user's 55 stored turns found the old
+  `fetch_episodic` chip shown once with no relevant memory recalled, and
+  silent on 34 turns where memory was injected.
+- **Older replies.** Replies stored before the field existed keep their original
+  chip.
 
 **Why inference was removed:** Gemma 4B (`gemma-4-e4b-it-4bit`) requires
 `max_tokens ≥ 300` to produce reliable output on binary classification

@@ -35,6 +35,9 @@ export interface Task {
     priority?:         number;
     fetch_rag?:        boolean;
     fetch_episodic?:   boolean;
+    // Relevance-selected memories that reached the prompt (2026-10-20);
+    // absent on replies stored before then.
+    episodic_recalled?: number;
     tools_fired?:      string[];
     agent?:            string;
     grounded?:         boolean;

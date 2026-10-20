@@ -1814,12 +1814,18 @@ class ControllerAgent:
                     # Episodes matched to this instruction (semantic hits,
                     # then graph neighbours) rank ahead of recency priming,
                     # after corrections — see select_top_episodes(relevant=).
+                    relevant_ids = {r.id for r in similar + graph_records}
                     for record in select_top_episodes(records, relevant=similar + graph_records):
                         episodic_bullets.append(EpisodeBullet(
                             content      = record.content,
                             episode_type = record.episode_type,
                             confidence   = record.confidence,
                         ))
+                        # Relevance-selected episodes that reached the
+                        # prompt (not recency priming) — what the chat's
+                        # "episodic" chip reports (RoutingPlan.episodic_recalled).
+                        if record.id in relevant_ids:
+                            plan.episodic_recalled += 1
                     self._planner.mark_episodic_injected()
                     logger.info(
                         "_execute_plan: episodic retrieval complete — "
@@ -2334,6 +2340,7 @@ class ControllerAgent:
             "priority":           plan.priority,
             "fetch_rag":          plan.fetch_rag,
             "fetch_episodic":     plan.fetch_episodic,
+            "episodic_recalled":  plan.episodic_recalled,
             "tools_fired":        plan.tools_to_call,
             "tool_signal_source": plan.tool_signal_source,
             "grounded":           r.output.get("grounded", False),
@@ -2465,6 +2472,7 @@ class ControllerAgent:
                 "priority":       plan.priority,
                 "fetch_rag":      plan.fetch_rag,
                 "fetch_episodic": plan.fetch_episodic,
+                "episodic_recalled": plan.episodic_recalled,
                 "tools_fired":    plan.tools_to_call,
                 "pending_diffs":  pending_diffs,
             },

@@ -548,3 +548,69 @@ def heldout_split(items: list) -> tuple[list, list]:
     """(calibration, held_out) — every third item (index % 3 == 2) held out."""
     return ([x for i, x in enumerate(items) if i % 3 != 2],
             [x for i, x in enumerate(items) if i % 3 == 2])
+
+
+# ---------------------------------------------------------------------------
+# episodic_relevance hard negatives v3 (2026-10-20, memory-check plan Phase
+# 1A). Requests that need no stored memory but contain the generic words the
+# deterministic _EPISODIC_KEYWORDS list matches as substrings ("before",
+# "wrong", "decided", "previously", "what do you know", "preference",
+# "workflow", "correction"), plus first-person statements and general
+# questions. Written before any scoring; data only until a later phase wires
+# it in.
+# ---------------------------------------------------------------------------
+
+EP_HARD_NEGATIVES_V3: list[str] = [
+    "what's wrong with this regex",
+    "what happened before the french revolution",
+    "what do you know about black holes",
+    "i decided to learn rust, where should i start",
+    "is it wrong to use tabs in python",
+    "how were vaccines tested previously",
+    "what's the css property for user preference of dark mode",
+    "explain a typical git workflow for small teams",
+    "how do i submit a correction to a wikipedia article",
+    "summarize the decision in brown v. board of education",
+    "explain what a cache does before a request hits the server",
+    "i bought a new keyboard yesterday",
+    "my code throws a null pointer exception, what does that mean",
+    "can you make my email sound more professional",
+    "write a birthday message for my sister",
+    "what's a good name for my new cat",
+]
+
+
+# ---------------------------------------------------------------------------
+# Episodic recall floor — adjacent off-topic queries (2026-10-20). RECALL_
+# NEGATIVES are general knowledge, far from every RECALL_EPISODES topic; real
+# traffic (tech news, products) sits much closer to a user's own episodes and
+# drew loosely related memories past nomic's 0.55 floor
+# (diagnostics/reports/memory_check_assessment_2026-10-20.md). Each query here
+# is in the same domain as a RECALL_EPISODES entry but about a different
+# thing than the episode, so the user's fact is not relevant to it: the
+# PlayStation owner asked about Xbox titles, the Pixel 8 owner about an
+# iPhone camera. Written before any scoring; data only.
+# ---------------------------------------------------------------------------
+
+RECALL_ADJACENT_NEGATIVES: list[str] = [
+    "Tell me more about this news story: Xbox Game Pass adds five day-one titles this month",
+    "Is the new Mario Kart worth buying?",
+    "Tell me more about this news story: Dell refreshes the XPS 15 with new Intel chips",
+    "How do I install Windows 11 on an older PC?",
+    "Tell me more about this Hacker News story: Perplexity raises a new funding round",
+    "Summarize this news story: The Guardian changes its paywall strategy",
+    "Tell me more about this Hacker News story: vLLM adds speculative decoding",
+    "What is retrieval-augmented generation?",
+    "How do I configure keybindings in VS Code?",
+    "What's new in Rust 1.85?",
+    "How do I squash commits in git?",
+    "How do I write a unit test in Jest?",
+    "Tell me more about this news story: coffee futures hit a ten-year high",
+    "What's a good recipe for beef stew?",
+    "Tell me more about this news story: a study links cycling to lower blood pressure",
+    "What's the population of Seattle?",
+    "Tell me more about this news story: Apple improves the iPhone 17 camera",
+    "Tell me more about this Hacker News story: Postgres 18 improves vacuum performance",
+    "Tell me more about this news story: Vercel changes its hobby plan limits",
+    "Tell me more about this news story: Italy sets a new tourism record",
+]
