@@ -40,7 +40,7 @@ export interface CalibrationResponse {
   profile_threshold?: GateCalibrationResponse | null;
   profile_threshold_in_use?: number | null;
   // Per-gate trust tier in use (validated / auto-calibrated /
-  // lexical-fallback / disabled). `gates` is what calibration measured; a
+  // lexical-fallback / disabled; "keyword" for the two search gates). `gates` is what calibration measured; a
   // hand-validated gate overrides it.
   gate_tiers?: Record<string, string> | null;
 }

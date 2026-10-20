@@ -1,5 +1,10 @@
 ## 10. Semantic Search-Intent Classifier
 
+> **Superseded for the two search gates, 2026-10-20 (§10.6).** `explicit_search_action` and
+> `lookup_request` are no longer embedding-scored for any model. They now use a keyword-coverage
+> score that is the same for every embedding model and for keyword-only. The embedding classifier
+> below still scores `research_intent`; §10.1–§10.5 are kept as the record of the original design.
+
 ### 10.1 Scope
 
 Before this change, `_priority3_tool()` in `planner.py` triggered `web_search` only when the
@@ -484,3 +489,99 @@ Fix 1's net of +5 reflects 7 new tests in `TestPriority3SemanticGating` minus 2 
 from its predecessor class `TestPriority3ToolUnaffectedBySemantic`, whose premise — "semantic
 signal never affects routing" — became false after that slot.
 
+### 10.6 Keyword-coverage search detection replaces the embedding search gates (2026-10-20)
+
+**Why.** Measured in two read-only phases; full data in the reports.
+
+- **Phase A** (`diagnostics/reports/search_intent_baseline_2026-10-20.md`):
+  - The calibration battery could not measure either search gate: it had three near-duplicate
+    "Can you look up …" positives, which the explicit-search gate borrowed.
+  - The templates were polite questions, while real searches are short commands ("look up
+    <topic>", "search github for <thing>", "research <topic>"). "Look at this image" outscored
+    every real lookup.
+  - Calibration embedded text as written, but production scores the lowercased request.
+  - The BM25 fallback was length-biased: long pasted messages fired a search.
+  - On the user's 32 typed requests (6 should search), the outcomes were:
+
+    | Setup | Searches caught | False alarms |
+    |---|---|---|
+    | nomic's hand-validated values | 1 | 1 |
+    | the BM25 fallback (both EmbeddingGemma models) | 5 | 12 |
+
+- **Phase B** (`diagnostics/reports/search_intent_v2_assessment_2026-10-20.md`):
+  - A rebuilt battery (`threshold_calibration_fixtures.*_V2`) has its own explicit-search
+    positives, short-command lookups, and hard negatives: attached files, opinions, follow-ups,
+    local lookups, and long pastes.
+  - It uses a fixed held-out split (`heldout_split()`).
+  - On this battery, no embedding model's search gates calibrated cleanly, with old or revised
+    templates, raw or lowercased.
+  - nomic's hand-validated values caught 15% of held-out searches with 18% false alarms.
+  - A content-word coverage score with revised templates did far better, and identically for every
+    model.
+
+**What changed.**
+
+- **Tier.** `planner._KEYWORD_SCORED_GATES` (`explicit_search_action`, `lookup_request`) always
+  resolve to the tier `"keyword"` in `resolve_gate_tiers()`.
+  - No hand-validated or calibrated cosine value applies to them, including values persisted
+    before this change.
+  - nomic's hand-validated 0.68 and 0.62 are retired.
+- **Templates.** Both gates' templates were replaced: lowercase, subject-free, no "look at"
+  wording, plus "research this topic" forms.
+- **Score** (`planner._keyword_coverage()`).
+  - The basis is the best share, over a gate's templates, of the template's content words
+    (`_KEYWORD_STOPWORDS` removed) present in the request.
+  - A template counts only when at least two of its content words match. A one-word template
+    such as "google this" counts only when that word is the request's first word.
+  - A request starting with a search verb (`_KEYWORD_LEAD_VERBS`: search, google, research)
+    scores 0.5 even without a template match.
+  - The result is multiplied by min(1, 12 / request tokens).
+- **Thresholds.** `_KEYWORD_COVERAGE_THRESHOLDS` are 0.5 and 0.5, chosen by Youden's J on the
+  calibration part of the v2 search battery (`threshold_calibration.calibrate_lexical_thresholds()`).
+  They are model-independent and offline, like the BM25 tier.
+- **Negative filters.** A negative-filter phrase still suppresses the keyword path outright, with
+  no tie-break.
+- **Calibration** (`CALIBRATION_VERSION` 2).
+  - `calibrate_thresholds()` measures only `research_intent` and `episodic_relevance`.
+  - It lowercases battery phrases before embedding, as production scores the request.
+  - Every model recalibrates once on its next activation.
+  - `research_intent` and `episodic_relevance` keep their templates and batteries. The episodic
+    gate is loose on every model and is a separate, unscheduled study. Battery v2's episodic
+    additions made it worse, so they are not used.
+- **Settings.** The trust badge ranks `"keyword"` with hand-validated, labelled "keyword-scored",
+  so the search gates never pull the badge down.
+
+**Single-word matching was rejected during the build.** With one matching content word enough, the
+project's existing routing tests showed generic words firing a search:
+
+- "check the wiki for …";
+- "are you made by google";
+- "i searched online for …";
+- "read the file about that github project".
+
+The two-word rule removed all six such false alarms. Measured through `Planner.route()`, it caught
+one fewer real search than single-word matching.
+
+**Results, shipped configuration, through `Planner.route()`:**
+
+| Check | Caught | False alarms |
+|---|---|---|
+| Held-out searches | 11 / 13 | 1 / 17 |
+| The user's real requests | 4 / 6 | 0 / 26 |
+| Existing routing-test phrases | 6 / 7 | 3 / 24 (all labelling artifacts of the harvest) |
+
+- Identical with nomic and with no embedding model.
+- The original §10.1 incident ("Go ahead and look it up.") still routes to `web_search`.
+- **Known misses:**
+  - long requests where the search ask is buried mid-paragraph (the length factor);
+  - "what can you tell me about <specific thing>" questions, whose words don't overlap the
+    templates.
+  - Rephrasing as a command ("search the web for …", "look up …") catches both.
+
+**Tests.** Planner, calibration, `/health` and model-switch tests were updated for the
+keyword tier, the retired nomic values, the new templates, and two-gate calibration.
+`test_calibrated_search_gate_values_are_ignored` is new. The three negative-filter
+tie-break tests now create their conflict through `research_intent`, with the research loop on.
+Full suite 1760 passed; `npm run check` clean. Verified live in a sandbox: a version-1 nomic row
+recalibrated once at startup (2 / 2 gates); `/health` reports `keyword` / `keyword` / `validated` /
+`validated`.

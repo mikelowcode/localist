@@ -372,15 +372,19 @@
   // the badge is correct on page load too. A model can be "validated" for
   // one gate and "disabled" for another (per-gate resolution, never a
   // single all-or-nothing verdict) — the badge shows the WORST tier across
-  // all four gates, with a tooltip listing the per-gate breakdown.
+  // all four gates, with a tooltip listing the per-gate breakdown. The two
+  // search gates are "keyword": keyword-coverage scored for every model by
+  // design (2026-10-20), so they rank with hand-validated and never pull the
+  // badge down.
   const GATE_TIER_RANK: Record<string, number> = {
-    disabled: 0, 'lexical-fallback': 1, 'auto-calibrated': 2, validated: 3, tuned: 4
+    disabled: 0, 'lexical-fallback': 1, 'auto-calibrated': 2, validated: 3, keyword: 3, tuned: 4
   };
   const GATE_TIER_LABEL: Record<string, string> = {
     tuned: 'hand-validated',
     validated: 'hand-validated',
     'auto-calibrated': 'auto-calibrated',
     'lexical-fallback': 'keyword fallback',
+    keyword: 'keyword-scored',
     disabled: 'gating disabled'
   };
   const GATE_TIER_BADGE_CLASS: Record<string, string> = {
@@ -388,6 +392,7 @@
     validated: 'badge-success',
     'auto-calibrated': 'badge-warning',
     'lexical-fallback': 'badge-accent',
+    keyword: 'badge-success',
     disabled: 'badge-muted'
   };
 

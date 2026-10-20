@@ -53,12 +53,20 @@ def main() -> None:
         print(f"  positive_count   = {gate.positive_count}")
         print(f"  negative_count   = {gate.negative_count}")
 
-    print("\n" + "=" * 60)
-    print("Paste into planner.py's _LEXICAL_FALLBACK_THRESHOLDS:\n")
-    print("_LEXICAL_FALLBACK_THRESHOLDS: dict[str, float] = {")
-    for name, threshold in result.thresholds.items():
-        print(f"    {name!r}: {threshold!r},")
-    print("}")
+    # Since 2026-10-20 the two search gates are keyword-coverage scored
+    # (planner._KEYWORD_SCORED_GATES) and live in their own table.
+    from localist.planner import _KEYWORD_SCORED_GATES
+
+    for table, names in (
+        ("_LEXICAL_FALLBACK_THRESHOLDS", [n for n in result.thresholds if n not in _KEYWORD_SCORED_GATES]),
+        ("_KEYWORD_COVERAGE_THRESHOLDS", [n for n in result.thresholds if n in _KEYWORD_SCORED_GATES]),
+    ):
+        print("\n" + "=" * 60)
+        print(f"Paste into planner.py's {table}:\n")
+        print(f"{table}: dict[str, float] = {{")
+        for name in names:
+            print(f"    {name!r}: {result.thresholds[name]!r},")
+        print("}")
 
     missing = set(result.gates) - set(result.thresholds)
     if missing:

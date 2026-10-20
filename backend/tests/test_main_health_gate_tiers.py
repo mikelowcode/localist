@@ -56,7 +56,8 @@ class TestHealthGateTiers:
         assert resp.status_code == 200
         body = resp.json()
         assert body["active_embedding_model_name"] is None
-        assert body["gate_tiers"] == {name: "lexical-fallback" for name in _GATE_NAMES}
+        # Search gates are keyword-scored for every model (2026-10-20).
+        assert body["gate_tiers"] == {"explicit_search_action": "keyword", "lookup_request": "keyword", "research_intent": "lexical-fallback", "episodic_relevance": "lexical-fallback"}
 
     def test_validated_model_reports_validated_tiers(self, client):
         main._state.active_embedding_model_name = "nomic-embed-text:latest"
@@ -64,7 +65,7 @@ class TestHealthGateTiers:
         resp = client.get("/health")
 
         assert resp.status_code == 200
-        assert resp.json()["gate_tiers"] == {name: "validated" for name in _GATE_NAMES}
+        assert resp.json()["gate_tiers"] == {"explicit_search_action": "keyword", "lookup_request": "keyword", "research_intent": "validated", "episodic_relevance": "validated"}
 
     def test_calibrated_model_reports_mixed_tiers_from_persisted_row(self, client):
         main._state.memory_manager.set_calibrated_thresholds(
@@ -76,13 +77,15 @@ class TestHealthGateTiers:
 
         assert resp.status_code == 200
         gate_tiers = resp.json()["gate_tiers"]
-        assert gate_tiers["lookup_request"] == "auto-calibrated"
+        # A persisted lookup_request value (pre-2026-10-20 row) is ignored:
+        # the search gates are keyword-scored for every model.
+        assert gate_tiers["lookup_request"] == "keyword"
         assert gate_tiers["research_intent"] == "auto-calibrated"
         # Not "disabled" -- PLAN_semantic_gating_calibration.md §9's
         # model-independent lexical/BM25 fallback tier covers every gate,
         # so a gate with neither a validated nor a persisted calibration
         # entry still gets real signal.
-        assert gate_tiers["explicit_search_action"] == "lexical-fallback"
+        assert gate_tiers["explicit_search_action"] == "keyword"
         assert gate_tiers["episodic_relevance"] == "lexical-fallback"
 
     def test_never_calibrated_unvalidated_model_reports_all_lexical_fallback(self, client):
@@ -91,7 +94,7 @@ class TestHealthGateTiers:
         resp = client.get("/health")
 
         assert resp.status_code == 200
-        assert resp.json()["gate_tiers"] == {name: "lexical-fallback" for name in _GATE_NAMES}
+        assert resp.json()["gate_tiers"] == {"explicit_search_action": "keyword", "lookup_request": "keyword", "research_intent": "lexical-fallback", "episodic_relevance": "lexical-fallback"}
 
 
 class TestHealthChatModel:

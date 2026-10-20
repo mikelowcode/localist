@@ -1447,7 +1447,7 @@ class TestSemanticSearchIntent:
         embed_fn.assert_called_once()                  # now called, unlike pre-redesign
         runtime.infer.assert_not_called()               # but no conflict -> no model call
 
-    def test_negative_filter_conflict_confirmed_by_tiebreak_returns_none(self):
+    def test_negative_filter_conflict_confirmed_by_tiebreak_returns_none(self, monkeypatch):
         """
         A filter phrase matches AND the score clears a gated threshold (a
         genuine conflict) — the tie-break model call fires. When it
@@ -1457,6 +1457,10 @@ class TestSemanticSearchIntent:
         """
         fixed_vec = _unit_vector(4)
         embed_fn = MagicMock(return_value=fixed_vec)    # same vector everywhere -> cosine 1.0
+        # Search gates are keyword-scored (2026-10-20); research_intent is the
+        # cosine-gated group a filter phrase can conflict with, and only while
+        # the research loop is on.
+        monkeypatch.setenv("LOCALIST_RESEARCH_LOOP_ENABLED", "true")
         runtime = make_runtime()                         # infer() returns "no" by default
         p = Planner(runtime=runtime, embed_fn=embed_fn, embedding_model_name="nomic-embed-text:latest")
 
@@ -1464,7 +1468,7 @@ class TestSemanticSearchIntent:
         assert result is None
         runtime.infer.assert_called_once()
 
-    def test_negative_filter_conflict_overridden_by_tiebreak_returns_result(self):
+    def test_negative_filter_conflict_overridden_by_tiebreak_returns_result(self, monkeypatch):
         """
         Same genuine-conflict setup as above, but the tie-break answers
         "lookup" — the filter is overridden and the real (best_group,
@@ -1472,6 +1476,10 @@ class TestSemanticSearchIntent:
         """
         fixed_vec = _unit_vector(4)
         embed_fn = MagicMock(return_value=fixed_vec)
+        # Search gates are keyword-scored (2026-10-20); research_intent is the
+        # cosine-gated group a filter phrase can conflict with, and only while
+        # the research loop is on.
+        monkeypatch.setenv("LOCALIST_RESEARCH_LOOP_ENABLED", "true")
         runtime = make_runtime(infer_return="lookup")
         p = Planner(runtime=runtime, embed_fn=embed_fn, embedding_model_name="nomic-embed-text:latest")
 
@@ -1663,7 +1671,12 @@ class TestNoneModelNameFallsToLexical:
         with caplog.at_level(logging.WARNING, logger="localist.planner"):
             p = Planner(runtime=make_runtime(), embed_fn=embed_fn, embedding_model_name=None)
 
-        assert all(tier == "lexical-fallback" for tier in p._gate_tier.values())
+        # Search gates are keyword-coverage scored for every model (2026-10-20);
+        # the other two fall to the BM25 lexical tier.
+        assert p._gate_tier == {
+            "explicit_search_action": "keyword", "lookup_request": "keyword",
+            "research_intent": "lexical-fallback", "episodic_relevance": "lexical-fallback",
+        }
         assert caplog.text == ""
 
         # Cosine-specific scoring correctly finds nothing to score against.
@@ -1688,8 +1701,10 @@ class TestValidatedModelThresholds:
     def test_validated_model_does_not_disable_gating(self, caplog):
         with caplog.at_level(logging.INFO, logger="localist.planner"):
             p = self._matching_vec_planner(embedding_model_name="nomic-embed-text:latest")
-
-        assert all(tier == "validated" for tier in p._gate_tier.values())
+        assert p._gate_tier == {
+            "explicit_search_action": "keyword", "lookup_request": "keyword",
+            "research_intent": "validated", "episodic_relevance": "validated",
+        }
         assert "per-gate threshold resolution" in caplog.text
         assert "nomic-embed-text:latest" in caplog.text
 
@@ -1699,33 +1714,32 @@ class TestValidatedModelThresholds:
         p = self._matching_vec_planner(embedding_model_name="nomic-embed-text:latest")
         validated = _VALIDATED_MODEL_THRESHOLDS["nomic-embed-text:latest"]
 
-        assert p._semantic_gate_thresholds == {
-            "explicit_search_action": validated["explicit_search_action"],
-            "lookup_request":         validated["lookup_request"],
-        }
+        # nomic's search-gate values were retired 2026-10-20: those gates are
+        # keyword-scored, so no cosine search threshold is set.
+        assert p._semantic_gate_thresholds == {}
         assert p._research_intent_threshold == validated["research_intent"]
         assert p._episodic_relevance_threshold == validated["episodic_relevance"]
 
     def test_validated_model_still_gates_via_its_own_threshold(self):
-        # A score that clears the tuned model's lookup_request threshold
-        # (0.60) but not nomic-embed-text:latest's validated one (0.62)
-        # must NOT fire under the validated model — proving the instance
-        # actually reads _semantic_gate_thresholds at scoring time, not
-        # just stores it unused.
+        # A research_intent score just under nomic-embed-text:latest's
+        # validated 0.58 must NOT clear it — proving the instance actually
+        # reads _research_intent_threshold at scoring time, not just stores
+        # it unused. (Was lookup_request at 0.62 before the search gates
+        # became keyword-scored, 2026-10-20.)
         fixed_vec = _unit_vector(8)  # every template embeds to this at construction
         embed_fn = MagicMock(return_value=fixed_vec)
         p = Planner(
             runtime=make_runtime(), embed_fn=embed_fn,
             embedding_model_name="nomic-embed-text:latest",
         )
-        assert p._semantic_gate_thresholds["lookup_request"] == 0.62
+        assert p._research_intent_threshold == 0.58
 
         # Every group's templates equal fixed_vec (embed_fn is constant), so
         # every group's score equals cosine(query_vec, fixed_vec) uniformly.
         # Construct query_vec = target_cos * fixed_vec + sin * orthogonal,
         # both unit vectors, for an exact, known cosine similarity.
         orthogonal_unit = [1 / math.sqrt(2), -1 / math.sqrt(2)] + [0.0] * 6
-        target_cos = 0.61
+        target_cos = 0.57
         sin_component = math.sqrt(1 - target_cos ** 2)
         query_vec = [
             target_cos * a + sin_component * b
@@ -1736,13 +1750,8 @@ class TestValidatedModelThresholds:
         result = p._semantic_search_intent("look up this")
         assert result is not None
         _, _, all_scores = result
-        assert 0.605 <= all_scores["lookup_request"] <= 0.615
-
-        fired = [
-            group for group, threshold in p._semantic_gate_thresholds.items()
-            if all_scores.get(group, 0.0) >= threshold
-        ]
-        assert "lookup_request" not in fired  # 0.61 < validated 0.62
+        assert 0.565 <= all_scores["research_intent"] <= 0.575
+        assert all_scores["research_intent"] < p._research_intent_threshold  # 0.57 < validated 0.58
 
     def test_unvalidated_mismatched_model_falls_to_lexical_not_disabled(self, caplog):
         """Regression guard, updated for PLAN_semantic_gating_calibration.md
@@ -1755,8 +1764,10 @@ class TestValidatedModelThresholds:
         this fixture)."""
         with caplog.at_level(logging.INFO, logger="localist.planner"):
             p = self._matching_vec_planner(embedding_model_name="some-other-model")
-
-        assert all(tier == "lexical-fallback" for tier in p._gate_tier.values())
+        assert p._gate_tier == {
+            "explicit_search_action": "keyword", "lookup_request": "keyword",
+            "research_intent": "lexical-fallback", "episodic_relevance": "lexical-fallback",
+        }
         assert "per-gate threshold resolution" in caplog.text
 
 
@@ -1801,8 +1812,8 @@ class TestCalibratedModelThresholds:
             embedding_model_name="mystery-model:latest",
             calibrated_thresholds={"research_intent": 0.55},
         )
-        assert p._gate_tier["explicit_search_action"] == "lexical-fallback"
-        assert p._gate_tier["lookup_request"] == "lexical-fallback"
+        assert p._gate_tier["explicit_search_action"] == "keyword"
+        assert p._gate_tier["lookup_request"] == "keyword"
         assert p._gate_tier["episodic_relevance"] == "lexical-fallback"
         assert p._gate_tier["research_intent"] == "auto-calibrated"
         # Cosine-scale thresholds must never be populated for a
@@ -1822,7 +1833,10 @@ class TestCalibratedModelThresholds:
             embedding_model_name="mystery-model:latest",
             calibrated_thresholds=None,
         )
-        assert all(tier == "lexical-fallback" for tier in p._gate_tier.values())
+        assert p._gate_tier == {
+            "explicit_search_action": "keyword", "lookup_request": "keyword",
+            "research_intent": "lexical-fallback", "episodic_relevance": "lexical-fallback",
+        }
         assert p._semantic_gate_thresholds == {}
         assert p._research_intent_threshold is None
         assert p._episodic_relevance_threshold is None
@@ -1835,12 +1849,24 @@ class TestCalibratedModelThresholds:
 
         p = self._matching_vec_planner(
             embedding_model_name="nomic-embed-text:latest",
-            calibrated_thresholds={"lookup_request": 0.99},
+            calibrated_thresholds={"research_intent": 0.99},
         )
-        assert p._gate_tier["lookup_request"] == "validated"
-        assert p._semantic_gate_thresholds["lookup_request"] == (
-            _VALIDATED_MODEL_THRESHOLDS["nomic-embed-text:latest"]["lookup_request"]
+        assert p._gate_tier["research_intent"] == "validated"
+        assert p._research_intent_threshold == (
+            _VALIDATED_MODEL_THRESHOLDS["nomic-embed-text:latest"]["research_intent"]
         )
+
+    def test_calibrated_search_gate_values_are_ignored(self):
+        # A row calibrated before 2026-10-20 can still carry cosine values
+        # for the search gates; they're keyword-scored for every model now,
+        # so those values must never come back into play.
+        p = self._matching_vec_planner(
+            embedding_model_name="mystery-model:latest",
+            calibrated_thresholds={"explicit_search_action": 0.5, "lookup_request": 0.5},
+        )
+        assert p._gate_tier["explicit_search_action"] == "keyword"
+        assert p._gate_tier["lookup_request"] == "keyword"
+        assert p._semantic_gate_thresholds == {}
 
 
 class TestLexicalFallbackTier:
@@ -1866,7 +1892,10 @@ class TestLexicalFallbackTier:
             runtime=make_runtime(), embed_fn=embed_fn,
             embedding_model_name="mystery-model:latest",
         )
-        assert all(tier == "lexical-fallback" for tier in p._gate_tier.values())
+        assert p._gate_tier == {
+            "explicit_search_action": "keyword", "lookup_request": "keyword",
+            "research_intent": "lexical-fallback", "episodic_relevance": "lexical-fallback",
+        }
         return p
 
     def test_priority3_fires_web_search_via_lexical_fallback(self):
@@ -2204,23 +2233,25 @@ class TestPriority3SemanticGating:
     # (§8.8 Open Item 11)
     # ------------------------------------------------------------------
 
-    def test_set1_lookup_request_templates_present(self):
-        """
-        All four Candidate Set 1 (object-specificity fix) templates are in lookup_request.
-        The four 2026-06-25 question-form templates were removed 2026-06-28 — this test
-        was renamed and updated from test_new_lookup_request_templates_present (pass→fail
-        change: old test asserted the removed templates; updated to assert the new Set 1
-        templates that replaced them).
-        """
+    def test_search_templates_are_the_2026_10_20_set(self):
+        """Regression guard for the keyword-scored search templates
+        (search_intent_v2_assessment_2026-10-20.md): lowercase, subject-free,
+        no "look at" wording (it fired on "look at this image")."""
         from localist.planner import _SEARCH_INTENT_TEMPLATES
-        templates = _SEARCH_INTENT_TEMPLATES["lookup_request"]
-        for expected in (
-            "can you look up the release date for this",
-            "could you look up what year this happened",
-            "can you look up information about the latest Apple products",
-            "could you find out the current stock price for me",
-        ):
-            assert expected in templates, f"Missing Set 1 template: {expected!r}"
+        assert _SEARCH_INTENT_TEMPLATES["explicit_search_action"] == (
+            "search the web for this", "do a web search for this", "search online for this",
+            "google this", "search the internet for this", "run a web search on this",
+            "search github for this", "find web results about this",
+        )
+        assert _SEARCH_INTENT_TEMPLATES["lookup_request"] == (
+            "look this up", "look up this topic", "look up information about this",
+            "find out about this", "find information on this", "can you look this up for me",
+            "what can you find out about this", "check online what the latest is on this",
+            "research this topic", "do some research on this",
+        )
+        for group in ("explicit_search_action", "lookup_request"):
+            for t in _SEARCH_INTENT_TEMPLATES[group]:
+                assert t == t.lower() and "look at" not in t
 
     def test_old_2026_06_25_lookup_request_templates_removed(self):
         """The 4 collision-prone templates added 2026-06-25 were removed 2026-06-28."""
@@ -2233,19 +2264,6 @@ class TestPriority3SemanticGating:
             "can you look into this for me",
         ):
             assert removed not in templates, f"Removed template still present: {removed!r}"
-
-    def test_original_lookup_request_templates_unchanged(self):
-        """Regression guard: original five lookup_request templates are present and unmodified."""
-        from localist.planner import _SEARCH_INTENT_TEMPLATES
-        templates = _SEARCH_INTENT_TEMPLATES["lookup_request"]
-        for expected in (
-            "look up this",
-            "look that up",
-            "go ahead and look it up",
-            "find information on this",
-            "find out about this",
-        ):
-            assert expected in templates, f"Original template missing or edited: {expected!r}"
 
     def test_lookup_request_score_at_new_threshold_fires_gate(self):
         """lookup_request at 0.605 (≥ 0.60) must fire the gate → web_search added."""
@@ -2271,15 +2289,8 @@ class TestPriority3SemanticGating:
         assert result is None
 
     def test_other_template_groups_unmodified(self):
-        """Regression guard: explicit_search_action, knowledge_request_open, freshness_request are unchanged."""
+        """Regression guard: knowledge_request_open and freshness_request are unchanged."""
         from localist.planner import _SEARCH_INTENT_TEMPLATES
-        assert _SEARCH_INTENT_TEMPLATES["explicit_search_action"] == (
-            "search the web for this",
-            "do a web search for this",
-            "search online for this",
-            "google this",
-            "go look it up",
-        )
         assert _SEARCH_INTENT_TEMPLATES["knowledge_request_open"] == (
             "what is this",
             "what do you know about this",
@@ -2612,7 +2623,7 @@ class TestGreetingFalsePositiveFilter:
     # Group 2 — behavioral: filter fires → _semantic_search_intent returns None
     # ------------------------------------------------------------------
 
-    def test_hey_lora_exclamation_filtered(self):
+    def test_hey_lora_exclamation_filtered(self, monkeypatch):
         """
         'Hey LORA!' — the confirmed live false positive (2026-06-27) — is
         still suppressed post-redesign, but now via the tie-break conflict
@@ -2630,6 +2641,10 @@ class TestGreetingFalsePositiveFilter:
         ≥ 0.60 — that was confirmed by the live diagnostic only.
         """
         spy = MagicMock(return_value=_unit_vector(8))
+        # Search gates are keyword-scored (2026-10-20); research_intent is the
+        # cosine-gated group a filter phrase can conflict with, and only while
+        # the research loop is on.
+        monkeypatch.setenv("LOCALIST_RESEARCH_LOOP_ENABLED", "true")
         runtime = make_runtime()
         p = Planner(runtime=runtime, embed_fn=spy, embedding_model_name="nomic-embed-text:latest")
         spy.reset_mock()

@@ -138,10 +138,9 @@ class TestCalibrateThresholdsIntegration:
         fixed_vec = _unit_vector(8)
         result = calibrate_thresholds(lambda text: fixed_vec)
 
-        assert set(result.gates.keys()) == {
-            "explicit_search_action", "lookup_request",
-            "research_intent", "episodic_relevance",
-        }
+        # The search gates are keyword-scored for every model (2026-10-20),
+        # so calibration measures only these two.
+        assert set(result.gates.keys()) == {"research_intent", "episodic_relevance"}
         assert result.all_degenerate is True
         assert result.thresholds == {}
 
@@ -167,17 +166,19 @@ class TestCalibrateThresholdsIntegration:
         near_vec = _unit_vector(8)
         far_vec = _orthogonal_vector(8)
 
+        # Calibration lowercases battery phrases before embedding (as
+        # production lowercases the request); templates are embedded as written.
+        near_lower = {p.lower() for p in near_set}
+
         def embed_fn(text: str) -> list[float]:
-            return near_vec if text in near_set else far_vec
+            return near_vec if text in near_set or text in near_lower else far_vec
 
         result = calibrate_thresholds(embed_fn)
 
         assert result.all_degenerate is False
-        for name in ("explicit_search_action", "lookup_request", "research_intent", "episodic_relevance"):
+        for name in ("research_intent", "episodic_relevance"):
             assert result.gates[name].degenerate is False, result.gates[name]
-        assert set(result.thresholds) == {
-            "explicit_search_action", "lookup_request", "research_intent", "episodic_relevance",
-        }
+        assert {"research_intent", "episodic_relevance"} <= set(result.thresholds)
 
     def test_embed_fn_failure_is_skipped_not_raised(self):
         calls = {"count": 0}
@@ -230,7 +231,7 @@ class TestCalibrateThresholdsIntegration:
         result_unit = calibrate_thresholds(unit_embed)
         result_scaled = calibrate_thresholds(scaled_embed)
 
-        for name in ("explicit_search_action", "lookup_request", "research_intent", "episodic_relevance"):
+        for name in ("research_intent", "episodic_relevance"):
             assert result_unit.gates[name].degenerate == result_scaled.gates[name].degenerate
             assert result_unit.gates[name].threshold == result_scaled.gates[name].threshold
 
@@ -271,16 +272,23 @@ class TestCalibrateLexicalThresholds:
         # this exact function's output (diagnostics/calibrate_lexical_
         # fallback_thresholds.py) — this is the tripwire that catches drift
         # if the fixtures/scoring change but the constant isn't re-derived.
-        from localist.planner import _LEXICAL_FALLBACK_THRESHOLDS
+        from localist.planner import _KEYWORD_COVERAGE_THRESHOLDS, _LEXICAL_FALLBACK_THRESHOLDS
 
         result = calibrate_lexical_thresholds()
-        assert result.thresholds == _LEXICAL_FALLBACK_THRESHOLDS
+        assert result.thresholds == {**_LEXICAL_FALLBACK_THRESHOLDS, **_KEYWORD_COVERAGE_THRESHOLDS}
 
     def test_scores_are_bm25_scale_not_cosine_scale(self):
         # A sanity guard against ever accidentally wiring cosine-scale
         # grids/assumptions into this path -- BM25 scores are unbounded,
         # so real thresholds here should NOT sit in the [0, 1] cosine
         # range (see bm25.py's module docstring).
+        # BM25 gates are unbounded; the keyword-coverage search gates are 0-1
+        # by construction (planner._keyword_coverage()).
+        from localist.planner import _KEYWORD_SCORED_GATES
+
         result = calibrate_lexical_thresholds()
         for name, threshold in result.thresholds.items():
-            assert threshold > 1.0, f"{name} threshold {threshold} looks cosine-scale, not BM25-scale"
+            if name in _KEYWORD_SCORED_GATES:
+                assert 0.0 < threshold <= 1.0, f"{name} threshold {threshold} outside coverage scale"
+            else:
+                assert threshold > 1.0, f"{name} threshold {threshold} looks cosine-scale, not BM25-scale"

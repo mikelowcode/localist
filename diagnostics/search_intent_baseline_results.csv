@@ -1,0 +1,301 @@
+model,gate,kind,phrase,raw_score,lowered_score,bm25
+nomic-embed-text:latest,explicit_search_action,positive,Can you look up Apple's price hike for the MacBook Neo and iPad?,0.4803,0.4803,2.8333
+nomic-embed-text:latest,explicit_search_action,positive,Can you look up their next-generation in-house Microsoft AI models?,0.5353,0.5353,2.8333
+nomic-embed-text:latest,explicit_search_action,positive,Can you look up Microsoft's next-generation in-house AI models?,0.5688,0.5688,2.8333
+nomic-embed-text:latest,explicit_search_action,negative,Tell me how Localist works?,0.4077,0.4077,0.0
+nomic-embed-text:latest,explicit_search_action,negative,Can you read my wiki files?,0.4761,0.4761,0.0
+nomic-embed-text:latest,explicit_search_action,negative,List the files in my vault?,0.4379,0.4379,1.2769
+nomic-embed-text:latest,explicit_search_action,negative,Can you help me with this?,0.5777,0.5777,0.3764
+nomic-embed-text:latest,explicit_search_action,negative,Could you check this for me?,0.5839,0.5839,0.8448
+nomic-embed-text:latest,explicit_search_action,negative,Would you look at this?,0.6476,0.6476,1.4167
+nomic-embed-text:latest,explicit_search_action,negative,Can you tell me about this?,0.5303,0.5303,0.3764
+nomic-embed-text:latest,explicit_search_action,negative,Will you look into this?,0.663,0.663,1.4167
+nomic-embed-text:latest,explicit_search_action,negative,Do you mind looking at this?,0.6184,0.6184,1.4033
+nomic-embed-text:latest,explicit_search_action,negative,Can you help?,0.5047,0.5047,0.0
+nomic-embed-text:latest,explicit_search_action,negative,Can you help me understand this particular concept in more depth?,0.4861,0.4861,0.3764
+nomic-embed-text:latest,explicit_search_action,negative,Can you help me understand how Localist works?,0.3935,0.3935,0.0
+nomic-embed-text:latest,explicit_search_action,negative,Could you explain what this system does?,0.4722,0.4722,0.3764
+nomic-embed-text:latest,explicit_search_action,negative,Can you look at my notes and help me organize them?,0.4623,0.4623,1.4167
+nomic-embed-text:latest,explicit_search_action,negative,Could you read through this document for me?,0.5269,0.5269,0.8448
+nomic-embed-text:latest,explicit_search_action,negative,Would you help me plan a trip to Japan?,0.446,0.446,1.1622
+nomic-embed-text:latest,explicit_search_action,negative,Can you tell me a joke?,0.3978,0.3978,1.1622
+nomic-embed-text:latest,lookup_request,positive,Can you look up Apple's price hike for the MacBook Neo and iPad?,0.6911,0.6911,4.7546
+nomic-embed-text:latest,lookup_request,positive,Can you look up their next-generation in-house Microsoft AI models?,0.6398,0.6398,2.5611
+nomic-embed-text:latest,lookup_request,positive,Can you look up Microsoft's next-generation in-house AI models?,0.6459,0.6459,2.5611
+nomic-embed-text:latest,lookup_request,negative,Tell me how Localist works?,0.4279,0.4279,1.505
+nomic-embed-text:latest,lookup_request,negative,Can you read my wiki files?,0.493,0.493,1.8368
+nomic-embed-text:latest,lookup_request,negative,List the files in my vault?,0.4647,0.4647,0.8826
+nomic-embed-text:latest,lookup_request,negative,Can you help me with this?,0.5819,0.5819,2.3394
+nomic-embed-text:latest,lookup_request,negative,Could you check this for me?,0.6071,0.6071,4.338
+nomic-embed-text:latest,lookup_request,negative,Would you look at this?,0.7039,0.7039,1.6337
+nomic-embed-text:latest,lookup_request,negative,Can you tell me about this?,0.7366,0.7366,2.833
+nomic-embed-text:latest,lookup_request,negative,Will you look into this?,0.6873,0.6873,1.6337
+nomic-embed-text:latest,lookup_request,negative,Do you mind looking at this?,0.6831,0.6831,1.2485
+nomic-embed-text:latest,lookup_request,negative,Can you help?,0.5131,0.5131,1.8368
+nomic-embed-text:latest,lookup_request,negative,Can you help me understand this particular concept in more depth?,0.4505,0.4505,2.3394
+nomic-embed-text:latest,lookup_request,negative,Can you help me understand how Localist works?,0.4029,0.4029,2.1385
+nomic-embed-text:latest,lookup_request,negative,Could you explain what this system does?,0.478,0.478,4.1843
+nomic-embed-text:latest,lookup_request,negative,Can you look at my notes and help me organize them?,0.4804,0.4804,2.3844
+nomic-embed-text:latest,lookup_request,negative,Could you read through this document for me?,0.5573,0.5573,4.338
+nomic-embed-text:latest,lookup_request,negative,Would you help me plan a trip to Japan?,0.4454,0.4454,2.1385
+nomic-embed-text:latest,lookup_request,negative,Can you tell me a joke?,0.4939,0.4939,2.1385
+nomic-embed-text:latest,research_intent,positive,How much does the Tesla Model 3 cost?,0.5529,0.5529,2.6219
+nomic-embed-text:latest,research_intent,positive,What's the price of the new iPhone?,0.6183,0.6183,2.5992
+nomic-embed-text:latest,research_intent,positive,Can you find out how much AWS charges for S3 storage?,0.6168,0.6168,5.4222
+nomic-embed-text:latest,research_intent,positive,What are the pricing tiers for Notion?,0.7318,0.7318,4.1871
+nomic-embed-text:latest,research_intent,positive,Look up the specs on the RTX 4090,0.642,0.642,4.553
+nomic-embed-text:latest,research_intent,positive,Find me the cost of a one-bedroom apartment in Austin,0.5895,0.5895,3.8589
+nomic-embed-text:latest,research_intent,positive,What does ChatGPT Plus cost per month?,0.6869,0.6869,5.1778
+nomic-embed-text:latest,research_intent,positive,Track down pricing for Salesforce Enterprise,0.6508,0.6508,3.6674
+nomic-embed-text:latest,research_intent,positive,Can you check what a Peloton subscription costs?,0.7948,0.7948,3.1446
+nomic-embed-text:latest,research_intent,positive,What's the going rate for a plumber in this area?,0.5281,0.5281,1.1009
+nomic-embed-text:latest,research_intent,negative,Can you look up the release date for this?,0.6109,0.6109,3.7228
+nomic-embed-text:latest,research_intent,negative,Could you look up what year this happened?,0.5099,0.5099,2.6804
+nomic-embed-text:latest,research_intent,negative,Can you look up information about the latest Apple products?,0.56,0.56,2.9549
+nomic-embed-text:latest,research_intent,negative,Can you look up Apple's price hike for the MacBook Neo and iPad?,0.6363,0.6363,5.7468
+nomic-embed-text:latest,research_intent,negative,Can you look up their next-generation in-house Microsoft AI models?,0.4824,0.4824,2.6219
+nomic-embed-text:latest,research_intent,negative,Could you find out the current stock price for me?,0.6942,0.6942,3.1333
+nomic-embed-text:latest,research_intent,negative,What is this?,0.487,0.487,0.0585
+nomic-embed-text:latest,research_intent,negative,Tell me about this company,0.4495,0.4495,0.0585
+nomic-embed-text:latest,research_intent,negative,Explain how blockchain works,0.3387,0.3387,1.3109
+nomic-embed-text:latest,research_intent,negative,What do you know about this?,0.4843,0.4843,0.0585
+nomic-embed-text:latest,research_intent,negative,What's the latest on this?,0.5131,0.5131,0.3915
+nomic-embed-text:latest,research_intent,negative,Is there anything new about this?,0.407,0.407,0.0585
+nomic-embed-text:latest,research_intent,negative,What's the current status of this project?,0.5515,0.5515,3.1918
+nomic-embed-text:latest,research_intent,negative,Can you help me with this?,0.5485,0.5485,0.0585
+nomic-embed-text:latest,research_intent,negative,What's up?,0.43,0.43,1.3109
+nomic-embed-text:latest,research_intent,negative,How are you doing today?,0.3644,0.3644,1.3109
+nomic-embed-text:latest,research_intent,negative,"Thanks, that's helpful",0.4269,0.4269,0.0
+nomic-embed-text:latest,episodic_relevance,positive,Help me prepare for the upcoming Claude Impact Lab on August 6th.,0.741,0.741,6.0708
+nomic-embed-text:latest,episodic_relevance,positive,What do I need to bring to my dentist appointment next week?,0.6643,0.6643,3.9244
+nomic-embed-text:latest,episodic_relevance,positive,Can you help me get ready for my presentation on Friday?,0.7372,0.7372,6.6615
+nomic-embed-text:latest,episodic_relevance,positive,What did we decide about the migration plan?,0.7349,0.7349,6.3892
+nomic-embed-text:latest,episodic_relevance,positive,What do I have going on this week?,0.8376,0.8376,5.6824
+nomic-embed-text:latest,episodic_relevance,positive,Catch me up on my project status.,0.6835,0.6835,4.0973
+nomic-embed-text:latest,episodic_relevance,positive,What was the plan we settled on last time?,0.7308,0.7308,1.9602
+nomic-embed-text:latest,episodic_relevance,positive,Help me get ready for my trip to Japan.,0.7155,0.7155,6.6615
+nomic-embed-text:latest,episodic_relevance,positive,Prep me for my meeting with the investors tomorrow.,0.6543,0.6543,2.0301
+nomic-embed-text:latest,episodic_relevance,positive,What did I say I would do about the server migration?,0.5023,0.5023,4.9276
+nomic-embed-text:latest,episodic_relevance,positive,What games do I play?,0.618,0.618,3.3991
+nomic-embed-text:latest,episodic_relevance,positive,What console do I own?,0.5091,0.5091,3.3991
+nomic-embed-text:latest,episodic_relevance,positive,Tell me about my Xbox.,0.5111,0.5111,1.7186
+nomic-embed-text:latest,episodic_relevance,negative,What is the capital of France?,0.3778,0.3778,2.1033
+nomic-embed-text:latest,episodic_relevance,negative,Write a haiku about the ocean.,0.4599,0.4599,1.7186
+nomic-embed-text:latest,episodic_relevance,negative,Search the web for the latest news on SpaceX.,0.4762,0.4762,0.8487
+nomic-embed-text:latest,episodic_relevance,negative,What is 2+2?,0.3979,0.3979,2.1033
+nomic-embed-text:latest,episodic_relevance,negative,Summarize this document for me.,0.554,0.554,2.2881
+nomic-embed-text:latest,episodic_relevance,negative,Fetch this URL and tell me what it says.,0.4416,0.4416,1.8241
+nomic-embed-text:latest,episodic_relevance,negative,Remind me how photosynthesis works.,0.4633,0.4633,2.3093
+nomic-embed-text:latest,episodic_relevance,negative,Help me write a cover letter for a job application.,0.5507,0.5507,2.6336
+nomic-embed-text:latest,episodic_relevance,negative,Prepare a report on quarterly earnings.,0.4574,0.4574,1.7186
+nomic-embed-text:latest,episodic_relevance,negative,What is on the front page of the New York Times today?,0.5163,0.5163,2.952
+nomic-embed-text:latest,episodic_relevance,negative,Explain how neural networks work.,0.3831,0.3831,0.0
+nomic-embed-text:latest,episodic_relevance,negative,Get ready to receive a large file upload.,0.5112,0.5112,3.4372
+nomic-embed-text:latest,episodic_relevance,negative,"I have a headache, what should I do?",0.5765,0.5765,6.456
+nomic-embed-text:latest,episodic_relevance,negative,"My favorite color is blue, what goes well with it?",0.4661,0.4661,2.694
+nomic-embed-text:latest,episodic_relevance,negative,Can you help me plan a birthday party for my friend?,0.6165,0.6165,3.2243
+nomic-embed-text:latest,episodic_relevance,negative,What is my IP address?,0.4622,0.4622,2.694
+nomic-embed-text:latest,episodic_relevance,negative,Prepare a Python script that reverses a string.,0.4061,0.4061,1.7186
+nomic-embed-text:latest,episodic_relevance,negative,I need help understanding this error message.,0.4335,0.4335,1.5285
+nomic-embed-text:latest,episodic_relevance,negative,What time is it in Tokyo right now?,0.5128,0.5128,2.1033
+nomic-embed-text:latest,episodic_relevance,negative,Draft an email to my landlord about the leak.,0.447,0.447,1.7186
+embeddinggemma:latest,explicit_search_action,positive,Can you look up Apple's price hike for the MacBook Neo and iPad?,0.3942,0.4234,2.8333
+embeddinggemma:latest,explicit_search_action,positive,Can you look up their next-generation in-house Microsoft AI models?,0.4112,0.4446,2.8333
+embeddinggemma:latest,explicit_search_action,positive,Can you look up Microsoft's next-generation in-house AI models?,0.4319,0.4864,2.8333
+embeddinggemma:latest,explicit_search_action,negative,Tell me how Localist works?,0.3892,0.4091,0.0
+embeddinggemma:latest,explicit_search_action,negative,Can you read my wiki files?,0.4171,0.432,0.0
+embeddinggemma:latest,explicit_search_action,negative,List the files in my vault?,0.4479,0.4546,1.2769
+embeddinggemma:latest,explicit_search_action,negative,Can you help me with this?,0.5859,0.5986,0.3764
+embeddinggemma:latest,explicit_search_action,negative,Could you check this for me?,0.5035,0.5035,0.8448
+embeddinggemma:latest,explicit_search_action,negative,Would you look at this?,0.5256,0.5299,1.4167
+embeddinggemma:latest,explicit_search_action,negative,Can you tell me about this?,0.6181,0.6375,0.3764
+embeddinggemma:latest,explicit_search_action,negative,Will you look into this?,0.5714,0.5756,1.4167
+embeddinggemma:latest,explicit_search_action,negative,Do you mind looking at this?,0.5492,0.5587,1.4033
+embeddinggemma:latest,explicit_search_action,negative,Can you help?,0.5209,0.5068,0.0
+embeddinggemma:latest,explicit_search_action,negative,Can you help me understand this particular concept in more depth?,0.4309,0.4297,0.3764
+embeddinggemma:latest,explicit_search_action,negative,Can you help me understand how Localist works?,0.3679,0.3725,0.0
+embeddinggemma:latest,explicit_search_action,negative,Could you explain what this system does?,0.3946,0.3935,0.3764
+embeddinggemma:latest,explicit_search_action,negative,Can you look at my notes and help me organize them?,0.3772,0.3831,1.4167
+embeddinggemma:latest,explicit_search_action,negative,Could you read through this document for me?,0.473,0.4824,0.8448
+embeddinggemma:latest,explicit_search_action,negative,Would you help me plan a trip to Japan?,0.4156,0.4245,1.1622
+embeddinggemma:latest,explicit_search_action,negative,Can you tell me a joke?,0.4179,0.4203,1.1622
+embeddinggemma:latest,lookup_request,positive,Can you look up Apple's price hike for the MacBook Neo and iPad?,0.6203,0.6299,4.7546
+embeddinggemma:latest,lookup_request,positive,Can you look up their next-generation in-house Microsoft AI models?,0.4761,0.5028,2.5611
+embeddinggemma:latest,lookup_request,positive,Can you look up Microsoft's next-generation in-house AI models?,0.4806,0.5218,2.5611
+embeddinggemma:latest,lookup_request,negative,Tell me how Localist works?,0.3977,0.4037,1.505
+embeddinggemma:latest,lookup_request,negative,Can you read my wiki files?,0.4344,0.4463,1.8368
+embeddinggemma:latest,lookup_request,negative,List the files in my vault?,0.4725,0.4804,0.8826
+embeddinggemma:latest,lookup_request,negative,Can you help me with this?,0.537,0.5507,2.3394
+embeddinggemma:latest,lookup_request,negative,Could you check this for me?,0.5323,0.5396,4.338
+embeddinggemma:latest,lookup_request,negative,Would you look at this?,0.6475,0.6641,1.6337
+embeddinggemma:latest,lookup_request,negative,Can you tell me about this?,0.7904,0.7959,2.833
+embeddinggemma:latest,lookup_request,negative,Will you look into this?,0.6428,0.6311,1.6337
+embeddinggemma:latest,lookup_request,negative,Do you mind looking at this?,0.62,0.6338,1.2485
+embeddinggemma:latest,lookup_request,negative,Can you help?,0.4922,0.4777,1.8368
+embeddinggemma:latest,lookup_request,negative,Can you help me understand this particular concept in more depth?,0.4821,0.4808,2.3394
+embeddinggemma:latest,lookup_request,negative,Can you help me understand how Localist works?,0.3627,0.3642,2.1385
+embeddinggemma:latest,lookup_request,negative,Could you explain what this system does?,0.4886,0.4871,4.1843
+embeddinggemma:latest,lookup_request,negative,Can you look at my notes and help me organize them?,0.4004,0.4055,2.3844
+embeddinggemma:latest,lookup_request,negative,Could you read through this document for me?,0.5159,0.5279,4.338
+embeddinggemma:latest,lookup_request,negative,Would you help me plan a trip to Japan?,0.38,0.39,2.1385
+embeddinggemma:latest,lookup_request,negative,Can you tell me a joke?,0.3635,0.3621,2.1385
+embeddinggemma:latest,research_intent,positive,How much does the Tesla Model 3 cost?,0.6007,0.6103,2.6219
+embeddinggemma:latest,research_intent,positive,What's the price of the new iPhone?,0.5829,0.6065,2.5992
+embeddinggemma:latest,research_intent,positive,Can you find out how much AWS charges for S3 storage?,0.5622,0.5793,5.4222
+embeddinggemma:latest,research_intent,positive,What are the pricing tiers for Notion?,0.7242,0.724,4.1871
+embeddinggemma:latest,research_intent,positive,Look up the specs on the RTX 4090,0.5644,0.5817,4.553
+embeddinggemma:latest,research_intent,positive,Find me the cost of a one-bedroom apartment in Austin,0.537,0.5337,3.8589
+embeddinggemma:latest,research_intent,positive,What does ChatGPT Plus cost per month?,0.6463,0.6666,5.1778
+embeddinggemma:latest,research_intent,positive,Track down pricing for Salesforce Enterprise,0.6962,0.6857,3.6674
+embeddinggemma:latest,research_intent,positive,Can you check what a Peloton subscription costs?,0.7787,0.7788,3.1446
+embeddinggemma:latest,research_intent,positive,What's the going rate for a plumber in this area?,0.5424,0.5408,1.1009
+embeddinggemma:latest,research_intent,negative,Can you look up the release date for this?,0.533,0.5478,3.7228
+embeddinggemma:latest,research_intent,negative,Could you look up what year this happened?,0.4292,0.4314,2.6804
+embeddinggemma:latest,research_intent,negative,Can you look up information about the latest Apple products?,0.5064,0.5324,2.9549
+embeddinggemma:latest,research_intent,negative,Can you look up Apple's price hike for the MacBook Neo and iPad?,0.441,0.4343,5.7468
+embeddinggemma:latest,research_intent,negative,Can you look up their next-generation in-house Microsoft AI models?,0.3775,0.4029,2.6219
+embeddinggemma:latest,research_intent,negative,Could you find out the current stock price for me?,0.5492,0.5613,3.1333
+embeddinggemma:latest,research_intent,negative,What is this?,0.5189,0.5376,0.0585
+embeddinggemma:latest,research_intent,negative,Tell me about this company,0.5034,0.503,0.0585
+embeddinggemma:latest,research_intent,negative,Explain how blockchain works,0.3468,0.3392,1.3109
+embeddinggemma:latest,research_intent,negative,What do you know about this?,0.4954,0.5018,0.0585
+embeddinggemma:latest,research_intent,negative,What's the latest on this?,0.3841,0.3891,0.3915
+embeddinggemma:latest,research_intent,negative,Is there anything new about this?,0.3947,0.3945,0.0585
+embeddinggemma:latest,research_intent,negative,What's the current status of this project?,0.4533,0.4633,3.1918
+embeddinggemma:latest,research_intent,negative,Can you help me with this?,0.4689,0.4758,0.0585
+embeddinggemma:latest,research_intent,negative,What's up?,0.3801,0.3925,1.3109
+embeddinggemma:latest,research_intent,negative,How are you doing today?,0.3234,0.3265,1.3109
+embeddinggemma:latest,research_intent,negative,"Thanks, that's helpful",0.4339,0.4394,0.0
+embeddinggemma:latest,episodic_relevance,positive,Help me prepare for the upcoming Claude Impact Lab on August 6th.,0.5923,0.6343,6.0708
+embeddinggemma:latest,episodic_relevance,positive,What do I need to bring to my dentist appointment next week?,0.6538,0.6866,3.9244
+embeddinggemma:latest,episodic_relevance,positive,Can you help me get ready for my presentation on Friday?,0.7415,0.7445,6.6615
+embeddinggemma:latest,episodic_relevance,positive,What did we decide about the migration plan?,0.683,0.6931,6.3892
+embeddinggemma:latest,episodic_relevance,positive,What do I have going on this week?,0.8668,0.8928,5.6824
+embeddinggemma:latest,episodic_relevance,positive,Catch me up on my project status.,0.5601,0.5625,4.0973
+embeddinggemma:latest,episodic_relevance,positive,What was the plan we settled on last time?,0.6917,0.6776,1.9602
+embeddinggemma:latest,episodic_relevance,positive,Help me get ready for my trip to Japan.,0.7097,0.7415,6.6615
+embeddinggemma:latest,episodic_relevance,positive,Prep me for my meeting with the investors tomorrow.,0.6569,0.655,2.0301
+embeddinggemma:latest,episodic_relevance,positive,What did I say I would do about the server migration?,0.4992,0.4914,4.9276
+embeddinggemma:latest,episodic_relevance,positive,What games do I play?,0.4951,0.504,3.3991
+embeddinggemma:latest,episodic_relevance,positive,What console do I own?,0.3877,0.4028,3.3991
+embeddinggemma:latest,episodic_relevance,positive,Tell me about my Xbox.,0.4037,0.4112,1.7186
+embeddinggemma:latest,episodic_relevance,negative,What is the capital of France?,0.2825,0.2867,2.1033
+embeddinggemma:latest,episodic_relevance,negative,Write a haiku about the ocean.,0.3151,0.3309,1.7186
+embeddinggemma:latest,episodic_relevance,negative,Search the web for the latest news on SpaceX.,0.3947,0.3891,0.8487
+embeddinggemma:latest,episodic_relevance,negative,What is 2+2?,0.3643,0.3666,2.1033
+embeddinggemma:latest,episodic_relevance,negative,Summarize this document for me.,0.4305,0.4639,2.2881
+embeddinggemma:latest,episodic_relevance,negative,Fetch this URL and tell me what it says.,0.4055,0.4118,1.8241
+embeddinggemma:latest,episodic_relevance,negative,Remind me how photosynthesis works.,0.6421,0.6358,2.3093
+embeddinggemma:latest,episodic_relevance,negative,Help me write a cover letter for a job application.,0.4885,0.4918,2.6336
+embeddinggemma:latest,episodic_relevance,negative,Prepare a report on quarterly earnings.,0.382,0.4106,1.7186
+embeddinggemma:latest,episodic_relevance,negative,What is on the front page of the New York Times today?,0.3323,0.3319,2.952
+embeddinggemma:latest,episodic_relevance,negative,Explain how neural networks work.,0.3054,0.2925,0.0
+embeddinggemma:latest,episodic_relevance,negative,Get ready to receive a large file upload.,0.4153,0.4647,3.4372
+embeddinggemma:latest,episodic_relevance,negative,"I have a headache, what should I do?",0.4747,0.504,6.456
+embeddinggemma:latest,episodic_relevance,negative,"My favorite color is blue, what goes well with it?",0.4495,0.4577,2.694
+embeddinggemma:latest,episodic_relevance,negative,Can you help me plan a birthday party for my friend?,0.6996,0.7105,3.2243
+embeddinggemma:latest,episodic_relevance,negative,What is my IP address?,0.3663,0.3581,2.694
+embeddinggemma:latest,episodic_relevance,negative,Prepare a Python script that reverses a string.,0.3995,0.4061,1.7186
+embeddinggemma:latest,episodic_relevance,negative,I need help understanding this error message.,0.3607,0.3894,1.5285
+embeddinggemma:latest,episodic_relevance,negative,What time is it in Tokyo right now?,0.3022,0.3046,2.1033
+embeddinggemma:latest,episodic_relevance,negative,Draft an email to my landlord about the leak.,0.3448,0.3442,1.7186
+embeddinggemma-2:latest,explicit_search_action,positive,Can you look up Apple's price hike for the MacBook Neo and iPad?,0.6859,0.6909,2.8333
+embeddinggemma-2:latest,explicit_search_action,positive,Can you look up their next-generation in-house Microsoft AI models?,0.6813,0.6815,2.8333
+embeddinggemma-2:latest,explicit_search_action,positive,Can you look up Microsoft's next-generation in-house AI models?,0.6863,0.6858,2.8333
+embeddinggemma-2:latest,explicit_search_action,negative,Tell me how Localist works?,0.7086,0.7361,0.0
+embeddinggemma-2:latest,explicit_search_action,negative,Can you read my wiki files?,0.72,0.7304,0.0
+embeddinggemma-2:latest,explicit_search_action,negative,List the files in my vault?,0.6914,0.6992,1.2769
+embeddinggemma-2:latest,explicit_search_action,negative,Can you help me with this?,0.7795,0.7995,0.3764
+embeddinggemma-2:latest,explicit_search_action,negative,Could you check this for me?,0.7931,0.8041,0.8448
+embeddinggemma-2:latest,explicit_search_action,negative,Would you look at this?,0.7999,0.8159,1.4167
+embeddinggemma-2:latest,explicit_search_action,negative,Can you tell me about this?,0.8013,0.81,0.3764
+embeddinggemma-2:latest,explicit_search_action,negative,Will you look into this?,0.825,0.8436,1.4167
+embeddinggemma-2:latest,explicit_search_action,negative,Do you mind looking at this?,0.7936,0.7979,1.4033
+embeddinggemma-2:latest,explicit_search_action,negative,Can you help?,0.7529,0.7655,0.0
+embeddinggemma-2:latest,explicit_search_action,negative,Can you help me understand this particular concept in more depth?,0.7209,0.7277,0.3764
+embeddinggemma-2:latest,explicit_search_action,negative,Can you help me understand how Localist works?,0.7038,0.7156,0.0
+embeddinggemma-2:latest,explicit_search_action,negative,Could you explain what this system does?,0.7117,0.7189,0.3764
+embeddinggemma-2:latest,explicit_search_action,negative,Can you look at my notes and help me organize them?,0.7051,0.7178,1.4167
+embeddinggemma-2:latest,explicit_search_action,negative,Could you read through this document for me?,0.7294,0.7443,0.8448
+embeddinggemma-2:latest,explicit_search_action,negative,Would you help me plan a trip to Japan?,0.6532,0.6604,1.1622
+embeddinggemma-2:latest,explicit_search_action,negative,Can you tell me a joke?,0.6985,0.6978,1.1622
+embeddinggemma-2:latest,lookup_request,positive,Can you look up Apple's price hike for the MacBook Neo and iPad?,0.776,0.7766,4.7546
+embeddinggemma-2:latest,lookup_request,positive,Can you look up their next-generation in-house Microsoft AI models?,0.7377,0.7342,2.5611
+embeddinggemma-2:latest,lookup_request,positive,Can you look up Microsoft's next-generation in-house AI models?,0.7452,0.7446,2.5611
+embeddinggemma-2:latest,lookup_request,negative,Tell me how Localist works?,0.7054,0.7278,1.505
+embeddinggemma-2:latest,lookup_request,negative,Can you read my wiki files?,0.7275,0.7365,1.8368
+embeddinggemma-2:latest,lookup_request,negative,List the files in my vault?,0.6875,0.6967,0.8826
+embeddinggemma-2:latest,lookup_request,negative,Can you help me with this?,0.7798,0.7985,2.3394
+embeddinggemma-2:latest,lookup_request,negative,Could you check this for me?,0.7832,0.7986,4.338
+embeddinggemma-2:latest,lookup_request,negative,Would you look at this?,0.8171,0.8239,1.6337
+embeddinggemma-2:latest,lookup_request,negative,Can you tell me about this?,0.8601,0.871,2.833
+embeddinggemma-2:latest,lookup_request,negative,Will you look into this?,0.8507,0.8625,1.6337
+embeddinggemma-2:latest,lookup_request,negative,Do you mind looking at this?,0.811,0.8169,1.2485
+embeddinggemma-2:latest,lookup_request,negative,Can you help?,0.7443,0.7502,1.8368
+embeddinggemma-2:latest,lookup_request,negative,Can you help me understand this particular concept in more depth?,0.7383,0.7447,2.3394
+embeddinggemma-2:latest,lookup_request,negative,Can you help me understand how Localist works?,0.7032,0.7106,2.1385
+embeddinggemma-2:latest,lookup_request,negative,Could you explain what this system does?,0.7483,0.7528,4.1843
+embeddinggemma-2:latest,lookup_request,negative,Can you look at my notes and help me organize them?,0.7034,0.7124,2.3844
+embeddinggemma-2:latest,lookup_request,negative,Could you read through this document for me?,0.7467,0.7573,4.338
+embeddinggemma-2:latest,lookup_request,negative,Would you help me plan a trip to Japan?,0.659,0.6627,2.1385
+embeddinggemma-2:latest,lookup_request,negative,Can you tell me a joke?,0.6928,0.6986,2.1385
+embeddinggemma-2:latest,research_intent,positive,How much does the Tesla Model 3 cost?,0.7646,0.7847,2.6219
+embeddinggemma-2:latest,research_intent,positive,What's the price of the new iPhone?,0.789,0.8016,2.5992
+embeddinggemma-2:latest,research_intent,positive,Can you find out how much AWS charges for S3 storage?,0.7678,0.7751,5.4222
+embeddinggemma-2:latest,research_intent,positive,What are the pricing tiers for Notion?,0.8404,0.8423,4.1871
+embeddinggemma-2:latest,research_intent,positive,Look up the specs on the RTX 4090,0.8214,0.8272,4.553
+embeddinggemma-2:latest,research_intent,positive,Find me the cost of a one-bedroom apartment in Austin,0.7601,0.7605,3.8589
+embeddinggemma-2:latest,research_intent,positive,What does ChatGPT Plus cost per month?,0.7934,0.7985,5.1778
+embeddinggemma-2:latest,research_intent,positive,Track down pricing for Salesforce Enterprise,0.7791,0.8004,3.6674
+embeddinggemma-2:latest,research_intent,positive,Can you check what a Peloton subscription costs?,0.8533,0.8532,3.1446
+embeddinggemma-2:latest,research_intent,positive,What's the going rate for a plumber in this area?,0.737,0.76,1.1009
+embeddinggemma-2:latest,research_intent,negative,Can you look up the release date for this?,0.7348,0.7457,3.7228
+embeddinggemma-2:latest,research_intent,negative,Could you look up what year this happened?,0.6708,0.673,2.6804
+embeddinggemma-2:latest,research_intent,negative,Can you look up information about the latest Apple products?,0.7267,0.7361,2.9549
+embeddinggemma-2:latest,research_intent,negative,Can you look up Apple's price hike for the MacBook Neo and iPad?,0.7825,0.7852,5.7468
+embeddinggemma-2:latest,research_intent,negative,Can you look up their next-generation in-house Microsoft AI models?,0.674,0.6724,2.6219
+embeddinggemma-2:latest,research_intent,negative,Could you find out the current stock price for me?,0.7383,0.7529,3.1333
+embeddinggemma-2:latest,research_intent,negative,What is this?,0.7278,0.7469,0.0585
+embeddinggemma-2:latest,research_intent,negative,Tell me about this company,0.7119,0.7301,0.0585
+embeddinggemma-2:latest,research_intent,negative,Explain how blockchain works,0.6258,0.6544,1.3109
+embeddinggemma-2:latest,research_intent,negative,What do you know about this?,0.7373,0.7537,0.0585
+embeddinggemma-2:latest,research_intent,negative,What's the latest on this?,0.6793,0.6744,0.3915
+embeddinggemma-2:latest,research_intent,negative,Is there anything new about this?,0.6997,0.6736,0.0585
+embeddinggemma-2:latest,research_intent,negative,What's the current status of this project?,0.6946,0.702,3.1918
+embeddinggemma-2:latest,research_intent,negative,Can you help me with this?,0.7098,0.722,0.0585
+embeddinggemma-2:latest,research_intent,negative,What's up?,0.6835,0.6901,1.3109
+embeddinggemma-2:latest,research_intent,negative,How are you doing today?,0.6816,0.6732,1.3109
+embeddinggemma-2:latest,research_intent,negative,"Thanks, that's helpful",0.6925,0.705,0.0
+embeddinggemma-2:latest,episodic_relevance,positive,Help me prepare for the upcoming Claude Impact Lab on August 6th.,0.7625,0.7739,6.0708
+embeddinggemma-2:latest,episodic_relevance,positive,What do I need to bring to my dentist appointment next week?,0.7302,0.7387,3.9244
+embeddinggemma-2:latest,episodic_relevance,positive,Can you help me get ready for my presentation on Friday?,0.8094,0.832,6.6615
+embeddinggemma-2:latest,episodic_relevance,positive,What did we decide about the migration plan?,0.7838,0.8022,6.3892
+embeddinggemma-2:latest,episodic_relevance,positive,What do I have going on this week?,0.9184,0.9298,5.6824
+embeddinggemma-2:latest,episodic_relevance,positive,Catch me up on my project status.,0.7148,0.7642,4.0973
+embeddinggemma-2:latest,episodic_relevance,positive,What was the plan we settled on last time?,0.8121,0.8221,1.9602
+embeddinggemma-2:latest,episodic_relevance,positive,Help me get ready for my trip to Japan.,0.8432,0.8398,6.6615
+embeddinggemma-2:latest,episodic_relevance,positive,Prep me for my meeting with the investors tomorrow.,0.8177,0.8092,2.0301
+embeddinggemma-2:latest,episodic_relevance,positive,What did I say I would do about the server migration?,0.7167,0.7409,4.9276
+embeddinggemma-2:latest,episodic_relevance,positive,What games do I play?,0.7121,0.7193,3.3991
+embeddinggemma-2:latest,episodic_relevance,positive,What console do I own?,0.6929,0.7054,3.3991
+embeddinggemma-2:latest,episodic_relevance,positive,Tell me about my Xbox.,0.6709,0.688,1.7186
+embeddinggemma-2:latest,episodic_relevance,negative,What is the capital of France?,0.6457,0.6487,2.1033
+embeddinggemma-2:latest,episodic_relevance,negative,Write a haiku about the ocean.,0.5936,0.5947,1.7186
+embeddinggemma-2:latest,episodic_relevance,negative,Search the web for the latest news on SpaceX.,0.6249,0.6308,0.8487
+embeddinggemma-2:latest,episodic_relevance,negative,What is 2+2?,0.6978,0.7106,2.1033
+embeddinggemma-2:latest,episodic_relevance,negative,Summarize this document for me.,0.7099,0.711,2.2881
+embeddinggemma-2:latest,episodic_relevance,negative,Fetch this URL and tell me what it says.,0.6858,0.7128,1.8241
+embeddinggemma-2:latest,episodic_relevance,negative,Remind me how photosynthesis works.,0.7272,0.7473,2.3093
+embeddinggemma-2:latest,episodic_relevance,negative,Help me write a cover letter for a job application.,0.6688,0.6755,2.6336
+embeddinggemma-2:latest,episodic_relevance,negative,Prepare a report on quarterly earnings.,0.676,0.6762,1.7186
+embeddinggemma-2:latest,episodic_relevance,negative,What is on the front page of the New York Times today?,0.6514,0.6579,2.952
+embeddinggemma-2:latest,episodic_relevance,negative,Explain how neural networks work.,0.6391,0.6464,0.0
+embeddinggemma-2:latest,episodic_relevance,negative,Get ready to receive a large file upload.,0.7079,0.7247,3.4372
+embeddinggemma-2:latest,episodic_relevance,negative,"I have a headache, what should I do?",0.6955,0.704,6.456
+embeddinggemma-2:latest,episodic_relevance,negative,"My favorite color is blue, what goes well with it?",0.7118,0.7287,2.694
+embeddinggemma-2:latest,episodic_relevance,negative,Can you help me plan a birthday party for my friend?,0.7628,0.7761,3.2243
+embeddinggemma-2:latest,episodic_relevance,negative,What is my IP address?,0.6457,0.6614,2.694
+embeddinggemma-2:latest,episodic_relevance,negative,Prepare a Python script that reverses a string.,0.6359,0.658,1.7186
+embeddinggemma-2:latest,episodic_relevance,negative,I need help understanding this error message.,0.7115,0.7303,1.5285
+embeddinggemma-2:latest,episodic_relevance,negative,What time is it in Tokyo right now?,0.5989,0.6095,2.1033
+embeddinggemma-2:latest,episodic_relevance,negative,Draft an email to my landlord about the leak.,0.5972,0.6017,1.7186

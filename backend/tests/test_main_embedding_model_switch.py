@@ -441,7 +441,7 @@ class TestAutomaticFirstTimeCalibration:
         assert resp.status_code == 200
         calibration = resp.json()["calibration"]
         assert calibration["model"] == "nomic-embed-text:latest"
-        assert set(calibration["gate_tiers"].values()) == {"validated"}
+        assert calibration["gate_tiers"] == {"explicit_search_action": "keyword", "lookup_request": "keyword", "research_intent": "validated", "episodic_relevance": "validated"}
         assert calibration["recall_floor_in_use"] == 0.55
         assert calibration["profile_threshold_in_use"] == 0.52
         assert main._state.memory_manager.get_calibration_version("nomic-embed-text:latest") == main.CALIBRATION_VERSION
@@ -462,8 +462,10 @@ class TestAutomaticFirstTimeCalibration:
 
         tiers = test_client.post("/settings/embedding-model", json={"model": "mystery-model"}).json()["calibration"]["gate_tiers"]
 
-        assert tiers["lookup_request"] == "auto-calibrated"
-        assert tiers["research_intent"] in {"lexical-fallback", "disabled"}
+        # _fake_calibration_result() still reports lookup_request; it's ignored
+        # (keyword-scored for every model), research_intent was degenerate.
+        assert tiers["lookup_request"] == "keyword"
+        assert tiers["research_intent"] == "lexical-fallback"
 
 
 class TestReembedRecalibration:

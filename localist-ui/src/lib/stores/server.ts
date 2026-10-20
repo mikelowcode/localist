@@ -29,8 +29,9 @@ export interface HealthState {
   startup_grace_over: boolean;
   // active_embedding_model_name / gate_tiers (PLAN_semantic_gating_
   // calibration.md §6): the RESOLVED model name Planner compares against
-  // its tuned model, and a per-gate trust tier ("tuned"/"validated"/
-  // "auto-calibrated"/"disabled") for the Settings page's trust badge —
+  // its tuned model, and a per-gate trust tier ("validated"/
+  // "auto-calibrated"/"lexical-fallback"/"disabled", or "keyword" for the
+  // two search gates) for the Settings page's trust badge —
   // refreshed on every health poll, not just after a switch/reembed.
   active_embedding_model_name: string | null;
   // The backend whose embed() is in use; differs from `backend` after a

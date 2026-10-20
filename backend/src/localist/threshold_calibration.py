@@ -34,10 +34,12 @@ from typing import Callable
 from . import bm25
 from .planner import (
     _ALL_SEARCH_NEGATIVE_FILTERS,
+    _KEYWORD_SCORED_GATES,
     _RESEARCH_NEGATIVE_FILTER,
     _SEARCH_INTENT_TEMPLATES,
     _EPISODIC_RELEVANCE_TEMPLATES,
     _cosine_similarity,
+    _keyword_coverage,
 )
 from .threshold_calibration_fixtures import (
     LR_CAT_A,
@@ -56,6 +58,10 @@ from .threshold_calibration_fixtures import (
     RECALL_EPISODES,
     RECALL_NEGATIVES,
     RECALL_POSITIVES,
+    ESA_POSITIVES_V2,
+    LR_POSITIVES_V2,
+    SEARCH_NEGATIVES_V2,
+    heldout_split,
     PROFILE_LINES,
     PROFILE_NEGATIVES,
     PROFILE_POSITIVES,
@@ -94,7 +100,15 @@ _RECALL_TOP_N: int = 5
 # model the next time it becomes active. Bump this whenever calibration
 # starts measuring something new or its method changes.
 #   1 — the four gates, the episodic recall floor, the profile-fact threshold.
-CALIBRATION_VERSION: int = 1
+#   2 — 2026-10-20: battery phrases lowercased before embedding, as production
+#       scores the request; explicit_search_action / lookup_request no longer
+#       measured (keyword-coverage scored for every model, see
+#       planner._KEYWORD_SCORED_GATES).
+CALIBRATION_VERSION: int = 2
+
+# Gates calibrate_thresholds() measures per model by cosine. The other two
+# (_KEYWORD_SCORED_GATES) are keyword-coverage scored for every model.
+_EMBEDDING_CALIBRATED_GATES: tuple[str, ...] = ("research_intent", "episodic_relevance")
 
 
 @dataclass
@@ -191,8 +205,10 @@ def _build_gate_phrase_pools() -> dict[str, tuple[list[str], list[str]]]:
     the explicit_search_action positive-pool proxy) and must never drift
     between the two calibration paths.
     """
-    lr_positive_phrases = [utt for _cat, utt in LR_CAT_C]
-    lr_negative_phrases = [utt for _cat, utt in LR_CAT_A] + [
+    # Search gates: the v2 battery (2026-10-20) plus the original Category
+    # A/C/D phrases — scored by keyword coverage, never by cosine.
+    lr_positive_phrases = LR_POSITIVES_V2 + [utt for _cat, utt in LR_CAT_C]
+    search_negative_phrases = SEARCH_NEGATIVES_V2 + [utt for _cat, utt in LR_CAT_A] + [
         utt for _cat, _domain, utt in LR_CAT_D
         if not any(neg in utt.lower() for neg in _ALL_SEARCH_NEGATIVE_FILTERS)
     ]
@@ -206,10 +222,8 @@ def _build_gate_phrase_pools() -> dict[str, tuple[list[str], list[str]]]:
     ep_positive_phrases = list(EP_POSITIVES) + list(EP_POSITIVES_LIVE)
     ep_negative_phrases = list(EP_NEGATIVES)
     return {
-        # explicit_search_action reuses lookup_request's pool -- see the
-        # comment in calibrate_thresholds() below for why.
-        "explicit_search_action": (lr_positive_phrases, lr_negative_phrases),
-        "lookup_request":         (lr_positive_phrases, lr_negative_phrases),
+        "explicit_search_action": (list(ESA_POSITIVES_V2), search_negative_phrases),
+        "lookup_request":         (lr_positive_phrases, search_negative_phrases),
         "research_intent":        (ri_positive_phrases, ri_negative_phrases),
         "episodic_relevance":     (ep_positive_phrases, ep_negative_phrases),
     }
@@ -449,36 +463,28 @@ def calibrate_thresholds(embed_fn: EmbedFn) -> CalibrationResult:
     that gate (see _youden_calibrate) rather than crashing the caller
     (auto-calibration on model switch, or the reembed endpoint).
     """
-    # explicit_search_action has no dedicated true-positive category in this
-    # battery -- the original hand-tuning diagnostics only ever scored
-    # LR_CAT_C against ESA as a regression/false-positive check (see
-    # planner.py's _SEMANTIC_GATE_THRESHOLDS comment: "Cat C max ESA score =
-    # 0.58, well under either threshold"), never as a required-to-fire
-    # positive set. Reusing lookup_request's pool here (see
-    # _build_gate_phrase_pools()) is the same framing, not a new assumption:
-    # if a given model doesn't treat "look up X" phrasing as ESA-positive,
-    # Youden's J will legitimately fail to clear _MIN_ACCEPTABLE_J and this
-    # gate falls back to a lower trust tier -- the honest outcome, not a
-    # guessed threshold.
-    template_vecs_by_gate = {
-        "explicit_search_action": _embed_template_group(embed_fn, _SEARCH_INTENT_TEMPLATES["explicit_search_action"]),
-        "lookup_request":         _embed_template_group(embed_fn, _SEARCH_INTENT_TEMPLATES["lookup_request"]),
-        "research_intent":        _embed_template_group(embed_fn, _SEARCH_INTENT_TEMPLATES["research_intent"]),
-        "episodic_relevance":     _embed_template_group(embed_fn, _EPISODIC_RELEVANCE_TEMPLATES),
+    # Only research_intent and episodic_relevance are cosine-calibrated per
+    # model; the search gates are keyword-coverage scored for every model
+    # (planner._KEYWORD_SCORED_GATES), so they're not measured here and
+    # CalibrationResult.gates carries just these two. Battery phrases are
+    # lowercased before embedding because production scores the lowercased
+    # request — calibrating on text as written gave case-sensitive models
+    # (EmbeddingGemma) thresholds that didn't match what they're applied to
+    # (diagnostics/reports/search_intent_baseline_2026-10-20.md). Templates
+    # are embedded as written, as Planner does.
+    template_phrases_by_gate = {
+        "research_intent":    _SEARCH_INTENT_TEMPLATES["research_intent"],
+        "episodic_relevance": _EPISODIC_RELEVANCE_TEMPLATES,
     }
-    grids_by_gate = {
-        "explicit_search_action": _LR_ESA_GRID,
-        "lookup_request":         _LR_ESA_GRID,
-        "research_intent":        _RI_EP_GRID,
-        "episodic_relevance":     _RI_EP_GRID,
-    }
+    pools = _build_gate_phrase_pools()
 
     result = CalibrationResult()
-    for name, (positive_phrases, negative_phrases) in _build_gate_phrase_pools().items():
-        template_vecs = template_vecs_by_gate[name]
-        pos_scores = _score_pool(embed_fn, positive_phrases, template_vecs)
-        neg_scores = _score_pool(embed_fn, negative_phrases, template_vecs)
-        result.gates[name] = _youden_calibrate(pos_scores, neg_scores, grids_by_gate[name])
+    for name in _EMBEDDING_CALIBRATED_GATES:
+        positive_phrases, negative_phrases = pools[name]
+        template_vecs = _embed_template_group(embed_fn, template_phrases_by_gate[name])
+        pos_scores = _score_pool(embed_fn, [p.lower() for p in positive_phrases], template_vecs)
+        neg_scores = _score_pool(embed_fn, [p.lower() for p in negative_phrases], template_vecs)
+        result.gates[name] = _youden_calibrate(pos_scores, neg_scores, _RI_EP_GRID)
 
     for name, gate in result.gates.items():
         logger.info(
@@ -523,8 +529,18 @@ def calibrate_lexical_thresholds() -> CalibrationResult:
     result = CalibrationResult()
     for name, (positive_phrases, negative_phrases) in _build_gate_phrase_pools().items():
         template_phrases = template_phrases_by_gate[name]
-        pos_scores = _bm25_score_pool(positive_phrases, template_phrases)
-        neg_scores = _bm25_score_pool(negative_phrases, template_phrases)
+        if name in _KEYWORD_SCORED_GATES:
+            # Keyword coverage, chosen on the calibration part of the v2
+            # search battery only — the held-out part (heldout_split()) is
+            # what the shipped thresholds were validated on
+            # (search_intent_v2_assessment_2026-10-20.md).
+            pos_cal, _ = heldout_split(positive_phrases)
+            neg_cal, _ = heldout_split(negative_phrases)
+            pos_scores = [_keyword_coverage(p.lower(), template_phrases) for p in pos_cal]
+            neg_scores = [_keyword_coverage(p.lower(), template_phrases) for p in neg_cal]
+        else:
+            pos_scores = _bm25_score_pool(positive_phrases, template_phrases)
+            neg_scores = _bm25_score_pool(negative_phrases, template_phrases)
         result.gates[name] = _youden_calibrate(pos_scores, neg_scores, grid=None)
 
     for name, gate in result.gates.items():

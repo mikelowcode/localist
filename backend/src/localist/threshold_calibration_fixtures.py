@@ -365,3 +365,186 @@ PROFILE_NEGATIVES: list[str] = [
     "Who painted the Sistine Chapel ceiling?",
     "What causes the seasons on Earth?",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Gate battery v2 — the rebuilt test set for the four semantic gates
+# (2026-10-20 search-intent plan, Phase B). Not wired into calibration yet:
+# diagnostics/diag_search_intent_v2.py measures it against the current
+# battery. Written before any scoring and never copied from real user
+# requests (those are personal data, kept out of the repo).
+#
+# Why it exists (diagnostics/reports/search_intent_baseline_2026-10-20.md):
+# the current battery gives lookup_request 3 near-duplicate positives,
+# which explicit_search_action borrows, so neither search gate can be
+# measured; and real searches are short imperatives the old battery has none
+# of.
+#
+# Search gates: both explicit_search_action and lookup_request trigger
+# web_search, so neither gate's positives count against the other —
+# each scores its own positives against the shared SEARCH_NEGATIVES_V2.
+# Positives here are things the user wants fetched from outside, whatever
+# their phrasing (commands, questions, "research <topic>"). Negatives are
+# requests a search shouldn't fire for: attached files and images, the
+# assistant's own knowledge, opinions, statements, follow-ups, local
+# (notes/files/memory) lookups, and long pasted text.
+#
+# research_intent keeps its narrow meaning — run down a specific fact (a
+# price, a spec, a plan tier) via the research loop — and
+# episodic_relevance its own; both get modest additions.
+#
+# Split: every third item of each list (index % 3 == 2) is held out, never
+# used to pick a threshold — see heldout_split().
+# ---------------------------------------------------------------------------
+
+ESA_POSITIVES_V2: list[str] = [
+    "search the web for the latest ollama release",
+    "google the opening hours of the louvre",
+    "do a web search on rust async runtimes",
+    "search online for reviews of the framework laptop 16",
+    "run a web search for the weather in tokyo this weekend",
+    "can you search the internet for cheap flights to lisbon",
+    "search for the release date of the next pixel phone",
+    "please search the web for what changed in python 3.14",
+    "search github for a swift port of whisper.cpp",
+    "search hacker news for discussions about sqlite wal mode",
+    "use web search to check the price of bitcoin",
+    "quick web search: is the british museum open on mondays",
+    "search reddit for opinions on the steam deck oled",
+    "find me web results about the new kindle colorsoft",
+    "search the web and tell me who won the last tour de france",
+    "Search online for the specs of the Snapdragon X2 Elite.",
+]
+
+LR_POSITIVES_V2: list[str] = [
+    "look up the specs of the rtx 5090",
+    "look up proposition 50 on the california ballot",
+    "Look up the ticker symbol for Arm Holdings.",
+    "can you look up when the next spacex launch is",
+    "could you find out who directed the movie sinners",
+    "find out what time the giants game starts tonight",
+    "check what current 30-year mortgage rates are",
+    "look into whether the new kindle supports epub",
+    "find information about the eu ai act enforcement dates",
+    "what can you find out about the qwen 3.5 release",
+    "what can you tell me about the phi-5-mini model",
+    "get me the latest news on the starship program",
+    "look up reviews for the sony wh-1000xm6",
+    "find the changelog for node 24",
+    "pull up details on the 2026 world cup schedule",
+    "check if the m4 ipad pro supports thunderbolt 5",
+    "find out how much the vision pro costs in japan",
+    "research the best budget 4k monitors",
+    "Research measures A and B on the city ballot.",
+    "do some research on local-first sync engines",
+    "look up the population of iceland next",
+    "what's the current status of the artemis iii mission",
+]
+
+SEARCH_NEGATIVES_V2: list[str] = [
+    # attached files and images
+    "take a look at this screenshot",
+    "look at the chart i attached",
+    "can you read this pdf",
+    "what does this photo show",
+    "can you see the attached file",
+    "look at this code and tell me what's wrong",
+    # the assistant's own knowledge
+    "how do i reverse a list in python",
+    "what's the difference between tcp and udp",
+    "explain how a cpu cache works",
+    "what is photosynthesis",
+    "tell me how localist works",
+    "write a haiku about autumn",
+    # opinions
+    "do you think remote work is here to stay",
+    "what's your take on tabs versus spaces",
+    "could an llm ever have good taste in product design",
+    # statements and feedback
+    "i bought a new laptop last week",
+    "that answer was really helpful, thanks",
+    "i think the second option is better",
+    "there are actually only twelve of them, not fifteen",
+    # follow-ups
+    "can you make it shorter",
+    "now translate that into spanish",
+    "what do you mean by that",
+    "let's start with the first one",
+    # local lookups, not web
+    "search my notes for the meeting summary",
+    "find the file named budget.xlsx",
+    "look through my wiki for the deployment checklist",
+    "what did i tell you about my car",
+    # greetings
+    "hello?",
+    "good morning",
+    # verb-swap near misses
+    "would you look at this?",
+    "will you look into this for me?",
+    "can you help me with this?",
+    # long pasted text
+    ("here are my notes from today's standup. backend: finished the search index refactor, "
+     "still need to look at the flaky retry test. frontend: the settings page now loads after "
+     "the backend starts; we found the bug was a race in the health poll. infra: moved the "
+     "nightly build to the new runner, it takes about twelve minutes. blockers: none. next: "
+     "release candidate on thursday if the soak test is clean."),
+    ("traceback (most recent call last): file \"main.py\", line 42, in <module> run() file "
+     "\"main.py\", line 37, in run results = index.search(query) file \"index.py\", line 118, in "
+     "search raise lookuperror(f\"no shard for {key}\") lookuperror: no shard for user_7. this "
+     "happens every time i start the app after an update. any idea what is going on?"),
+    ("changelog for today's build. added: per-model thresholds for profile lines, so off-topic "
+     "questions stop picking them up. fixed: new documents now show up in search results for "
+     "questions you asked before. changed: every embedding model is calibrated when it becomes "
+     "active, including at startup. known issue: the first launch after updating takes a few "
+     "extra seconds while calibration runs."),
+    ("hi team, quick update on the venue: we looked at three options and the community hall "
+     "is the best fit for budget and size. i still need to find out whether they allow catering "
+     "from outside, and look up parking. can everyone confirm their availability for the 14th by "
+     "friday? thanks, sam"),
+]
+
+RI_POSITIVES_V2: list[str] = [
+    "look up how much the claude pro plan costs per month",
+    "find the price of the m4 mac mini with 32gb",
+    "check the current price of a nintendo switch 2",
+    "find out the pricing tiers for notion",
+    "track down the cost of a spotify family plan",
+    "look up the battery capacity and price of the pixel 10",
+]
+
+RI_NEGATIVES_V2: list[str] = [
+    "is the vision pro worth the price",
+    "that seems like a lot of money for a phone",
+    "why are graphics cards so expensive now",
+    "should i buy the cheaper model or wait",
+    "what's a good budget for a first car",
+    "summarize the pros and cons of buying versus leasing",
+]
+
+EP_POSITIVES_V2: list[str] = [
+    "what did i tell you about my laptop",
+    "remind me what we decided about the logo",
+    "based on what you know about me, suggest a weekend plan",
+    "what's my usual coffee order",
+    "help me prepare for my meeting next tuesday",
+    "do you remember which gpu i ended up buying",
+    "what was the plan we discussed for the garden",
+    "given my preferences, which of these laptops suits me",
+]
+
+EP_NEGATIVES_V2: list[str] = [
+    "what's the capital of australia",
+    "explain how vaccines work",
+    "write a short poem about rain",
+    "how do i center a div",
+    "summarize the plot of hamlet",
+    "what's the boiling point of water at altitude",
+    "translate 'thank you' into japanese",
+    "list three uses for baking soda",
+]
+
+
+def heldout_split(items: list) -> tuple[list, list]:
+    """(calibration, held_out) — every third item (index % 3 == 2) held out."""
+    return ([x for i, x in enumerate(items) if i % 3 != 2],
+            [x for i, x in enumerate(items) if i % 3 == 2])

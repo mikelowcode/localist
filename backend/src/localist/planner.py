@@ -540,36 +540,38 @@ _SLASH_COMMAND_TOOL_MAP: dict[str, str] = {
 # These strings are embedded at startup and used only for cosine-similarity logging;
 # they do not gate any routing decision until a threshold prompt replaces this comment.
 _SEARCH_INTENT_TEMPLATES: dict[str, tuple[str, ...]] = {
+    # explicit_search_action / lookup_request: both trigger web_search, and
+    # both are scored for every embedding model by keyword coverage
+    # (_keyword_coverage(), _KEYWORD_COVERAGE_THRESHOLDS), not cosine — see
+    # _KEYWORD_SCORED_GATES. Replaced 2026-10-20 (diagnostics/reports/
+    # search_intent_v2_assessment_2026-10-20.md): the old lookup templates
+    # were polite questions ("can you look up the release date for this")
+    # while real searches are short commands ("look up <topic> next",
+    # "search github for <thing>", "research <topic>"), and "look that up"
+    # sat close enough to "look at this image" to fire on it. These are
+    # lowercase, subject-free, avoid "look at" wording, and add "research
+    # this topic" forms; earlier template history is in sessions-log.md.
     "explicit_search_action": (
         "search the web for this",
         "do a web search for this",
         "search online for this",
         "google this",
-        "go look it up",
+        "search the internet for this",
+        "run a web search on this",
+        "search github for this",
+        "find web results about this",
     ),
     "lookup_request": (
-        "look up this",
-        "look that up",
-        "go ahead and look it up",
-        "find information on this",
+        "look this up",
+        "look up this topic",
+        "look up information about this",
         "find out about this",
-        # 2026-06-28: The 4 polite-imperative templates added 2026-06-25 caused a
-        # confirmed, threshold-unfixable false-positive surface: 6/14 fresh adversarial
-        # negatives scored 0.81–0.90, ABOVE every true positive's max (~0.62). Replaced
-        # with Candidate Set 1 (object-specificity fix) per:
-        #   diagnostics/reports/lookup_request_template_rework_2026-06-28.md
-        #   diagnostics/reports/full_pertable_lr_set1_esa_2026-06-28.md
-        # Effect: Cat D false positives 13/14 → 6/14; 3 true positives fully preserved
-        # (3/3); 5 negative-filter-protected identity/greeting phrases unaffected.
-        # KNOWN ACCEPTED RESIDUAL — 6/14 adversarial negatives remain gate-positive:
-        #   D-verb-swap ×4: "Can you help me with this?", "Could you check this for me?",
-        #                   "Would you look at this?", "Can you tell me about this?"
-        #   D-modal-swap ×2: "Will you look into this?", "Do you mind looking at this?"
-        # These fire via the modal-question scaffold; not eliminated by Set 1.
-        "can you look up the release date for this",
-        "could you look up what year this happened",
-        "can you look up information about the latest Apple products",
-        "could you find out the current stock price for me",
+        "find information on this",
+        "can you look this up for me",
+        "what can you find out about this",
+        "check online what the latest is on this",
+        "research this topic",
+        "do some research on this",
     ),
     "knowledge_request_open": (
         "what is this",
@@ -813,9 +815,11 @@ _GATE_NAMES: tuple[str, ...] = (
 #     that category of query and does not include hobby/possession terms
 #     either — a separate, not-yet-scoped follow-up.
 _VALIDATED_MODEL_THRESHOLDS: dict[str, dict[str, float]] = {
+    # explicit_search_action 0.68 / lookup_request 0.62 retired 2026-10-20:
+    # those gates are keyword-scored for every model (_KEYWORD_SCORED_GATES);
+    # on the v2 battery these values caught 15% of held-out searches with
+    # 18% false alarms (search_intent_v2_assessment_2026-10-20.md).
     "nomic-embed-text:latest": {
-        "explicit_search_action": 0.68,
-        "lookup_request":         0.62,
         "research_intent":        0.58,
         "episodic_relevance":     0.62,
     },
@@ -944,12 +948,87 @@ def resolve_profile_fact_threshold(
 # have no relationship to the 0-1 cosine-similarity scale used everywhere
 # else in this file — never compare a BM25 score against a value from
 # _VALIDATED_MODEL_THRESHOLDS or vice versa.
+#
+# explicit_search_action / lookup_request left this table 2026-10-20: they
+# are keyword-coverage scored for every model now (_KEYWORD_COVERAGE_
+# THRESHOLDS below). BM25 was length-biased for them — long pasted messages
+# scored 12–16 against ~2.7 thresholds and fired a web search
+# (search_intent_baseline_2026-10-20.md).
 _LEXICAL_FALLBACK_THRESHOLDS: dict[str, float] = {
-    "explicit_search_action": 2.833302343894667,
-    "lookup_request":         2.5611057478287096,
     "research_intent":        3.144647104366297,
     "episodic_relevance":     3.3990800432380546,
 }
+
+
+# ---------------------------------------------------------------------------
+# Keyword-coverage search detection (2026-10-20) — how explicit_search_action
+# and lookup_request decide whether a request wants a web search, for EVERY
+# embedding model and for keyword-only alike. Their resolved tier is always
+# "keyword" (resolve_gate_tiers()); no hand-validated or calibrated cosine
+# value applies to them, and calibration doesn't measure them.
+#
+# Why not cosine: on a realistic battery with hard negatives (attached
+# files, opinions, follow-ups, local lookups, long pasted text) no embedding
+# model separated search requests from the rest — every model's search gates
+# calibrated inconclusive, and nomic's hand-validated values caught 15% of
+# held-out searches with 18% false alarms. This score caught 100% / 24% on
+# held-out data and 5 of 6 real searches with 1 false alarm in 32 requests
+# (diagnostics/reports/search_intent_v2_assessment_2026-10-20.md, variant L3).
+#
+# Score: the best share, over a gate's templates, of the template's content
+# words (_KEYWORD_STOPWORDS removed) that appear in the request — counted
+# only when at least two of them match (one, for a one-word template, and
+# then only as the request's first word: "google the hours", not "made by
+# google"). A request that STARTS with a search verb
+# (_KEYWORD_LEAD_VERBS: "research measures a and b") scores 0.5 even
+# without a template match. Times min(1, _KEYWORD_LENGTH_PIVOT / request
+# tokens) — long messages are rarely search commands. 0–1.
+#
+# The two-word rule is from Phase C (2026-10-20): with single-word matches
+# allowed, existing routing tests showed one generic word firing a search
+# ("check the wiki for …", "are you made by google", "i searched online
+# for …", "read the file about that github project"). Measured through
+# Planner.route(): held-out 10/13 caught, 1 false of 17; real requests 4/6
+# caught, 0 false of 26; 0 false on the routing tests' phrases, against 6
+# for single-word matching.
+#
+# Thresholds are Youden's-J-optimal on the calibration part of the v2
+# search battery (threshold_calibration_fixtures.*_V2, heldout_split()),
+# re-derived by threshold_calibration.calibrate_lexical_thresholds() /
+# diagnostics/calibrate_lexical_fallback_thresholds.py — never per model.
+_KEYWORD_SCORED_GATES: tuple[str, ...] = ("explicit_search_action", "lookup_request")
+_KEYWORD_STOPWORDS: frozenset[str] = frozenset(
+    "a an the this that these those it is are was be to of for on in at about and or "
+    "me my you your i we can could would will please do does what how".split()
+)
+_KEYWORD_LENGTH_PIVOT: int = 12
+_KEYWORD_LEAD_VERBS: frozenset[str] = frozenset({"search", "google", "research"})
+_KEYWORD_COVERAGE_THRESHOLDS: dict[str, float] = {
+    "explicit_search_action": 0.5,
+    "lookup_request":         0.5,
+}
+
+
+def _keyword_coverage(lowered: str, phrases: tuple[str, ...]) -> float:
+    """Keyword-coverage score of `lowered` against a gate's templates — see
+    _KEYWORD_COVERAGE_THRESHOLDS. 0.0 when no template has a content word."""
+    tokens = _bm25.tokenize(lowered)
+    present = set(tokens)
+    first = tokens[0] if tokens else None
+    coverage = 0.0
+    for phrase in phrases:
+        words = {w for w in _bm25.tokenize(phrase) if w not in _KEYWORD_STOPWORDS}
+        if not words:
+            continue
+        matched = len(words & present)
+        if matched < min(2, len(words)):
+            continue
+        if len(words) == 1 and first not in words:
+            continue
+        coverage = max(coverage, matched / len(words))
+    if coverage == 0.0 and first in _KEYWORD_LEAD_VERBS:
+        coverage = 0.5
+    return coverage * min(1.0, _KEYWORD_LENGTH_PIVOT / max(1, len(tokens)))
 
 
 # ---------------------------------------------------------------------------
@@ -1204,7 +1283,9 @@ def resolve_gate_tiers(
     Pure per-gate trust-tier resolution — _VALIDATED_MODEL_THRESHOLDS ->
     calibrated_thresholds -> _LEXICAL_FALLBACK_THRESHOLDS -> disabled.
     Returns all four _GATE_NAMES as keys, each mapped to "validated" /
-    "auto-calibrated" / "lexical-fallback" / "disabled".
+    "auto-calibrated" / "lexical-fallback" / "disabled" — or "keyword" for
+    _KEYWORD_SCORED_GATES, which are keyword-coverage scored for every model
+    regardless of the rest of the chain.
 
     Extracted so GET /health can show the same per-gate trust badges
     Planner.__init__ resolves internally, without constructing a full
@@ -1223,7 +1304,11 @@ def resolve_gate_tiers(
     calibrated = calibrated_thresholds or {}
     tiers: dict[str, str] = {}
     for name in _GATE_NAMES:
-        if name in validated:
+        if name in _KEYWORD_SCORED_GATES:
+            # Keyword coverage for every model; a calibrated value persisted
+            # before 2026-10-20 for these gates is ignored.
+            tiers[name] = "keyword"
+        elif name in validated:
             tiers[name] = "validated"
         elif name in calibrated:
             tiers[name] = "auto-calibrated"
@@ -1377,12 +1462,12 @@ class Planner:
         self._episodic_relevance_threshold = resolved.get("episodic_relevance")
 
         cosine_enabled  = sorted(resolved)
-        lexical_enabled = [name for name in _GATE_NAMES if self._gate_tier[name] == "lexical-fallback"]
+        lexical_enabled = [name for name in _GATE_NAMES if self._gate_tier[name] in ("keyword", "lexical-fallback")]
         disabled        = [name for name in _GATE_NAMES if self._gate_tier[name] == "disabled"]
         if cosine_enabled or lexical_enabled:
             logger.info(
                 "Planner: active embedding model %r — per-gate threshold "
-                "resolution: cosine=%s lexical-fallback=%s disabled=%s.",
+                "resolution: cosine=%s keyword/lexical=%s disabled=%s.",
                 embedding_model_name,
                 {name: (resolved[name], self._gate_tier[name]) for name in cosine_enabled},
                 lexical_enabled or "none",
@@ -2002,14 +2087,18 @@ class Planner:
         zero-config keyword-only install, not only a model with a
         gate-specific calibration gap.
         """
+        if name in _KEYWORD_SCORED_GATES:
+            return True
         if name not in _LEXICAL_FALLBACK_THRESHOLDS:
             return False
         return self._embed_fn is None or self._gate_tier.get(name) == "lexical-fallback"
 
     def _lexical_search_intent_scores(self, lowered: str) -> dict[str, float]:
         """
-        BM25 max-score per group in _SEARCH_INTENT_TEMPLATES, scored
-        against `lowered` — the lexical-fallback tier's counterpart to
+        Lexical score per group in _SEARCH_INTENT_TEMPLATES, scored against
+        `lowered`: keyword coverage (_keyword_coverage()) for
+        _KEYWORD_SCORED_GATES, BM25 max-score for the rest — the
+        keyword / lexical-fallback tiers' counterpart to
         _semantic_search_intent()'s cosine group_scores.
 
         Always computable (no embed_fn/embedding model involved at all),
@@ -2023,8 +2112,9 @@ class Planner:
         case of a working embedding model.
         """
         return {
-            group: max(
-                _bm25.score_documents(lowered, [(i, p) for i, p in enumerate(phrases)]).values()
+            group: (
+                _keyword_coverage(lowered, phrases) if group in _KEYWORD_SCORED_GATES
+                else max(_bm25.score_documents(lowered, [(i, p) for i, p in enumerate(phrases)]).values())
             )
             for group, phrases in _SEARCH_INTENT_TEMPLATES.items()
         }
@@ -2353,13 +2443,13 @@ class Planner:
             if lexical_esa_lr_gates and "web_search" not in tools:
                 fired_lexical = [
                     g for g in lexical_esa_lr_gates
-                    if lexical_scores.get(g, 0.0) >= _LEXICAL_FALLBACK_THRESHOLDS[g]
+                    if lexical_scores.get(g, 0.0) >= _KEYWORD_COVERAGE_THRESHOLDS[g]
                 ]
                 if fired_lexical:
                     tools.append("web_search")
                     logger.debug(
                         "Planner: Priority 3 — web_search signal detected via "
-                        "lexical-fallback gate(s) %s.", fired_lexical,
+                        "keyword-coverage gate(s) %s.", fired_lexical,
                     )
 
             if (
