@@ -117,6 +117,10 @@ backend/wiki/
 backend/raw/
 backend/generated_files/
 
+# auditlog-core scope doc — kept local-only by design, never goes to the
+# public repo. Local reference copy only.
+docs/architecture/23-auditlog-core-scope.md
+
 # SQLite database files (runtime artifacts, never committed)
 backend/*.db
 backend/localist_memory.db
