@@ -41,7 +41,7 @@ import pytest
 
 from mcp.shared.memory import create_connected_server_and_client_session
 
-from localist.mcp_server import chart, file_ops, github, hacker_news, news_search, ocr, ocr_ollama, search_format, url_fetch, web_search
+from localist.mcp_server import chart, file_ops, github, hacker_news, msn_resolve, news_search, ocr, ocr_ollama, search_format, url_fetch, web_search
 from localist.mcp_server.main import mcp as mcp_app
 from localist.mcp_server.ocr_provider import OCRProvider
 
@@ -240,6 +240,258 @@ class TestFetchUrlErrors:
                 asyncio.run(url_fetch.fetch_url("https://example.com/paywalled"))
         assert exc_info.value.error_code == "extraction_failed"
         assert str(exc_info.value).startswith("ERROR: extraction_failed —")
+
+
+# JavaScript app-shell fixtures (§14.17) — synthetic, shaped after the real
+# 2026-10-21 MSN article shell (0 visible body chars, scripts ~77% of bytes).
+_BUNDLE_JS = b"window.__APP_STATE__ = {};" + b"function f(){return 1;}" * 400
+
+_SCRIPT_HEAVY_SHELL_HTML = (
+    b"<html><head><title>MSN</title><script>" + _BUNDLE_JS + b"</script></head>"
+    b"<body><div id=\"entry\"></div></body></html>"
+)
+_MOUNT_NODE_SHELL_HTML = (
+    b"<html><head><title>App</title><script src=\"/bundle.js\"></script></head>"
+    b"<body><div id=\"__next\"></div></body></html>"
+)
+_NOSCRIPT_STUB_HTML = (
+    b"<html><head><title>App</title><script src=\"/main.js\"></script></head>"
+    b"<body><noscript>You need to enable JavaScript to run this app.</noscript>"
+    b"<div id=\"container\"></div></body></html>"
+)
+# A real article that also ships a large inline bundle — must stay a success.
+_SCRIPT_HEAVY_ARTICLE_HTML = _SAMPLE_ARTICLE_HTML.replace(
+    b"</head>", b"<script>" + _BUNDLE_JS + b"</script></head>",
+)
+
+
+class TestFetchUrlJavaScriptShell:
+    @pytest.mark.parametrize("html", [
+        _SCRIPT_HEAVY_SHELL_HTML, _MOUNT_NODE_SHELL_HTML, _NOSCRIPT_STUB_HTML,
+    ], ids=["script-heavy", "empty-mount-node", "noscript-stub"])
+    def test_js_shell_maps_to_javascript_required(self, html: bytes):
+        with patch.object(url_fetch, "_fetch", AsyncMock(return_value=_raw_response(html))):
+            with pytest.raises(url_fetch.FetchUrlError) as exc_info:
+                asyncio.run(url_fetch.fetch_url("https://spa.example/article"))
+        assert exc_info.value.error_code == "javascript_required"
+        assert str(exc_info.value).startswith(
+            "ERROR: javascript_required — This site loads its content with JavaScript"
+        )
+
+    def test_bare_paywall_page_is_not_a_js_shell(self):
+        """No text and no JavaScript signal — stays extraction_failed."""
+        assert url_fetch._looks_like_js_shell(_EMPTY_HTML) is False
+
+    def test_script_heavy_real_article_still_succeeds(self):
+        with patch.object(
+            url_fetch, "_fetch", AsyncMock(return_value=_raw_response(_SCRIPT_HEAVY_ARTICLE_HTML)),
+        ):
+            result = asyncio.run(url_fetch.fetch_url("https://example.com/article"))
+        assert result["title"] == "Test Article Title"
+        assert url_fetch._looks_like_js_shell(_SCRIPT_HEAVY_ARTICLE_HTML) is False
+
+    def test_unparseable_html_is_not_a_js_shell(self):
+        assert url_fetch._looks_like_js_shell(b"") is False
+
+
+# ---------------------------------------------------------------------------
+# MSN republished-article resolution (§14.17)
+# ---------------------------------------------------------------------------
+
+_MSN_URL = (
+    "https://www.msn.com/en-us/news/other/the-next-xbox-might-cost-1800-report-says/"
+    "ar-AA2fGabX?ocid=BingNewsSerp"
+)
+_MSN_ORIGINAL_URL = "https://www.engadget.com/2292408/the-next-xbox-might-cost-1800-report-says/"
+
+# Trimmed from the real 2026-10-21 content-API response for _MSN_URL.
+_MSN_API_JSON = {
+    "id":                "AA2fGabX",
+    "title":             "The next Xbox might cost $1,800, report says",
+    "sourceHref":        _MSN_ORIGINAL_URL,
+    "provider":          {"id": "AA22USYh", "name": "Engadget"},
+    "authors":           [{"name": "Anna Washenko"}],
+    "publishedDateTime": "2026-10-20T22:01:23Z",
+    "body": (
+        '<img data-reference="image"><p><a href="https://fortune.com/x"><em>Fortune</em></a> '
+        "published a lengthy profile of Xbox leadership.</p>"
+        + "<p>Project Helix could cost between $1,200 and $1,800 per internal estimates.</p>" * 6
+    ),
+}
+
+
+def _msn_article(**overrides) -> msn_resolve.MsnArticle:
+    fields = dict(
+        title          = "The next Xbox might cost $1,800, report says",
+        author         = "Anna Washenko",
+        date_published = "2026-10-20T22:01:23Z",
+        provider       = "Engadget",
+        source_href    = _MSN_ORIGINAL_URL,
+        body_text      = "MSN copy of the article. " * 20,
+    )
+    fields.update(overrides)
+    return msn_resolve.MsnArticle(**fields)
+
+
+def _mock_content_api(monkeypatch, handler) -> list[str]:
+    """Route msn_resolve's httpx client through a MockTransport; returns seen URLs."""
+    seen: list[str] = []
+    real_client = httpx.AsyncClient
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return handler(request)
+
+    monkeypatch.setattr(
+        msn_resolve.httpx, "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(_handler), **kw),
+    )
+    return seen
+
+
+class TestMsnParseArticleUrl:
+    def test_real_article_url(self):
+        assert msn_resolve.parse_article_url(_MSN_URL) == msn_resolve.MsnArticleRef(
+            locale="en-us", article_id="AA2fGabX",
+        )
+
+    def test_other_locale_is_kept(self):
+        ref = msn_resolve.parse_article_url("https://www.msn.com/fr-fr/actualite/x/ar-AB12cd")
+        assert ref == msn_resolve.MsnArticleRef(locale="fr-fr", article_id="AB12cd")
+
+    def test_missing_locale_defaults_to_en_us(self):
+        ref = msn_resolve.parse_article_url("https://msn.com/news/ar-AB12cd")
+        assert ref == msn_resolve.MsnArticleRef(locale="en-us", article_id="AB12cd")
+
+    @pytest.mark.parametrize("url", [
+        "https://www.msn.com/en-us/video/x/vi-AA1abc",       # video
+        "https://www.msn.com/en-us/news/x/gm-AA1abc",        # gallery
+        "https://www.msn.com/en-us/news",                    # section page
+        "https://www.msn.com/",
+        "https://notmsn.com/en-us/news/x/ar-AA1abc",         # lookalike host
+        "https://example.com/en-us/news/x/ar-AA1abc",
+        "ftp://www.msn.com/en-us/news/x/ar-AA1abc",
+    ])
+    def test_non_article_urls_are_not_resolved(self, url: str):
+        assert msn_resolve.parse_article_url(url) is None
+
+
+class TestMsnLookup:
+    _REF = msn_resolve.MsnArticleRef(locale="en-us", article_id="AA2fGabX")
+
+    def test_parses_real_shaped_response(self, monkeypatch):
+        seen = _mock_content_api(monkeypatch, lambda r: httpx.Response(200, json=_MSN_API_JSON))
+        article = asyncio.run(msn_resolve.lookup(self._REF, 5.0, {}))
+
+        assert seen == ["https://assets.msn.com/content/view/v2/Detail/en-us/AA2fGabX"]
+        assert article.provider == "Engadget"
+        assert article.source_href == _MSN_ORIGINAL_URL
+        assert article.author == "Anna Washenko"
+        assert article.date_published == "2026-10-20T22:01:23Z"
+        assert article.body_text.startswith("Fortune published a lengthy profile")
+        assert "<p>" not in article.body_text
+
+    def test_msn_hosted_source_href_is_dropped(self, monkeypatch):
+        payload = {**_MSN_API_JSON, "sourceHref": "https://www.msn.com/en-us/news/ar-AA2fGabX"}
+        _mock_content_api(monkeypatch, lambda r: httpx.Response(200, json=payload))
+        article = asyncio.run(msn_resolve.lookup(self._REF, 5.0, {}))
+        assert article.source_href == ""
+
+    def test_http_error_returns_none(self, monkeypatch):
+        _mock_content_api(monkeypatch, lambda r: httpx.Response(404))
+        assert asyncio.run(msn_resolve.lookup(self._REF, 5.0, {})) is None
+
+    def test_non_json_returns_none(self, monkeypatch):
+        _mock_content_api(monkeypatch, lambda r: httpx.Response(200, text="<html>nope</html>"))
+        assert asyncio.run(msn_resolve.lookup(self._REF, 5.0, {})) is None
+
+
+_ORIGINAL_ARTICLE_RAW = _raw_response(_SAMPLE_ARTICLE_HTML, url=_MSN_ORIGINAL_URL)
+
+
+class TestFetchUrlMsnResolution:
+    def test_original_publisher_page_is_fetched(self):
+        fake_fetch = AsyncMock(return_value=_ORIGINAL_ARTICLE_RAW)
+        with patch.object(msn_resolve, "lookup", AsyncMock(return_value=_msn_article(
+                body_text="Short MSN copy.",
+             ))), \
+             patch.object(url_fetch, "_fetch", fake_fetch):
+            result = asyncio.run(url_fetch.fetch_url(_MSN_URL))
+
+        assert fake_fetch.call_args.args[0] == _MSN_ORIGINAL_URL
+        assert result["url"] == _MSN_ORIGINAL_URL
+        assert result["title"] == "Test Article Title"
+        assert result["via"] == "msn.com (republished from Engadget)"
+
+    def test_original_failure_falls_back_to_msn_copy(self):
+        request = httpx.Request("GET", _MSN_ORIGINAL_URL)
+        blocked = httpx.HTTPStatusError(
+            "403", request=request, response=httpx.Response(403, request=request),
+        )
+        with patch.object(msn_resolve, "lookup", AsyncMock(return_value=_msn_article())), \
+             patch.object(url_fetch, "_fetch", AsyncMock(side_effect=blocked)):
+            result = asyncio.run(url_fetch.fetch_url(_MSN_URL))
+
+        assert result["url"] == _MSN_URL
+        assert result["cleaned_text"].startswith("MSN copy of the article.")
+        assert result["word_count"] == 100
+        assert result["author"] == "Anna Washenko"
+        assert result["via"] == (
+            f"msn.com (republished from Engadget); original: {_MSN_ORIGINAL_URL}"
+        )
+
+    def test_thin_original_loses_to_fuller_msn_copy(self):
+        """A publisher paywall teaser (well under half MSN's copy) → MSN's copy wins."""
+        with patch.object(msn_resolve, "lookup", AsyncMock(return_value=_msn_article(
+                body_text="Full syndicated article text. " * 100,
+             ))), \
+             patch.object(url_fetch, "_fetch", AsyncMock(return_value=_ORIGINAL_ARTICLE_RAW)):
+            result = asyncio.run(url_fetch.fetch_url(_MSN_URL))
+
+        assert result["url"] == _MSN_URL
+        assert result["word_count"] == 400
+
+    def test_no_source_href_uses_msn_copy_without_fetching(self):
+        fake_fetch = AsyncMock()
+        with patch.object(msn_resolve, "lookup", AsyncMock(return_value=_msn_article(
+                source_href="",
+             ))), \
+             patch.object(url_fetch, "_fetch", fake_fetch):
+            result = asyncio.run(url_fetch.fetch_url(_MSN_URL))
+
+        fake_fetch.assert_not_called()
+        assert result["via"] == "msn.com (republished from Engadget)"
+        assert result["url"] == _MSN_URL
+
+    def test_lookup_failure_falls_through_to_msn_page_itself(self):
+        """API down → normal fetch of the MSN shell → honest javascript_required."""
+        fake_fetch = AsyncMock(return_value=_raw_response(_SCRIPT_HEAVY_SHELL_HTML, url=_MSN_URL))
+        with patch.object(msn_resolve, "lookup", AsyncMock(return_value=None)), \
+             patch.object(url_fetch, "_fetch", fake_fetch):
+            with pytest.raises(url_fetch.FetchUrlError) as exc_info:
+                asyncio.run(url_fetch.fetch_url(_MSN_URL))
+
+        assert fake_fetch.call_args.args[0] == _MSN_URL
+        assert exc_info.value.error_code == "javascript_required"
+
+    def test_empty_msn_copy_and_no_original_falls_through(self):
+        fake_fetch = AsyncMock(return_value=_raw_response(_SCRIPT_HEAVY_SHELL_HTML, url=_MSN_URL))
+        with patch.object(msn_resolve, "lookup", AsyncMock(return_value=_msn_article(
+                source_href="", body_text="",
+             ))), \
+             patch.object(url_fetch, "_fetch", fake_fetch):
+            with pytest.raises(url_fetch.FetchUrlError):
+                asyncio.run(url_fetch.fetch_url(_MSN_URL))
+        assert fake_fetch.call_args.args[0] == _MSN_URL
+
+    def test_non_msn_url_never_calls_content_api(self):
+        fake_lookup = AsyncMock()
+        with patch.object(msn_resolve, "lookup", fake_lookup), \
+             patch.object(url_fetch, "_fetch", AsyncMock(return_value=_raw_response(_SAMPLE_ARTICLE_HTML))):
+            result = asyncio.run(url_fetch.fetch_url("https://example.com/article"))
+
+        fake_lookup.assert_not_called()
+        assert "via" not in result
 
 
 # ---------------------------------------------------------------------------

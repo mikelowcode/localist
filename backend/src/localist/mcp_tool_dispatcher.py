@@ -234,6 +234,13 @@ _ENRICH_EXCERPT_CHARS: int = 3000
 # up to this many candidate URLs (in result order) before giving up.
 _ENRICH_MAX_ATTEMPTS: int = 3
 
+# 2026-10-21 (§14.17): Ollama Cloud web_fetch can "succeed" on a page the
+# fetcher already rejected by returning the unrendered shell itself — live,
+# an MSN article came back as 1 word ("MSN"). The fallback only runs after
+# the fetcher failed, so a result this thin is treated as a failure too.
+# Same bar as mcp_server/url_fetch.py's _JS_SHELL_TINY_WORD_COUNT.
+_MIN_FALLBACK_FETCH_WORDS: int = 40
+
 # Chart argument extraction — matches diag_shadow_chart_toolcall_v4_full.py's
 # measured pipeline exactly. _CHART_RETRY_TEMPERATURE is a second,
 # independent inference sample on a MALFORMED_ENVELOPE first pass, not a
@@ -430,10 +437,16 @@ def _format_fetch_result_text(url: str, data: dict) -> str:
     mcp_server/ollama_web_fetch.py) specifically so this one function can
     format both tiers identically, with nothing downstream able to tell
     which tier answered.
+
+    A "via" key (fetch_url's MSN resolution, §14.17) adds a "Via:" line so
+    the model knows the text came by way of a republisher — absent on every
+    other fetch, which keeps the default shape byte-identical.
     """
+    via_line = f"Via: {data['via']}\n" if data.get("via") else ""
     return (
         f"Title: {data.get('title', '')}\n"
         f"Source: {data.get('url', url)}\n"
+        f"{via_line}"
         f"Words: {data.get('word_count', 0)}\n\n"
         f"{data.get('cleaned_text', '')}"
     )
@@ -787,6 +800,13 @@ class MCPToolDispatcher:
         here. The fallback is skipped when the failure is localist-mcp
         itself being unreachable, same suppression rule
         _execute_web_search_query uses.
+
+        When both tiers fail, the result leads with the fetcher's own
+        error and carries the fallback's as secondary detail (§14.17). The
+        fetcher's diagnosis is the one that describes the target page
+        (e.g. an HTTP 200 JavaScript shell); returning only the
+        fallback's error once led the model to report a "404" for a page
+        that had actually loaded.
         """
         url: str = context.get("fetch_url", "")
         if not url:
@@ -814,6 +834,19 @@ class MCPToolDispatcher:
             url,
         )
         fallback = await self._run_ollama_url_fetch(session, connect_error, url)
+        if not fallback.success:
+            logger.info(
+                "MCPToolDispatcher: url_fetch Ollama fallback also failed for url=%r — "
+                "reporting the fetcher's error first.",
+                url,
+            )
+            fallback = replace(
+                fallback,
+                result = (
+                    f"{fetch_result.result} "
+                    f"(Ollama Cloud fallback also failed: {fallback.result})"
+                ),
+            )
         return replace(fallback, tool_name="url_fetch:ollama_fallback")
 
     async def _execute_fetcher_url_fetch(
@@ -904,7 +937,9 @@ class MCPToolDispatcher:
         mcp_server/ollama_web_fetch.py), so _format_fetch_result_text
         formats both tiers identically — this method has no opinion on
         being the fallback tier; the caller retags .tool_name afterward
-        ("url_fetch:ollama_fallback").
+        ("url_fetch:ollama_fallback"). A response under
+        _MIN_FALLBACK_FETCH_WORDS is returned as a failure, not a success
+        (see that constant).
         """
         params_str = f"url={url!r}"
 
@@ -945,6 +980,24 @@ class MCPToolDispatcher:
                 tool_name  = "url_fetch",
                 parameters = params_str,
                 result     = f"ERROR: failed to parse ollama_web_fetch response — {exc}",
+                success    = False,
+            )
+
+        word_count = data.get("word_count", 0)
+        if word_count < _MIN_FALLBACK_FETCH_WORDS:
+            logger.info(
+                "MCPToolDispatcher: ollama_web_fetch returned only %d words for url=%r — "
+                "treating as failed.",
+                word_count, url,
+            )
+            return ToolResult(
+                tool_name  = "url_fetch",
+                parameters = params_str,
+                result     = (
+                    f"ERROR: ollama_web_fetch returned only {word_count} "
+                    f"word{'' if word_count == 1 else 's'} — "
+                    "not the page's content"
+                ),
                 success    = False,
             )
 

@@ -63,6 +63,7 @@ from localist.mcp_tool_dispatcher import (
     _RESEARCH_CLASSIFIER_TIMEOUT,
     _RESEARCH_GATE_SYSTEM_PROMPT,
     _RESEARCH_REFORMULATE_SYSTEM_PROMPT,
+    _format_fetch_result_text,
 )
 from localist.prompt_builder import ToolResult
 
@@ -445,8 +446,12 @@ class TestUrlFetchOllamaFallback:
             "fetch_duration_ms": 5.0,
         }), False
 
+    # Article-length (≥ _MIN_FALLBACK_FETCH_WORDS): a thinner fallback body is
+    # treated as a failure since 2026-10-21 (§14.17).
+    _OLLAMA_BODY = "Ollama fallback body text. " + "More real article words here. " * 10
+
     @staticmethod
-    def _ollama_fetch_success(url: str, content: str = "Ollama fallback body text.") -> tuple[str, bool]:
+    def _ollama_fetch_success(url: str, content: str = _OLLAMA_BODY) -> tuple[str, bool]:
         return json.dumps({
             "url": url, "title": "Ollama Title", "author": "", "date_published": "",
             "cleaned_text": content, "word_count": len(content.split()),
@@ -530,6 +535,101 @@ class TestUrlFetchOllamaFallback:
         assert results[0].tool_name == "url_fetch:ollama_fallback"
         assert results[0].success is True
         assert "Ollama fallback body text." in results[0].result
+
+    # -- 3b. both tiers fail: fetcher's error leads, fallback's is secondary
+
+    def test_both_tiers_fail_reports_fetcher_error_first(self, dispatcher: MCPToolDispatcher):
+        """
+        The 2026-10-21 MSN case: the fetcher got an HTTP 200 shell and
+        failed extraction, then Ollama's web_fetch failed with its own
+        error. Previously only the fallback's error survived, so the model
+        reported a "404" for a page that had loaded. The fetcher's
+        diagnosis must lead.
+        """
+        async def fake_call(session, name, arguments):
+            if name == "fetch_url":
+                return (
+                    "Error executing tool fetch_url: "
+                    "ERROR: extraction_failed — Content extraction failed. "
+                    "(extraction produced empty text after tag stripping)"
+                ), True
+            assert name == "ollama_web_fetch"
+            return (
+                "Error executing tool ollama_web_fetch: "
+                "ERROR: ollama_web_fetch failed — Client error '404 Not Found'"
+            ), True
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["url_fetch"],
+                instruction   = "fetch this https://shell.example/article",
+                context       = {},
+            )
+
+        assert [c.args[1] for c in mock_call.call_args_list] == ["fetch_url", "ollama_web_fetch"]
+        assert len(results) == 1
+        result = results[0]
+        assert result.tool_name == "url_fetch:ollama_fallback"
+        assert result.success is False
+        assert result.result.startswith("ERROR: extraction_failed — Content extraction failed.")
+        assert (
+            "(Ollama Cloud fallback also failed: "
+            "ERROR: ollama_web_fetch failed — Client error '404 Not Found')"
+        ) in result.result
+
+    def test_thin_fallback_result_is_treated_as_failure(self, dispatcher: MCPToolDispatcher):
+        """
+        Live 2026-10-21: Ollama's web_fetch returned an MSN shell as a
+        1-word "success" ("MSN"). That must not displace the fetcher's
+        javascript_required diagnosis.
+        """
+        async def fake_call(session, name, arguments):
+            if name == "fetch_url":
+                return (
+                    "Error executing tool fetch_url: "
+                    "ERROR: javascript_required — This site loads its content with "
+                    "JavaScript and can't be read by the fetcher."
+                ), True
+            return self._ollama_fetch_success(arguments["url"], content="MSN")
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["url_fetch"],
+                instruction   = "fetch this https://www.msn.com/en-us/news/ar-AA1",
+                context       = {},
+            )
+
+        result = results[0]
+        assert result.tool_name == "url_fetch:ollama_fallback"
+        assert result.success is False
+        assert result.result.startswith("ERROR: javascript_required —")
+        assert (
+            "(Ollama Cloud fallback also failed: "
+            "ERROR: ollama_web_fetch returned only 1 word — not the page's content)"
+        ) in result.result
+        assert "Title: Ollama Title" not in result.result
+
+    def test_unreachable_mcp_skips_fallback_and_composition(self, dispatcher: MCPToolDispatcher):
+        """No fallback (and so no composed error) when localist-mcp itself is down."""
+        results = asyncio.run(dispatcher._run_url_fetch(
+            None, ConnectionError("refused"), "fetch https://example.com/a", {},
+        ))
+        assert results.tool_name == "url_fetch"
+        assert results.result.startswith("ERROR: localist-mcp unreachable")
+        assert "fallback also failed" not in results.result
+
+    # -- 3c. MSN-resolved results carry a Via: line (§14.17) ---------------
+
+    def test_via_line_rendered_only_when_present(self):
+        base = {"url": "https://www.engadget.com/a", "title": "T", "word_count": 2,
+                "cleaned_text": "Body text."}
+        assert _format_fetch_result_text("u", base) == (
+            "Title: T\nSource: https://www.engadget.com/a\nWords: 2\n\nBody text."
+        )
+        assert _format_fetch_result_text("u", {**base, "via": "msn.com (republished from Engadget)"}) == (
+            "Title: T\nSource: https://www.engadget.com/a\n"
+            "Via: msn.com (republished from Engadget)\nWords: 2\n\nBody text."
+        )
 
     # -- 4. fallback-provenance marker present and correct -----------------
 

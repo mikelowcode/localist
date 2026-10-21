@@ -43,7 +43,7 @@ brought this document back in sync.
 | `read_file` | `mcp_server/file_ops.py` | `(path: str) -> str` | File content (max 4000 chars, `"\n… [truncated]"` suffix if longer) |
 | `write_file` | `mcp_server/file_ops.py` | `(path: str, content: str) -> str` | `"OK: wrote {n} characters to {name}"` |
 | `append_file` | `mcp_server/file_ops.py` | `(path: str, content: str) -> str` | `"OK: appended {n} characters to {name}"` |
-| `fetch_url` | `mcp_server/url_fetch.py` | `(url: str, timeout: float = 10.0) -> dict` | `{url, title, author, date_published, cleaned_text, word_count, fetch_duration_ms}` |
+| `fetch_url` | `mcp_server/url_fetch.py` | `(url: str, timeout: float = 10.0) -> dict` | `{url, title, author, date_published, cleaned_text, word_count, fetch_duration_ms}`, plus `via` when an MSN article was resolved — see §14.17 |
 | `web_search` | `mcp_server/web_search.py` | `(query: str) -> dict` | `{query, result_text, result_count}` — `result_text` is the formatted bullet block, or `"No results found."` |
 | `generate_chart` | `mcp_server/chart.py` | `(chart_type: str, labels: list[str], datasets: list[dict], title: str = "") -> dict` | `{summary, png_path, chart_config}` — see §14.8 |
 | `news_search` | `mcp_server/news_search.py` | `(query: str) -> dict` | `{query, result_text, result_count, is_miss}` — see §14.9 |
@@ -62,7 +62,9 @@ parent of `mcp_server/`).
 **`fetch_url` error taxonomy** (ported from the retired Fetcher's
 `ErrorResponse.error_code`, minus `not_json` since `/api` was never
 ported): `connection_error`, `timeout`, `http_client_error`,
-`http_server_error`, `extraction_failed`. Timeout is clamped to 1.0–30.0s,
+`http_server_error`, `extraction_failed`, plus the Localist-only
+`javascript_required` (2026-10-21, §14.17: an HTTP 200 JavaScript app shell
+with no readable text). Timeout is clamped to 1.0–30.0s,
 same bounds the Fetcher's `ExtractRequest` validator used.
 
 **`web_search`** (updated 2026-07-09 — provider abstraction added).
@@ -182,7 +184,10 @@ Phase 1. Internally:
 - **`url_fetch`** — URL resolved from `context["fetch_url"]` or a
   `https?://` regex over the instruction (same pattern the legacy
   `_run_url_fetch` used), then calls `fetch_url`, falling back to Ollama
-  Cloud's `web_fetch` on failure — see §14.16 (2026-07-31).
+  Cloud's `web_fetch` on failure — see §14.16 (2026-07-31). When both
+  fail, the fetcher's error leads and the fallback's is secondary; a
+  fallback result under 40 words counts as a failure — see §14.17
+  (2026-10-21).
 - **`web_search`** — query resolution ported verbatim from the legacy
   `_run_web_search`: explicit `context["web_search_queries"]` (max 3 used)
   if present, else derived from the instruction by stripping known filler
@@ -432,6 +437,13 @@ LOCALIST_LOG_LEVEL           localist-mcp's root log level. Default: INFO.
   2026-07-31) — `TestUrlFetchOllamaFallback` (`test_mcp_tool_dispatcher.py`,
   4 tests), plus live verification against the real Ollama Cloud API —
   see §14.16 and `sessions-log.md` under 2026-07-31.
+- `url_fetch` hardening (§14.17, 2026-10-21) — both-tier error
+  composition, fallback quality floor and `Via:` rendering
+  (`test_mcp_tool_dispatcher.py`); `TestFetchUrlJavaScriptShell`,
+  `TestMsnParseArticleUrl`, `TestMsnLookup`, `TestFetchUrlMsnResolution`
+  (`test_mcp_server.py`), plus live verification against real MSN,
+  publisher and Ollama Cloud traffic — see §14.17 and `sessions-log.md`
+  §94. Re-runnable live check: `diagnostics/diag_url_fetch_hardening.py`.
 
 ### 14.7 Open Items
 
@@ -1663,3 +1675,81 @@ to the tuple as each new leak is confirmed" — read here as "as each new leak v
 plausible," not strictly "after one has already fired through this exact fixture"). Full suite
 re-run clean, 1406 passed, 0 failed — a pure test-isolation change, no production code touched.
 
+
+### 14.17 `url_fetch` Hardening — Honest Failures, JavaScript Shells, MSN Resolution (2026-10-21)
+
+**Trigger.** In a 2026-10-21 desktop (v0.1.5) conversation, three `url_fetch` calls on
+`msn.com/…/ar-<ID>` links failed and the model told the user each page "returned a 404". Not a
+v0.1.5 regression — no fetch code changed between v0.1.4 and v0.1.5. Reproduced root cause: MSN
+article pages return HTTP 200 with a ~42 KB JavaScript app shell (`<title>MSN</title>`, zero visible
+body text, 77% of bytes in `<script>`), so `_extract()` raised `extraction_failed`; the Ollama
+fallback (§14.16) then failed too — `ollama.com/api/web_fetch` itself answered 404 — and
+`_run_url_fetch()` returned **only the fallback's error**, discarding the fetcher's diagnosis. The
+fetcher is the primary tier for all three `_run_url_fetch()` callers (direct `url_fetch`,
+`_enrich_top_result()`, the research loop), so all three changes below land there.
+
+**1. Both-tier failure reporting** (`mcp_tool_dispatcher.py`, `_run_url_fetch()`). When the
+fallback also fails, the result leads with the fetcher's error and carries the fallback's as
+secondary: `ERROR: <fetcher code — message> (Ollama Cloud fallback also failed: <fallback
+error>)`. `tool_name` stays `url_fetch:ollama_fallback`; the `_MCP_UNREACHABLE_PREFIX` suppression
+rule is unchanged (no fallback, so no composition).
+
+**Fallback quality floor** (`_MIN_FALLBACK_FETCH_WORDS = 40`, `_run_ollama_url_fetch()`). Live,
+Ollama's `web_fetch` was inconsistent on the same MSN page — a 404 on one call, a 200 "success"
+containing the unrendered shell (1 word, `"MSN"`) on the next. Since the fallback only runs after
+the fetcher already failed, a response under 40 words is returned as a failure (`ERROR:
+ollama_web_fetch returned only N words — not the page's content`), so it can't displace the
+fetcher's diagnosis. Same bar as the fetcher's own tiny-extraction check below.
+
+**2. `javascript_required` error code** (`mcp_server/url_fetch.py`, `_looks_like_js_shell()`). A
+page is a shell when its visible `<body>` text (after dropping `script`/`style`/`noscript`/
+`template`) is under 200 chars **and** it shows a positive JavaScript-app signal: scripts are
+≥ 50% of the page's bytes, an SPA mount node (`#root`, `#app`, `#__next`, `#__nuxt`) is empty, or a
+`<noscript>` mentions JavaScript. The second clause keeps a bare paywall/login page (no text, no
+scripts) on `extraction_failed`. Calibrated on real pages: MSN shell 0 chars / 0.77 script share;
+Digital Foundry 26k / 0.14; Engadget 3.4k / 0.20. Checked only when extraction fails or yields
+< 40 words, so normal articles never pay for it. Message: *"This site loads its content with
+JavaScript and can't be read by the fetcher."* The Ollama fallback still runs (it may render some
+sites); if it fails, (1) keeps this message in front.
+
+**3. MSN republished-article resolution** (new `mcp_server/msn_resolve.py`, called first in
+`fetch_url()`). `parse_article_url()` matches `msn.com`/`*.msn.com` URLs whose last path segment is
+`ar-<ID>` (locale from the first segment, default `en-us`; `vi-`/`gm-`/section pages are left
+alone). `lookup()` calls MSN's public, keyless content API — the one the page's own scripts use —
+`https://assets.msn.com/content/view/v2/Detail/<locale>/<id>`, returning `sourceHref` (original
+publisher; dropped if it is itself MSN), `provider.name`, `title`, `authors`,
+`publishedDateTime`, and the article `body` HTML. `url_fetch._fetch_msn_article()` then:
+
+1. fetches + extracts `sourceHref` with the normal `_fetch_and_extract()` path and returns it,
+   unless it fails or extracts to < 50% of MSN's copy's word count (`_MSN_ORIGINAL_MIN_SHARE`, a
+   publisher paywall teaser);
+2. otherwise returns MSN's own copy (body text, author, date) under the MSN URL;
+3. returns `None` — falling through to a plain fetch of the MSN URL, which reports
+   `javascript_required` — when the API lookup fails or yields nothing readable.
+
+All resolver failures are swallowed (`None`), never raised: resolution is an enhancement over the
+honest error, not a new failure mode. A resolved result adds a `via` key to `fetch_url`'s dict
+(`"msn.com (republished from Engadget)"`, plus `"; original: <url>"` when MSN's copy was used);
+`_format_fetch_result_text()` renders it as a `Via:` line between `Source:` and `Words:`, and
+omits the line when absent, so every other fetch's text is byte-identical. UI sources come only
+from corpus documents (`conversational_agent.py`), so `via` affects only what the model reads.
+`msn_resolve` is statically imported, so the PyInstaller `localist-mcp.spec` bundles it with no
+`hiddenimports` change.
+
+**Test coverage.** `test_mcp_tool_dispatcher.py`: both-tier failure composition, unreachable-MCP
+skips composition, thin fallback treated as failure, `Via:` line rendered only when present;
+`TestUrlFetchOllamaFallback`'s shared mock Ollama body made article-length (it was 4 words, under
+the new floor). `test_mcp_server.py`: `TestFetchUrlJavaScriptShell` (three shell signals, bare
+paywall stays `extraction_failed`, script-heavy real article still succeeds, empty input),
+`TestMsnParseArticleUrl`, `TestMsnLookup` (real-shaped API fixture via `httpx.MockTransport`),
+`TestFetchUrlMsnResolution` (original wins, original blocked → MSN copy, thin original → MSN copy,
+no `sourceHref`, lookup failure falls through, empty copy falls through, non-MSN URL never calls
+the API). Full suite 1817 → 1848 passed.
+
+**Live verification (2026-10-21)**, real network, the dispatcher's `_run_url_fetch()` driving the
+real `fetch_url`/`ollama_web_fetch` in-process (the installed app held ports 8001/8003): both
+original MSN links resolved to their originals — Engadget 354 words (0.4s), GameRant 536 words
+(0.9s), each with a `Via:` line; an MSN section page returned `javascript_required` with the
+fallback's error secondary; Digital Foundry unaffected; a forced original-publisher failure fell
+back to MSN's copy (437 words, correct author and date). Re-runnable with
+`diagnostics/diag_url_fetch_hardening.py`.
