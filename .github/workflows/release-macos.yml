@@ -131,6 +131,41 @@ jobs:
           name: Localist-macos-dmg
           path: ${{ steps.dmg.outputs.path }}
 
+      # The version's changes live in README.md, one bullet per item tagged
+      # "(vX.Y.Z)". generate_release_notes alone only lists merged PRs —
+      # there are none (work is pushed straight to the release branch), so
+      # every release used to carry the same install blurb and nothing else.
+      - name: Write release notes
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          NOTES="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "## What's new in $TAG"
+            echo
+            if grep -qF "($TAG)" README.md; then
+              grep -F "($TAG)" README.md | sed -e 's/^- ✅ /- /' -e "s/ (${TAG//./\\.})//"
+            else
+              echo "See the README's feature list for this version's changes."
+            fi
+            echo
+            echo "## Installing"
+            echo
+            echo "Unsigned build — no Apple Developer ID certificate is used for this project."
+            echo "After downloading and moving the app to Applications, run this once from Terminal:"
+            echo
+            echo '```'
+            echo 'xattr -cr /Applications/Localist.app'
+            echo '```'
+            echo
+            echo "Then launch normally. Right-click → Open does **not** bypass this on current macOS —"
+            echo "it will still say \"is damaged and can't be opened\"; \`xattr -cr\` is the actual fix."
+            echo
+            echo "See the repo README's \"Native macOS app\" section for details."
+          } > "$NOTES"
+          cat "$NOTES"
+
       - name: Attach DMG to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -140,17 +175,6 @@ jobs:
           name: ${{ github.ref_name }}
           files: ${{ steps.dmg.outputs.path }}
           generate_release_notes: true
-          body: |
-            Unsigned build — no Apple Developer ID certificate is used for this project.
-            After downloading and moving the app to Applications, run this once from Terminal:
-
-            ```
-            xattr -cr /Applications/Localist.app
-            ```
-
-            Then launch normally. Right-click → Open does **not** bypass this on current macOS —
-            it will still say "is damaged and can't be opened"; `xattr -cr` is the actual fix.
-
-            See the repo README's "Native macOS app" section for details.
+          body_path: ${{ runner.temp }}/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
