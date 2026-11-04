@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import date
 from typing import Any
 
 import httpx
@@ -43,6 +44,28 @@ _SUBSCRIPTIONS_PER_PAGE: int = 100
 # this key never does).
 _WATCH_FEED_ERROR_KEY: str = "_error"
 
+_TOKEN_MISSING_MESSAGE: str = "No GitHub token yet. Add one in Settings → API Keys."
+_TOKEN_REJECTED_MESSAGE: str = (
+    "GitHub rejected your token. It may have expired or been revoked. "
+    "Update it in Settings → API Keys."
+)
+_TOKEN_FORBIDDEN_MESSAGE: str = (
+    "GitHub refused this token. Localist needs a classic token with no scopes "
+    "selected; fine-grained tokens can't read your watched repos. "
+    "Update it in Settings → API Keys."
+)
+# Save-time versions of the two above, for validate_token(): the user is
+# already on the API Keys card, so these say what happened to the save instead
+# of pointing them there.
+_SAVE_REJECTED_MESSAGE: str = (
+    "GitHub rejected this token, so it wasn't saved. It may have expired or been revoked."
+)
+_SAVE_FORBIDDEN_MESSAGE: str = (
+    "GitHub refused this token, so it wasn't saved. Localist needs a classic token "
+    "with no scopes selected; fine-grained tokens can't read your watched repos."
+)
+_RATE_LIMITED_MESSAGE: str = "GitHub's rate limit was reached. Try again in a little while."
+
 
 def _headers(token: str) -> dict[str, str]:
     return {
@@ -51,6 +74,94 @@ def _headers(token: str) -> dict[str, str]:
         "X-GitHub-Api-Version": _GITHUB_API_VERSION,
         "User-Agent":           _GITHUB_USER_AGENT,
     }
+
+
+def _is_rate_limited(resp: httpx.Response) -> bool:
+    """
+    True for GitHub's primary/secondary rate limits, which share 403 with a
+    token that lacks access (429 is also possible). Primary limits set
+    x-ratelimit-remaining to 0; secondary limits set retry-after.
+    """
+    if resp.status_code == 429:
+        return True
+    return resp.status_code == 403 and (
+        resp.headers.get("x-ratelimit-remaining") == "0"
+        or "retry-after" in resp.headers
+    )
+
+
+def _token_expiry_date(resp: httpx.Response) -> str | None:
+    """
+    The token's expiry as "January 24, 2027", from GitHub's
+    github-authentication-token-expiration header. None when the token never
+    expires, or when the header's format isn't recognized (the date is a
+    courtesy, never a reason to fail a save).
+    """
+    raw = resp.headers.get("github-authentication-token-expiration", "")
+    try:
+        expiry = date.fromisoformat(raw[:10])
+    except ValueError:
+        return None
+    return f"{expiry:%B} {expiry.day}, {expiry.year}"
+
+
+async def validate_token(token: str) -> dict[str, Any]:
+    """
+    Check a candidate token against the endpoint the watch feed depends on
+    (GET /user/subscriptions), so a token that passes here works for the feed
+    rather than merely being a real token — a fine-grained PAT authenticates
+    but 403s on this endpoint.
+
+    Never raises. Returns {"status", "message", "expires_on"}, where status is:
+      "valid"      — GitHub accepted it; expires_on may carry the expiry date.
+      "rejected"   — GitHub said no (401, or a non-rate-limit 403). Definitive,
+                     so PUT /settings/api-keys refuses to save it.
+      "unverified" — no verdict on the token itself (network failure, rate
+                     limit, GitHub 5xx). PUT /settings/api-keys saves it with
+                     a warning, since an outage shouldn't block a save.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{_GITHUB_API_BASE}/user/subscriptions",
+                headers=_headers(token),
+                params={"per_page": 1},
+            )
+    except Exception as exc:
+        logger.warning("github_watch: token check could not reach GitHub — %s", exc)
+        return {
+            "status":     "unverified",
+            "message":    "Couldn't reach GitHub to verify the token.",
+            "expires_on": None,
+        }
+
+    if resp.is_success:
+        return {"status": "valid", "message": "", "expires_on": _token_expiry_date(resp)}
+    if resp.status_code == 401:
+        return {"status": "rejected", "message": _SAVE_REJECTED_MESSAGE, "expires_on": None}
+    if _is_rate_limited(resp):
+        return {"status": "unverified", "message": _RATE_LIMITED_MESSAGE, "expires_on": None}
+    if resp.status_code == 403:
+        return {"status": "rejected", "message": _SAVE_FORBIDDEN_MESSAGE, "expires_on": None}
+    logger.warning("github_watch: token check got HTTP %s from GitHub", resp.status_code)
+    return {
+        "status":     "unverified",
+        "message":    f"GitHub returned an error (HTTP {resp.status_code}) while verifying the token.",
+        "expires_on": None,
+    }
+
+
+def _feed_error_message(exc: Exception) -> str:
+    """User-facing text for a failure to list watched repos — the auth cases
+    point at the fix in Settings instead of showing httpx's raw error."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        if exc.response.status_code == 401:
+            return _TOKEN_REJECTED_MESSAGE
+        if _is_rate_limited(exc.response):
+            return _RATE_LIMITED_MESSAGE
+        if exc.response.status_code == 403:
+            return _TOKEN_FORBIDDEN_MESSAGE
+    return str(exc)
 
 
 def _error_entry(message: str) -> dict[str, Any]:
@@ -143,13 +254,13 @@ async def build_watch_feed(
     """
     token = os.environ.get("GITHUB_TOKEN", "")
     if not token:
-        return [_error_entry("GITHUB_TOKEN not configured")]
+        return [_error_entry(_TOKEN_MISSING_MESSAGE)]
 
     try:
         repos = await fetch_watched_repos(token)
     except Exception as exc:
         logger.warning("github_watch: failed to list watched repos — %s", exc)
-        return [_error_entry(str(exc))]
+        return [_error_entry(_feed_error_message(exc))]
 
     feed: list[dict[str, Any]] = []
     watched_names: set[str] = set()

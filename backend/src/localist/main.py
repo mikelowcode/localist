@@ -128,12 +128,14 @@ import mimetypes
 import os
 import platform
 import re
+import sys
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Any, AsyncIterator, Literal
 
+import httpx
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -155,7 +157,7 @@ from .mcp_server.ocr import get_upload_root as _ocr_upload_root
 from .mcp_server.ocr import OCR_MIME_BY_EXTENSION as _OCR_MIME_BY_EXTENSION
 from .mcp_server.file_ops import write_file as _write_generated_file
 from .mcp_server.file_ops import set_project_root as _set_generated_file_root
-from .mcp_tool_dispatcher import MCPToolDispatcher
+from .mcp_tool_dispatcher import MCPToolDispatcher, _MCP_SERVER_URL
 from .memory_manager import MemoryManager, EpisodicMemoryWriter, EpisodicMemoryReader
 from . import news_brief
 from .planner import (
@@ -1622,6 +1624,7 @@ class ApiKeysStatusResponse(BaseModel):
     langsearch_api_key_set: bool
     brave_api_key_set:      bool
     newsapi_api_key_set:    bool
+    github_token_set:       bool
 
 
 class ApiKeysUpdateRequest(BaseModel):
@@ -1630,6 +1633,7 @@ class ApiKeysUpdateRequest(BaseModel):
     langsearch_api_key: str | None = None
     brave_api_key:      str | None = None
     newsapi_api_key:    str | None = None
+    github_token:       str | None = None
 
 
 class ApiKeysUpdateResponse(ApiKeysStatusResponse):
@@ -3478,13 +3482,14 @@ async def put_assistant_name_setting(
 
 
 # ---------------------------------------------------------------------------
-# Optional API keys  (Settings tab — BRAVE/LANGSEARCH/NEWSAPI, .env-backed)
+# Optional API keys  (Settings tab — BRAVE/LANGSEARCH/NEWSAPI/GITHUB, .env-backed)
 # ---------------------------------------------------------------------------
 
 _API_KEY_ENV_NAMES: dict[str, str] = {
     "langsearch_api_key": "LANGSEARCH_API_KEY",
     "brave_api_key":      "BRAVE_API_KEY",
     "newsapi_api_key":    "NEWSAPI_API_KEY",
+    "github_token":       "GITHUB_TOKEN",
 }
 
 
@@ -3493,7 +3498,54 @@ def _api_keys_status() -> ApiKeysStatusResponse:
         langsearch_api_key_set = bool(os.environ.get("LANGSEARCH_API_KEY")),
         brave_api_key_set      = bool(os.environ.get("BRAVE_API_KEY")),
         newsapi_api_key_set    = bool(os.environ.get("NEWSAPI_API_KEY")),
+        github_token_set       = bool(os.environ.get("GITHUB_TOKEN")),
     )
+
+
+def _normalize_api_key(env_key: str, value: str) -> str:
+    """
+    Trim a pasted key and refuse anything that can't be a real key: whitespace
+    or control characters could add extra lines to .env, since _write_env_var
+    writes values as-is. An empty value is valid (it clears the key), but a
+    whitespace-only one is refused rather than silently clearing it. The error
+    names the key, never its value.
+    """
+    cleaned = value.strip()
+    invalid = (
+        (value and not cleaned)
+        or not cleaned.isascii()
+        or any(c.isspace() or not c.isprintable() for c in cleaned)
+    )
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{env_key} contains spaces or invalid characters. Check what you pasted.",
+        )
+    return cleaned
+
+
+async def _reload_mcp_keys() -> bool:
+    """
+    Ask localist-mcp to re-read the API keys from .env, so a saved key reaches
+    its tools without a restart. Never raises: False means it couldn't be
+    reached or failed, and the key takes effect on its next start instead.
+    """
+    url = f"{_MCP_SERVER_URL.removesuffix('/sse')}/internal/reload-keys"
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            resp = await client.post(url)
+            resp.raise_for_status()
+    except Exception as exc:
+        logger.warning("API keys: couldn't reload keys in localist-mcp (%s).", exc)
+        return False
+    return True
+
+
+def _mcp_restart_hint() -> str:
+    """How to restart localist-mcp, for whichever way Localist is running."""
+    if getattr(sys, "frozen", False):
+        return "Quit and reopen Localist for the new key(s) to take effect in chat."
+    return "Restart localist-mcp (./start_localist.sh) for the new key(s) to take effect."
 
 
 @app.get(
@@ -3504,8 +3556,9 @@ def _api_keys_status() -> ApiKeysStatusResponse:
 async def get_api_keys_status() -> ApiKeysStatusResponse:
     """
     Reports only whether each key is set (non-empty) — never the value
-    itself. These keys (web_search / news_search) are consumed by the
-    separate localist-mcp process, not this one.
+    itself. These keys (web_search / news_search / github_*) are consumed by
+    the separate localist-mcp process; GITHUB_TOKEN is also read by this
+    process, for the GitHub Watch Feed.
     """
     return _api_keys_status()
 
@@ -3513,7 +3566,7 @@ async def get_api_keys_status() -> ApiKeysStatusResponse:
 @app.put(
     "/settings/api-keys",
     response_model = ApiKeysUpdateResponse,
-    summary        = "Set optional API keys (BRAVE/LANGSEARCH/NEWSAPI) used by localist-mcp tools",
+    summary        = "Set optional API keys (BRAVE/LANGSEARCH/NEWSAPI/GITHUB)",
 )
 async def put_api_keys(request: ApiKeysUpdateRequest) -> ApiKeysUpdateResponse:
     """
@@ -3521,26 +3574,56 @@ async def put_api_keys(request: ApiKeysUpdateRequest) -> ApiKeysUpdateResponse:
     untouched; an empty string clears that key) and mirror it into this
     process's os.environ.
 
-    These keys are actually read by the separate localist-mcp process
-    (mcp_server/web_search.py, mcp_server/news_search.py), not this one —
-    so the .env write makes the value survive a restart, but localist-mcp
-    itself must be restarted to pick up a changed or newly-set key.
+    Every key is checked before any is written, so a refused request changes
+    nothing: a malformed key, or a GITHUB_TOKEN that GitHub itself rejects,
+    is a 400 and the currently saved keys stay in place. A GITHUB_TOKEN that
+    can't be verified (GitHub unreachable or rate limited) is saved anyway,
+    with a warning, since an outage shouldn't block a save.
+
+    Most of these keys are read by the separate localist-mcp process
+    (mcp_server/web_search.py, mcp_server/news_search.py,
+    mcp_server/github.py), which is told to re-read them after a write, so a
+    new key takes effect without a restart. If that fails, the response says
+    how to restart it. GITHUB_TOKEN is also read by this process, for the
+    GitHub Watch Feed, and the os.environ mirror covers that.
     """
-    updates = request.model_dump(exclude_unset=True)
-    warning: str | None = None
+    updates = {
+        field: _normalize_api_key(_API_KEY_ENV_NAMES[field], value)
+        for field, value in request.model_dump(exclude_unset=True).items()
+        if value is not None
+    }
+
+    token_check: dict[str, Any] | None = None
+    if updates.get("github_token"):
+        token_check = await github_watch.validate_token(updates["github_token"])
+        if token_check["status"] == "rejected":
+            raise HTTPException(status_code=400, detail=token_check["message"])
+
+    failures: list[str] = []
+    wrote_any = False
     for field, value in updates.items():
-        if value is None:
-            continue
         env_key = _API_KEY_ENV_NAMES[field]
         try:
             _write_env_var(_PROJECT_ROOT, env_key, value)
         except OSError as exc:
-            warning = f"Failed writing {env_key} to .env ({exc})."
+            failures.append(f"Failed writing {env_key} to .env ({exc}).")
             continue
         os.environ[env_key] = value
+        wrote_any = True
 
-    if updates and warning is None:
-        warning = "Restart localist-mcp (./start_localist.sh) for the new key(s) to take effect."
+    notes: list[str] = list(failures)
+    if token_check is not None and os.environ.get("GITHUB_TOKEN") == updates["github_token"]:
+        if token_check["status"] == "valid":
+            expires_on = token_check["expires_on"]
+            notes.append(
+                f"Connected to GitHub. This token expires {expires_on}." if expires_on
+                else "Connected to GitHub."
+            )
+        else:
+            notes.append(f"{token_check['message']} The token was saved anyway.")
+    if wrote_any and not await _reload_mcp_keys():
+        notes.append(_mcp_restart_hint())
+    warning = " ".join(notes) or None
 
     return ApiKeysUpdateResponse(**_api_keys_status().model_dump(), warning=warning)
 

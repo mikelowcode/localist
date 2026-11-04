@@ -274,8 +274,8 @@ export const tips: Tip[] = [
 		id: 'settings-api-keys',
 		category: 'ui-action',
 		trigger: 'Settings → API Keys',
-		example: 'Open Settings and paste your LangSearch/Brave/NewsAPI key',
-		description: 'Only LANGSEARCH_API_KEY is required for web_search; Brave adds a search fallback and NewsAPI powers the Daily News Brief. Keys save to backend/.env and are never echoed back.'
+		example: 'Open Settings and paste your LangSearch/Brave/NewsAPI key or GitHub token',
+		description: 'Only LANGSEARCH_API_KEY is required for web_search; Brave adds a search fallback, NewsAPI powers the Daily News Brief, and a GitHub token powers the GitHub Watch Feed. Keys take effect right away and are never echoed back.'
 	},
 	{
 		id: 'settings-assistant-name',

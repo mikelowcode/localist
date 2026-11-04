@@ -71,12 +71,76 @@ class TestFetchLatestRelease:
                 asyncio.run(github_watch.fetch_latest_release("tok", "o/r"))
 
 
+def _token_check_response(status_code: int, headers: dict[str, str] | None = None) -> httpx.Response:
+    return httpx.Response(
+        status_code, json=[], headers=headers or {},
+        request=httpx.Request("GET", f"{github_watch._GITHUB_API_BASE}/user/subscriptions"),
+    )
+
+
+class TestValidateToken:
+    def _run(self, response):
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            return asyncio.run(github_watch.validate_token("tok"))
+
+    def test_success_with_expiry_header(self):
+        result = self._run(_token_check_response(200, {
+            "github-authentication-token-expiration": "2027-01-04 17:21:18 UTC",
+        }))
+        assert result["status"] == "valid"
+        assert result["expires_on"] == "January 4, 2027"
+
+    def test_success_without_expiry_header(self):
+        result = self._run(_token_check_response(200))
+        assert result["status"] == "valid"
+        assert result["expires_on"] is None
+
+    def test_unrecognized_expiry_format_is_not_a_failure(self):
+        result = self._run(_token_check_response(200, {
+            "github-authentication-token-expiration": "soon",
+        }))
+        assert result["status"] == "valid"
+        assert result["expires_on"] is None
+
+    def test_401_is_rejected(self):
+        result = self._run(_token_check_response(401))
+        assert result["status"] == "rejected"
+        assert result["message"] == github_watch._SAVE_REJECTED_MESSAGE
+
+    def test_403_without_rate_limit_is_rejected_as_wrong_token_type(self):
+        result = self._run(_token_check_response(403, {"x-ratelimit-remaining": "4999"}))
+        assert result["status"] == "rejected"
+        assert result["message"] == github_watch._SAVE_FORBIDDEN_MESSAGE
+
+    @pytest.mark.parametrize("status_code,headers", [
+        (403, {"x-ratelimit-remaining": "0"}),
+        (403, {"retry-after": "60"}),
+        (429, {}),
+    ])
+    def test_rate_limit_is_unverified_not_rejected(self, status_code, headers):
+        result = self._run(_token_check_response(status_code, headers))
+        assert result["status"] == "unverified"
+        assert result["message"] == github_watch._RATE_LIMITED_MESSAGE
+
+    def test_server_error_is_unverified(self):
+        result = self._run(_token_check_response(503))
+        assert result["status"] == "unverified"
+        assert "503" in result["message"]
+
+    def test_network_failure_is_unverified(self):
+        with patch.object(
+            httpx.AsyncClient, "get", AsyncMock(side_effect=httpx.ConnectError("refused")),
+        ):
+            result = asyncio.run(github_watch.validate_token("tok"))
+        assert result["status"] == "unverified"
+
+
 class TestBuildWatchFeed:
     def test_missing_token_returns_single_error_entry(self, monkeypatch):
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
         result = asyncio.run(github_watch.build_watch_feed())
         assert len(result) == 1
-        assert result[0]["error"] == "GITHUB_TOKEN not configured"
+        assert result[0]["error"] == github_watch._TOKEN_MISSING_MESSAGE
 
     def test_subscriptions_failure_returns_single_error_entry(self, monkeypatch):
         monkeypatch.setenv("GITHUB_TOKEN", "tok")
@@ -87,6 +151,21 @@ class TestBuildWatchFeed:
             result = asyncio.run(github_watch.build_watch_feed())
         assert len(result) == 1
         assert "refused" in result[0]["error"]
+
+    @pytest.mark.parametrize("status_code,headers,expected", [
+        (401, {}, github_watch._TOKEN_REJECTED_MESSAGE),
+        (403, {}, github_watch._TOKEN_FORBIDDEN_MESSAGE),
+        (403, {"x-ratelimit-remaining": "0"}, github_watch._RATE_LIMITED_MESSAGE),
+    ])
+    def test_auth_failures_point_at_settings_not_raw_http_error(
+        self, monkeypatch, status_code, headers, expected,
+    ):
+        monkeypatch.setenv("GITHUB_TOKEN", "tok")
+        response = _token_check_response(status_code, headers)
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=response)):
+            result = asyncio.run(github_watch.build_watch_feed())
+        assert len(result) == 1
+        assert result[0]["error"] == expected
 
     def test_success_builds_one_entry_per_repo(self, monkeypatch):
         monkeypatch.setenv("GITHUB_TOKEN", "tok")
@@ -208,4 +287,4 @@ class TestBuildWatchFeed:
             github_watch.build_watch_feed(pinned_full_names=["ollama/ollama"])
         )
         assert len(result) == 1
-        assert result[0]["error"] == "GITHUB_TOKEN not configured"
+        assert result[0]["error"] == github_watch._TOKEN_MISSING_MESSAGE

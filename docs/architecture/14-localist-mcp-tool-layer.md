@@ -346,7 +346,8 @@ GITHUB_TOKEN                 Optional for github_search/github_read/
                               30 req/min auth). Also read by
                               backend/github_watch.py in the main backend
                               process (§7.20), where it is required, not
-                              optional.
+                              optional. Settable from Settings → API Keys
+                              without a restart (§14.18).
 
 LOCALIST_LOG_LEVEL           localist-mcp's root log level. Default: INFO.
 ```
@@ -1753,3 +1754,32 @@ original MSN links resolved to their originals — Engadget 354 words (0.4s), Ga
 fallback's error secondary; Digital Foundry unaffected; a forced original-publisher failure fell
 back to MSN's copy (437 words, correct author and date). Re-runnable with
 `diagnostics/diag_url_fetch_hardening.py`.
+
+### 14.18 Live API Key Reload — `POST /internal/reload-keys` (2026-11-04)
+
+Saving a key in Settings (§7.28) wrote `.env` and told the user to run `./start_localist.sh`, which doesn't
+exist in the packaged app. The stale value mattered most for `GITHUB_TOKEN`: `github.py` sends whatever
+token it has, so a revoked one gets a 401 from the tools until localist-mcp restarts, rather than falling
+back to anonymous access.
+
+**Route.** `POST /internal/reload-keys` re-reads `_RELOADABLE_KEY_NAMES` (the four Settings keys) from
+`.env` into `os.environ`. No tool needed changing, because each reads its key from `os.environ` at call
+time. It takes no input and returns only key names, so it relies on the localhost binding alone: at worst a
+caller makes the process re-read a file it already trusts. A name missing from `.env` is left alone, since
+it may have come from the shell, matching what `load_dotenv()` does at startup. Other `.env` values are
+never loaded. `test_main_api_keys_endpoints.py` fails if this list stops matching `_API_KEY_ENV_NAMES` in
+`main.py`.
+
+**Caller.** `put_api_keys` calls `_reload_mcp_keys()` after writing at least one key. It never raises: on
+failure the save stands and the response gives a restart hint for the current setup, "Quit and reopen
+Localist" when frozen and the script otherwise. On success the restart message is simply gone.
+
+**Known limitation.** The route reloads from localist-mcp's own `.env`. A dev backend talking to a
+localist-mcp started by the desktop app would report success without that process getting the new key.
+Running both at once isn't a normal setup, so this was left alone.
+
+**Verification.** From source: a real localist-mcp with a fake token got a 401 from `github_release`;
+after saving the real token through the endpoint, the same process returned real data. The packaged app
+(frozen sidecars, `LOCALIST_BACKEND_ROOT` pointed at a scratch folder, real `.env` files and DB unchanged)
+gave the same result with the same sidecar PID. A fake token and a malformed token were both refused, the
+feed returned real data, and with the sidecar killed a save returned the "Quit and reopen Localist" hint.

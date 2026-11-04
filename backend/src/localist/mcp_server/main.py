@@ -139,7 +139,7 @@ from pathlib import Path
 
 from ..paths import get_backend_root
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 load_dotenv(get_backend_root() / ".env")
 
 import logging
@@ -172,6 +172,17 @@ logging.basicConfig(
     datefmt = "%H:%M:%S",
 )
 logger = logging.getLogger("localist-mcp")
+
+
+# Keys settable from the Settings tab — must match the values of
+# _API_KEY_ENV_NAMES in backend main.py (test_main_api_keys_endpoints.py
+# checks this).
+_RELOADABLE_KEY_NAMES: tuple[str, ...] = (
+    "LANGSEARCH_API_KEY",
+    "BRAVE_API_KEY",
+    "NEWSAPI_API_KEY",
+    "GITHUB_TOKEN",
+)
 
 
 # ── MCP tools ────────────────────────────────────────────────────────────────
@@ -313,8 +324,30 @@ async def health():
     return {"status": "ok"}
 
 
+@app.post("/internal/reload-keys")
+async def reload_keys():
+    """
+    Re-read the Settings tab's API keys from .env into this process, so a key
+    saved in Settings reaches the tools without a restart (each tool reads its
+    key from os.environ at call time). Called by the main backend's PUT
+    /settings/api-keys.
+
+    Takes no input and returns only key names, never values, so it needs no
+    auth beyond this server's localhost binding: at worst a caller makes this
+    process re-read a file it already trusts. A name missing from .env is left
+    alone, since it may have come from the shell environment instead (same
+    precedence as the load_dotenv() call at startup, which only fills gaps).
+    """
+    values = dotenv_values(get_backend_root() / ".env")
+    reloaded = [name for name in _RELOADABLE_KEY_NAMES if name in values]
+    for name in reloaded:
+        os.environ[name] = values[name] or ""
+    return {"reloaded": reloaded}
+
+
 # Mount the MCP SSE app at root — exposes GET /sse and POST /messages/.
-# Registered after /health so the explicit route takes precedence over the mount.
+# Registered after /health and /internal/reload-keys so the explicit routes take
+# precedence over the mount.
 app.mount("/", mcp.sse_app())
 
 

@@ -68,8 +68,13 @@
     apiKeysLoading,
     apiKeysError,
     loadApiKeysStatus,
-    setApiKeys
+    setApiKeys,
+    type ApiKeysUpdate
   } from '$lib/stores/apiKeys';
+  import { openGithubWatch, fetchGithubWatchPreview } from '$lib/stores/githubWatch';
+  import { openExternal } from '$lib/openExternal';
+
+  const GITHUB_NEW_TOKEN_URL = 'https://github.com/settings/tokens/new?description=Localist';
 
   const EVICTION_PRESETS: { value: EvictionPreset; label: string }[] = [
     { value: '7d',      label: '7 days' },
@@ -561,19 +566,21 @@
 
   // Optional API keys — inputs start blank regardless of whether a key is
   // already configured (the backend never echoes a saved value back), and
-  // an empty field is left out of the PUT payload so saving the other two
+  // an empty field is left out of the PUT payload so saving the other
   // fields can't accidentally clear one you didn't touch.
   let langsearchKeyInput = '';
   let braveKeyInput = '';
   let newsapiKeyInput = '';
+  let githubTokenInput = '';
   let apiKeysSaveResult: string | null = null;
 
   async function handleSaveApiKeys() {
     apiKeysSaveResult = null;
-    const update: { langsearch_api_key?: string; brave_api_key?: string; newsapi_api_key?: string } = {};
+    const update: ApiKeysUpdate = {};
     if (langsearchKeyInput.trim()) update.langsearch_api_key = langsearchKeyInput.trim();
     if (braveKeyInput.trim()) update.brave_api_key = braveKeyInput.trim();
     if (newsapiKeyInput.trim()) update.newsapi_api_key = newsapiKeyInput.trim();
+    if (githubTokenInput.trim()) update.github_token = githubTokenInput.trim();
     if (Object.keys(update).length === 0) return;
 
     const warning = await setApiKeys(update);
@@ -581,8 +588,23 @@
       langsearchKeyInput = '';
       braveKeyInput = '';
       newsapiKeyInput = '';
+      githubTokenInput = '';
       apiKeysSaveResult = warning || 'Saved.';
+      if (update.github_token) void refreshGithubFeed();
     }
+  }
+
+  // The Live Feed shows its cached result until the next refresh, so without
+  // this a new token would leave the old token's error on screen. Not awaited
+  // by the save: this makes one GitHub call per repo, and any failure shows up
+  // in the feed itself.
+  async function refreshGithubFeed() {
+    if (await openGithubWatch()) await fetchGithubWatchPreview();
+  }
+
+  function handleCreateGithubToken(event: MouseEvent) {
+    event.preventDefault();
+    openExternal(GITHUB_NEW_TOKEN_URL);
   }
 </script>
 
@@ -958,14 +980,14 @@
       {/if}
     </section>
 
-    <!-- Optional API keys (BRAVE/LANGSEARCH/NEWSAPI — .env-backed, used by localist-mcp) -->
+    <!-- Optional API keys (BRAVE/LANGSEARCH/NEWSAPI/GITHUB — .env-backed, used by localist-mcp) -->
     <section class="settings-card">
       <div class="card-title">API Keys</div>
       <p class="card-desc">
-        Optional keys for web search and news tools, saved to backend/.env. Only
-        LANGSEARCH_API_KEY is required for full web_search functionality — the others enable
-        Brave as a search fallback and the daily news brief. Values are never shown once saved;
-        leave a field blank to keep its current key unchanged.
+        Optional keys for web search, news and GitHub. Only LANGSEARCH_API_KEY is required for
+        full web_search functionality — the others enable Brave as a search fallback, the daily
+        news brief and the GitHub Watch Feed. Values are never shown once saved; leave a field
+        blank to keep its current key unchanged.
       </p>
 
       <label class="news-field-label" for="langsearch-key-input">
@@ -1004,13 +1026,36 @@
         placeholder={$apiKeysStatus.newsapi_api_key_set ? '••••••••' : 'Not set'}
       />
 
+      <label class="news-field-label" for="github-token-input" style="margin-top: var(--sp-3)">
+        GITHUB_TOKEN {#if $apiKeysStatus.github_token_set}<span class="card-hint">(configured)</span>{/if}
+      </label>
+      <input
+        id="github-token-input"
+        class="news-text-input"
+        type="password"
+        autocomplete="off"
+        bind:value={githubTokenInput}
+        placeholder={$apiKeysStatus.github_token_set ? '••••••••' : 'Not set'}
+      />
+      <p class="card-hint">
+        Powers the GitHub Watch Feed in Live Feed and raises rate limits for GitHub chat tools. Use
+        a classic token with no scopes selected: Localist only reads public data. When it expires,
+        create a new one and paste it here.
+        <a
+          href={GITHUB_NEW_TOKEN_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          on:click={handleCreateGithubToken}
+        >Create a token on GitHub</a>
+      </p>
+
       <button
         type="button"
         class="seg-btn news-save-btn"
         style="margin-top: var(--sp-3)"
-        disabled={$apiKeysLoading || (!langsearchKeyInput.trim() && !braveKeyInput.trim() && !newsapiKeyInput.trim())}
+        disabled={$apiKeysLoading || (!langsearchKeyInput.trim() && !braveKeyInput.trim() && !newsapiKeyInput.trim() && !githubTokenInput.trim())}
         on:click={handleSaveApiKeys}
-      >Save</button>
+      >{$apiKeysLoading ? 'Saving…' : 'Save'}</button>
 
       {#if apiKeysSaveResult}
         <p class="card-hint">{apiKeysSaveResult}</p>

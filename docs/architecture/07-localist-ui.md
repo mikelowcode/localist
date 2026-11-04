@@ -926,7 +926,8 @@ tag/name + date, or "no releases yet", or "unavailable" on a per-repo error) —
 this feed has no chat involvement at all. `onMount` now fires both `fetchNewsBriefPreview()` and
 `fetchGithubWatchPreview()`.
 
-A whole-feed failure (most commonly `GITHUB_TOKEN` unset or invalid) comes back from the backend as a
+(§7.28 later replaced the raw error text with messages pointing to Settings → API Keys.) A whole-feed
+failure (most commonly `GITHUB_TOKEN` unset or invalid) comes back from the backend as a
 single sentinel repo entry (`key: "_error"`) rather than an HTTP error — the panel special-cases that key
 and renders its `error` message alone in the same italic "unavailable" style used elsewhere, rather than
 one confusing-looking repo row named `_error`.
@@ -1363,3 +1364,53 @@ GitHub block entirely (`.preview-pin-badge` CSS rule deleted along with it) — 
 'pinned'` still exists on the data model, it just isn't surfaced visually anymore.
 
 **Verification.** `svelte-check`: 0 errors/warnings.
+
+### 7.28 GitHub Token in Settings → API Keys (2026-11-04)
+
+`GITHUB_TOKEN` was the one key the Live Feed needs that could only be set by editing `.env`. On the
+packaged app that means a file under `~/Library/Application Support/Localist/`, separate from the repo's
+`backend/.env`. Rotating the token in only `backend/.env` left the desktop app on the old one and showed
+a raw `401 Unauthorized` in the feed, which prompted this work.
+
+**Backend.** `PUT /settings/api-keys` accepts `github_token`, and `GET` reports `github_token_set`. Every
+key in a request is checked before any is written, so a refused request changes nothing:
+
+- `_normalize_api_key()` trims each value and returns 400 for whitespace, control or non-ASCII characters.
+  `_write_env_var()` writes values as-is, so a pasted line break could otherwise add lines to `.env`. A
+  whitespace-only value is refused rather than treated as a clear; an explicit empty string still clears.
+- `github_watch.validate_token()` calls `GET /user/subscriptions?per_page=1`, the endpoint the feed depends
+  on, because a fine-grained PAT authenticates but is documented to 403 there.
+
+| GitHub's response | Status | Save |
+|---|---|---|
+| 2xx | `valid` | Saved; the response gives the expiry date when GitHub sends one |
+| 401 | `rejected` | Refused with a 400; the current token stays |
+| 403, not rate limited | `rejected` | Refused with a 400, naming the classic-token requirement |
+| 403 with `x-ratelimit-remaining: 0` or `retry-after`, or 429 | `unverified` | Saved with a warning |
+| Other error, or GitHub unreachable | `unverified` | Saved with a warning |
+
+The expiry date is only shown in the save result; it isn't stored and nothing warns ahead of time.
+
+**Feed errors.** `build_watch_feed()` now turns a missing token, a 401, a 403 and a rate limit into plain
+messages, with the auth cases pointing to Settings → API Keys, instead of `str(exc)`. Save-time versions
+of the 401/403 messages say what happened to the save, since the user is already on that card.
+
+**UI.** The API Keys card gains the field, help text and a "Create a token on GitHub" link through
+`openExternal()` (`target="_blank"` no-ops in the packaged app's WKWebView; see `openExternal.ts`). Save shows "Saving…"
+during the check. A rejected save keeps what was pasted and shows the error; a successful GitHub save also
+calls `openGithubWatch()` and `fetchGithubWatchPreview()` without blocking the save, because the feed
+otherwise keeps showing the old token's cached error until the next refresh. "saved to backend/.env" is
+gone from the card and `tips.ts`, since that path is wrong on the packaged app.
+
+**Known gap, accepted as-is.** Like the other keys, the UI can replace a token but not remove it. The
+backend supports clearing with an empty string.
+
+**Verification.** `svelte-check`: 0 errors/warnings. 1893 backend tests pass. Headless browser against
+sandboxed dev services and real GitHub: a fake token was refused with the input kept and the feed
+unchanged; the real token saved, showed "(configured)" and its expiry, and the feed updated to real release
+data with no click. The packaged app's sidecars were checked with `LOCALIST_BACKEND_ROOT` pointed at a
+scratch folder; see §14.18.
+
+Michael hand-checked the two things that needed the packaged app's own window and a real token: the
+"Create a token" link opens GitHub's new-token page in the default browser, and a real fine-grained token is
+refused with the classic-token message.
