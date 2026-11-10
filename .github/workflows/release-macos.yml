@@ -20,7 +20,9 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14 # Apple Silicon (arm64)
+    # Apple Silicon (arm64). macos-14 was retired 2026-11-02 and now fails
+    # before any step runs ("configuration ... is not supported").
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
