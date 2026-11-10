@@ -166,7 +166,7 @@ from .planner import (
     resolve_profile_fact_threshold,
     resolve_rag_floor,
 )
-from .runtime_factory import available_backends, create_runtime
+from .runtime_factory import available_backends, create_runtime, embedding_host_for
 from .threshold_calibration import CALIBRATION_VERSION, calibrate_thresholds, CalibrationResult
 from . import session_files
 from . import wiki_maintenance_log
@@ -270,6 +270,13 @@ class AppState:
         # no usable embedding pin keeps the previous embedder (§16.25).
         # None in keyword-only mode.
         self.active_embedding_backend: str | None = None
+        # The embed-only client for the embedding host, when the chat backend
+        # can't embed (runtime_factory.embedding_host_for(), §16.32) — e.g. a
+        # local Ollama client serving embeddings while a hosted API chats.
+        # None when the chat runtime is its own embedding host. Kept so
+        # GET /health can report the host's reachability (the "Ollama isn't
+        # running" banner) and recover embeddings once it comes up.
+        self.embedder_runtime:  BaseRuntimeClient | None = None
         # Resolved at startup by lifespan()
         self.wiki_dir:          Path | None = None
         self.raw_dir:           Path | None = None
@@ -289,18 +296,22 @@ def _configure_embedding_source(
     settings: Settings,
     runtime:  BaseRuntimeClient,
     health:   dict,
+    backend:  str | None = None,
 ) -> Any:
     """
     Decide which embedding source lifespan() should use, in two-tier
     precedence order:
 
-      1. The active runtime backend's own embed() — used when
-         the backend's resolved embedding model (_resolve_embedding_model())
-         is set AND health["embed_model_found"]
-         (from the health check already run in lifespan()) is truthy.
-         Platform-agnostic.
+      1. The embedding host's own embed() — used when the host's resolved
+         embedding model (_resolve_embedding_model()) is set AND
+         health["embed_model_found"] (from the host's health check, already
+         run in lifespan()) is truthy. Platform-agnostic.
       2. Neither — MemoryManager falls back to keyword-only (BM25)
          retrieval.
+
+    `runtime`/`health`/`backend` describe the embedding host
+    (embedding_host_for(), §16.32): the chat runtime itself by default, or
+    an embed-only local client when the chat backend can't embed.
 
     Returns
     -------
@@ -312,11 +323,12 @@ def _configure_embedding_source(
     sequence (real runtime construction, directory indexing, graph build,
     etc.) — lifespan() itself is not exercised by the test suite.
     """
-    model = _resolve_embedding_model(settings, settings.runtime_backend)
+    host = backend or settings.runtime_backend
+    model = _resolve_embedding_model(settings, host)
     if model and health.get("embed_model_found"):
         logger.info(
             "Runtime-backend embeddings ready — backend=%s model=%s.",
-            settings.runtime_backend.upper(), model,
+            host.upper(), model,
         )
         return runtime.embed
 
@@ -324,6 +336,82 @@ def _configure_embedding_source(
         "No embedding model configured or found — MemoryManager will run "
         "in keyword-only mode."
     )
+    return None
+
+
+def _create_and_check_embedder(
+    settings: Settings, host: str, embedding_model: str | None = None,
+) -> tuple[BaseRuntimeClient, dict]:
+    """
+    Build an embed-only client for embedding host `host` and health-check
+    it. Blocking — run via asyncio.to_thread outside lifespan(). Used when
+    the chat backend can't embed (§16.32): the client never chats, so it
+    gets no chat model; `embedding_model` overrides the host's resolved pin
+    (POST /settings/embedding-model validating a candidate).
+    """
+    client = create_runtime(
+        backend         = host,
+        chat_model      = "",
+        embedding_model = (
+            embedding_model if embedding_model is not None
+            else _resolve_embedding_model(settings, host)
+        ),
+        omlx_url        = settings.omlx_url,
+        ollama_url      = settings.ollama_url,
+        request_timeout = settings.request_timeout,
+        stream_timeout  = settings.stream_timeout,
+    )
+    return client, client.health_check()
+
+
+def _resolve_embedding_host(
+    settings: Settings, backend: str, chat_runtime: BaseRuntimeClient, chat_health: dict,
+) -> tuple[str, BaseRuntimeClient, dict, BaseRuntimeClient | None]:
+    """
+    Where `backend`'s embeddings come from (§16.32). Blocking. Returns
+    (host, host_runtime, host_health, embedder_runtime):
+
+      - `backend` can embed -> (backend, chat_runtime, chat_health, None):
+        the chat runtime is its own embedding host, exactly as before;
+      - it can't -> (fallback, embed-only client, its health, that client):
+        a separate local client serves embeddings, and is returned a second
+        time as the embedder_runtime to keep in _state.
+    """
+    normalized = backend.strip().lower()
+    host = embedding_host_for(normalized)
+    if host == normalized:
+        return host, chat_runtime, chat_health, None
+    embedder, embedder_health = _create_and_check_embedder(settings, host)
+    return host, embedder, embedder_health, embedder
+
+
+def _embedding_host_warning(
+    settings: Settings, host: str, host_health: dict | None,
+) -> str | None:
+    """
+    The banner text for a chat-only backend whose local embedding host isn't
+    serving (§16.32), or None. Only meaningful when the embedding host
+    differs from the chat backend — callers pass host_health=None otherwise.
+    """
+    if host_health is None:
+        return None
+    label = "Ollama" if host == "ollama" else host
+    if not host_health.get("reachable"):
+        return (
+            f"{label} isn't running. Embeddings run locally through {label}, so memory and "
+            f"document search are using keyword matching only until it starts."
+        )
+    model = _resolve_embedding_model(settings, host)
+    if not model:
+        return (
+            f"No embedding model is set for {label}, so memory and document search are "
+            f"using keyword matching only."
+        )
+    if not host_health.get("embed_model_found"):
+        return (
+            f"{label} is running, but the embedding model {model!r} isn't installed, so "
+            f"memory and document search are using keyword matching only."
+        )
     return None
 
 
@@ -830,11 +918,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # See _configure_embedding_source() for the two-tier precedence rules
     # (runtime-backend embed / keyword-only).
 
-    embed_fn = _configure_embedding_source(settings, runtime, health)
-    _state.active_embedding_model_name = _derive_active_embedding_model_name(
-        settings, embed_fn,
+    # A chat-only backend gets a separate local embedding host (§16.32).
+    embed_host, embed_runtime, embed_health, embedder_runtime = _resolve_embedding_host(
+        settings, settings.runtime_backend, runtime, health,
     )
-    _state.active_embedding_backend = settings.runtime_backend if embed_fn is not None else None
+    _state.embedder_runtime = embedder_runtime
+    embed_fn = _configure_embedding_source(settings, embed_runtime, embed_health, embed_host)
+    if embedder_runtime is not None:
+        host_warning = _embedding_host_warning(settings, embed_host, embed_health)
+        if host_warning:
+            logger.warning("Embedding host: %s", host_warning)
+    _state.active_embedding_model_name = _derive_active_embedding_model_name(
+        settings, embed_fn, embed_host,
+    )
+    _state.active_embedding_backend = embed_host if embed_fn is not None else None
 
     memory_manager = MemoryManager(
         db_path               = memory_db,
@@ -1071,6 +1168,14 @@ class HealthResponse(BaseModel):
     # differs from `backend` after a switch that kept the previous embedder.
     active_embedding_backend: str | None = None
     gate_tiers: dict[str, str] = Field(default_factory=dict)
+    # The backend that serves embeddings for the active chat backend
+    # (runtime_factory.embedding_host_for(), §16.32): the chat backend itself,
+    # or local Ollama for a chat-only backend.
+    embedding_host:    str        = ""
+    # Set when a chat-only backend's local embedding host isn't serving
+    # (not running, no model set, model not installed) and nothing else is
+    # embedding either — drives the chat view's embedding banner.
+    embedding_warning: str | None = None
 
 
 class AgentsResponse(BaseModel):
@@ -1913,6 +2018,39 @@ async def post_task_stream(request: TaskRequest) -> StreamingResponse:
     )
 
 
+async def _recover_embedder_on_poll(embedder: BaseRuntimeClient, host_health: dict) -> None:
+    """
+    GET /health's hook for a chat-only backend whose local embedding host
+    came up after Localist did (§16.32): once that host serves its pinned
+    model and nothing is embedding yet (keyword-only), switch embeddings on
+    and rebuild the controller — the embedding counterpart of
+    _recover_chat_model_on_poll(). Takes _runtime_switch_lock only when there
+    is something to do.
+    """
+    settings = _state.settings
+    if settings is None or _state.active_embedding_backend is not None:
+        return
+    host = embedding_host_for(settings.runtime_backend)
+    model = _resolve_embedding_model(settings, host)
+    if not (model and host_health.get("reachable") and host_health.get("embed_model_found")):
+        return
+
+    async with _runtime_switch_lock:
+        # A switch or embedding change may have landed while this waited.
+        if _state.embedder_runtime is not embedder or _state.active_embedding_backend is not None:
+            return
+        memory_manager = _require_memory_manager()
+        logger.info("Embedding host %s is now serving %r — enabling embeddings.", host.upper(), model)
+        await _apply_embedding_source(memory_manager, embedder.embed, model, host)
+        wiki_agent, _conversational_agent, controller = await asyncio.to_thread(
+            _build_controller,
+            settings, _require_runtime(), memory_manager, memory_manager.embed_fn,
+            _PROJECT_ROOT, _state.templates_dir, _state.active_embedding_model_name,
+        )
+        _state.wiki_agent = wiki_agent
+        _state.controller = controller
+
+
 async def _recover_chat_model_on_poll(runtime: BaseRuntimeClient, health: dict) -> dict:
     """
     GET /health's hook into _recover_missing_chat_model(): covers a backend
@@ -1988,16 +2126,36 @@ async def get_health() -> HealthResponse:
     # embedder was kept from another backend across a switch (§16.25), the
     # active client's own check says nothing about it; report it as in use.
     settings = _state.settings
+    chat_backend = settings.runtime_backend if settings is not None else ""
+    embedding_host = embedding_host_for(chat_backend) if chat_backend else ""
+
+    # A chat-only backend's embeddings come from a separate local host
+    # (§16.32): check that host too, recover once it's serving, and warn
+    # while it isn't. Its embedder stands in for the chat runtime below.
+    embedder = _state.embedder_runtime
+    host_health: dict | None = None
+    if embedder is not None:
+        host_health = await asyncio.to_thread(embedder.health_check)
+        await _recover_embedder_on_poll(embedder, host_health)
+    embed_check = host_health if host_health is not None else raw
+
     embedding_model = (
-        _resolve_embedding_model(settings, settings.runtime_backend) if settings is not None else ""
+        _resolve_embedding_model(settings, embedding_host) if settings is not None else ""
     )
     embedding_backend = _state.active_embedding_backend
     if embedding_backend is None:
         embed_available = False
-    elif settings is not None and embedding_backend != settings.runtime_backend:
+    elif embedding_backend != embedding_host:
         embed_available = True
     else:
-        embed_available = bool(embedding_model and raw.get("embed_model_found"))
+        embed_available = bool(embedding_model and embed_check.get("embed_model_found"))
+
+    # Only warn when the local host is what's (supposed to be) embedding: an
+    # embedder kept from another backend across a switch is still working.
+    embedding_warning = (
+        _embedding_host_warning(settings, embedding_host, host_health)
+        if settings is not None and embedding_backend in (None, embedding_host) else None
+    )
 
     active_embedding_model_name = _state.active_embedding_model_name
     calibrated_thresholds = _derive_calibrated_thresholds(_state.memory_manager, active_embedding_model_name)
@@ -2017,6 +2175,8 @@ async def get_health() -> HealthResponse:
         active_embedding_model_name = active_embedding_model_name,
         active_embedding_backend    = embedding_backend,
         gate_tiers                  = gate_tiers,
+        embedding_host              = embedding_host,
+        embedding_warning           = embedding_warning,
     )
 
 
@@ -2191,16 +2351,28 @@ async def switch_runtime_backend(request: RuntimeBackendSwitchRequest) -> Runtim
         chat_model = _resolve_chat_model(settings, backend)
 
         memory_manager = _require_memory_manager()
-        # The embedder follows the target backend's own embedding pin when
-        # that backend serves it; otherwise the current one is kept, never
-        # silently dropped (§16.25, revising §16.5's never-re-derive rule).
-        new_embed_fn, new_embedding_model, embedding_warning = _plan_embedding_for_switch(
-            settings, backend, candidate_runtime, health,
+        # The embedder follows the target's embedding host — the target
+        # itself, or the local fallback for a chat-only target (§16.32) —
+        # when that host serves its own embedding pin; otherwise the current
+        # one is kept, never silently dropped (§16.25, revising §16.5's
+        # never-re-derive rule).
+        embed_host, embed_runtime, embed_health, embedder_runtime = await asyncio.to_thread(
+            _resolve_embedding_host, settings, backend, candidate_runtime, health,
         )
+        new_embed_fn, new_embedding_model, embedding_warning = _plan_embedding_for_switch(
+            settings, embed_host, embed_runtime, embed_health,
+        )
+        if embedder_runtime is not None:
+            # A local host that's down, unpinned, or missing its model is
+            # named plainly ("Ollama isn't running"), rather than as "doesn't
+            # serve" or not at all.
+            embedding_warning = (
+                _embedding_host_warning(settings, embed_host, embed_health) or embedding_warning
+            )
         calibration: CalibrationResponse | None = None
         if new_embed_fn is not None:
             calibration = await _apply_embedding_source(
-                memory_manager, new_embed_fn, new_embedding_model, backend,
+                memory_manager, new_embed_fn, new_embedding_model, embed_host,
             )
         elif embedding_warning:
             logger.warning("switch_runtime_backend: %s", embedding_warning)
@@ -2218,6 +2390,7 @@ async def switch_runtime_backend(request: RuntimeBackendSwitchRequest) -> Runtim
         _state.runtime    = candidate_runtime
         _state.wiki_agent = wiki_agent
         _state.controller = controller
+        _state.embedder_runtime = embedder_runtime
         settings.runtime_backend = backend
 
         persisted: bool = True
@@ -2376,13 +2549,24 @@ async def set_embedding_model(request: EmbeddingModelRequest) -> EmbeddingModelR
     """
     settings       = _require_settings()
     memory_manager = _require_memory_manager()
-    backend        = settings.runtime_backend.strip().lower()
+    chat_backend   = settings.runtime_backend.strip().lower()
+    # The embedding host's pin is what's being set: the chat backend itself,
+    # or the local fallback when the chat backend can't embed (§16.32). In
+    # the latter case the candidate is an embed-only client and the chat
+    # runtime is left as it is.
+    backend        = embedding_host_for(chat_backend)
+    separate_host  = backend != chat_backend
     model          = request.model.strip()
 
     async with _runtime_switch_lock:
-        candidate_runtime, health = await asyncio.to_thread(
-            _create_and_check_embedding_candidate, settings, backend, model,
-        )
+        if separate_host:
+            candidate_runtime, health = await asyncio.to_thread(
+                _create_and_check_embedder, settings, backend, model,
+            )
+        else:
+            candidate_runtime, health = await asyncio.to_thread(
+                _create_and_check_embedding_candidate, settings, backend, model,
+            )
 
         if not health.get("reachable"):
             raise HTTPException(
@@ -2413,20 +2597,23 @@ async def set_embedding_model(request: EmbeddingModelRequest) -> EmbeddingModelR
         # tier left to fall back to.
         embed_fn = candidate_runtime.embed if model else None
 
-        embedding_model_name = _derive_active_embedding_model_name(settings, embed_fn)
+        embedding_model_name = _derive_active_embedding_model_name(settings, embed_fn, backend)
         calibration = await _apply_embedding_source(
             memory_manager, embed_fn, embedding_model_name, backend,
         )
 
+        chat_runtime = _require_runtime() if separate_host else candidate_runtime
         wiki_agent, _conversational_agent, controller = await asyncio.to_thread(
             _build_controller,
-            settings, candidate_runtime, memory_manager, embed_fn,
+            settings, chat_runtime, memory_manager, embed_fn,
             _PROJECT_ROOT, _state.templates_dir, embedding_model_name,
         )
 
-        _state.runtime    = candidate_runtime
+        _state.runtime    = chat_runtime
         _state.wiki_agent = wiki_agent
         _state.controller = controller
+        if separate_host:
+            _state.embedder_runtime = candidate_runtime
 
         persisted: bool = True
         error: str | None = None

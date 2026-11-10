@@ -38,6 +38,13 @@ export interface HealthState {
   // switch that kept the previous embedder (§16.25). null = keyword-only.
   active_embedding_backend: string | null;
   gate_tiers: Record<string, string>;
+  // The backend serving embeddings for the active chat backend: the chat
+  // backend itself, or local Ollama for a chat-only backend (§16.32).
+  embedding_host: string;
+  // Set while a chat-only backend's local embedding host isn't serving
+  // (Ollama not running, no model set, model not installed) and nothing
+  // else is embedding — shown by ModelStatusBanner.
+  embedding_warning: string | null;
 }
 
 export interface AgentsState {
@@ -62,7 +69,9 @@ const initialHealth: HealthState = {
   startup_grace_over: false,
   active_embedding_model_name: null,
   active_embedding_backend: null,
-  gate_tiers: {}
+  gate_tiers: {},
+  embedding_host: '',
+  embedding_warning: null
 };
 
 export const health = writable<HealthState>(initialHealth);

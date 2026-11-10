@@ -2332,3 +2332,48 @@ separate copies of the same files into one `document_index`.
   (57 → 32), and a RAG question returned three distinct documents where it had returned three copies
   of one page.
 - Tests: `test_wiki_dir_paths.py` (4), `test_duplicate_documents.py` (5). Full suite 1817 passed.
+
+---
+
+### §16.32 — Embedding host: local embeddings for chat-only backends (2026-11-10)
+
+**Why.** Phase 1 of the OpenRouter-backend plan (Phase 0 findings:
+`diagnostics/reports/openrouter_free_tier_2026-11-10.md`). Until now `embed_fn` was always the chat
+runtime's own `embed()`. A hosted chat API can't embed locally, so starting on one would have dropped
+to keyword-only retrieval, and calling its embeddings would break "embeddings always run locally".
+
+**Design.**
+
+- **Embedding host.** `runtime_factory.embedding_host_for(backend)` names the backend whose `embed()`
+  serves embeddings. It is the backend itself when it's in `_EMBEDDING_CAPABLE` (`omlx`, `ollama`),
+  and otherwise `LOCAL_EMBEDDING_FALLBACK` (`ollama`). A new registered backend is chat-only unless
+  it's added to that set.
+- **Embed-only client.** For a chat-only backend, `_resolve_embedding_host()` builds a separate
+  Ollama client through `_create_and_check_embedder()`, with no chat model and Ollama's own pin
+  (`LOCALIST_EMBEDDING_MODEL_OLLAMA`). It is kept as `_state.embedder_runtime`, which is `None`
+  whenever the chat runtime is its own host.
+- **All §16.25 rules apply to the host, not the chat backend.**
+  - Startup: `_configure_embedding_source()` takes the host's runtime, health and name.
+  - Live switch: `_plan_embedding_for_switch()` follows the host when it serves its pin, and otherwise
+    keeps the current embedder.
+  - `POST /settings/embedding-model` sets the host's pin. With a chat-only backend active, it
+    validates against an embed-only Ollama client and leaves the chat runtime untouched.
+  - Switching from Ollama to a chat-only backend keeps the same model, so nothing re-embeds.
+- **`GET /health`** gains `embedding_host` and `embedding_warning`.
+  - With a separate host, each poll also health-checks `_state.embedder_runtime`.
+  - The warning is set while the host isn't serving: not running, no model set, or the model isn't
+    installed. It is suppressed while an embedder kept from another backend is still in use.
+- **Recovery.** `_recover_embedder_on_poll()` turns embeddings on (and rebuilds the controller) once
+  Ollama starts serving the pinned model after Localist did. It is the embedding counterpart of
+  §16.22's poll-time chat-model recovery.
+- **UI.** `ModelStatusBanner` shows "Memory search is limited" with the backend's warning text. It is
+  the lowest-priority problem, shown only when chat itself is healthy, and clears on the next healthy
+  poll (user decision 2026-11-10: warn, rather than fall back silently).
+
+**Not yet exercised live.** No chat-only backend exists until Phase 2 (OpenRouter). With Ollama or
+oMLX active, the host is the chat backend and behaviour is unchanged. The Phase 0 diagnostic
+(Part A) did run the real `ControllerAgent` with a cloud chat client and a local Ollama embedder
+(`nomic-embed-text`), confirming the pairing works.
+
+**Tests.** `test_main_embedding_host.py` (21, with a fake `chatonly` backend registered). Full suite
+1914 passed.

@@ -16,7 +16,13 @@
     (m) => !NON_CHAT_MODEL_MARKERS.some((marker) => m.toLowerCase().includes(marker))
   );
 
-  type Problem = 'api-down' | 'backend-down' | 'no-chat-models' | 'model-missing' | null;
+  type Problem =
+    | 'api-down'
+    | 'backend-down'
+    | 'no-chat-models'
+    | 'model-missing'
+    | 'embeddings-off'
+    | null;
 
   // Nothing until the first poll has answered, or while the backend is still
   // starting (see isStillStarting), so the banner never flashes on a normal
@@ -25,8 +31,13 @@
     if ($health.last_checked === null || isStillStarting($health)) return null;
     if (!$health.api_ok) return 'api-down';
     if (!$health.reachable) return 'backend-down';
-    if ($health.chat_model_found) return null;
-    return chatModels.length === 0 ? 'no-chat-models' : 'model-missing';
+    if (!$health.chat_model_found) {
+      return chatModels.length === 0 ? 'no-chat-models' : 'model-missing';
+    }
+    // Chat works, but a chat-only backend's local embedding host (Ollama)
+    // isn't serving, so retrieval is keyword-only (§16.32). Lowest priority:
+    // only shown when chat itself is fine.
+    return $health.embedding_warning ? 'embeddings-off' : null;
   })();
 
   $: tone = problem === 'api-down' || problem === 'backend-down' ? 'error' : 'warning';
@@ -53,6 +64,10 @@
         </strong>
         Available: {#each chatModels as m, i}<code>{m}</code>{i < chatModels.length - 1 ? ', ' : ''}{/each}.
         <a href="/settings#chat-model">Choose a chat model in Settings</a>.
+      {:else if problem === 'embeddings-off'}
+        <strong>Memory search is limited.</strong>
+        {$health.embedding_warning}
+        This message clears on its own once embeddings are available.
       {/if}
     </div>
     <button class="model-banner-retry" on:click={checkHealth} disabled={$health.checking}>

@@ -103,6 +103,30 @@ _REGISTRY: dict[str, Any] = {
 
 
 # ---------------------------------------------------------------------------
+# Embedding host (docs/architecture/16-runtime-backend-layer.md §16.32)
+# ---------------------------------------------------------------------------
+# Backends whose own client can serve embeddings. Any registered backend NOT
+# listed here is chat-only (a hosted chat API): its embeddings come from the
+# local fallback host below, never from the remote service, so "embeddings
+# always run locally" holds whichever chat backend is active.
+_EMBEDDING_CAPABLE: frozenset[str] = frozenset({"omlx", "ollama"})
+
+# Where a chat-only backend's embeddings come from: the local Ollama daemon,
+# through an embed-only client built with Ollama's own embedding pin.
+LOCAL_EMBEDDING_FALLBACK = "ollama"
+
+
+def embedding_host_for(backend: str) -> str:
+    """
+    The backend whose embed() serves embeddings while `backend` is the chat
+    backend: `backend` itself when it can embed, otherwise
+    LOCAL_EMBEDDING_FALLBACK.
+    """
+    key = backend.strip().lower()
+    return key if key in _EMBEDDING_CAPABLE else LOCAL_EMBEDDING_FALLBACK
+
+
+# ---------------------------------------------------------------------------
 # Public factory function
 # ---------------------------------------------------------------------------
 

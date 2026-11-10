@@ -1,0 +1,15 @@
+completion_tokens,cost,empty_content,finish_reason,label,latency_s,method,mid_stream_error,phase,prompt_chars,prompt_tokens,provider,reasoning_chunks,reasoning_tokens,status,ttft_s,turn
+16,0,False,length,(unlabelled),0.92,infer,,startup,4372,1010,Nvidia,,0,200,,cache_warmup
+306,0,False,stop,main_dispatch,11.03,infer_stream,,turn,530,161,Nvidia,0,0,200,1.87,chit_chat
+24,0,False,stop,working_state,1.05,infer,,turn,3030,677,Nvidia,,0,200,,chit_chat
+7,0,False,stop,(unlabelled),0.62,infer,,turn,728,177,Nvidia,,0,200,,explicit_memory
+30,0,False,stop,main_dispatch,1.7,infer_stream,,turn,2204,546,Nvidia,0,0,200,0.96,explicit_memory
+466,0,False,stop,main_dispatch,11.42,infer_stream,,turn,2470,615,Nvidia,0,0,200,1.84,implicit_fact
+58,0,False,stop,working_state,1.83,infer,,turn,3425,835,Nvidia,,0,200,,implicit_fact
+277,0,False,stop,main_dispatch,8.87,infer_stream,,turn,4467,1144,Nvidia,0,0,200,0.85,factual
+58,0,False,stop,working_state,1.44,infer,,turn,2808,678,Nvidia,,0,200,,factual
+2,0,False,stop,(unlabelled),0.59,infer,,turn,279,71,Nvidia,,0,200,,web_search
+381,0,False,stop,main_dispatch,8.43,infer_stream,,turn,9218,2295,Nvidia,0,0,200,0.73,web_search
+29,0,False,stop,working_state,1.53,infer,,turn,3229,787,Nvidia,,0,200,,web_search
+89,0,False,stop,main_dispatch,3.66,infer_stream,,turn,7357,1923,Nvidia,0,0,200,1.35,follow_up
+24,0,False,stop,working_state,1.33,infer,,turn,1970,465,Nvidia,,0,200,,follow_up

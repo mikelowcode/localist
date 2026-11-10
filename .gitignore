@@ -136,3 +136,6 @@ backend/__pycache__/
 sessions-log.md
 sessions-log.md.DS_Store
 **/.DS_Store
+
+# OpenRouter diagnostic probe output — includes account identifiers from GET /api/v1/key
+diagnostics/openrouter_free_tier_probes.json

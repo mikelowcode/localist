@@ -1,0 +1,299 @@
+{
+  "model": "google/gemma-4-31b-it:free",
+  "reasoning": "off",
+  "run_at": "2026-11-10T13:18:42-0800",
+  "part_c": {
+    "C1_poll": {
+      "polls": [
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.19,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:18:42"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.43,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:19:12"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.34,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:19:43"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.23,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:20:13"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.29,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:20:43"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.48,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:21:14"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.45,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:21:44"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.23,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:22:14"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.54,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:22:45"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.23,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:23:15"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.42,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:23:46"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.26,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:24:16"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.42,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:24:46"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.31,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:25:17"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.28,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:25:47"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.24,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:26:17"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.59,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:26:48"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.3,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:27:18"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.29,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:27:48"
+        },
+        {
+          "model": "google/gemma-4-31b-it:free",
+          "status": 429,
+          "latency_s": 0.27,
+          "limit_source": "upstream_provider_shared_pool",
+          "provider": "Google AI Studio",
+          "content": "",
+          "t": "13:28:19"
+        }
+      ],
+      "ok": 0,
+      "total": 20
+    },
+    "C2_free_models": [
+      {
+        "model": "thinkingmachines/inkling-2-small:free",
+        "status": 403,
+        "latency_s": 0.12,
+        "limit_source": null,
+        "provider": null,
+        "content": ""
+      },
+      {
+        "model": "liquid/lfm-3-1.7b:free",
+        "status": 200,
+        "latency_s": 0.38,
+        "limit_source": null,
+        "provider": "Liquid",
+        "content": ""
+      },
+      {
+        "model": "recursive/flint-v1.0:free",
+        "status": 200,
+        "latency_s": 0.73,
+        "limit_source": null,
+        "provider": "Recursive",
+        "content": ""
+      },
+      {
+        "model": "xingchen-agi/xing4.0-29b-a4b:free",
+        "status": 429,
+        "latency_s": 0.23,
+        "limit_source": "upstream_provider_shared_pool",
+        "provider": "Phala",
+        "content": ""
+      },
+      {
+        "model": "nvidia/nemotron-3.5-super-vl:free",
+        "status": 200,
+        "latency_s": 0.64,
+        "limit_source": null,
+        "provider": "Nvidia",
+        "content": ""
+      },
+      {
+        "model": "dots-studio/dots-3-note-preview:free",
+        "status": 200,
+        "latency_s": 1.57,
+        "limit_source": null,
+        "provider": "AtlasCloud",
+        "content": ""
+      },
+      {
+        "model": "liquid/lfm-2.5-2.6b:free",
+        "status": 200,
+        "latency_s": 0.79,
+        "limit_source": null,
+        "provider": "Liquid",
+        "content": ""
+      },
+      {
+        "model": "nvidia/nemotron-3.5-lightning:free",
+        "status": 200,
+        "latency_s": 1.05,
+        "limit_source": null,
+        "provider": "Nvidia",
+        "content": ""
+      },
+      {
+        "model": "cohere/north-mini-code:free",
+        "status": 200,
+        "latency_s": 0.3,
+        "limit_source": null,
+        "provider": "Cohere",
+        "content": ""
+      },
+      {
+        "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "status": 200,
+        "latency_s": 0.66,
+        "limit_source": null,
+        "provider": "Nvidia",
+        "content": "OK"
+      },
+      {
+        "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+        "status": 200,
+        "latency_s": 0.75,
+        "limit_source": null,
+        "provider": "Nvidia",
+        "content": ""
+      },
+      {
+        "model": "google/gemma-4-26b-a4b-it:free",
+        "status": 429,
+        "latency_s": 0.23,
+        "limit_source": "upstream_provider_shared_pool",
+        "provider": "Google AI Studio",
+        "content": ""
+      },
+      {
+        "model": "google/gemma-4-31b-it:free",
+        "status": 429,
+        "latency_s": 0.21,
+        "limit_source": "upstream_provider_shared_pool",
+        "provider": "Google AI Studio",
+        "content": ""
+      }
+    ]
+  }
+}
