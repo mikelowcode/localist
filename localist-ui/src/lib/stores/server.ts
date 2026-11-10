@@ -45,6 +45,30 @@ export interface HealthState {
   // (Ollama not running, no model set, model not installed) and nothing
   // else is embedding — shown by ModelStatusBanner.
   embedding_warning: string | null;
+  // Hosted backends only (OpenRouter, backend §16.34): free-tier status and
+  // free requests left today, and the most recent failed request — cleared
+  // by the next successful one. null for oMLX/Ollama.
+  runtime_key_info: RuntimeKeyInfo | null;
+  runtime_last_error: RuntimeLastError | null;
+}
+
+export interface RuntimeKeyInfo {
+  is_free_tier: boolean | null;
+  free_requests_used: number | null;
+  free_requests_limit: number | null;
+  free_requests_remaining: number | null;
+  limit_usd: number | null;
+  limit_remaining_usd: number | null;
+  limit_reset: string | null;
+  usage_usd: number | null;
+}
+
+// kind: no_key | auth | credits | daily_limit | minute_limit | upstream_busy |
+// rate_limited | no_endpoint | transport | stream | other
+export interface RuntimeLastError {
+  kind: string;
+  message: string;
+  at: number;
 }
 
 export interface AgentsState {
@@ -71,7 +95,9 @@ const initialHealth: HealthState = {
   active_embedding_backend: null,
   gate_tiers: {},
   embedding_host: '',
-  embedding_warning: null
+  embedding_warning: null,
+  runtime_key_info: null,
+  runtime_last_error: null
 };
 
 export const health = writable<HealthState>(initialHealth);

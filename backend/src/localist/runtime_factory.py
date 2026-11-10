@@ -27,7 +27,7 @@ The lifespan function constructs the active runtime via:
     from .runtime_factory import create_runtime
 
     runtime = create_runtime(
-        backend  = settings.runtime_backend,   # "omlx" | "ollama"
+        backend  = settings.runtime_backend,   # "omlx" | "ollama" | "openrouter"
         settings = settings,
     )
 
@@ -94,11 +94,32 @@ def _make_ollama(kwargs: dict[str, Any]) -> BaseRuntimeClient:
     )
 
 
+def _make_openrouter(kwargs: dict[str, Any]) -> BaseRuntimeClient:
+    """
+    Construct an OpenRouterRuntimeClient (§16.33) — a hosted, chat-only
+    backend. The API key is the OPENROUTER_API_KEY secret, read from the
+    process environment at construction time (set from .env at startup, or by
+    PUT /settings/api-keys) unless passed explicitly as openrouter_api_key.
+    embedding_model is ignored: this backend's embeddings come from local
+    Ollama (embedding_host_for() below).
+    """
+    import os
+    from .openrouter_runtime_client import DEFAULT_CHAT_MODEL, OpenRouterRuntimeClient
+    api_key = kwargs.get("openrouter_api_key")
+    return OpenRouterRuntimeClient(
+        chat_model      = kwargs.get("chat_model") or DEFAULT_CHAT_MODEL,
+        api_key         = api_key if api_key is not None else os.environ.get("OPENROUTER_API_KEY", ""),
+        request_timeout = kwargs.get("request_timeout", 30.0),
+        stream_timeout  = kwargs.get("stream_timeout",  60.0),
+    )
+
+
 # Registry maps backend name → factory function.
 # All entries must return a BaseRuntimeClient-conforming object.
 _REGISTRY: dict[str, Any] = {
-    "omlx":    _make_omlx,
-    "ollama":  _make_ollama,
+    "omlx":       _make_omlx,
+    "ollama":     _make_ollama,
+    "openrouter": _make_openrouter,
 }
 
 
@@ -141,7 +162,7 @@ def create_runtime(
     ----------
     backend:
         Backend identifier string.  Case-insensitive.
-        Supported values: "omlx", "ollama".
+        Supported values: "omlx", "ollama", "openrouter".
         New backends are added by inserting an entry into _REGISTRY.
 
     **kwargs:

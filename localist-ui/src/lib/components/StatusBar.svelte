@@ -1,6 +1,6 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { connectivityLabel } from '$lib/stores/server';
+  import { connectivityLabel, health } from '$lib/stores/server';
   import { runtimeBackendLabel } from '$lib/stores/model';
   import { pendingCount } from '$lib/stores/episodes';
   import { toggleSidebarCollapsed } from '$lib/stores/sidebar';
@@ -19,6 +19,12 @@
   $: isMemory = path.startsWith('/memory');
   $: screenTitle =
     Object.entries(TITLES).find(([prefix]) => path.startsWith(prefix))?.[1] ?? '';
+
+  // OpenRouter on a free model: free requests left today (backend §16.34).
+  $: freeLeft =
+    $health.chat_model?.endsWith(':free')
+      ? $health.runtime_key_info?.free_requests_remaining ?? null
+      : null;
 </script>
 
 <header class="appbar" aria-label="System status">
@@ -51,7 +57,10 @@
           class:dot-pulse={$connectivityLabel === 'checking' || $connectivityLabel === 'online'}
           aria-hidden="true"
         />
-        {$runtimeBackendLabel}
+        {$runtimeBackendLabel}{#if freeLeft !== null}<span
+            class="free-left"
+            title="Free OpenRouter requests left today (a chat turn uses about 2–3)"
+          >&nbsp;· {freeLeft} free left</span>{/if}
       </span>
     {:else if isMemory && $pendingCount > 0}
       <span class="pill-mono pending-chip">{$pendingCount} pending</span>
@@ -60,6 +69,10 @@
 </header>
 
 <style>
+  .free-left {
+    color: var(--text-tertiary);
+  }
+
   .appbar {
     height: var(--topbar-h);
     flex-shrink: 0;

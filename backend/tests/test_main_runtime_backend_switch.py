@@ -289,6 +289,7 @@ class TestGetRuntimeBackendModels:
             "chat_model_source": "default",
             "chat_model_found": True,
             "error":            None,
+            "model_details":    [],
         }
         assert main._state.runtime is initial_runtime
         assert main._state.controller is prev_controller

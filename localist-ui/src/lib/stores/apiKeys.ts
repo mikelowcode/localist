@@ -1,5 +1,5 @@
 /**
- * apiKeys.ts — optional API keys settings store (BRAVE / LANGSEARCH / NEWSAPI / GITHUB)
+ * apiKeys.ts — optional API keys settings store (BRAVE / LANGSEARCH / NEWSAPI / GITHUB / OPENROUTER)
  *
  * Talks to:
  *   GET /api/settings/api-keys — which keys are currently configured (booleans only)
@@ -10,7 +10,8 @@
  * Follows retentionSettings.ts's pattern: on failure, state is left
  * untouched (no optimistic update).
  *
- * The backend refuses a malformed key or a GitHub token that GitHub rejects
+ * The backend refuses a malformed key, or a GitHub token / OpenRouter key that
+ * the service itself rejects
  * (a save then fails with nothing changed, and the message lands in
  * apiKeysError). On a successful save it tells localist-mcp to reload its keys,
  * so no restart is needed. The `warning` field carries anything worth showing:
@@ -26,13 +27,15 @@ export interface ApiKeysStatus {
   brave_api_key_set: boolean;
   newsapi_api_key_set: boolean;
   github_token_set: boolean;
+  openrouter_api_key_set: boolean;
 }
 
 const DEFAULT_STATE: ApiKeysStatus = {
   langsearch_api_key_set: false,
   brave_api_key_set: false,
   newsapi_api_key_set: false,
-  github_token_set: false
+  github_token_set: false,
+  openrouter_api_key_set: false
 };
 
 export const apiKeysStatus: Writable<ApiKeysStatus> = writable(DEFAULT_STATE);
@@ -59,6 +62,7 @@ export interface ApiKeysUpdate {
   brave_api_key?: string;
   newsapi_api_key?: string;
   github_token?: string;
+  openrouter_api_key?: string;
 }
 
 /** Returns the save-success warning (e.g. "restart localist-mcp"), or null on failure. */
@@ -80,7 +84,8 @@ export async function setApiKeys(update: ApiKeysUpdate): Promise<string | null> 
       langsearch_api_key_set: data.langsearch_api_key_set,
       brave_api_key_set: data.brave_api_key_set,
       newsapi_api_key_set: data.newsapi_api_key_set,
-      github_token_set: data.github_token_set
+      github_token_set: data.github_token_set,
+      openrouter_api_key_set: data.openrouter_api_key_set
     });
     return data.warning ?? '';
   } catch (err) {

@@ -8,13 +8,22 @@ export interface ModelState {
 
 const BACKEND_KEY = 'localist-runtime-backend';
 
-export const RUNTIME_BACKENDS = ['omlx', 'ollama'] as const;
+export const RUNTIME_BACKENDS = ['omlx', 'ollama', 'openrouter'] as const;
 export type RuntimeBackend = (typeof RUNTIME_BACKENDS)[number];
 
 export const RUNTIME_BACKEND_LABELS: Record<RuntimeBackend, string> = {
   omlx: 'oMLX',
-  ollama: 'Ollama'
+  ollama: 'Ollama',
+  openrouter: 'OpenRouter'
 };
+
+// Hosted, chat-only backends: they need an API key, send chat over the
+// internet, and get their embeddings from local Ollama (backend §16.32).
+export const HOSTED_BACKENDS: readonly RuntimeBackend[] = ['openrouter'];
+
+export function isHostedBackend(backend: string): boolean {
+  return (HOSTED_BACKENDS as readonly string[]).includes(backend);
+}
 
 function readStoredBackend(): string {
   if (!browser) return 'omlx';

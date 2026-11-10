@@ -1414,3 +1414,50 @@ scratch folder; see §14.18.
 Michael hand-checked the two things that needed the packaged app's own window and a real token: the
 "Create a token" link opens GitHub's new-token page in the default browser, and a real fine-grained token is
 refused with the classic-token message.
+
+### 7.29 OpenRouter in Settings, the chat banner and the status chip (2026-11-10)
+
+Phase 4 of the OpenRouter-backend plan; backend in §16.32–§16.34.
+
+- **Runtime Backend card.** Gains OpenRouter (`RUNTIME_BACKENDS`, `HOSTED_BACKENDS` /
+  `isHostedBackend()` in `stores/model.ts`).
+  - Without a saved key, clicking it previews its models and says to add a key under API Keys,
+    rather than sending a switch that would fail.
+  - The confirm dialog for a hosted backend says chat goes over the internet to OpenRouter and the
+    model's provider, that providers of free models may use prompts for training, and that memory
+    and document search stay on the Mac.
+- **Chat Model card (OpenRouter).**
+  - A "Free models only" checkbox, on by default; the list comes from
+    `GET …/openrouter/models?free_only=`.
+  - Options show the model's name and "(free)" alongside its ID.
+  - A hint covers the request limits, with free requests left today when OpenRouter is active.
+  - Always shown: the training disclosure (user decision 2026-11-10: allow training on free
+    models, disclose it in Settings).
+- **Embedding Model card.** Follows `/health`'s `embedding_host`, not the chat backend: with
+  OpenRouter active it lists and sets Ollama's models and says embeddings run locally through
+  Ollama. The "embeddings still come from …" warning compares against the host.
+- **API Keys card.** An `OPENROUTER_API_KEY` field with a "Create a key on OpenRouter" link
+  (`openExternal`). Saving clears a "no key" switch error, refreshes the OpenRouter model list, and
+  re-polls health when OpenRouter is active.
+- **ModelStatusBanner.**
+  - A hosted backend that's unreachable shows the health check's reason (no key, or a rejected
+    key) and links to the key field.
+  - A hosted model with no provider links to the model picker.
+  - New `request-failed` problem: `runtime_last_error`'s message (busy upstream, daily or
+    per-minute free limit, no credits …), with a link where one helps. It clears after the next
+    successful reply.
+  - Priority order: backend down > chat model > last request failed > embeddings off.
+- **Status chip.** "OpenRouter · N free left" while a `:free` model is in use, from
+  `runtime_key_info.free_requests_remaining`.
+
+**Verified.**
+
+- `npm run check`: 0 errors, 0 warnings.
+- Live, through a dev frontend on :5174 proxied to a sandbox backend on :8011. The sandbox used
+  `LOCALIST_BACKEND_ROOT` with its own `.env`, DB and folders, so Settings writes stayed out of the
+  real `backend/.env`.
+  - `/health`: OpenRouter with Nemotron, Ollama embeddings, free requests left.
+  - The free model list held 13 models with names.
+  - Key status configured.
+  - Pinning Gemma 4 31B free and sending a message produced the "busy at its provider" error and
+    `runtime_last_error.kind == "upstream_busy"`. Re-pinning Nemotron cleared it.

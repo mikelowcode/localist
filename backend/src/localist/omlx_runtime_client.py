@@ -51,6 +51,7 @@ from typing import Generator, Iterator
 
 import requests
 
+from .openai_compat import TURN_ROLE_TO_MESSAGE_ROLE, build_messages, iter_content_deltas
 from .prompt_builder import Turn
 
 logger = logging.getLogger(__name__)
@@ -69,31 +70,11 @@ def _iter_sse_chunks(response: requests.Response) -> Iterator[str]:
     or:
         data: [DONE]
 
-    Malformed lines and empty deltas are silently skipped.
+    Malformed lines and empty deltas are silently skipped. Parsing (and
+    explicit UTF-8 decoding) lives in openai_compat.py, shared with
+    OpenRouterRuntimeClient (§16.33).
     """
-    for raw_line in response.iter_lines(decode_unicode=True):
-        if not raw_line:
-            continue
-        if not raw_line.startswith("data:"):
-            continue
-
-        data_str = raw_line[len("data:"):].strip()
-        if data_str == "[DONE]":
-            return
-
-        try:
-            data = json.loads(data_str)
-        except json.JSONDecodeError:
-            logger.debug("SSE: skipping non-JSON line: %s", raw_line[:120])
-            continue
-
-        choices = data.get("choices", [])
-        if not choices:
-            continue
-
-        delta_content = choices[0].get("delta", {}).get("content", "")
-        if delta_content:
-            yield delta_content
+    yield from iter_content_deltas(response)
 
 # ---------------------------------------------------------------------------
 # Concurrency guard
@@ -146,14 +127,10 @@ DEFAULT_EMBEDDING_MODEL = ""
 # request the server would reject.
 _DEFAULT_MAX_MODEL_LEN = 8192
 
-# conversation_log stores role="agent" for completed agent turns
-# (memory_manager.py's add_agent_result()), not "assistant" — but oMLX's
-# OpenAI-compatible /v1/chat/completions only recognizes system/user/
-# assistant/tool. Map at the message-building boundary rather than
-# upstream, since "agent" is the correct value everywhere else (DB rows,
-# PromptBuilder's flattened [WORKING MEMORY] text) and this endpoint is the
-# only place that needs the OpenAI vocabulary.
-_TURN_ROLE_TO_MESSAGE_ROLE = {"agent": "assistant"}
+# conversation_log stores role="agent" for completed agent turns; oMLX's
+# OpenAI-compatible endpoint only knows system/user/assistant/tool. The map
+# now lives in openai_compat.py (shared with OpenRouterRuntimeClient).
+_TURN_ROLE_TO_MESSAGE_ROLE = TURN_ROLE_TO_MESSAGE_ROLE
 
 # oMLX's server.py validate_context_window() 400s with a JSON body shaped
 # like {"detail": "Prompt too long: {N} tokens exceeds max context window
@@ -492,21 +469,15 @@ class OMLXRuntimeClient:
             an oMLX "Prompt too long" 400 that persists after the single
             oldest-turn-drop retry described below.
         """
-        messages: list[dict] = []
-        if system:
-            messages.append({"role": "system", "content": system})
+        # system (if any) → working-memory turns → current query, always last.
+        messages: list[dict] = build_messages(prompt, system, working_memory_turns)
 
         # Index of the first working-memory message (or, if there are none,
-        # the index the final current-query message below will land at) —
-        # used by the "Prompt too long" retry to identify which entry is
-        # the single oldest conversation-log turn, never the system message
-        # or the current query.
-        working_memory_start_idx = len(messages)
-        for turn in working_memory_turns or []:
-            role = _TURN_ROLE_TO_MESSAGE_ROLE.get(turn.role, turn.role)
-            messages.append({"role": role, "content": turn.content})
-
-        messages.append({"role": "user", "content": prompt})   # current query — always last
+        # the index the final current-query message landed at) — used by
+        # the "Prompt too long" retry to identify which entry is the single
+        # oldest conversation-log turn, never the system message or the
+        # current query.
+        working_memory_start_idx = 1 if system else 0
 
         effective_timeout = timeout if timeout is not None else self._stream_timeout
 

@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Localist Framework is a local-first, agentic general assistant running entirely on macOS Apple
 Silicon: persistent cross-session memory, live web fetch/search, indexed document retrieval, and a
 deterministic priority engine that routes every query before any inference is spent. It is
-inference-engine-agnostic (oMLX, Ollama/Ollama Cloud, swappable via one config
+inference-engine-agnostic (oMLX, Ollama/Ollama Cloud, OpenRouter, swappable via one config
 variable); embeddings always run locally regardless of the active chat backend.
 
 ## Commands
@@ -49,7 +49,7 @@ python -m pytest tests/test_planner_phase3.py -v    # one file
 python -m pytest tests/test_planner_phase3.py -k test_whats_up_with_question_mark_filtered -v   # one test
 ```
 All tests mock inference and SQLite — no live oMLX/Ollama server or API keys required to run them.
-Verified clean as of 2026-11-10: 1914 passed, 0 failed.
+Verified clean as of 2026-11-10: 1975 passed, 0 failed.
 
 ### Frontend
 ```bash
@@ -78,7 +78,8 @@ localist-mcp.
 
 All inference goes through a `BaseRuntimeClient`-conforming runtime selected at startup via
 `LOCALIST_RUNTIME_BACKEND` and constructed by `runtime_factory.py`: `OMLXRuntimeClient` or
-`OllamaRuntimeClient` (also serves Ollama Cloud models over the same local daemon). The active
+`OllamaRuntimeClient` (also serves Ollama Cloud models over the same local daemon), or
+`OpenRouterRuntimeClient` (hosted, chat-only, `OPENROUTER_API_KEY`; §16.33–§16.34). The active
 backend can also be changed live, without a restart, via
 `POST /settings/runtime-backend` (health-checks the target before swapping, persists the choice to
 `.env`; see `docs/architecture/16-runtime-backend-layer.md` §16.5) — so never assume the backend
@@ -86,7 +87,8 @@ active at startup is still the one active when a request is handled; always reso
 `_state.runtime` at request time, never capture it once and hold onto it. The Settings UI's Runtime
 Backend control is wired to this endpoint (§7.10, §16.6) — a live switch there is a real,
 confirm-gated action, not a display preference. There is no local embedding model in this repo —
-vector embeddings, when configured, come from the active runtime backend's own `embed()`
+vector embeddings, when configured, come from the embedding host's `embed()` — the active runtime
+backend itself, or local Ollama when the active backend is chat-only like OpenRouter (§16.32)
 (`LOCALIST_EMBEDDING_MODEL`, Ollama only; oMLX does not yet wire this through). Two-tier
 precedence (§16.4): a runtime-backend embed source, if configured and found by the active backend,
 is used; otherwise MemoryManager runs the true zero-config default — keyword-only (BM25) retrieval.

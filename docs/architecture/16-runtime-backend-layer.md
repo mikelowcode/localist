@@ -7,15 +7,20 @@
 `runtime_factory.py`'s `create_runtime()` is the single entry point that constructs the active
 backend at process startup, selected via `LOCALIST_RUNTIME_BACKEND`. Concurrency posture is
 swap-only: exactly one backend is active per process; dual-runtime/concurrent-backend operation is
-explicitly out of scope for both backends below.
+explicitly out of scope for all backends below.
 
-Two backends are registered in `_REGISTRY` today:
+Three backends are registered in `_REGISTRY` today:
 
 - **`OMLXRuntimeClient`** (`omlx_runtime_client.py`) — oMLX local inference, fixed port 8000,
   OpenAI-compatible SSE streaming, native MarkItDown file ingestion (`infer_with_file()`, an
   oMLX-only capability not part of the Protocol).
 - **`OllamaRuntimeClient`** (`ollama_runtime_client.py`, added 2026-07-08) — Ollama local
   inference, fixed port 11434, native NDJSON streaming (not OpenAI-compatible SSE). See §16.2.
+- **`OpenRouterRuntimeClient`** (`openrouter_runtime_client.py`, added 2026-11-10) — hosted chat
+  through OpenRouter (`https://openrouter.ai/api/v1`), OpenAI-compatible SSE shared with oMLX via
+  `openai_compat.py`, `OPENROUTER_API_KEY`, default model `nvidia/nemotron-3-ultra-550b-a55b:free`.
+  Chat only: its embeddings come from local Ollama (§16.32). `is_local = False`. Added when Ollama
+  Cloud's free plan ended (2026-11-09). See §16.33–§16.34.
 
 **Known-working oMLX chat models.** Model IDs below are exactly as oMLX's `GET /v1/models` lists
 them. Each one shows up in the Settings Chat Model dropdown (§16.6) with no code change.
@@ -2377,3 +2382,114 @@ oMLX active, the host is the chat backend and behaviour is unchanged. The Phase 
 
 **Tests.** `test_main_embedding_host.py` (21, with a fake `chatonly` backend registered). Full suite
 1914 passed.
+
+---
+
+### §16.33 — `OpenRouterRuntimeClient` and the shared OpenAI-compatible helpers (2026-11-10)
+
+**Why.** Phase 2 of the OpenRouter-backend plan. Ollama Cloud's free plan ended 2026-11-09; OpenRouter's
+free tier is the replacement. The client exists and is tested; registering it as a backend, with its
+settings and API key, is Phase 3.
+
+**`openai_compat.py` (new, shared with `OMLXRuntimeClient`).**
+
+- `build_messages()`: system, then working-memory turns (`agent` → `assistant`), then the prompt.
+- `iter_sse_events()` / `iter_content_deltas()`: OpenAI-style SSE parsing. Comment keep-alives
+  (`: OPENROUTER PROCESSING`) are skipped and parsing stops at `[DONE]`.
+- **SSE lines are read as bytes and decoded as UTF-8.** `iter_lines(decode_unicode=True)` uses the
+  declared charset. OpenRouter's `text/event-stream` declares none, so `requests` fell back to
+  ISO-8859-1 and "–" arrived as "â\x80\x93" (Phase 0).
+- oMLX now uses the same helpers (`_iter_sse_chunks` delegates to them). oMLX is a FastAPI server and
+  Starlette adds `charset=utf-8` to `text/*` responses, so oMLX was probably not affected, but the
+  explicit decode is correct either way. Its behaviour, tests and "Prompt too long" retry are
+  unchanged.
+
+**`OpenRouterRuntimeClient`.**
+
+- Chat only. `embed()` raises; embeddings come from local Ollama (§16.32). `is_local = False`.
+- Default model `nvidia/nemotron-3-ultra-550b-a55b:free` (user decision 2026-11-10: Gemma 4 31B free
+  was rate-limited upstream on every Phase 0 request; it stays selectable).
+- Every request sends `reasoning: {"enabled": false}`, the counterpart of Ollama's `think: false`
+  (§4.6.2). `{"exclude": true}` only hides reasoning, and the model still spends the tokens.
+- `infer()` joins `infer_stream()`, so there is one code path. Usage from the final chunk is kept
+  in `last_usage`.
+- Headers: the Bearer key, `Content-Type` and `X-Title: Localist`. Nothing identifying.
+- **Errors** are `OpenRouterError(RuntimeError)` with a `kind` and a message meant for people:
+  - `no_key`
+  - `auth` (401/403)
+  - `credits` (402)
+  - `daily_limit` / `minute_limit` (free-models-per-day / -per-min)
+  - `upstream_busy` (`metadata.limit_source == "upstream_provider_shared_pool"`)
+  - `rate_limited` (any other 429), `no_endpoint` (404), `transport`, `stream` (an error event
+    mid-stream), `other`
+
+  Only `upstream_busy` is retried: once, after `Retry-After` or 2 s, capped at 10 s. The most recent
+  failure is kept in `last_error` and cleared by the next success.
+- **`health_check()`**: `GET /key` (costs no quota) decides reachability and key validity, and
+  `GET /models/{id}/endpoints` decides `chat_model_found`. It adds `key_info` (free-tier status,
+  free requests used/limit/remaining, spend limit; no label, user or workspace ID) and `last_error`.
+- **`list_models(free_only)`**: chat models with tool support and text output, free models first,
+  cached for 10 min. OpenRouter's own routers (`openrouter/free`, `openrouter/auto`) are excluded:
+  they change model per request, which defeats prompt caching.
+
+**Verified.**
+
+- Tests: `test_openrouter_runtime_client.py` (36). Full suite 1950 passed.
+- Live, 2026-11-10:
+  - Nemotron answered "Tomatoes need 6–8 hours of sun daily." in 1.4 s, with `reasoning_tokens` 0.
+  - Health reported 22 of 50 free requests left.
+  - The list held 14 free tool-capable models.
+  - Gemma 4 31B free was still busy upstream: classified `upstream_busy` and retried once.
+
+---
+
+### §16.34 — OpenRouter registered as a runtime backend (2026-11-10)
+
+**Why.** Phase 3 of the OpenRouter-backend plan: make the §16.33 client selectable. The Settings UI
+is Phase 4.
+
+**Backend.**
+
+- `runtime_factory._REGISTRY["openrouter"]` (`_make_openrouter`). The key is `OPENROUTER_API_KEY`
+  from the process environment, read at construction unless passed as `openrouter_api_key`. The
+  model is `LOCALIST_CHAT_MODEL_OPENROUTER`, else `DEFAULT_CHAT_MODEL`. It isn't in
+  `_EMBEDDING_CAPABLE`, so its embedding host is local Ollama (§16.32).
+- `Settings.chat_model_openrouter` and the `_CHAT_MODEL_*` maps gain `openrouter`. Pins, the live
+  switch and chat-model recovery work as for the other backends.
+- **Switching** health-checks first, as before. Without a key the client reports unreachable, so
+  the switch is refused (502) and the current backend is untouched. The 502 detail now includes the
+  health check's error ("No OpenRouter API key is set.").
+- **No cache warm-up for OpenRouter.** `_build_controller()` skips `run_cache_warmup()` when the
+  runtime sets `wants_cache_warmup = False`. Each warm-up would spend one of the free tier's daily
+  requests on every start and switch, and the free endpoints report no implicit prompt caching.
+- **`GET /settings/runtime-backend/{backend}/models?free_only=`**: a client with a catalog
+  (`list_models()`, looked up on its class) returns that instead of the health check's list, with
+  `model_details` (`id`, `name`, `free`, `context_length`).
+- **`GET /health`** passes through `runtime_key_info` (free-tier status, free requests left today)
+  and `runtime_last_error` (`{kind, message, at}` of the most recent failed request). Both are
+  `None` for oMLX and Ollama.
+
+**API key.**
+
+- `openrouter_api_key` ↔ `OPENROUTER_API_KEY` in `PUT /settings/api-keys` / `GET` status.
+- It is checked like `GITHUB_TOKEN` (`openrouter_runtime_client.validate_api_key()`, `GET /key`,
+  no quota): rejected → 400 and nothing saved; OpenRouter unreachable → saved with a warning.
+- It is read only by this process. It is in `_BACKEND_ONLY_API_KEYS`, kept out of localist-mcp's
+  reload list, and saving only it doesn't trigger an MCP reload.
+- A new key is handed to the live client (`set_api_key()`) when OpenRouter is active. The packaged
+  app writes it to its own `.env` through the same path as the other keys.
+- `tests/conftest.py` now clears `OPENROUTER_API_KEY` and `LOCALIST_CHAT_MODEL_OPENROUTER` before
+  every test: `main`'s `load_dotenv()` had carried the real key into
+  `test_main_api_keys_endpoints`.
+
+**Verified.**
+
+- Tests: `test_main_openrouter_backend.py` (13), plus OpenRouter-key cases in
+  `test_main_api_keys_endpoints.py` and validator/key-swap cases in
+  `test_openrouter_runtime_client.py`. Full suite 1975 passed.
+- Live (sandbox backend on :8011, temp DB and folders, started with
+  `LOCALIST_RUNTIME_BACKEND=openrouter`):
+  - Startup: OpenRouter chat with Nemotron, embeddings on local Ollama (`nomic-embed-text`), no
+    warm-up, healthy, `runtime_key_info` showing the free requests left.
+  - One `POST /task`: a correct answer in 3 OpenRouter calls (classifier, `main_dispatch`,
+    `working_state`), with `runtime_last_error` still null.

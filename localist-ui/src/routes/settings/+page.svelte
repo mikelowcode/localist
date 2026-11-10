@@ -4,7 +4,13 @@
   import { onMount, tick } from 'svelte';
   import { health, checkHealth, backendReady } from '$lib/stores/server';
   import { apiUrl } from '$lib/api';
-  import { modelConfig, RUNTIME_BACKENDS, RUNTIME_BACKEND_LABELS, type RuntimeBackend } from '$lib/stores/model';
+  import {
+    modelConfig,
+    RUNTIME_BACKENDS,
+    RUNTIME_BACKEND_LABELS,
+    isHostedBackend,
+    type RuntimeBackend
+  } from '$lib/stores/model';
   import {
     runtimeBackendSwitchLoading,
     runtimeBackendSwitchError,
@@ -12,7 +18,8 @@
     switchRuntimeBackend,
     fetchBackendModels,
     pinChatModel,
-    type ChatModelSource
+    type ChatModelSource,
+    type ModelDetail
   } from '$lib/stores/runtimeBackendSwitch';
   import {
     embeddingModelSwitchLoading,
@@ -75,6 +82,7 @@
   import { openExternal } from '$lib/openExternal';
 
   const GITHUB_NEW_TOKEN_URL = 'https://github.com/settings/tokens/new?description=Localist';
+  const OPENROUTER_KEYS_URL = 'https://openrouter.ai/settings/keys';
 
   const EVICTION_PRESETS: { value: EvictionPreset; label: string }[] = [
     { value: '7d',      label: '7 days' },
@@ -260,15 +268,40 @@
   let previewChatModel = '';
   let chatModelSource: ChatModelSource = 'default';
   let modelsFetchToken = 0;
+  // OpenRouter's catalog is hundreds of models: details (name, free) label
+  // the options, and the list starts narrowed to free models.
+  let modelDetails: ModelDetail[] = [];
+  let modelsError: string | null = null;
+  let freeModelsOnly = true;
 
   async function refreshModelsForSelected() {
     const token = ++modelsFetchToken;
-    const result = await fetchBackendModels(selectedUiBackend);
+    const result = await fetchBackendModels(
+      selectedUiBackend,
+      isHostedBackend(selectedUiBackend) && freeModelsOnly
+    );
     if (token !== modelsFetchToken) return;
     availableModels  = result.models;
+    modelDetails     = result.details;
+    modelsError      = result.error;
     previewChatModel = result.chatModel;
     chatModelSource  = result.chatModelSource;
   }
+
+  $: detailsById = new Map(modelDetails.map((d) => [d.id, d]));
+  function modelOptionLabel(id: string): string {
+    const d = detailsById.get(id);
+    if (!d) return id;
+    return `${d.name}${d.free && !d.name.toLowerCase().includes('(free)') ? ' (free)' : ''} — ${id}`;
+  }
+  $: selectedIsHosted = isHostedBackend(selectedUiBackend);
+  // A free model (OpenRouter ":free") is what the daily request limit and
+  // the training note apply to.
+  $: chatModelIsFree = chatModel.endsWith(':free') || detailsById.get(chatModel)?.free === true;
+  $: freeRequestsLeft =
+    selectedUiBackend === $modelConfig.backend
+      ? $health.runtime_key_info?.free_requests_remaining ?? null
+      : null;
 
   // The model the dropdown shows as selected. For the active backend this
   // is GET /health's chat_model, refreshed on every poll, so a poll-time
@@ -281,7 +314,9 @@
       : previewChatModel;
   $: chatModelMissing = !!chatModel && availableModels.length > 0 && !availableModels.includes(chatModel);
 
-  $: if (selectedUiBackend && backendUp) refreshModelsForSelected();
+  // Keyed on the free-only filter too, so toggling it reloads the list.
+  $: modelsQueryKey = `${selectedUiBackend}|${freeModelsOnly}`;
+  $: if (modelsQueryKey && backendUp) refreshModelsForSelected();
 
   // selectedUiBackend starts from $modelConfig.backend, which before the
   // first health response is only the browser's last-remembered backend —
@@ -299,8 +334,23 @@
     selectedUiBackend = backend;
     if (backend === $modelConfig.backend) return; // already active — nothing to switch
 
+    // A hosted backend can't be reached without its key: say so here rather
+    // than letting the switch fail. Selecting it still previews its models.
+    if (isHostedBackend(backend) && !$apiKeysStatus.openrouter_api_key_set) {
+      runtimeBackendSwitchError.set(
+        `Add an OpenRouter API key under API Keys (below) before switching to ${RUNTIME_BACKEND_LABELS[backend]}.`
+      );
+      return;
+    }
+    runtimeBackendSwitchError.set(null);
+
+    const hostedNote = isHostedBackend(backend)
+      ? ` Your messages will be sent over the internet to ${RUNTIME_BACKEND_LABELS[backend]} and the ` +
+        `model's provider. Providers of free models may use prompts for training. Memory and ` +
+        `document search stay on this Mac (embeddings run through local Ollama).`
+      : '';
     const proceed = await confirmDialog(
-      `Switch the active runtime backend to ${RUNTIME_BACKEND_LABELS[backend]}? ` +
+      `Switch the active runtime backend to ${RUNTIME_BACKEND_LABELS[backend]}?${hostedNote} ` +
       `In-flight requests will keep running on the current backend unaffected, ` +
       `but this switch itself can take several seconds.`
     );
@@ -326,6 +376,7 @@
   // backend the embeddings still come from.
   $: embeddingViaOtherBackend =
     $health.active_embedding_backend && $health.active_embedding_backend !== $health.backend
+      && $health.active_embedding_backend !== $health.embedding_host
       ? ` via ${RUNTIME_BACKEND_LABELS[$health.active_embedding_backend as RuntimeBackend] ?? $health.active_embedding_backend}`
       : '';
 
@@ -340,8 +391,14 @@
   let embeddingModelsFetchToken = 0;
   let embeddingModelResult: string | null = null;
 
+  // The backend embeddings come from: the active backend itself, or local
+  // Ollama while a chat-only (hosted) backend is active (backend §16.32).
+  $: embeddingHost = ($health.embedding_host || $modelConfig.backend) as RuntimeBackend;
+  $: embeddingHostLabel = RUNTIME_BACKEND_LABELS[embeddingHost] ?? embeddingHost;
+  $: embeddingHostIsSeparate = embeddingHost !== $modelConfig.backend;
+
   async function refreshEmbeddingModels() {
-    const backend = $modelConfig.backend as RuntimeBackend;
+    const backend = embeddingHost;
     const token = ++embeddingModelsFetchToken;
     const { models } = await fetchBackendModels(backend);
     if (token !== embeddingModelsFetchToken) return;
@@ -354,11 +411,11 @@
   // Embeddings kept from the other backend after a switch (§16.25): this
   // backend has no usable embedding model of its own yet.
   $: embeddingsFromOtherBackend =
-    $health.active_embedding_backend && $health.active_embedding_backend !== $modelConfig.backend
+    $health.active_embedding_backend && $health.active_embedding_backend !== embeddingHost
       ? (RUNTIME_BACKEND_LABELS[$health.active_embedding_backend as RuntimeBackend] ?? $health.active_embedding_backend)
       : null;
 
-  $: if ($modelConfig.backend && backendUp) refreshEmbeddingModels();
+  $: if (embeddingHost && backendUp) refreshEmbeddingModels();
 
   async function handleEmbeddingModelPick(value: string) {
     embeddingModelResult = null;
@@ -572,6 +629,7 @@
   let braveKeyInput = '';
   let newsapiKeyInput = '';
   let githubTokenInput = '';
+  let openrouterKeyInput = '';
   let apiKeysSaveResult: string | null = null;
 
   async function handleSaveApiKeys() {
@@ -581,6 +639,7 @@
     if (braveKeyInput.trim()) update.brave_api_key = braveKeyInput.trim();
     if (newsapiKeyInput.trim()) update.newsapi_api_key = newsapiKeyInput.trim();
     if (githubTokenInput.trim()) update.github_token = githubTokenInput.trim();
+    if (openrouterKeyInput.trim()) update.openrouter_api_key = openrouterKeyInput.trim();
     if (Object.keys(update).length === 0) return;
 
     const warning = await setApiKeys(update);
@@ -589,8 +648,16 @@
       braveKeyInput = '';
       newsapiKeyInput = '';
       githubTokenInput = '';
+      openrouterKeyInput = '';
       apiKeysSaveResult = warning || 'Saved.';
       if (update.github_token) void refreshGithubFeed();
+      if (update.openrouter_api_key) {
+        // The key reaches a live OpenRouter client at once; refresh what
+        // depends on it, and drop a "no key" switch error.
+        runtimeBackendSwitchError.set(null);
+        if (isHostedBackend(selectedUiBackend)) void refreshModelsForSelected();
+        if (isHostedBackend($modelConfig.backend)) void checkHealth();
+      }
     }
   }
 
@@ -605,6 +672,11 @@
   function handleCreateGithubToken(event: MouseEvent) {
     event.preventDefault();
     openExternal(GITHUB_NEW_TOKEN_URL);
+  }
+
+  function handleCreateOpenrouterKey(event: MouseEvent) {
+    event.preventDefault();
+    openExternal(OPENROUTER_KEYS_URL);
   }
 </script>
 
@@ -708,6 +780,12 @@
     <section class="settings-card">
       <div class="card-title">Chat Model — {RUNTIME_BACKEND_LABELS[selectedUiBackend]}</div>
       <div class="field-group">
+        {#if selectedIsHosted}
+          <label class="checkbox-row">
+            <input type="checkbox" bind:checked={freeModelsOnly} />
+            Free models only
+          </label>
+        {/if}
         <select
           id="chat-model"
           aria-label={`Chat model for ${RUNTIME_BACKEND_LABELS[selectedUiBackend]}`}
@@ -716,16 +794,39 @@
           on:change={onChatModelSelectChange}
         >
           {#if chatModelMissing}
-            <option value="" disabled selected>{chatModel} (not found on this backend)</option>
+            <option value="" disabled selected>
+              {chatModel} ({selectedIsHosted ? 'not in this list' : 'not found on this backend'})
+            </option>
           {:else}
             <option value="" disabled selected={!chatModel}>
               {availableModels.length ? 'Select a model…' : 'No models reported by this backend'}
             </option>
           {/if}
           {#each availableModels as m}
-            <option value={m} selected={m === chatModel}>{m}</option>
+            <option value={m} selected={m === chatModel}>{modelOptionLabel(m)}</option>
           {/each}
         </select>
+        {#if selectedIsHosted && modelsError}
+          <p class="field-hint" style="color:var(--warning)">
+            {modelsError}
+            {#if !$apiKeysStatus.openrouter_api_key_set}Add a key under API Keys below.{/if}
+          </p>
+        {/if}
+        {#if selectedIsHosted}
+          <p class="field-hint">
+            Chat goes over the internet to OpenRouter and the model's provider; memory and document
+            search stay on this Mac. Only models that support tools are listed.
+            {#if chatModelIsFree}
+              Free models allow 50 requests a day (1,000 after a one-time $10 credit purchase on
+              OpenRouter); a chat turn uses about 2–3.
+              {#if freeRequestsLeft !== null}<strong>{freeRequestsLeft} left today.</strong>{/if}
+            {/if}
+          </p>
+          <p class="field-hint" style="color:var(--warning)">
+            Providers of free models may use your prompts for training. Pick a paid model if that
+            matters for what you ask.
+          </p>
+        {/if}
         {#if chatModelSource === 'override'}
           <p class="field-hint" style="color:var(--warning)">
             <code>LOCALIST_CHAT_MODEL</code> in <code>.env</code> overrides the model picked here for every
@@ -743,7 +844,7 @@
     <!-- Embedding model, for the active backend (§16.25, §16.27) -->
     <section class="settings-card">
       <div class="card-title">
-        Embedding Model — {activeBackendLabel}
+        Embedding Model — {embeddingHostLabel}
         {#if worstGateTier}
           <span
             class="badge {GATE_TIER_BADGE_CLASS[worstGateTier]}"
@@ -756,7 +857,7 @@
       <div class="field-group">
         <select
           id="embedding-model"
-          aria-label={`Embedding model for ${activeBackendLabel}`}
+          aria-label={`Embedding model for ${embeddingHostLabel}`}
           class="settings-input"
           disabled={$embeddingModelSwitchLoading}
           on:change={onEmbeddingModelSelectChange}
@@ -779,17 +880,24 @@
             </optgroup>
           {/if}
         </select>
+        {#if embeddingHostIsSeparate}
+          <p class="field-hint">
+            {activeBackendLabel} only does chat, so embeddings run on this Mac through
+            {embeddingHostLabel}. If {embeddingHostLabel} isn't running, memory and document search
+            fall back to keyword matching until it starts.
+          </p>
+        {/if}
         {#if embeddingsFromOtherBackend}
           <p class="field-hint" style="color:var(--warning)">
             Embeddings still come from {embeddingsFromOtherBackend}
-            ({$health.active_embedding_model_name}) — pick a model here to use {activeBackendLabel}'s own.
+            ({$health.active_embedding_model_name}) — pick a model here to use {embeddingHostLabel}'s own.
           </p>
         {/if}
         <p class="field-hint">
-          Routes embeddings through {activeBackendLabel}'s
-          <code>{$modelConfig.backend === 'omlx' ? '/v1/embeddings' : '/api/embed'}</code> via
+          Routes embeddings through {embeddingHostLabel}'s
+          <code>{embeddingHost === 'omlx' ? '/v1/embeddings' : '/api/embed'}</code> via
           <code>POST /settings/embedding-model</code>; leave it unset to run in keyword-only (BM25)
-          mode instead. Saved for {activeBackendLabel} only — each backend keeps its own choice, and
+          mode instead. Saved for {embeddingHostLabel} only — each backend keeps its own choice, and
           switching backends switches to it. Vectors are kept per model, so going back to a model
           that has already embedded everything needs no re-embed; a model that hasn't leaves
           documents and chat history keyword-only until "Re-embed Memory Now" fills the gaps
@@ -980,14 +1088,15 @@
       {/if}
     </section>
 
-    <!-- Optional API keys (BRAVE/LANGSEARCH/NEWSAPI/GITHUB — .env-backed, used by localist-mcp) -->
+    <!-- Optional API keys (BRAVE/LANGSEARCH/NEWSAPI/GITHUB — .env-backed, used by localist-mcp;
+         OPENROUTER — read by the backend only) -->
     <section class="settings-card">
       <div class="card-title">API Keys</div>
       <p class="card-desc">
-        Optional keys for web search, news and GitHub. Only LANGSEARCH_API_KEY is required for
-        full web_search functionality — the others enable Brave as a search fallback, the daily
-        news brief and the GitHub Watch Feed. Values are never shown once saved; leave a field
-        blank to keep its current key unchanged.
+        Optional keys for web search, news, GitHub and the OpenRouter chat backend. Only
+        LANGSEARCH_API_KEY is required for full web_search functionality — the others enable Brave
+        as a search fallback, the daily news brief, the GitHub Watch Feed and OpenRouter. Values
+        are never shown once saved; leave a field blank to keep its current key unchanged.
       </p>
 
       <label class="news-field-label" for="langsearch-key-input">
@@ -1049,11 +1158,33 @@
         >Create a token on GitHub</a>
       </p>
 
+      <label class="news-field-label" for="openrouter-key-input" style="margin-top: var(--sp-3)">
+        OPENROUTER_API_KEY {#if $apiKeysStatus.openrouter_api_key_set}<span class="card-hint">(configured)</span>{/if}
+      </label>
+      <input
+        id="openrouter-key-input"
+        class="news-text-input"
+        type="password"
+        autocomplete="off"
+        bind:value={openrouterKeyInput}
+        placeholder={$apiKeysStatus.openrouter_api_key_set ? '••••••••' : 'Not set'}
+      />
+      <p class="card-hint">
+        Lets you pick OpenRouter as the Runtime Backend, including its free models. Checked with
+        OpenRouter before it's saved, and used only by Localist's backend.
+        <a
+          href={OPENROUTER_KEYS_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          on:click={handleCreateOpenrouterKey}
+        >Create a key on OpenRouter</a>
+      </p>
+
       <button
         type="button"
         class="seg-btn news-save-btn"
         style="margin-top: var(--sp-3)"
-        disabled={$apiKeysLoading || (!langsearchKeyInput.trim() && !braveKeyInput.trim() && !newsapiKeyInput.trim() && !githubTokenInput.trim())}
+        disabled={$apiKeysLoading || (!langsearchKeyInput.trim() && !braveKeyInput.trim() && !newsapiKeyInput.trim() && !githubTokenInput.trim() && !openrouterKeyInput.trim())}
         on:click={handleSaveApiKeys}
       >{$apiKeysLoading ? 'Saving…' : 'Save'}</button>
 
@@ -1325,6 +1456,16 @@
     font-size: var(--text-xs);
     color: var(--text-tertiary);
     line-height: 1.5;
+  }
+
+  /* Same look as EpisodeFilterPane's filter checkboxes. */
+  .checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    font-size: var(--text-sm);
+    color: var(--text-secondary);
+    cursor: pointer;
   }
 
   .field-row {

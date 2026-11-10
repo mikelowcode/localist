@@ -14,7 +14,7 @@ a real server on :8003; TestReloadMcpKeys covers the helper itself.
 
 import asyncio
 import os
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import httpx
@@ -23,7 +23,8 @@ from fastapi.testclient import TestClient
 from localist import main
 from localist.mcp_server import main as mcp_main
 
-_ENV_NAMES = ("LANGSEARCH_API_KEY", "BRAVE_API_KEY", "NEWSAPI_API_KEY", "GITHUB_TOKEN")
+_ENV_NAMES = ("LANGSEARCH_API_KEY", "BRAVE_API_KEY", "NEWSAPI_API_KEY", "GITHUB_TOKEN",
+              "OPENROUTER_API_KEY")
 _VALID = {"status": "valid", "message": "", "expires_on": "January 24, 2027"}
 _REJECTED = {"status": "rejected", "message": "GitHub rejected your token.", "expires_on": None}
 _UNVERIFIED = {"status": "unverified", "message": "Couldn't reach GitHub.", "expires_on": None}
@@ -52,6 +53,7 @@ class TestGetStatus:
             "brave_api_key_set":      False,
             "newsapi_api_key_set":    False,
             "github_token_set":       False,
+            "openrouter_api_key_set": False,
         }
 
     def test_reports_set_without_echoing_value(self, client, monkeypatch):
@@ -309,4 +311,67 @@ class TestMcpReloadRoute:
         assert resp.json() == {"reloaded": []}
 
     def test_covers_every_settings_key(self):
-        assert set(mcp_main._RELOADABLE_KEY_NAMES) == set(main._API_KEY_ENV_NAMES.values())
+        assert set(mcp_main._RELOADABLE_KEY_NAMES) == (
+            set(main._API_KEY_ENV_NAMES.values()) - main._BACKEND_ONLY_API_KEYS
+        )
+
+    def test_backend_only_keys_never_reach_localist_mcp(self):
+        assert "OPENROUTER_API_KEY" not in mcp_main._RELOADABLE_KEY_NAMES
+
+
+# ---------------------------------------------------------------------------
+# OPENROUTER_API_KEY (§16.34): checked like GITHUB_TOKEN, read only by this
+# process, handed to the live OpenRouter client.
+# ---------------------------------------------------------------------------
+
+_OR_VALID      = {"status": "valid", "message": "Connected to OpenRouter.", "key_info": {}}
+_OR_REJECTED   = {"status": "rejected", "message": "OpenRouter rejected this API key.", "key_info": None}
+_OR_UNVERIFIED = {"status": "unverified", "message": "Couldn't reach OpenRouter.", "key_info": None}
+
+
+class TestOpenRouterKey:
+    def test_valid_key_is_saved_without_reloading_mcp(self, client):
+        test_client, env_path = client
+        with patch.object(main, "validate_openrouter_key", return_value=_OR_VALID) as check:
+            resp = test_client.put("/settings/api-keys", json={"openrouter_api_key": " test-openrouter-key-good "})
+        assert resp.status_code == 200, resp.text
+        check.assert_called_once_with("test-openrouter-key-good")
+        assert resp.json()["openrouter_api_key_set"] is True
+        assert resp.json()["warning"] is None
+        assert "OPENROUTER_API_KEY=test-openrouter-key-good\n" in _env_file(env_path)
+        assert os.environ["OPENROUTER_API_KEY"] == "test-openrouter-key-good"
+        main._reload_mcp_keys.assert_not_called()
+
+    def test_rejected_key_changes_nothing(self, client):
+        test_client, env_path = client
+        with patch.object(main, "validate_openrouter_key", return_value=_OR_REJECTED):
+            resp = test_client.put("/settings/api-keys", json={"openrouter_api_key": "test-openrouter-key-bad"})
+        assert resp.status_code == 400
+        assert "rejected" in resp.json()["detail"]
+        assert _env_file(env_path) == ""
+        assert "OPENROUTER_API_KEY" not in os.environ
+
+    def test_unverified_key_is_saved_with_a_warning(self, client):
+        test_client, env_path = client
+        with patch.object(main, "validate_openrouter_key", return_value=_OR_UNVERIFIED):
+            resp = test_client.put("/settings/api-keys", json={"openrouter_api_key": "test-openrouter-key-maybe"})
+        assert resp.status_code == 200
+        assert "saved anyway" in resp.json()["warning"]
+        assert "OPENROUTER_API_KEY=test-openrouter-key-maybe\n" in _env_file(env_path)
+
+    def test_live_openrouter_client_gets_the_new_key(self, client, monkeypatch):
+        test_client, _ = client
+        live = MagicMock(name="openrouter-runtime")
+        monkeypatch.setattr(main._state, "runtime", live)
+        with patch.object(main, "validate_openrouter_key", return_value=_OR_VALID):
+            test_client.put("/settings/api-keys", json={"openrouter_api_key": "test-openrouter-key-new"})
+        live.set_api_key.assert_called_once_with("test-openrouter-key-new")
+
+    def test_clearing_skips_the_check(self, client, monkeypatch):
+        test_client, env_path = client
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key-old")
+        with patch.object(main, "validate_openrouter_key") as check:
+            resp = test_client.put("/settings/api-keys", json={"openrouter_api_key": ""})
+        check.assert_not_called()
+        assert resp.json()["openrouter_api_key_set"] is False
+        assert "OPENROUTER_API_KEY=\n" in _env_file(env_path)

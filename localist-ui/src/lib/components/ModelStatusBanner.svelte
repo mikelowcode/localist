@@ -6,7 +6,7 @@
   // §16.21). Driven entirely by the existing 15s health poll; clears itself
   // as soon as a poll comes back healthy.
   import { health, checkHealth, isStillStarting } from '$lib/stores/server';
-  import { runtimeBackendLabel } from '$lib/stores/model';
+  import { runtimeBackendLabel, isHostedBackend } from '$lib/stores/model';
 
   // Mirrors main.py's _NON_CHAT_MODEL_MARKERS — utility and embedding
   // entries a backend lists alongside its chat models.
@@ -21,8 +21,13 @@
     | 'backend-down'
     | 'no-chat-models'
     | 'model-missing'
+    | 'request-failed'
     | 'embeddings-off'
     | null;
+
+  // A hosted backend (OpenRouter) is "unreachable" mostly for key reasons —
+  // no key, or a rejected one — which the health check's error names.
+  $: hosted = isHostedBackend($health.backend);
 
   // Nothing until the first poll has answered, or while the backend is still
   // starting (see isStillStarting), so the banner never flashes on a normal
@@ -32,8 +37,12 @@
     if (!$health.api_ok) return 'api-down';
     if (!$health.reachable) return 'backend-down';
     if (!$health.chat_model_found) {
-      return chatModels.length === 0 ? 'no-chat-models' : 'model-missing';
+      return chatModels.length === 0 && !hosted ? 'no-chat-models' : 'model-missing';
     }
+    // The hosted backend is up, but the last request failed: busy upstream,
+    // daily/minute free limit, out of credits... (backend §16.33). Cleared
+    // by the next successful request.
+    if ($health.runtime_last_error) return 'request-failed';
     // Chat works, but a chat-only backend's local embedding host (Ollama)
     // isn't serving, so retrieval is keyword-only (§16.32). Lowest priority:
     // only shown when chat itself is fine.
@@ -49,6 +58,11 @@
       {#if problem === 'api-down'}
         <strong>Can't reach the Localist backend.</strong>
         Try restarting Localist. This message clears on its own once the backend answers.
+      {:else if problem === 'backend-down' && hosted}
+        <strong>{$runtimeBackendLabel} isn't available.</strong>
+        {$health.error ?? ''}
+        <a href="/settings#openrouter-key-input">Check the API key in Settings</a>, or switch
+        backends there.
       {:else if problem === 'backend-down'}
         <strong>Can't reach {$runtimeBackendLabel}</strong>{#if $health.base_url}&nbsp;at
           <code>{$health.base_url}</code>{/if}.
@@ -57,6 +71,19 @@
       {:else if problem === 'no-chat-models'}
         <strong>{$runtimeBackendLabel} is running, but no chat model is loaded.</strong>
         Load a chat model in {$runtimeBackendLabel}, then click Check again.
+      {:else if problem === 'model-missing' && hosted}
+        <strong>
+          {$runtimeBackendLabel} has no provider for <code>{$health.chat_model}</code> right now.
+        </strong>
+        <a href="/settings#chat-model">Choose another model in Settings</a>.
+      {:else if problem === 'request-failed' && $health.runtime_last_error}
+        <strong>{$health.runtime_last_error.message}</strong>
+        {#if $health.runtime_last_error.kind === 'upstream_busy' || $health.runtime_last_error.kind === 'no_endpoint'}
+          <a href="/settings#chat-model">Pick another model in Settings</a>.
+        {:else if $health.runtime_last_error.kind === 'auth' || $health.runtime_last_error.kind === 'no_key'}
+          <a href="/settings#openrouter-key-input">Check the API key in Settings</a>.
+        {/if}
+        This clears after the next successful reply.
       {:else if problem === 'model-missing'}
         <strong>
           {$runtimeBackendLabel} is running, but

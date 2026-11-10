@@ -58,21 +58,41 @@ export async function switchRuntimeBackend(
 /** Which step of the backend's chat-model precedence chose `chatModel`. */
 export type ChatModelSource = 'override' | 'pin' | 'default';
 
+/** One entry of a hosted backend's catalog (OpenRouter's model_details). */
+export interface ModelDetail {
+  id: string;
+  name: string;
+  free: boolean;
+  context_length: number | null;
+}
+
 export interface BackendModels {
   models: string[];
+  /** Per-model details, for backends with a catalog (OpenRouter); empty otherwise. */
+  details: ModelDetail[];
+  /** The backend couldn't be reached (OpenRouter: no key, or it was rejected). */
+  error: string | null;
   /** The chat model this backend runs, or would run once switched to ('' if none). */
   chatModel: string;
   chatModelSource: ChatModelSource;
 }
 
-export async function fetchBackendModels(backend: RuntimeBackend): Promise<BackendModels> {
-  const empty: BackendModels = { models: [], chatModel: '', chatModelSource: 'default' };
+export async function fetchBackendModels(
+  backend: RuntimeBackend,
+  freeOnly = false
+): Promise<BackendModels> {
+  const empty: BackendModels = {
+    models: [], details: [], error: null, chatModel: '', chatModelSource: 'default'
+  };
   try {
-    const res = await fetch(apiUrl(`/api/settings/runtime-backend/${backend}/models`));
+    const query = freeOnly ? '?free_only=true' : '';
+    const res = await fetch(apiUrl(`/api/settings/runtime-backend/${backend}/models${query}`));
     if (!res.ok) return empty;
     const data = await res.json();
     return {
       models: data.models ?? [],
+      details: data.model_details ?? [],
+      error: data.reachable === false ? (data.error ?? 'Not reachable.') : null,
       chatModel: data.chat_model ?? '',
       chatModelSource: data.chat_model_source ?? 'default'
     };

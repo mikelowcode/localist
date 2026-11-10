@@ -2,7 +2,7 @@
 
 A local-first, agentic general assistant built primarily for macOS Apple Silicon. Persistent memory across sessions, live web search/fetch, indexed document search, and a deterministic priority-based router — no inference spent deciding how to route a query.
 
-Inference-engine-agnostic: ships with oMLX and Ollama (including Ollama Cloud models), swappable via one config variable or live at runtime with no restart. Embeddings, when configured, always run locally — via an embedding model served by whichever backend is active: oMLX (e.g. `embeddinggemma-300m-4bit`, loaded alongside your chat model) or Ollama (e.g. `nomic-embed-text`, live-switchable from Settings with no restart). With no embedding model configured, the framework runs zero-config on keyword (BM25) retrieval instead — real semantic-gating signal, not a degraded no-op, across every platform.
+Inference-engine-agnostic: ships with oMLX, Ollama (including Ollama Cloud models) and [OpenRouter](https://openrouter.ai) (hosted chat, including free models), swappable via one config variable or live at runtime with no restart. Embeddings, when configured, always run locally — via an embedding model served by whichever backend is active: oMLX (e.g. `embeddinggemma-300m-4bit`, loaded alongside your chat model) or Ollama (e.g. `nomic-embed-text`, live-switchable from Settings with no restart). OpenRouter only does chat, so while it's active, embeddings run through local Ollama. With no embedding model configured, the framework runs zero-config on keyword (BM25) retrieval instead — real semantic-gating signal, not a degraded no-op, across every platform.
 
 See `PRIVACY.md` for what stays local, what can leave your machine and when, and what a fresh clone actually contains; `THIRD_PARTY_LICENSES.md` for the dependency/model-weight license audit; `NAMING.md` for the naming convention forks are asked to follow.
 
@@ -44,7 +44,7 @@ reached via `MCPToolDispatcher`'s normal chat-turn dispatch; see Attachments bel
 ## Prerequisites
 
 - Python 3.13, Node.js
-- One runtime backend: oMLX (chat model on :8000, macOS Apple Silicon only), or [Ollama](https://ollama.com) (local or Ollama Cloud, :11434, any OS)
+- One runtime backend: oMLX (chat model on :8000, macOS Apple Silicon only), [Ollama](https://ollama.com) (local or Ollama Cloud, :11434, any OS), or an [OpenRouter](https://openrouter.ai) API key (hosted chat with free and paid models, any OS; embeddings still need local Ollama)
 - Local embeddings (optional): pick an embedding model your active backend already serves in Settings → Embedding Model — any OS with Ollama (e.g. `nomic-embed-text`), or macOS Apple Silicon with oMLX (e.g. `embeddinggemma-300m-4bit`) — no separate extra or download to install. Without one, retrieval runs keyword-only (BM25), automatically, with no configuration at all
 - OCR'd PDF chat uploads (see Attachments below) require macOS on Apple Silicon (Apple Vision framework + pypdfium2); on other platforms those uploads are cleanly rejected with an explanatory error, everything else in the app is unaffected. Image uploads work everywhere: Apple Silicon uses Vision framework, other platforms fall back to a configured Ollama vision-capable chat model (`LOCALIST_OLLAMA_VISION_MODEL`)
 
@@ -135,9 +135,9 @@ Copy `backend/.env.example` to `backend/.env`. Only an API key for the active `w
 
 | Variable | Default | Description |
 |---|---|---|
-| `LOCALIST_RUNTIME_BACKEND` | `omlx` | `omlx` or `ollama` — also swappable live at runtime, see below |
+| `LOCALIST_RUNTIME_BACKEND` | `omlx` | `omlx`, `ollama` or `openrouter` — also swappable live at runtime, see below |
 | `LOCALIST_CHAT_MODEL` | *(none)* | Chat model ID override — wins over any per-backend pin below. If neither is set, Localist picks a served chat model on first run and saves it as that backend's pin |
-| `LOCALIST_CHAT_MODEL_OLLAMA` / `_OMLX` | *(none)* | Per-backend chat model pin, used when `LOCALIST_CHAT_MODEL` is unset — lets each backend remember its own model choice independently, including across a live runtime-backend switch |
+| `LOCALIST_CHAT_MODEL_OLLAMA` / `_OMLX` / `_OPENROUTER` | *(none)* | Per-backend chat model pin (OpenRouter defaults to the free `nvidia/nemotron-3-ultra-550b-a55b:free`), used when `LOCALIST_CHAT_MODEL` is unset — lets each backend remember its own model choice independently, including across a live runtime-backend switch |
 | `LOCALIST_EMBEDDING_MODEL_OLLAMA` / `_OMLX` | *(none)* | Per-backend embedding model ID (set for you by Settings → Embedding Model); if set and served, it's used instead of the zero-config keyword-only (BM25) retrieval default |
 | `LOCALIST_EMBEDDING_MODEL` | *(none)* | Legacy single embedding model, used only by a backend with no per-backend value; moved into the matching per-backend key automatically the first time the backend that serves it starts |
 | `SEARCH_PROVIDER` | `langsearch` | `web_search` provider: `langsearch` or `brave` |
@@ -145,6 +145,7 @@ Copy `backend/.env.example` to `backend/.env`. Only an API key for the active `w
 | `BRAVE_API_KEY` | *(none)* | Required when `SEARCH_PROVIDER=brave`; without it, `web_search` fails and falls back to corpus |
 | `NEWSAPI_API_KEY` | *(none)* | Optional — powers `news_search` (falls back to Brave-backed `web_search` without it) and the Daily News Brief Live Feed panel (individual sections degrade to "unavailable" without it, no fallback). Free Developer tier only (100 req/day); not licensed for production use |
 | `GITHUB_TOKEN` | *(none)* | Optional for `github_search`/`github_read`/`github_release` (works unauthenticated at a lower rate limit); **required** for the GitHub Watch Feed Live Feed panel, for watched *and* pinned repos alike (`GET /user/subscriptions` and the per-repo releases lookup both need an authenticated identity). A classic PAT with no scopes selected is sufficient — public data only, read-only, nothing is ever written back to GitHub. Paste it into Settings → API Keys, which checks it with GitHub before saving |
+| `OPENROUTER_API_KEY` | *(none)* | Required for the `openrouter` runtime backend. Paste it into Settings → API Keys, which checks it with OpenRouter before saving. Read only by the backend, never by localist-mcp. Free models allow 50 requests a day (1,000 after a one-time $10 credit purchase on OpenRouter); a chat turn uses about 2–3. Providers of free models may use prompts for training |
 | `LOCALIST_MCP_URL` | `http://localhost:8003` | localist-mcp server URL |
 | `LOCALIST_OLLAMA_VISION_MODEL` | *(none)* | Vision-capable Ollama chat model (e.g. `llava`, `qwen2.5vl`) for image OCR on non-Apple-Silicon platforms — see Attachments above; no effect on Apple Silicon, where Vision framework is always used |
 | `LOCALIST_EPISODIC_WRITE_APPROVAL` | `false` | Gate implicit memory writes behind approve/reject |
@@ -153,7 +154,7 @@ Copy `backend/.env.example` to `backend/.env`. Only an API key for the active `w
 
 See `backend/.env.example` for the full list (embedding engine, wiki/raw directories, MCP project root, etc.).
 
-**Live runtime-backend switching** — the active backend doesn't require a restart to change: the Settings UI (or `POST /settings/runtime-backend` directly) health-checks the target backend, swaps it in, and persists the choice to `.env`, all while the server keeps running. Each backend remembers its own chat-model pin (`LOCALIST_CHAT_MODEL_OLLAMA`/`_OMLX` above), so switching back to a backend you'd previously configured doesn't lose that choice.
+**Live runtime-backend switching** — the active backend doesn't require a restart to change: the Settings UI (or `POST /settings/runtime-backend` directly) health-checks the target backend, swaps it in, and persists the choice to `.env`, all while the server keeps running. Each backend remembers its own chat-model pin (`LOCALIST_CHAT_MODEL_OLLAMA`/`_OMLX`/`_OPENROUTER` above), so switching back to a backend you'd previously configured doesn't lose that choice.
 
 ---
 
@@ -198,7 +199,7 @@ localist/
 │   │   ├── episodic_extractor.py    # Episode extraction
 │   │   ├── content_safety.py        # Pre-write content scanner
 │   │   ├── embedding_engine.py      # Local embedding engine
-│   │   ├── runtime_factory.py       # Backend selection (omlx/ollama), live-swappable
+│   │   ├── runtime_factory.py       # Backend selection (omlx/ollama/openrouter), live-swappable
 │   │   ├── chart_tool_schema.py     # generate_chart argument extraction/validation
 │   │   ├── news_brief.py            # Daily News Brief: NewsAPI calls, formatting (Live Feed panel)
 │   │   ├── github_watch.py          # GitHub Watch Feed: watched-repo releases (Live Feed panel)
@@ -272,6 +273,9 @@ Tests are organized by phase (memory substrate, routing, controller dispatch, ex
 - ✅ **Connect GitHub from Settings** (v0.1.6) — paste your GitHub token into Settings → API Keys instead of editing `.env`. It's checked with GitHub before saving, so an expired, revoked or fine-grained token is refused and your working one stays in place, and you see when the new one expires. A successful save refreshes the GitHub Watch Feed right away.
 - ✅ **API keys take effect without a restart** (v0.1.6) — a key saved in Settings now reaches web search, news and GitHub tools immediately.
 - ✅ Fixes (v0.1.6): the GitHub Watch Feed now explains a missing or rejected token and points to Settings, instead of showing a raw `401` error; pasted API keys are trimmed, and ones with spaces or line breaks are refused.
+- ✅ **OpenRouter as a chat backend** (v0.1.6) — pick OpenRouter in Settings → Runtime Backend and chat with its free models (Nemotron 3 Ultra by default), a free option now that Ollama Cloud's free plan has ended. Paste your key into Settings → API Keys, where it's checked before saving. Free models allow 50 requests a day (1,000 after a one-time $10 credit purchase); the status bar shows how many are left, and Settings notes that providers of free models may use prompts for training.
+- ✅ **Embeddings stay local with a hosted chat model** (v0.1.6) — while OpenRouter handles chat, memory and document search still embed on your Mac through Ollama. If Ollama isn't running, the chat view says so and search uses keyword matching until it starts, then switches back by itself.
+- ✅ Fixes (v0.1.6): clear messages in the chat view when a free model is busy at its provider, the daily or per-minute free limit is reached, or the OpenRouter key is missing or rejected.
 
 **Open**
 - ⬜ Native `.app`: first-run config UX (a fresh app defaults to unreachable `omlx`), code signing/notarization, `tauri build` auto-triggering the PyInstaller build

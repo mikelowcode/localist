@@ -84,10 +84,13 @@ Environment / configuration
 All tuneable values are in the ``Settings`` class (pydantic-settings).  They
 can be overridden via environment variables or a .env file:
 
-  LOCALIST_RUNTIME_BACKEND             Runtime backend: "omlx" | "ollama" (default "omlx")
+  LOCALIST_RUNTIME_BACKEND             Runtime backend: "omlx" | "ollama" | "openrouter" (default "omlx")
   LOCALIST_CHAT_MODEL                  Chat model ID override (wins over any per-backend pin below)
   LOCALIST_CHAT_MODEL_OMLX             Per-backend chat model pin for "omlx"
   LOCALIST_CHAT_MODEL_OLLAMA           Per-backend chat model pin for "ollama"
+  LOCALIST_CHAT_MODEL_OPENROUTER       Per-backend chat model pin for "openrouter"
+                                       (default nvidia/nemotron-3-ultra-550b-a55b:free)
+  OPENROUTER_API_KEY                   OpenRouter API key (openrouter only; set in Settings)
   LOCALIST_OMLX_URL                    oMLX server base URL (omlx only, default http://localhost:8000)
   LOCALIST_OLLAMA_URL                  Ollama server base URL (ollama only, default http://localhost:11434)
   LOCALIST_LOG_LEVEL                   Root log level (default INFO)
@@ -166,6 +169,7 @@ from .planner import (
     resolve_profile_fact_threshold,
     resolve_rag_floor,
 )
+from .openrouter_runtime_client import validate_api_key as validate_openrouter_key
 from .runtime_factory import available_backends, create_runtime, embedding_host_for
 from .threshold_calibration import CALIBRATION_VERSION, calibrate_thresholds, CalibrationResult
 from . import session_files
@@ -193,12 +197,14 @@ class Settings(BaseSettings):
     # the active runtime backend, MemoryManager runs keyword-only (BM25).
     chat_model:       str | None = None
 
-    # Per-backend chat-model pins (LOCALIST_CHAT_MODEL_OMLX / _OLLAMA).
+    # Per-backend chat-model pins (LOCALIST_CHAT_MODEL_OMLX / _OLLAMA /
+    # _OPENROUTER).
     # Used by _resolve_chat_model() when chat_model above is unset; lets a
     # live runtime-backend switch remember which model to use per backend
     # instead of carrying one backend's model id into another's client.
     chat_model_omlx:    str | None = None
     chat_model_ollama:  str | None = None
+    chat_model_openrouter: str | None = None
 
     # Per-backend embedding-model pins (LOCALIST_EMBEDDING_MODEL_OMLX /
     # _OLLAMA), resolved by _resolve_embedding_model(). Empty string = not
@@ -506,7 +512,10 @@ def _build_controller(
         episodic_write_approval = settings.episodic_write_approval,
         wiki_dir                = _state.wiki_dir,
     )
-    _run_cache_warmup(controller, runtime, templates_dir)
+    # A backend can opt out (OpenRouter: each warm-up would spend one of the
+    # free tier's daily requests, §16.34).
+    if getattr(runtime, "wants_cache_warmup", True):
+        _run_cache_warmup(controller, runtime, templates_dir)
     return wiki_agent, conversational_agent, controller
 
 
@@ -526,13 +535,15 @@ _PROJECT_ROOT = get_backend_root()
 _runtime_switch_lock = asyncio.Lock()
 
 _CHAT_MODEL_SETTINGS_FIELD: dict[str, str] = {
-    "omlx":    "chat_model_omlx",
-    "ollama":  "chat_model_ollama",
+    "omlx":       "chat_model_omlx",
+    "ollama":     "chat_model_ollama",
+    "openrouter": "chat_model_openrouter",
 }
 
 _CHAT_MODEL_ENV_KEY: dict[str, str] = {
-    "omlx":    "LOCALIST_CHAT_MODEL_OMLX",
-    "ollama":  "LOCALIST_CHAT_MODEL_OLLAMA",
+    "omlx":       "LOCALIST_CHAT_MODEL_OMLX",
+    "ollama":     "LOCALIST_CHAT_MODEL_OLLAMA",
+    "openrouter": "LOCALIST_CHAT_MODEL_OPENROUTER",
 }
 
 
@@ -1176,6 +1187,12 @@ class HealthResponse(BaseModel):
     # (not running, no model set, model not installed) and nothing else is
     # embedding either — drives the chat view's embedding banner.
     embedding_warning: str | None = None
+    # Hosted backends only (OpenRouter, §16.34): the key's free-tier status
+    # and free requests left today (OpenRouterRuntimeClient.health_check()'s
+    # key_info), and the most recent failed request ({kind, message, at}),
+    # cleared by the next success. None for oMLX/Ollama.
+    runtime_key_info:   dict[str, Any] | None = None
+    runtime_last_error: dict[str, Any] | None = None
 
 
 class AgentsResponse(BaseModel):
@@ -1227,6 +1244,9 @@ class RuntimeBackendModelsResponse(BaseModel):
     chat_model_source: str       = "default"
     chat_model_found: bool       = False
     error:            str | None = None
+    # Backends with a large catalog (OpenRouter) also describe each model:
+    # {id, name, free, context_length}. Empty for oMLX/Ollama.
+    model_details:    list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ChatModelPinRequest(BaseModel):
@@ -1730,6 +1750,7 @@ class ApiKeysStatusResponse(BaseModel):
     brave_api_key_set:      bool
     newsapi_api_key_set:    bool
     github_token_set:       bool
+    openrouter_api_key_set: bool = False
 
 
 class ApiKeysUpdateRequest(BaseModel):
@@ -1739,6 +1760,7 @@ class ApiKeysUpdateRequest(BaseModel):
     brave_api_key:      str | None = None
     newsapi_api_key:    str | None = None
     github_token:       str | None = None
+    openrouter_api_key: str | None = None
 
 
 class ApiKeysUpdateResponse(ApiKeysStatusResponse):
@@ -2177,6 +2199,8 @@ async def get_health() -> HealthResponse:
         gate_tiers                  = gate_tiers,
         embedding_host              = embedding_host,
         embedding_warning           = embedding_warning,
+        runtime_key_info            = raw.get("key_info"),
+        runtime_last_error          = raw.get("last_error"),
     )
 
 
@@ -2340,7 +2364,9 @@ async def switch_runtime_backend(request: RuntimeBackendSwitchRequest) -> Runtim
                 status_code = 502,
                 detail      = (
                     f"Runtime backend {backend!r} is not reachable at "
-                    f"{health.get('base_url')!r} — current backend left untouched."
+                    f"{health.get('base_url')!r}"
+                    + (f" ({health['error']})" if health.get("error") else "")
+                    + " — current backend left untouched."
                 ),
             )
 
@@ -2426,28 +2452,51 @@ async def switch_runtime_backend(request: RuntimeBackendSwitchRequest) -> Runtim
     response_model = RuntimeBackendModelsResponse,
     summary        = "List models available on a runtime backend without switching to it",
 )
-async def get_runtime_backend_models(backend: str) -> RuntimeBackendModelsResponse:
+async def get_runtime_backend_models(
+    backend: str, free_only: bool = False,
+) -> RuntimeBackendModelsResponse:
     """
     Build a throwaway client for `backend`, health-check it, and return its
     reported models. Never touches _state — not even a read — so this is
     safe to call for the currently-inactive backend(s) as a "what's
     available there" lookup.
+
+    A backend with a catalog of its own (OpenRouter's list_models(), §16.34)
+    returns that instead of the health check's model list, with details per
+    model; `free_only` narrows it to free models. Ignored elsewhere.
     """
     normalized = _validate_backend_name(backend)
     settings   = _require_settings()
 
-    _candidate_runtime, health = await asyncio.to_thread(
+    candidate_runtime, health = await asyncio.to_thread(
         _create_and_check_backend, settings, normalized,
     )
+
+    models: list[str] = health.get("models", [])
+    details: list[dict[str, Any]] = []
+    error = health.get("error")
+    # Looked up on the class, so only a client that really defines a catalog
+    # matches (never a test double that answers every attribute).
+    list_models = (
+        getattr(candidate_runtime, "list_models")
+        if callable(getattr(type(candidate_runtime), "list_models", None)) else None
+    )
+    if list_models is not None and health.get("reachable"):
+        try:
+            details = await asyncio.to_thread(list_models, free_only)
+            models = [m["id"] for m in details]
+        except RuntimeError as exc:
+            error = str(exc)
 
     return RuntimeBackendModelsResponse(
         reachable         = bool(health.get("reachable", False)),
         base_url          = str(health.get("base_url", "")),
-        models            = health.get("models", []),
+        models            = models,
         chat_model        = str(health.get("chat_model") or ""),
         chat_model_source = _chat_model_source(settings, normalized),
         chat_model_found  = bool(health.get("chat_model_found", False)),
-        error             = health.get("error"),
+        error             = error,
+        model_details     = details,
     )
 
 
@@ -3669,7 +3718,7 @@ async def put_assistant_name_setting(
 
 
 # ---------------------------------------------------------------------------
-# Optional API keys  (Settings tab — BRAVE/LANGSEARCH/NEWSAPI/GITHUB, .env-backed)
+# Optional API keys  (Settings tab — BRAVE/LANGSEARCH/NEWSAPI/GITHUB/OPENROUTER, .env-backed)
 # ---------------------------------------------------------------------------
 
 _API_KEY_ENV_NAMES: dict[str, str] = {
@@ -3677,7 +3726,13 @@ _API_KEY_ENV_NAMES: dict[str, str] = {
     "brave_api_key":      "BRAVE_API_KEY",
     "newsapi_api_key":    "NEWSAPI_API_KEY",
     "github_token":       "GITHUB_TOKEN",
+    "openrouter_api_key": "OPENROUTER_API_KEY",
 }
+
+# Keys read only by this process, never by localist-mcp: not in its reload
+# list (mcp_server/main.py's _RELOADABLE_KEY_NAMES), so the secret isn't
+# copied into a process that has no use for it.
+_BACKEND_ONLY_API_KEYS: frozenset[str] = frozenset({"OPENROUTER_API_KEY"})
 
 
 def _api_keys_status() -> ApiKeysStatusResponse:
@@ -3686,6 +3741,7 @@ def _api_keys_status() -> ApiKeysStatusResponse:
         brave_api_key_set      = bool(os.environ.get("BRAVE_API_KEY")),
         newsapi_api_key_set    = bool(os.environ.get("NEWSAPI_API_KEY")),
         github_token_set       = bool(os.environ.get("GITHUB_TOKEN")),
+        openrouter_api_key_set = bool(os.environ.get("OPENROUTER_API_KEY")),
     )
 
 
@@ -3753,7 +3809,7 @@ async def get_api_keys_status() -> ApiKeysStatusResponse:
 @app.put(
     "/settings/api-keys",
     response_model = ApiKeysUpdateResponse,
-    summary        = "Set optional API keys (BRAVE/LANGSEARCH/NEWSAPI/GITHUB)",
+    summary        = "Set optional API keys (BRAVE/LANGSEARCH/NEWSAPI/GITHUB/OPENROUTER)",
 )
 async def put_api_keys(request: ApiKeysUpdateRequest) -> ApiKeysUpdateResponse:
     """
@@ -3773,6 +3829,9 @@ async def put_api_keys(request: ApiKeysUpdateRequest) -> ApiKeysUpdateResponse:
     new key takes effect without a restart. If that fails, the response says
     how to restart it. GITHUB_TOKEN is also read by this process, for the
     GitHub Watch Feed, and the os.environ mirror covers that.
+    OPENROUTER_API_KEY is read only by this process (the openrouter runtime
+    backend, §16.34): it is checked against OpenRouter like GITHUB_TOKEN,
+    and handed to the live client when OpenRouter is active.
     """
     updates = {
         field: _normalize_api_key(_API_KEY_ENV_NAMES[field], value)
@@ -3786,8 +3845,18 @@ async def put_api_keys(request: ApiKeysUpdateRequest) -> ApiKeysUpdateResponse:
         if token_check["status"] == "rejected":
             raise HTTPException(status_code=400, detail=token_check["message"])
 
+    # Same contract for the OpenRouter key (§16.34): rejected → 400, nothing
+    # saved; unreachable → saved with a warning.
+    openrouter_check: dict[str, Any] | None = None
+    if updates.get("openrouter_api_key"):
+        openrouter_check = await asyncio.to_thread(
+            validate_openrouter_key, updates["openrouter_api_key"],
+        )
+        if openrouter_check["status"] == "rejected":
+            raise HTTPException(status_code=400, detail=openrouter_check["message"])
+
     failures: list[str] = []
-    wrote_any = False
+    wrote_any = False          # any key localist-mcp reads
     for field, value in updates.items():
         env_key = _API_KEY_ENV_NAMES[field]
         try:
@@ -3796,7 +3865,7 @@ async def put_api_keys(request: ApiKeysUpdateRequest) -> ApiKeysUpdateResponse:
             failures.append(f"Failed writing {env_key} to .env ({exc}).")
             continue
         os.environ[env_key] = value
-        wrote_any = True
+        wrote_any = wrote_any or env_key not in _BACKEND_ONLY_API_KEYS
 
     notes: list[str] = list(failures)
     if token_check is not None and os.environ.get("GITHUB_TOKEN") == updates["github_token"]:
@@ -3808,6 +3877,16 @@ async def put_api_keys(request: ApiKeysUpdateRequest) -> ApiKeysUpdateResponse:
             )
         else:
             notes.append(f"{token_check['message']} The token was saved anyway.")
+    if "openrouter_api_key" in updates and os.environ.get("OPENROUTER_API_KEY") == updates["openrouter_api_key"]:
+        # The OpenRouter key is read by this process, not localist-mcp: hand
+        # it to the live client when OpenRouter is the active backend, so it
+        # takes effect on the next request (a later switch builds its client
+        # from os.environ).
+        set_key = getattr(_state.runtime, "set_api_key", None)
+        if callable(set_key):
+            set_key(updates["openrouter_api_key"])
+        if openrouter_check is not None and openrouter_check["status"] != "valid":
+            notes.append(f"{openrouter_check['message']} The key was saved anyway.")
     if wrote_any and not await _reload_mcp_keys():
         notes.append(_mcp_restart_hint())
     warning = " ".join(notes) or None

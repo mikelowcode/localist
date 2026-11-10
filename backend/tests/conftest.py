@@ -70,5 +70,10 @@ def _clean_search_provider_env(monkeypatch):
         # packaged app's real folders, and no test should ever index those.
         "LOCALIST_EMBEDDING_MODEL_OLLAMA", "LOCALIST_EMBEDDING_MODEL_OMLX",
         "LOCALIST_WIKI_DIR", "LOCALIST_RAW_DIR",
+        # 2026-11-10: a real OpenRouter key in backend/.env leaked into
+        # test_main_api_keys_endpoints. Cleared so no test can see it, let
+        # alone spend it — OpenRouterRuntimeClient/_make_openrouter read it
+        # from os.environ.
+        "OPENROUTER_API_KEY", "LOCALIST_CHAT_MODEL_OPENROUTER",
     ):
         monkeypatch.delenv(var, raising=False)
