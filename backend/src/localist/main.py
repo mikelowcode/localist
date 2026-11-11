@@ -4345,9 +4345,18 @@ async def _stream_task(
             event_queue.put_nowait, {"_kind": "answer_ready", "result": result_dict}
         )
 
+    # The answer guard caught a non-answer (junk, empty, "Let me search…"
+    # stub) after its tokens were already streamed, and is about to retry:
+    # tell the client to clear what it has shown so the retry's tokens don't
+    # land after the junk.
+    def on_answer_reset() -> None:
+        loop.call_soon_threadsafe(event_queue.put_nowait, {"_kind": "answer_reset"})
+
     def _drain_item(item: dict[str, Any]) -> str:
         if item["_kind"] == "status":
             return _sse({"type": "status", "message": item["message"], "task_id": task_id})
+        if item["_kind"] == "answer_reset":
+            return _sse({"type": "answer_reset", "task_id": task_id})
         return _sse({"type": "token", "token": item["chunk"]})
 
     producer_task: asyncio.Task[dict[str, Any]] = asyncio.create_task(
@@ -4358,6 +4367,7 @@ async def _stream_task(
             on_token=on_token,
             on_status=on_status,
             on_answer_ready=on_answer_ready,
+            on_answer_reset=on_answer_reset,
         )
     )
 

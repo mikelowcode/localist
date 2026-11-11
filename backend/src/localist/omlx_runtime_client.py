@@ -47,10 +47,11 @@ import logging
 import mimetypes
 import threading
 from pathlib import Path
-from typing import Generator, Iterator
+from typing import Any, Generator, Iterator
 
 import requests
 
+from .completion_record import CompletionRecorder, record_from_openai_meta
 from .openai_compat import TURN_ROLE_TO_MESSAGE_ROLE, build_messages, iter_content_deltas
 from .prompt_builder import Turn
 
@@ -61,7 +62,9 @@ logger = logging.getLogger(__name__)
 # SSE streaming helper
 # ---------------------------------------------------------------------------
 
-def _iter_sse_chunks(response: requests.Response) -> Iterator[str]:
+def _iter_sse_chunks(
+    response: requests.Response, meta: dict[str, Any] | None = None,
+) -> Iterator[str]:
     """
     Yield text delta strings from an OpenAI-compatible SSE stream.
 
@@ -72,9 +75,10 @@ def _iter_sse_chunks(response: requests.Response) -> Iterator[str]:
 
     Malformed lines and empty deltas are silently skipped. Parsing (and
     explicit UTF-8 decoding) lives in openai_compat.py, shared with
-    OpenRouterRuntimeClient (§16.33).
+    OpenRouterRuntimeClient (§16.33). `meta`, when given, collects
+    finish_reason/usage for the completion record (§16.35).
     """
-    yield from iter_content_deltas(response)
+    yield from iter_content_deltas(response, meta=meta)
 
 # ---------------------------------------------------------------------------
 # Concurrency guard
@@ -220,6 +224,9 @@ class OMLXRuntimeClient:
         # fallback (see _DEFAULT_MAX_MODEL_LEN).
         self.max_model_len = _DEFAULT_MAX_MODEL_LEN
 
+        # Per-thread record of how the last completion ended (§16.35).
+        self._completions = CompletionRecorder()
+
         self._chat_endpoint  = self._base_url + _CHAT_COMPLETIONS_PATH
         self._embed_endpoint = self._base_url + _EMBEDDINGS_PATH
 
@@ -233,6 +240,11 @@ class OMLXRuntimeClient:
     # -----------------------------------------------------------------------
     # BaseRuntimeClient interface
     # -----------------------------------------------------------------------
+
+    @property
+    def last_completion(self) -> dict[str, Any] | None:
+        """How this thread's last completion ended (completion_record.py)."""
+        return self._completions.get()
 
     def infer(
         self,
@@ -488,6 +500,7 @@ class OMLXRuntimeClient:
             len(working_memory_turns or []), label, effective_timeout,
         )
 
+        self._completions.clear()
         global _inflight_count
         with _inflight_lock:
             if _inflight_count > 0:
@@ -540,12 +553,16 @@ class OMLXRuntimeClient:
                 # ("data: {...}" lines, "data: [DONE]" sentinel).  If oMLX uses
                 # a non-standard SSE format, replace this with a custom iterator.
                 # TODO(omlx): Verify the SSE envelope format matches OpenAI spec.
+                stream_meta: dict[str, Any] = {}
                 try:
-                    yield from _iter_sse_chunks(response)
+                    yield from _iter_sse_chunks(response, meta=stream_meta)
                 except Exception as exc:
                     raise RuntimeError(
                         f"Error reading oMLX SSE stream: {exc}"
                     ) from exc
+                self._completions.set(
+                    record_from_openai_meta("omlx", self._chat_model, stream_meta)
+                )
             finally:
                 _inflight_count -= 1
 

@@ -94,9 +94,33 @@ def content_delta(event: Mapping[str, Any]) -> str:
     return (choices[0].get("delta") or {}).get("content") or ""
 
 
-def iter_content_deltas(response: Any) -> Iterator[str]:
-    """Non-empty text content deltas from an OpenAI-style SSE stream."""
+def update_stream_meta(meta: dict[str, Any], event: Mapping[str, Any]) -> None:
+    """
+    Fold one stream event's end-of-reply facts into `meta`: finish_reason
+    (and OpenRouter's native_finish_reason), usage (usually only on the
+    final chunk), provider and model. Feeds completion_record (§16.35).
+    """
+    if event.get("usage"):
+        meta["usage"] = event["usage"]
+    if event.get("provider"):
+        meta["provider"] = event["provider"]
+    if event.get("model"):
+        meta["model"] = event["model"]
+    for choice in event.get("choices") or []:
+        if choice.get("finish_reason"):
+            meta["finish_reason"] = choice["finish_reason"]
+        if choice.get("native_finish_reason"):
+            meta["native_finish_reason"] = choice["native_finish_reason"]
+
+
+def iter_content_deltas(response: Any, meta: dict[str, Any] | None = None) -> Iterator[str]:
+    """
+    Non-empty text content deltas from an OpenAI-style SSE stream. When
+    `meta` is given, it is filled in place via update_stream_meta().
+    """
     for event in iter_sse_events(response):
+        if meta is not None:
+            update_stream_meta(meta, event)
         text = content_delta(event)
         if text:
             yield text

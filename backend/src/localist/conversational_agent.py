@@ -67,6 +67,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime
 from typing import Any
 
@@ -96,6 +97,164 @@ def _is_fabricated_toolcall(text: str) -> bool:
     fabrication, never a legitimate format to parse or honour.
     """
     return bool(_FABRICATED_TOOLCALL_PATTERN.search(text))
+
+
+# ---------------------------------------------------------------------------
+# Non-answer detection (2026-11-11, non-answer guard plan Phase 1)
+# ---------------------------------------------------------------------------
+#
+# Free hosted models were observed (2026-11-11, OpenRouter) ending a
+# completion cleanly — finish_reason "stop", HTTP 200, no error — after 0–8
+# tokens of junk ("那些\"", "i.ζiusfrac.\n\nto.τ", " שח", "The.\n\n\n"), or
+# with a "Let me search for this…" stub and nothing after it, on turns whose
+# prompt already held the search results. Only a fully empty reply was
+# caught before; everything else was delivered as the answer. See
+# diagnostics/diag_openrouter_news_feed_garbage.py.
+#
+# Reasons, in check order (first match wins):
+#   "empty"           — blank after strip.
+#   "script_mismatch" — >20% of the reply's letters are non-Latin while the
+#                       user's instruction is Latin-script (a user writing
+#                       in another script is never flagged).
+#   "degenerate"      — long token soup (")))-Re-Re-Re…"); any turn. See
+#                       _is_degenerate().
+#   "intent_stub"     — the reply only announces a search/lookup it can't
+#                       perform. Tool-result turns only.
+#   "too_short"       — fewer than _MIN_GROUNDED_ANSWER_WORDS words (runs of
+#                       2+ Latin letters, or numbers). Tool-result turns only — a short
+#                       reply to chit-chat is normal.
+# Validated read-only against 94 stored assistant turns (55 with tools):
+# these rules flagged exactly the four 2026-11-11 failures and nothing else.
+
+_NON_LATIN_LETTER_RATIO = 0.2
+
+# Deliberately low. Every observed junk reply had 0–2 such words; a real
+# tool-grounded answer essentially never has fewer than 3. A false positive
+# here only costs one same-prompt retry, and a retry that is merely short
+# again is accepted (see ControllerAgent's answer guard), never replaced.
+_MIN_GROUNDED_ANSWER_WORDS = 3
+# The same floor for a reply in a non-Latin script (only reachable when the
+# user wrote in one too), counted in letters/digits since e.g. Chinese
+# doesn't space-separate words.
+_MIN_NON_LATIN_ANSWER_CHARS = 4
+
+# "degenerate" thresholds — see _is_degenerate() for the measured margins.
+_DEGENERATE_MIN_CHARS = 12
+_DEGENERATE_MIN_WORD_SHARE = 0.80
+_DEGENERATE_MAX_WHITESPACE_SHARE = 0.35
+_CODE_FENCE_PATTERN = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)
+# Words for the word-share measure: Capitalised/lowercase words, acronyms,
+# numbers. Junk like "(PAATION" or "-Re-Re" contributes little.
+_PROSE_WORD_PATTERN = re.compile(r"[A-Za-z][a-z]+|[A-Z]{2,}|\d+")
+# Markdown syntax and ordinary sentence punctuation, left out of the
+# word-share denominator so a table-only answer or a terse sentence
+# ("Bitcoin is $87,000.") isn't penalised for them. Brackets stay counted —
+# junk is full of them (")V)ide(CA)())Document)Das)").
+_NON_WORD_SYNTAX_CHARS = frozenset("|*-#_>~:—–.,!?;'\"$%’‘“”")
+
+_INTENT_STUB_MAX_WORDS = 60
+_INTENT_STUB_PATTERN = re.compile(
+    r"^\W*(?:let me|i'll|i will|i'm going to|i am going to|searching|looking up|one moment)\b"
+    r".{0,200}?\b(?:search|look|check|find|fetch|pull)",
+    re.IGNORECASE | re.DOTALL,
+)
+# A "word" for too_short: 2+ Latin letters, or a number ("87,000" is one) —
+# so a terse factual answer like "Bitcoin is $87,000." still counts as 3.
+_LATIN_WORD_PATTERN = re.compile(r"[A-Za-z]{2,}|\d[\d,.]*")
+
+
+def _non_latin_letter_ratio(text: str) -> float:
+    letters = [ch for ch in text if ch.isalpha()]
+    if not letters:
+        return 0.0
+    non_latin = sum(
+        1 for ch in letters if not unicodedata.name(ch, "").startswith("LATIN")
+    )
+    return non_latin / len(letters)
+
+
+def _is_degenerate(text: str) -> bool:
+    """
+    Long token soup — the same broken-model failure as the short junk, at
+    length. Seen live 2026-11-11 (Nemotron 3 Ultra free, ~1,000+ chars):
+    ")))-Re-Re-Re-Re…" and "E(P\\n\\n\\n(PAN\\n\\nThe%%%%\\n\\nU(PA…".
+
+    Measured outside ``` code fences (code legitimately scores low on both
+    signals), on Latin-script text of at least _DEGENERATE_MIN_CHARS
+    non-space characters (shorter replies are left to too_short). Also
+    catches short soup that has enough word-like fragments to pass
+    too_short, e.g. ")V)ide(CA)())Document)Das)" (live, 27 chars):
+      - word share: fraction of non-space, non-markdown-syntax characters
+        that belong to words or numbers. Every stored real answer scored
+        >= 0.905 (a table-only answer 0.95); the live junk 0.46–0.70.
+      - whitespace share: every stored real answer <= 0.19; junk 0.51.
+    """
+    prose = _CODE_FENCE_PATTERN.sub(" ", text)
+    if _non_latin_letter_ratio(prose) > _NON_LATIN_LETTER_RATIO:
+        return False
+    non_space = sum(1 for ch in prose if not ch.isspace())
+    if non_space < _DEGENERATE_MIN_CHARS:
+        return False
+    content_chars = sum(
+        1 for ch in prose if not ch.isspace() and ch not in _NON_WORD_SYNTAX_CHARS
+    )
+    word_chars = sum(len(m) for m in _PROSE_WORD_PATTERN.findall(prose))
+    whitespace = len(prose) - non_space
+    return (
+        content_chars == 0
+        or word_chars / content_chars < _DEGENERATE_MIN_WORD_SHARE
+        or whitespace / len(prose) > _DEGENERATE_MAX_WHITESPACE_SHARE
+    )
+
+
+def classify_non_answer(
+    answer: str,
+    *,
+    had_tool_results: bool,
+    instruction: str = "",
+) -> str | None:
+    """
+    Return why `answer` is not a usable answer ("empty", "script_mismatch",
+    "degenerate", "intent_stub", "too_short"), or None when it is fine. Pure — no I/O.
+    See the block comment above for the rules and their evidence.
+    """
+    stripped = answer.strip()
+    if not stripped:
+        return "empty"
+    if (
+        _non_latin_letter_ratio(stripped) > _NON_LATIN_LETTER_RATIO
+        and _non_latin_letter_ratio(instruction) <= _NON_LATIN_LETTER_RATIO
+    ):
+        return "script_mismatch"
+    if _is_degenerate(stripped):
+        return "degenerate"
+    if not had_tool_results:
+        return None
+    if (
+        len(stripped.split()) < _INTENT_STUB_MAX_WORDS
+        and _INTENT_STUB_PATTERN.search(stripped)
+    ):
+        return "intent_stub"
+    if _non_latin_letter_ratio(stripped) > _NON_LATIN_LETTER_RATIO:
+        # Only reachable when the user also wrote in a non-Latin script
+        # (script_mismatch above). Word-splitting doesn't apply to e.g.
+        # Chinese, so measure in letters/digits instead.
+        if sum(1 for ch in stripped if ch.isalnum()) < _MIN_NON_LATIN_ANSWER_CHARS:
+            return "too_short"
+        return None
+    if len(_LATIN_WORD_PATTERN.findall(stripped)) < _MIN_GROUNDED_ANSWER_WORDS:
+        # A short reply with stray non-Latin letters ("i.ζiusfrac. to.τ",
+        # 17% Greek — under the ratio bar) is junk, not a terse answer.
+        # Kept to short replies so a long answer quoting π or Δ is never
+        # affected. The distinction matters: the guard accepts a merely
+        # short retry, but not a script_mismatch one.
+        if (
+            _non_latin_letter_ratio(stripped) > 0
+            and _non_latin_letter_ratio(instruction) <= _NON_LATIN_LETTER_RATIO
+        ):
+            return "script_mismatch"
+        return "too_short"
+    return None
 
 
 # Substituted when fabricated tool-call syntax is detected.  Grounded=False
@@ -458,10 +617,17 @@ class ConversationalAgent:
         # path has no tool-dispatch capability of its own and nothing wraps
         # it with a retry, so a single substitution is the best available
         # guarantee that TaskStatus.COMPLETE never carries an empty answer).
-        if not answer.strip():
+        # Since 2026-11-11 it also catches junk replies (classify_non_answer;
+        # this path never has tool results, so only "empty" and
+        # "script_mismatch" can fire here).
+        non_answer = classify_non_answer(
+            answer, had_tool_results=False, instruction=subtask.instruction,
+        )
+        if non_answer is not None:
             logger.warning(
-                "ConversationalAgent: empty completion (legacy RAG path) "
-                "for subtask %s — substituting fallback.", subtask.subtask_id,
+                "ConversationalAgent: non-answer (%s) on legacy RAG path "
+                "for subtask %s (%d chars) — substituting fallback.",
+                non_answer, subtask.subtask_id, len(answer),
             )
             return AgentResult(
                 subtask_id = subtask.subtask_id,

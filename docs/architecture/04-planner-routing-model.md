@@ -617,6 +617,10 @@ Step 3b's corpus grounding using real embeddings, not a mocked score.
 
 #### 4.6.2 Empty-completion guard + forced-tool retry (added 2026-07-17)
 
+*Generalised 2026-11-11 to junk, stub and too-short replies (non-answers),
+and renamed `_dispatch_conversational_with_answer_guard()`. See the
+2026-11-11 update at the end of this section.*
+
 **Bug.** Confirmed live: for a query the Planner's P3 gate doesn't
 recognize as needing a tool (see §4.2's 2026-07-17 update above), Ollama
 can return a well-formed but zero-content stream — `"done": true` with no
@@ -628,7 +632,8 @@ string could reach the user as the final response.
 **Two-layer fix, deliberately asymmetric across the two places
 `ConversationalAgent.run()` can be reached from:**
 
-1. **`ControllerAgent._dispatch_conversational_with_empty_guard()`** — the
+1. **`ControllerAgent._dispatch_conversational_with_empty_guard()`** (renamed
+   `_dispatch_conversational_with_answer_guard()` 2026-11-11) — the
    real fix, and the only one with retry capability, because tool dispatch
    (`MCPToolDispatcher`) and prompt assembly (`PromptBuilder.build()`) both
    live in `ControllerAgent`, not `ConversationalAgent`. Used for
@@ -875,6 +880,95 @@ code fix is being attempted from this data alone; item (3)'s fix-location
 decision stays deferred until either a larger temperature-focused sweep
 or more real occurrences (now diagnosable via the Phase 1 warning log)
 firm up the correlation further.
+
+*Update 2026-11-11 — generalised from empty completions to non-answers.*
+**What prompted it.** On the OpenRouter backend (§16.33), free models
+returned replies that finished cleanly (HTTP 200, `finish_reason: "stop"`,
+no error) but were not answers, and every one was delivered to the user,
+because the guard only checked for an empty string:
+- Nemotron 3 Ultra free: `"那些\""`, `"i.ζiusfrac.\n\nto.τ"`, `" שח"`,
+  `"The.\n\n\n"`, or nothing, after 0–8 completion tokens. Later the same
+  day it produced 1,000+ characters of token soup (`")))-Re-Re-Re…"`).
+- Nemotron 3.5 Lightning free: `"Let me search for this news story…"` and
+  then stopped, although the search results were already in its prompt.
+
+A live diagnostic (`diagnostics/diag_openrouter_news_feed_garbage.py`,
+report `diagnostics/reports/openrouter_news_feed_garbage_2026-11-11.md`)
+reproduced it on 4 of 6 requests, including a plain web-search prompt.
+The prompts were clean, so the cause is the model/provider, not the News
+Feed path or Localist's prompt.
+
+**Classifier.** `conversational_agent.classify_non_answer(answer, *,
+had_tool_results, instruction)` returns the first matching reason, or
+`None`:
+
+| Reason | Rule | Applies on |
+|---|---|---|
+| `empty` | Blank after strip (the original rule). | Every turn |
+| `script_mismatch` | More than 20% of the reply's letters are non-Latin while the instruction is Latin-script. Also: a short reply (fewer than 3 words) that contains any non-Latin letter. A user writing in another script is never flagged. | Every turn |
+| `degenerate` | Token soup, measured outside ``` code fences on 12+ non-space characters: under 80% of the content characters belong to words or numbers (markdown syntax and sentence punctuation are not counted), or more than 35% of the text is whitespace. | Every turn |
+| `intent_stub` | Under 60 words, opening with "let me / I'll / I will / I'm going to / searching / looking up / one moment" followed by search/look/check/find/fetch/pull. | Tool-result turns only |
+| `too_short` | Fewer than 3 words. A word is 2+ Latin letters or a number; non-Latin replies are measured in letters and digits instead (fewer than 4). | Tool-result turns only |
+
+Validated read-only against all 94 stored assistant turns (55 with
+tools): it flags exactly the four 2026-11-11 failures and no real answer.
+Real answers scored at least 0.905 on the word-share measure and at most
+0.19 on whitespace share; the live soup scored 0.46–0.70 and 0.51.
+
+**Guard.** `_dispatch_conversational_with_empty_guard()` is renamed
+`ControllerAgent._dispatch_conversational_with_answer_guard()` and still
+makes one bounded retry (`_EMPTY_RESPONSE_RETRY_LIMIT = 1`), now chosen
+by reason:
+- `empty` with no tool results in the prompt: unchanged. The retry
+  forces `web_search` and rebuilds the prompt.
+- Every other case (junk, stub or short reply, or an empty reply despite
+  tool results): re-run the same prebuilt prompt. That is one more
+  inference request and no repeated tool calls.
+
+After the retry:
+- A real answer is used.
+- A retry that is only `too_short` is also kept, because a terse answer
+  must never be replaced by an error message.
+- Anything else falls back to `_EMPTY_RESPONSE_FALLBACK`, as before.
+
+`had_tool_results` comes from the same filtered tool-result list the
+prompt was built from.
+
+**What the guard records.** The verdict goes on a new
+`AgentResult.diagnostics` dict, deliberately **not** on `output`:
+`add_agent_result()` serialises `str(output)` into working memory, which
+is fed back into later prompts. `_build_conversational_result()` merges
+`diagnostics` into the turn metadata:
+- `non_answer_reason`, `non_answer_retried`, `non_answer_recovered`
+- `completion` and `completion_first` (the per-reply telemetry, §16.35)
+
+**Streaming.** Junk tokens have already been streamed by the time the
+guard sees them. Before retrying, the guard calls `on_answer_reset`, which
+is threaded `handle_task_with_plan()` → `_execute_plan()` → guard.
+`main._stream_task` turns it into an `{"type": "answer_reset"}` SSE event,
+which `tasks.ts` handles by clearing the streamed tokens. The guard then
+calls `on_status("Retrying — the model's reply was unusable…")`.
+
+**Legacy RAG path.** The non-prebuilt path in `ConversationalAgent.run()`
+uses the same classifier, for substitution only. It never has tool
+results, so only `empty`, `script_mismatch` and `degenerate` can fire
+there.
+
+**Verification.** Tests:
+- `TestClassifyNonAnswer` in `test_conversational_agent_empty_guard.py`,
+  using the real failure strings plus terse, non-English, code-block and
+  table-only answers that must pass.
+- `TestNonAnswerGuard` in `test_controller_phase4.py`.
+
+Live smoke (real ControllerAgent and OpenRouter, temp DB, News Feed
+context):
+- Nemotron 3 Ultra replied `"11\n1"`. The guard reset, retried, got junk
+  again, and fell back, recording `non_answer_reason: "too_short"` and
+  `non_answer_recovered: false`.
+- Lightning's real answers were not flagged.
+
+Not seen live: the `answer_reset` event clearing text in the desktop UI
+(type-checked only).
 
 ### 4.7 Gemma 4B Behavioral Constraints
 

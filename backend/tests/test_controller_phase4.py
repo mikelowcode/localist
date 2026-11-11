@@ -246,9 +246,10 @@ class TestCurrentDatetimeSlot:
 
 class TestEmptyCompletionGuard:
     """
-    ControllerAgent._dispatch_conversational_with_empty_guard(): the
+    ControllerAgent._dispatch_conversational_with_answer_guard(): the
     controller-owned floor + bounded forced-web_search retry for empty
-    completions. See conversational_agent.py's own (narrower) legacy-path
+    completions on tool-less turns (the original case; junk/stub replies
+    are covered by TestNonAnswerGuard below). See conversational_agent.py's own (narrower) legacy-path
     guard and its tests in test_conversational_agent_empty_guard.py — that
     guard deliberately does NOT cover the prebuilt-prompt path, since this
     is the layer that owns it.
@@ -388,6 +389,122 @@ class TestEmptyCompletionGuard:
         )
         assert "" not in [e["content"] for e in agent_entries]
         assert "Real retried answer." in agent_entries[0]["content"]
+
+
+class TestNonAnswerGuard:
+    """
+    The 2026-11-11 generalisation of the guard: replies that finish cleanly
+    but are junk (" שח"), a "Let me search…" stub, or too short, on a turn
+    whose prompt already held tool results. The retry re-runs the same
+    prebuilt prompt (no repeated tool calls); a junk retry falls back to the
+    canned message, a merely-short retry is kept.
+    """
+
+    _INSTRUCTION = 'Tell me more about this news story: "iPhone Air 2 and iPhone 18 dummy models leak"'
+    _GOOD = "GSMArena reports that dummy models of the iPhone Air 2 and iPhone 18 have leaked."
+
+    @staticmethod
+    def _plan() -> RoutingPlan:
+        return RoutingPlan(
+            agent          = "conversational_agent",
+            fetch_episodic = False,
+            fetch_rag      = False,
+            priority       = 3,
+            tools_to_call  = ["news_search"],
+        )
+
+    @staticmethod
+    def _news_result() -> _ToolResult:
+        return _ToolResult(
+            tool_name  = "news_search",
+            parameters = "query='iPhone Air 2 dummy models'",
+            result     = "• iPhone Air 2 and iPhone 18 dummy models leak — GSMArena — 2026-11-10",
+            success    = True,
+        )
+
+    def _run(self, mm, answers, *, task_id="na-test", callbacks=None):
+        rt   = make_runtime(infer_return="no")
+        conv = make_conv_agent_with_answers(answers)
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.dispatch.return_value = [self._news_result()]
+        with patch("localist.controller_agent.MCPToolDispatcher", return_value=mock_dispatcher):
+            result = ctrl.handle_task_with_plan(
+                {"instruction": self._INSTRUCTION, "task_id": task_id},
+                self._plan(),
+                **(callbacks or {}),
+            )
+        return result, conv, mock_dispatcher
+
+    def test_junk_then_real_retries_same_prompt_without_redispatch(self, mm):
+        result, conv, dispatcher = self._run(mm, [" שח", self._GOOD])
+
+        assert result["answer"] == self._GOOD
+        assert len(conv._received) == 2
+        assert dispatcher.dispatch.call_count == 1, "retry must not repeat the tool calls"
+        assert (conv._received[1].context["_prebuilt_prompt"]
+                == conv._received[0].context["_prebuilt_prompt"])
+        md = result["metadata"]
+        assert md["non_answer_reason"] == "script_mismatch"
+        assert md["non_answer_retried"] is True
+        assert md["non_answer_recovered"] is True
+
+    def test_intent_stub_is_retried(self, mm):
+        stub = "Let me search for this news story to get the latest information."
+        result, conv, _ = self._run(mm, [stub, self._GOOD])
+
+        assert result["answer"] == self._GOOD
+        assert result["metadata"]["non_answer_reason"] == "intent_stub"
+
+    def test_junk_twice_falls_back(self, mm):
+        result, conv, _ = self._run(mm, ['那些"', "i.ζiusfrac.\n\nto.τ"])
+
+        assert result["status"] == "complete"
+        assert result["answer"] == _EMPTY_RESPONSE_FALLBACK
+        assert result["sources"] == []
+        assert len(conv._received) == 2, "retry must be bounded to exactly one attempt"
+        assert result["metadata"]["non_answer_recovered"] is False
+
+    def test_short_twice_keeps_the_retry(self, mm):
+        """too_short is the weakest signal: a terse retry is never replaced."""
+        result, conv, _ = self._run(mm, ["The.", "It leaked."])
+
+        assert result["answer"] == "It leaked."
+        assert result["metadata"]["non_answer_reason"] == "too_short"
+        assert result["metadata"]["non_answer_recovered"] is True
+
+    def test_good_answer_no_retry_no_metadata(self, mm):
+        events: list[str] = []
+        result, conv, _ = self._run(mm, [self._GOOD], callbacks={
+            "on_answer_reset": lambda: events.append("reset"),
+        })
+
+        assert result["answer"] == self._GOOD
+        assert len(conv._received) == 1
+        assert events == []
+        assert "non_answer_reason" not in result["metadata"]
+
+    def test_reset_and_status_fire_once_before_retry(self, mm):
+        events: list[str] = []
+        result, conv, _ = self._run(mm, [" שח", self._GOOD], callbacks={
+            "on_answer_reset": lambda: events.append("reset"),
+            "on_status":       lambda msg: events.append(f"status:{msg}"),
+        })
+
+        assert events[0] == "reset"
+        assert events[1].startswith("status:Retrying")
+        assert events.count("reset") == 1
+
+    def test_guard_verdict_stays_out_of_working_memory(self, mm):
+        """diagnostics must not be serialised into the prompt-facing memory."""
+        self._run(mm, [" שח", self._GOOD], task_id="na-mem-test")
+
+        entries = mm.get_context_window(task_id="na-mem-test", limit=50)
+        agent_entries = [e for e in entries if e["role"] == "agent"]
+        assert len(agent_entries) == 1
+        assert self._GOOD in agent_entries[0]["content"]
+        assert "non_answer" not in agent_entries[0]["content"]
+        assert "שח" not in agent_entries[0]["content"]
 
 
 # ---------------------------------------------------------------------------

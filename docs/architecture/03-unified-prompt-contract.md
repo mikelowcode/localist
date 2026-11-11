@@ -1541,7 +1541,7 @@ ceiling value changed there, not how this method trims against it).
 **Wiring (oMLX-only).** `controller_agent.py` passes `emit_structured_working_memory=True` only when
 `isinstance(self._runtime, OMLXRuntimeClient)` — checked independently at both the primary
 `_execute_plan` build() call and the separate-scope empty-answer retry path
-(`_dispatch_conversational_with_empty_guard`, which needed its own recomputed check; a real test
+(`_dispatch_conversational_with_empty_guard`, renamed `_dispatch_conversational_with_answer_guard` 2026-11-11 — §4.6.2, which needed its own recomputed check; a real test
 failure during development caught the missing one). The resulting turns are threaded onto
 `subtask_context["_prebuilt_working_memory_turns"]`, following the same passthrough convention as
 `_prebuilt_prompt`/`_prebuilt_system`. **A plumbing gap was found and closed while wiring this in:**

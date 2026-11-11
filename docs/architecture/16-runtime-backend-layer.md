@@ -826,7 +826,7 @@ posture as the pre-existing pattern this replaces); `max_model_len` defaults to
 access returns another `MagicMock`, not an `AttributeError`, so a plain `getattr(..., default)`
 alone would silently pass a non-numeric value into the subtraction below and raise `TypeError` at
 call time — confirmed by a real test failure while wiring this in (`controller_agent.py`'s
-`_dispatch_conversational_with_empty_guard`, a separate method/scope from the primary
+`_dispatch_conversational_with_empty_guard` — renamed `_dispatch_conversational_with_answer_guard` 2026-11-11, §4.6.2 — a separate method/scope from the primary
 `_execute_plan` call site, hadn't recomputed the runtime-type check it needed independently).
 
 `controller_agent.py`'s one call site (`profile_for(getattr(self._runtime, "is_local", True))` →
@@ -2441,6 +2441,20 @@ settings and API key, is Phase 3.
   - The list held 14 free tool-capable models.
   - Gemma 4 31B free was still busy upstream: classified `upstream_busy` and retried once.
 
+**Free-model reliability (finding, 2026-11-11).** Free endpoints can fail *silently*: a reply that
+ends normally (HTTP 200, `finish_reason: "stop"`, no `error` event) but isn't an answer, which this
+client cannot tell apart from a real one.
+- Nemotron 3 Ultra free returned junk or nothing after 0–8 tokens on 4 of 6 diagnostic requests,
+  including a plain web-search prompt. The prompts were clean. Later the same day it produced
+  1,000+ characters of token soup.
+- Turning reasoning back on (`reasoning` omitted) fixed one failure and not the other (N=2,
+  inconclusive).
+- Nemotron 3.5 Lightning free once produced a "Let me search…" stub and stopped.
+
+Recovery is backend-agnostic and lives above this client: the non-answer guard (§4.6.2,
+2026-11-11) retries once and then falls back. §16.35 records `finish_reason` and token counts per
+reply. Report: `diagnostics/reports/openrouter_news_feed_garbage_2026-11-11.md`.
+
 ---
 
 ### §16.34 — OpenRouter registered as a runtime backend (2026-11-10)
@@ -2493,3 +2507,70 @@ is Phase 4.
     warm-up, healthy, `runtime_key_info` showing the free requests left.
   - One `POST /task`: a correct answer in 3 OpenRouter calls (classifier, `main_dispatch`,
     `working_state`), with `runtime_last_error` still null.
+
+### §16.35 — Per-reply completion record: why a reply ended (2026-11-11)
+
+**Why.** Phase 2 of the non-answer guard plan (§4.6.2, 2026-11-11 update). On 2026-11-11, free
+OpenRouter models ended junk replies cleanly: `finish_reason: "stop"` after 1 completion token,
+HTTP 200, no error. Nothing recorded `finish_reason` or token counts, and the packaged app keeps
+no backend log on disk, so explaining it took a live diagnostic
+(`diagnostics/diag_openrouter_news_feed_garbage.py`). Each reply now carries that record in its
+turn metadata.
+
+**Record.** `completion_record.py` defines one backend-neutral dict, built with `make_record()`:
+
+| Key | Value |
+|---|---|
+| `backend` | `"openrouter"`, `"ollama"` or `"omlx"` |
+| `model` | The model that served the reply. OpenRouter and oMLX report it in the stream; otherwise the configured chat model. |
+| `finish_reason` | `"stop"`, `"length"`, … Ollama reports it as `done_reason`. |
+| `prompt_tokens`, `completion_tokens` | Ollama reports these as `prompt_eval_count` and `eval_count`. |
+| `reasoning_tokens` | OpenRouter only, when reported. |
+| `provider` | OpenRouter's upstream provider, e.g. `"Nvidia"`. |
+
+A field the backend doesn't report is `None`.
+
+**Clients.** Each client exposes the record as a read-only `last_completion` property. It is
+cleared when a request starts and set when the stream ends, so a failed request never leaves an
+old record behind.
+
+| Client | Where the values come from |
+|---|---|
+| `OpenRouterRuntimeClient` | `openai_compat.update_stream_meta()`, which folds each SSE event's `finish_reason`, `native_finish_reason`, `usage`, `provider` and `model` into a dict. The client also logs one INFO line per completion. |
+| `OMLXRuntimeClient` | The same helper, via `iter_content_deltas(response, meta=…)`. Token counts are filled only if oMLX's stream includes `usage`. |
+| `OllamaRuntimeClient` | The `meta` that `_iter_ndjson_chunks()` already filled for the 2026-08-04 zero-content warning (§4.6.2). |
+
+**Thread-local storage.** `CompletionRecorder` keeps one record per thread. A single client serves
+the main answer, the post-answer hooks (working state, implicit extraction) and background jobs,
+from different worker threads. A plain attribute would let a hook overwrite the main answer's
+record before the controller reads it. The streaming generators run on the consuming thread, so
+the record lands on the thread that made the call.
+
+**Not a Protocol member.** `last_completion` is deliberately not added to `BaseRuntimeClient`.
+Callers read it with `getattr(runtime, "last_completion", None)` and accept only a dict, so test
+doubles (a bare `MagicMock` returns a `MagicMock`) and any future client without it keep working.
+
+**Controller.** `_dispatch_conversational_with_answer_guard()` reads `self._runtime.last_completion`
+immediately after each main-answer attempt. The controller is rebuilt together with its agents on a
+live backend switch, so this is the client that served the call. It stores the record on
+`AgentResult.diagnostics`, which `_build_conversational_result()` merges into the turn metadata
+(persisted in `chat_turns.metadata_json`):
+
+- `completion`: the attempt whose answer was used. If the fallback message was shown, it is the last
+  attempt.
+- `completion_first`: the rejected first attempt, set only when the guard retried a non-answer.
+
+One INFO log line per turn summarises the record.
+
+**Verified.**
+
+- Tests: `tests/test_completion_record.py` (11), covering:
+  - the recorder, including that a record set on another thread doesn't overwrite this thread's
+  - `update_stream_meta()` on the real 2026-11-11 junk shape
+  - all three clients from faked streams
+  - controller metadata, including `completion_first` on a retried turn and no key when the runtime
+    has no record
+- Full suite 2026 passed.
+- Live (real ControllerAgent with `OpenRouterRuntimeClient`, temp DB, News Feed context):
+  Lightning's turn recorded `finish_reason: "stop"`, 429→666 tokens, provider `Nvidia`. That is the
+  main answer's numbers, not the `working_state` call that followed on the same client.

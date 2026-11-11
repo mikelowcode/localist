@@ -75,7 +75,7 @@ from .mcp_tool_dispatcher import MCPToolDispatcher
 from .prompt_builder import ToolResult as _ToolResult
 from .wiki_doc import load_wiki_doc, parse_wiki_doc
 from . import session_files as _session_files
-from .conversational_agent import _EMPTY_RESPONSE_FALLBACK
+from .conversational_agent import _EMPTY_RESPONSE_FALLBACK, classify_non_answer
 
 logger = logging.getLogger(__name__)
 
@@ -105,13 +105,14 @@ def _excluded_from_rag(path: str | Path) -> bool:
     p = Path(path)
     return p.name.endswith("persona.md") or p.parts[-len(_USER_PROFILE_PARTS):] == _USER_PROFILE_PARTS
 
-# Bounded retry count for the empty-completion guard (see
-# _dispatch_conversational_with_empty_guard). Deliberately its own constant,
+# Bounded retry count for the non-answer guard (see
+# _dispatch_conversational_with_answer_guard). Deliberately its own constant,
 # not a reuse of mcp_tool_dispatcher._MAX_RESEARCH_ITERATIONS — that constant
 # bounds the unrelated multi-turn research loop, scoped to the "research"
 # tool variant once web_search has already fired. This one bounds a single
-# forced-tool re-dispatch when the Planner's P3 gate produced no grounding
-# at all and the model returned a well-formed, zero-content completion.
+# retry of a non-answer: a forced-tool re-dispatch when the Planner's P3
+# gate produced no grounding and the model returned a zero-content
+# completion, or a same-prompt re-run when the model returned junk.
 _EMPTY_RESPONSE_RETRY_LIMIT = 1
 
 # Display labels for the persona's "Web search" tool description, keyed by
@@ -193,6 +194,11 @@ class AgentResult:
     status:     TaskStatus
     output:     dict[str, Any]
     error:      str | None = None
+    # Controller-side annotations about how this result was produced (e.g.
+    # the answer guard's non_answer_reason). Kept out of `output` on
+    # purpose: memory_manager.add_agent_result() serialises str(output) into
+    # working memory, which is fed back into later prompts.
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -1243,6 +1249,7 @@ class ControllerAgent:
         on_token:       Callable[[str], None]            | None = None,
         on_status:      Callable[[str], None]            | None = None,
         on_answer_ready: Callable[[dict[str, Any]], None] | None = None,
+        on_answer_reset: Callable[[], None]               | None = None,
     ) -> dict[str, Any]:
         """
         Entry point for callers that have already run routing separately.
@@ -1287,6 +1294,7 @@ class ControllerAgent:
                 on_token=on_token,
                 on_status=on_status,
                 on_answer_ready=on_answer_ready,
+                on_answer_reset=on_answer_reset,
             )
         except Exception as exc:
             logger.exception("Unhandled exception in controller for task %s.", task.task_id)
@@ -1317,6 +1325,7 @@ class ControllerAgent:
         on_token:        Callable[[str], None]            | None = None,
         on_status:       Callable[[str], None]            | None = None,
         on_answer_ready: Callable[[dict[str, Any]], None] | None = None,
+        on_answer_reset: Callable[[], None]               | None = None,
     ) -> ControllerResult:
         """
         Execute the 7-step contract from §4.4 of LOCALIST-Architecture.md.
@@ -2114,10 +2123,13 @@ class ControllerAgent:
 
         logger.info("TIMING dispatch_start t=%.4f", time.monotonic())
         if effective_agent_name == "conversational_agent":
-            results = self._dispatch_conversational_with_empty_guard(
+            results = self._dispatch_conversational_with_answer_guard(
                 subtask, memory, mem_key, task, plan,
                 episodic_bullets, profile_facts, rag_sources,
                 graph_result, graph_neighborhood, working_state, working_turns,
+                had_tool_results = bool(_build_kwargs["tool_results"]),
+                on_status        = on_status,
+                on_answer_reset  = on_answer_reset,
             )
         else:
             results = self._dispatch([subtask], memory, mem_key)
@@ -2367,6 +2379,12 @@ class ControllerAgent:
         if workflow_id is not None:
             metadata["workflow_id"] = workflow_id
             metadata["workflow_steps"] = workflow_steps
+        # From the answer guard: "completion" (how the reply ended — model,
+        # finish_reason, token counts; §16.35) on every turn the runtime
+        # reports it, plus non_answer_reason / non_answer_retried /
+        # non_answer_recovered / completion_first when it caught a
+        # non-answer.
+        metadata.update(r.diagnostics)
 
         answer = r.output.get("answer", "")
         if not plan.tools_to_call:
@@ -2537,7 +2555,7 @@ class ControllerAgent:
 
         return results
 
-    def _dispatch_conversational_with_empty_guard(
+    def _dispatch_conversational_with_answer_guard(
         self,
         subtask:          SubTask,
         memory:            _AnyMemory,
@@ -2551,32 +2569,50 @@ class ControllerAgent:
         graph_neighborhood: GraphNeighborhood | None,
         working_state:     WorkingMemoryState | None,
         working_turns:     list[Turn],
+        had_tool_results:  bool = False,
+        on_status:         Callable[[str], None] | None = None,
+        on_answer_reset:   Callable[[], None]    | None = None,
     ) -> list[AgentResult]:
         """
         Dispatch a single conversational_agent subtask with a floor against
-        empty completions.
+        non-answers: empty completions, junk, and "Let me search…" stubs
+        (conversational_agent.classify_non_answer; formerly
+        _dispatch_conversational_with_empty_guard, which caught only
+        empty completions — generalised 2026-11-11 after free OpenRouter
+        models returned clean-finishing junk such as "那些\"" and " שח").
 
-        Ollama can return a well-formed, zero-content stream ("done": true,
-        no content in between) when the model has no tool grounding for a
-        query it structurally can't answer from training alone — most
-        commonly a query naming a specific recent/future date the Planner's
-        P3 gate didn't recognize as needing a tool. An empty answer must
-        never reach the user; when no tool fired this turn, that itself is
-        evidence the gate missed, so the one bounded retry (see
-        _EMPTY_RESPONSE_RETRY_LIMIT) forces web_search into tools_to_call and
-        rebuilds the prompt with real tool results, rather than re-running
-        the identical ungrounded prompt (which risks reproducing the same
-        empty output for no reason). If the retry is also empty (or raises),
-        the result is replaced with _EMPTY_RESPONSE_FALLBACK.
+        One bounded retry (_EMPTY_RESPONSE_RETRY_LIMIT), shaped by why the
+        first reply failed:
+
+          - "empty" with no tool results in the prompt: the original case.
+            Ollama can return a well-formed, zero-content stream when the
+            model has no tool grounding for a query it structurally can't
+            answer from training alone — evidence the Planner's P3 gate
+            missed — so the retry forces web_search into tools_to_call and
+            rebuilds the prompt with real tool results, rather than
+            re-running the identical ungrounded prompt.
+          - anything else (junk/stub/short, or empty despite tool results):
+            the grounding was already there and the model glitched, so the
+            retry re-runs the same prebuilt prompt — one more inference
+            request, no repeated tool calls.
+
+        A retry is accepted when it is a real answer, or merely short again
+        ("too_short" is the weakest signal — a terse answer must never be
+        replaced by an error message). Otherwise the result is replaced with
+        _EMPTY_RESPONSE_FALLBACK. Before retrying, on_answer_reset tells the
+        streaming endpoint to clear the junk already streamed to the client,
+        and on_status shows a "Retrying…" status. The verdict is recorded on
+        result.diagnostics (non_answer_reason / non_answer_retried /
+        non_answer_recovered) for the turn's metadata.
 
         Deliberately does not delegate to self._dispatch(): that method
         calls memory.add_agent_result() immediately and synchronously per
         subtask (memory_manager.add_agent_result() serializes the result
         into SQLite at call time), which would permanently persist the
-        empty/failed first attempt into working memory before a retry ever
-        had a chance to replace it. This method defers that write until the
-        final outcome — original, retried, or fallback-substituted — is
-        decided, and writes it exactly once.
+        failed first attempt into working memory before a retry ever had a
+        chance to replace it. This method defers that write until the final
+        outcome — original, retried, or fallback-substituted — is decided,
+        and writes it exactly once.
         """
         agent = self._agents[subtask.agent_name]
         # Recomputed here (not shared from _execute_plan) — this method has
@@ -2598,110 +2634,168 @@ class ControllerAgent:
                     error      = str(exc),
                 )
 
-        result = _run(subtask)
-
-        if (
-            result.status == TaskStatus.COMPLETE
-            and not str(result.output.get("answer", "")).strip()
-        ):
-            logger.warning(
-                "_execute_plan: empty answer from conversational_agent for "
-                "subtask %s — retrying with web_search forced.",
-                subtask.subtask_id,
+        def _verdict(r: AgentResult, tools: bool) -> str | None:
+            if r.status != TaskStatus.COMPLETE:
+                return None   # failures are surfaced as failures, not retried here
+            return classify_non_answer(
+                str(r.output.get("answer", "")),
+                had_tool_results = tools,
+                instruction      = task.instruction,
             )
+
+        def _completion() -> dict[str, Any] | None:
+            # How the attempt that just ran on this thread ended
+            # (completion_record.py, §16.35). Read immediately after the
+            # attempt — the post-answer hooks reuse the same runtime.
+            # self._runtime is rebuilt together with the agents on a live
+            # backend switch, so it is the client that served this call.
+            record = getattr(self._runtime, "last_completion", None)
+            return dict(record) if isinstance(record, dict) else None
+
+        result = _run(subtask)
+        first_completion = _completion()
+        final_completion = first_completion
+        reason = _verdict(result, had_tool_results)
+
+        if reason is not None:
+            logger.warning(
+                "_execute_plan: non-answer (%s) from conversational_agent for "
+                "subtask %s (%d chars) — retrying once.",
+                reason, subtask.subtask_id,
+                len(str(result.output.get("answer", ""))),
+            )
+            if on_answer_reset is not None:
+                on_answer_reset()
+            if on_status is not None:
+                on_status("Retrying — the model's reply was unusable…")
+
+            force_web_search = reason == "empty" and not had_tool_results
             retried = False
             for _attempt in range(_EMPTY_RESPONSE_RETRY_LIMIT):
                 try:
-                    forced_tools = list(plan.tools_to_call)
-                    if "web_search" not in forced_tools and "research" not in forced_tools:
-                        forced_tools.append("web_search")
+                    if force_web_search:
+                        forced_tools = list(plan.tools_to_call)
+                        if "web_search" not in forced_tools and "research" not in forced_tools:
+                            forced_tools.append("web_search")
 
-                    retry_dispatcher = MCPToolDispatcher(
-                        runtime      = self._runtime,
-                        project_root = task.context.get("project_root"),
-                    )
-                    retry_tool_results = retry_dispatcher.dispatch(
-                        tools_to_call = forced_tools,
-                        instruction   = task.instruction,
-                        context       = task.context,
-                    )
-
-                    _retry_build_kwargs = dict(
-                        instruction      = task.instruction,
-                        current_datetime = datetime.now().astimezone(),
-                        persona          = self._load_persona(),
-                        assistant_name   = self._current_assistant_name(),
-                        episodic_summary = episodic_bullets or None,
-                        profile_facts    = profile_facts    or None,
-                        rag_snippets     = rag_sources       or None,
-                        tool_results     = [
-                            r for r in retry_tool_results
-                            if not r.result.startswith("ERROR:")
-                            and not r.result.startswith("<")
-                            and len(r.result.strip()) >= 5
-                        ] or None,
-                        tool_failures    = [
-                            r for r in retry_tool_results
-                            if r.result.startswith("ERROR:")
-                        ] or None,
-                        graph_result     = graph_result   or None,
-                        graph_neighborhood = graph_neighborhood,
-                        working_state    = working_state,
-                        working_memory   = working_turns  or None,
-                        session_files    = _session_files.get_files() or None,
-                    )
-                    if _use_structured_working_memory:
-                        retry_system, retry_prompt, retry_working_memory_turns = _PROMPT_BUILDER.build(
-                            **_retry_build_kwargs, emit_structured_working_memory=True,
+                        retry_dispatcher = MCPToolDispatcher(
+                            runtime      = self._runtime,
+                            project_root = task.context.get("project_root"),
                         )
-                    else:
-                        retry_system, retry_prompt = _PROMPT_BUILDER.build(**_retry_build_kwargs)
-                        retry_working_memory_turns = None
+                        retry_tool_results = retry_dispatcher.dispatch(
+                            tools_to_call = forced_tools,
+                            instruction   = task.instruction,
+                            context       = task.context,
+                        )
 
-                    retry_sources = [s.path for s in rag_sources] + [
-                        f"session://{sf.filename}" for sf in _session_files.get_files()
-                    ]
-                    retry_context = {
-                        **subtask.context,
-                        "_prebuilt_prompt":  retry_prompt,
-                        "_prebuilt_system":  retry_system,
-                        "_prebuilt_sources": retry_sources,
-                    }
-                    if retry_working_memory_turns is not None:
-                        retry_context["_prebuilt_working_memory_turns"] = retry_working_memory_turns
-                    retry_subtask = SubTask(
-                        subtask_id  = subtask.subtask_id,
-                        agent_name  = subtask.agent_name,
-                        instruction = task.instruction,
-                        context     = retry_context,
+                        _retry_build_kwargs = dict(
+                            instruction      = task.instruction,
+                            current_datetime = datetime.now().astimezone(),
+                            persona          = self._load_persona(),
+                            assistant_name   = self._current_assistant_name(),
+                            episodic_summary = episodic_bullets or None,
+                            profile_facts    = profile_facts    or None,
+                            rag_snippets     = rag_sources       or None,
+                            tool_results     = [
+                                r for r in retry_tool_results
+                                if not r.result.startswith("ERROR:")
+                                and not r.result.startswith("<")
+                                and len(r.result.strip()) >= 5
+                            ] or None,
+                            tool_failures    = [
+                                r for r in retry_tool_results
+                                if r.result.startswith("ERROR:")
+                            ] or None,
+                            graph_result     = graph_result   or None,
+                            graph_neighborhood = graph_neighborhood,
+                            working_state    = working_state,
+                            working_memory   = working_turns  or None,
+                            session_files    = _session_files.get_files() or None,
+                        )
+                        if _use_structured_working_memory:
+                            retry_system, retry_prompt, retry_working_memory_turns = _PROMPT_BUILDER.build(
+                                **_retry_build_kwargs, emit_structured_working_memory=True,
+                            )
+                        else:
+                            retry_system, retry_prompt = _PROMPT_BUILDER.build(**_retry_build_kwargs)
+                            retry_working_memory_turns = None
+
+                        retry_sources = [s.path for s in rag_sources] + [
+                            f"session://{sf.filename}" for sf in _session_files.get_files()
+                        ]
+                        retry_context = {
+                            **subtask.context,
+                            "_prebuilt_prompt":  retry_prompt,
+                            "_prebuilt_system":  retry_system,
+                            "_prebuilt_sources": retry_sources,
+                        }
+                        if retry_working_memory_turns is not None:
+                            retry_context["_prebuilt_working_memory_turns"] = retry_working_memory_turns
+                        retry_subtask = SubTask(
+                            subtask_id  = subtask.subtask_id,
+                            agent_name  = subtask.agent_name,
+                            instruction = task.instruction,
+                            context     = retry_context,
+                        )
+                        retry_result = _run(retry_subtask)
+                    else:
+                        retry_result = _run(subtask)
+                    final_completion = _completion()
+                    # Retry prompts always carry grounding when tools ran
+                    # (forced web_search, or the original tool results).
+                    retry_reason = _verdict(
+                        retry_result, had_tool_results or force_web_search,
                     )
-                    retry_result = _run(retry_subtask)
                     if (
                         retry_result.status == TaskStatus.COMPLETE
-                        and str(retry_result.output.get("answer", "")).strip()
+                        and retry_reason in (None, "too_short")
                     ):
                         result  = retry_result
                         retried = True
                         logger.info(
-                            "_execute_plan: empty-answer retry succeeded for "
-                            "subtask %s (forced tools=%s).",
-                            subtask.subtask_id, forced_tools,
+                            "_execute_plan: non-answer retry succeeded for "
+                            "subtask %s (forced_web_search=%s, retry verdict=%s).",
+                            subtask.subtask_id, force_web_search, retry_reason,
                         )
                         break
+                    logger.warning(
+                        "_execute_plan: non-answer retry for subtask %s was "
+                        "also unusable (%s).", subtask.subtask_id, retry_reason,
+                    )
                 except Exception as exc:
                     logger.warning(
-                        "_execute_plan: empty-answer retry raised (%s) — "
+                        "_execute_plan: non-answer retry raised (%s) — "
                         "continuing to fallback.", exc,
                     )
 
             if not retried:
                 logger.warning(
-                    "_execute_plan: empty-answer retry exhausted for "
+                    "_execute_plan: non-answer retry exhausted for "
                     "subtask %s — substituting fallback.", subtask.subtask_id,
                 )
                 result.output["answer"]   = _EMPTY_RESPONSE_FALLBACK
                 result.output["sources"]  = []
                 result.output["grounded"] = False
+            result.diagnostics.update({
+                "non_answer_reason":    reason,
+                "non_answer_retried":   True,
+                "non_answer_recovered": retried,
+            })
+            if first_completion is not None:
+                # The rejected first attempt — usually the interesting one.
+                result.diagnostics["completion_first"] = first_completion
+
+        if final_completion is not None:
+            result.diagnostics["completion"] = final_completion
+            logger.info(
+                "_execute_plan: main_dispatch completion — backend=%s model=%s "
+                "finish=%s tokens=%s→%s provider=%s non_answer=%s",
+                final_completion.get("backend"), final_completion.get("model"),
+                final_completion.get("finish_reason"),
+                final_completion.get("prompt_tokens"),
+                final_completion.get("completion_tokens"),
+                final_completion.get("provider"), reason,
+            )
 
         memory.add_agent_result(result, task_id=mem_key)
         return [result]

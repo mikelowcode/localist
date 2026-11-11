@@ -320,6 +320,14 @@ function handleSSEEvent(task_id: string, event: Record<string, unknown>): void {
       });
       break;
     }
+    case 'answer_reset': {
+      // The backend's answer guard rejected what was just streamed (junk,
+      // empty, or a "Let me search…" stub) and is retrying — drop it so the
+      // retry's tokens start from a clean slate. A 'status' event
+      // ("Retrying…") follows.
+      patchTask(task_id, { tokens: [], answer: '' });
+      break;
+    }
     case 'sources': {
       patchTask(task_id, { sources: (event.sources as Source[]) ?? [] });
       break;

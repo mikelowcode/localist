@@ -57,7 +57,8 @@ from typing import Any, Generator
 
 import requests
 
-from .openai_compat import build_messages, content_delta, iter_sse_events
+from .completion_record import CompletionRecorder, record_from_openai_meta
+from .openai_compat import build_messages, content_delta, iter_sse_events, update_stream_meta
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +197,8 @@ class OpenRouterRuntimeClient:
         self.last_error: dict[str, Any] | None = None
         # `usage` from the last completed stream (tokens, cost).
         self.last_usage: dict[str, Any] | None = None
+        # Per-thread record of how the last completion ended (§16.35).
+        self._completions = CompletionRecorder()
 
         self._model_list: list[dict[str, Any]] | None = None
         self._model_list_at = 0.0
@@ -226,6 +229,11 @@ class OpenRouterRuntimeClient:
             prompt, system, max_tokens, temperature, label=label, timeout=timeout,
         ))
 
+    @property
+    def last_completion(self) -> dict[str, Any] | None:
+        """How this thread's last completion ended (completion_record.py)."""
+        return self._completions.get()
+
     def embed(self, text: str) -> list[float]:
         raise RuntimeError(
             "OpenRouterRuntimeClient is chat-only: embeddings come from local Ollama "
@@ -241,6 +249,7 @@ class OpenRouterRuntimeClient:
         label:       str   = "",
         timeout:     float | None = None,
     ) -> Generator[str, None, None]:
+        self._completions.clear()
         if not self._api_key:
             raise self._record(OpenRouterError(
                 "no_key", "No OpenRouter API key is set. Add one in Settings.",
@@ -282,8 +291,10 @@ class OpenRouterRuntimeClient:
                 detail=f"(model {self._chat_model}: {metadata.get('raw') or message})",
             ))
 
+        stream_meta: dict[str, Any] = {}
         try:
             for event in iter_sse_events(response):
+                update_stream_meta(stream_meta, event)
                 if event.get("error"):
                     error = event["error"]
                     raise OpenRouterError(
@@ -304,6 +315,15 @@ class OpenRouterRuntimeClient:
         finally:
             response.close()
         self.last_error = None
+        record = record_from_openai_meta("openrouter", self._chat_model, stream_meta)
+        self._completions.set(record)
+        logger.info(
+            "OpenRouter completion — model=%s finish=%s native_finish=%s provider=%s "
+            "tokens=%s→%s label=%s",
+            record["model"], record["finish_reason"],
+            stream_meta.get("native_finish_reason"), record["provider"],
+            record["prompt_tokens"], record["completion_tokens"], label,
+        )
 
     def health_check(self) -> dict:
         """

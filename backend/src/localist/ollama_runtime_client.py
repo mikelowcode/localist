@@ -51,6 +51,8 @@ from typing import Generator, Iterator
 
 import requests
 
+from .completion_record import CompletionRecorder, make_record
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -232,6 +234,9 @@ class OllamaRuntimeClient:
 
         self.is_local = not _is_cloud_model(chat_model)
 
+        # Per-thread record of how the last completion ended (§16.35).
+        self._completions = CompletionRecorder()
+
         self._chat_endpoint  = self._base_url + _CHAT_PATH
         self._tags_endpoint  = self._base_url + _TAGS_PATH
         self._embed_endpoint = self._base_url + _EMBED_PATH
@@ -248,6 +253,11 @@ class OllamaRuntimeClient:
     # -----------------------------------------------------------------------
     # BaseRuntimeClient interface
     # -----------------------------------------------------------------------
+
+    @property
+    def last_completion(self) -> dict | None:
+        """How this thread's last completion ended (completion_record.py)."""
+        return self._completions.get()
 
     def infer(
         self,
@@ -427,6 +437,7 @@ class OllamaRuntimeClient:
                 "name listed by GET /api/tags."
             )
 
+        self._completions.clear()
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -507,6 +518,14 @@ class OllamaRuntimeClient:
             raise RuntimeError(
                 f"Error reading Ollama NDJSON stream: {exc}"
             ) from exc
+
+        self._completions.set(make_record(
+            backend           = "ollama",
+            model             = self._chat_model,
+            finish_reason     = stream_meta.get("done_reason"),
+            prompt_tokens     = stream_meta.get("prompt_eval_count"),
+            completion_tokens = stream_meta.get("eval_count"),
+        ))
 
         if total_chars == 0:
             # Passive instrumentation added 2026-08-04 — see §4.6.2's

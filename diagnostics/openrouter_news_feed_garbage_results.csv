@@ -1,0 +1,5 @@
+case,repeat,model,status,prompt_chars,steps,provider,finish_reason,native_finish_reason,saw_done,prompt_tokens,completion_tokens,reasoning_tokens,reasoning_chars,content_chars,non_latin_letter_ratio,looks_degenerate,latency_s,ttft_s,mid_stream_error,error_body,content_head
+news_verge_gta,1,nvidia/nemotron-3-ultra-550b-a55b:free,200,1307,,Nvidia,stop,stop,True,383,8,0,0,9,0.0,True,3.49,1.55,,,The.⏎⏎⏎⏎⏎
+news_gsmarena_iphone,1,nvidia/nemotron-3-ultra-550b-a55b:free,200,1321,,Nvidia,stop,stop,True,429,309,0,0,1212,0.0,False,4.26,0.75,,,"Based on the search result, this appears to be a **Slashdot aggregation** (dated **2026-11-10**) pointing to a **GSMArena.com** article about leaked dummy model"
+news_ign_achievements,1,nvidia/nemotron-3-ultra-550b-a55b:free,200,4706,news_search;url_fetch,Nvidia,stop,stop,True,1108,1,0,0,0,,True,1.06,,,,
+control_lookup,1,nvidia/nemotron-3-ultra-550b-a55b:free,200,2084,web_search;url_fetch,Nvidia,stop,stop,True,620,1,0,0,0,,True,1.02,,,,
