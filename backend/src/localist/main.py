@@ -156,6 +156,7 @@ from .controller_agent import ControllerAgent, TaskStatus, _MEMORY_MD_PATH
 from .conversational_agent import ConversationalAgent
 from . import github_watch
 from . import hacker_news
+from . import log_file
 from .mcp_server.ocr import get_upload_root as _ocr_upload_root
 from .mcp_server.ocr import OCR_MIME_BY_EXTENSION as _OCR_MIME_BY_EXTENSION
 from .mcp_server.file_ops import write_file as _write_generated_file
@@ -825,6 +826,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         format  = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
         datefmt = "%H:%M:%S",
     )
+    # basicConfig is a no-op when the packaged launcher already installed
+    # its file handler (§7.30) — apply the configured level in that case.
+    log_file.apply_configured_level(getattr(logging, settings.log_level.upper(), logging.INFO))
     # The MCP SDK's SSE transport logs every raw JSON-RPC message (full tool
     # schemas, full results) at DEBUG — useless noise even under
     # LOCALIST_LOG_LEVEL=DEBUG. Keep warnings/errors from it, drop the rest.
@@ -3789,6 +3793,71 @@ def _mcp_restart_hint() -> str:
     if getattr(sys, "frozen", False):
         return "Quit and reopen Localist for the new key(s) to take effect in chat."
     return "Restart localist-mcp (./start_localist.sh) for the new key(s) to take effect."
+
+
+# ---------------------------------------------------------------------------
+# Log files — Settings "Show logs" (§7.30)
+# ---------------------------------------------------------------------------
+
+class LogFileInfo(BaseModel):
+    name:     str
+    size:     int
+    modified: str
+
+
+class LogsStatusResponse(BaseModel):
+    enabled: bool            = Field(description="True when this backend writes a log file (packaged app only).")
+    dir:     str             = Field(description="Log folder, with the home folder shown as ~.")
+    files:   list[LogFileInfo]
+
+
+def _logs_dir() -> Path:
+    return log_file.active_log_dir() or log_file.default_log_dir()
+
+
+def _display_path(p: Path) -> str:
+    home = str(Path.home())
+    s = str(p)
+    return "~" + s[len(home):] if s == home or s.startswith(home + os.sep) else s
+
+
+@app.get(
+    "/settings/logs",
+    response_model = LogsStatusResponse,
+    summary        = "Where log files are written, and which exist",
+)
+async def get_logs_status() -> LogsStatusResponse:
+    """
+    The packaged app writes backend.log / mcp.log / app.log to
+    ~/Library/Logs/Localist (§7.30). Running from source writes no log
+    file (enabled=False), but files left by the desktop app are still
+    listed.
+    """
+    d = _logs_dir()
+    return LogsStatusResponse(
+        enabled = log_file.active_log_dir() is not None,
+        dir     = _display_path(d),
+        files   = [LogFileInfo(**f) for f in log_file.list_log_files(d)],
+    )
+
+
+@app.post(
+    "/settings/logs/open",
+    summary = "Open the log folder in Finder",
+)
+async def open_logs_folder() -> dict[str, Any]:
+    if sys.platform != "darwin":
+        raise HTTPException(status_code=501, detail="Opening the log folder is only supported on macOS.")
+    d = _logs_dir()
+    if not d.is_dir():
+        raise HTTPException(status_code=404, detail="No log files yet.")
+    proc = await asyncio.create_subprocess_exec(
+        "open", str(d),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    if await proc.wait() != 0:
+        raise HTTPException(status_code=500, detail="Couldn't open the log folder.")
+    return {"opened": True, "dir": _display_path(d)}
 
 
 @app.get(

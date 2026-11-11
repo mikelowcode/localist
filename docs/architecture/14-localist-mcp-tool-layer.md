@@ -1174,6 +1174,9 @@ before being attached as `SearchResult.extra` — see §14.2's result-formatting
 update. Previously unbounded (subject only to NewsAPI dev-tier's own
 truncation and Slot 5's now-larger 1,500-token ceiling).
 
+**Update (2026-11-11):** exact-match pinning silently missed, and the clicked article was never
+fetched. Matching is now looser, and the dispatcher fetches the clicked URL directly. See §14.19.
+
 ### 14.11 `github_search` / `github_read` Tools — Public-Repo Crawl (2026-07-29)
 
 A seventh and eighth MCP tool (`mcp_server/github.py`), scoped to let Localist read public GitHub repos
@@ -1783,3 +1786,58 @@ after saving the real token through the endpoint, the same process returned real
 (frozen sidecars, `LOCALIST_BACKEND_ROOT` pointed at a scratch folder, real `.env` files and DB unchanged)
 gave the same result with the same sidecar PID. A fake token and a malformed token were both refused, the
 feed returned real data, and with the sidecar killed a save returned the "Quit and reopen Localist" hint.
+
+### 14.19 Live Feed "Tell me more" Reads the Clicked Article (2026-11-11)
+
+**Problem.** Clicking a Live Feed story about GTA VI on Xbox Cloud Gaming (The Verge) got no article
+text to the model on any backend. oMLX answered that it couldn't find the story. Three things went
+wrong:
+- **The pin missed.** `news_search` pins only on an exact URL match. NewsAPI's `/v2/everything` search
+  on the headline returned just one, newer result: a Slashdot "firehose" repost. The pin silently fell
+  back to the unfiltered results (§14.10).
+- **The wrong page was fetched.** Enrichment (`_enrich_top_result`) fetches the first URL in the search
+  result. Here that was the Slashdot link, which returned 403. The clicked Verge URL was never fetched,
+  although Localist's fetcher retrieves it fine (432 words).
+- **NewsAPI's links can be HTML-escaped.** The Slashdot URL came back with `&amp;` in place of `&`.
+
+Found while investigating that day's OpenRouter junk replies (§4.6.2). Report:
+`diagnostics/reports/openrouter_news_feed_garbage_2026-11-11.md`.
+
+**Fix in `mcp_server/news_search.py`.**
+- `_normalize_article_url()` decides whether two URLs are the same article. It ignores the scheme, a
+  leading `www.`, host case, a trailing `/`, the `#fragment` and `utm_*` parameters. It keeps other
+  query parameters, because some sites identify the article by them (`?id=…`).
+- `_clean_url()` runs `html.unescape` on every NewsAPI URL before it's shown or matched.
+- **Pin miss.** When `url` is given but not matched, `result_text` opens with `_PIN_MISS_NOTE`. It says
+  the selected article wasn't among the results and that they're other reports on the same story.
+  Without the note the model reads another outlet's copy as the clicked article.
+- The response gains a `pinned` boolean.
+
+**Fix in `MCPToolDispatcher._run_news_search`.**
+- When `context["news_article_url"]` is set, `_fetch_pinned_article()` fetches that URL directly,
+  whether or not NewsAPI returned it.
+- Its result is the enrichment on whichever tier answers: NewsAPI, or the Brave fallback after a
+  NewsAPI miss.
+- Search-result enrichment runs only if that fetch fails. The clicked URL goes into `tried_urls` either
+  way, so the pin-miss note (which quotes it) can't lead to fetching it twice.
+- Excerpt clipping is shared with `_enrich_top_result` (`_clip_enrichment`).
+- The fetch goes through `_run_url_fetch`, so the §14.16 Ollama fallback still applies. It uses no
+  NewsAPI quota.
+
+**Tests.** `test_mcp_server.py`:
+- the normalised-match cases
+- `?id=` still distinguishes articles
+- the pin-miss note and `&amp;` clean-up
+
+`test_mcp_tool_dispatcher.py::TestNewsSearchPinnedArticleFetch`:
+- the clicked URL is fetched instead of the copy
+- fallback when that fetch fails, with no second fetch
+- the fetch also happens on the Brave-fallback path
+- an entity-escaped clicked URL is unescaped
+
+2026 → 2037 tests.
+
+**Live.** The real dispatcher ran against this code's localist-mcp on a spare port (8013). NewsAPI
+again returned only the Slashdot copy. The result now opened with the pin-miss note, the Slashdot link
+read `&id=`, and the second tool result was the Verge article itself. No model requests were used.
+

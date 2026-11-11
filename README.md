@@ -115,6 +115,8 @@ keyword-only retrieval are unaffected either way, on both source and packaged in
 (build the `.app`). No first-run config UX yet — a fresh build defaults to the unreachable `omlx`
 runtime backend, same as an unconfigured source install.
 
+The packaged app writes its logs to `~/Library/Logs/Localist/` (Settings → Logs → **Show logs**).
+
 **Unsigned build — Gatekeeper will flag it.** There's no Apple Developer ID certificate behind
 this build, so macOS treats `Localist.app`/the `.dmg` as from an unidentified developer. After
 dragging `Localist.app` to Applications (or wherever you keep it), run this once from Terminal:
@@ -277,6 +279,8 @@ Tests are organized by phase (memory substrate, routing, controller dispatch, ex
 - ✅ **Embeddings stay local with a hosted chat model** (v0.1.6) — while OpenRouter handles chat, memory and document search still embed on your Mac through Ollama. If Ollama isn't running, the chat view says so and search uses keyword matching until it starts, then switches back by itself.
 - ✅ Fixes (v0.1.6): clear messages in the chat view when a free model is busy at its provider, the daily or per-minute free limit is reached, or the OpenRouter key is missing or rejected.
 - ✅ **Garbled or empty replies are caught and retried** (v0.1.6) — some free hosted models sometimes end a reply after a few junk characters, return nothing, or say "Let me search for that…" and stop. Localist now spots these, clears them from the chat, and asks the model once more; if the second reply is also unusable, you get a short "couldn't answer — please ask again" message instead of the junk. Each saved answer also records which model wrote it, why the reply ended and how many tokens it used.
+- ✅ **"Tell me more" reads the story you clicked** (v0.1.6) — a News Feed story now always gets its own article fetched, even when the news search only turns up another site's copy of it. If the search results are other outlets' reports, the model is told so.
+- ✅ **Log files for the desktop app** (v0.1.6) — the backend, tools and app now keep size-capped logs in `~/Library/Logs/Localist/`, and Settings → Logs → **Show logs** opens the folder. Logs stay on your Mac; they include your questions and the pages fetched, never API keys.
 
 **Open**
 - ⬜ Native `.app`: first-run config UX (a fresh app defaults to unreachable `omlx`), code signing/notarization, `tauri build` auto-triggering the PyInstaller build

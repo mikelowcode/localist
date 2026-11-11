@@ -24,8 +24,10 @@ inherit backend/main.py's own load_dotenv() call.
 
 from __future__ import annotations
 
+import html
 import logging
 import os
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
 
@@ -37,6 +39,42 @@ _NEWSAPI_ENDPOINT: str = "https://newsapi.org/v2/everything"
 _NEWSAPI_PAGE_SIZE: int = 5
 _NEWSAPI_SUMMARY_CHARS: int = 600
 _NEWSAPI_CONTENT_CHARS: int = 500
+
+# Shown above the results when a caller pinned a URL that NewsAPI didn't
+# return (2026-11-11): without it the model reads another outlet's copy —
+# e.g. a Slashdot "firehose" repost of a Verge story — as the clicked
+# article itself. The dispatcher fetches the clicked URL directly (§14.19).
+_PIN_MISS_NOTE: str = (
+    "Note: the article the user selected ({url}) was not among these "
+    "results; they are other reports on the same story."
+)
+
+
+def _clean_url(url: str) -> str:
+    """NewsAPI sometimes returns HTML-escaped URLs (``&amp;`` for ``&``) —
+    seen live on a Slashdot firehose link, which then 403'd when fetched."""
+    return html.unescape((url or "").strip())
+
+
+def _normalize_article_url(url: str) -> str:
+    """
+    Comparison key for URL pinning. Two links to the same article often
+    differ only cosmetically, so exact string equality silently dropped the
+    pin. Ignored: scheme, a leading ``www.``, host case, a trailing ``/``,
+    the ``#fragment``, and ``utm_*`` tracking parameters. Other query
+    parameters are kept — some sites identify the article by them
+    (``?id=…``).
+    """
+    parts = urlsplit(_clean_url(url))
+    host = parts.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = parts.path.rstrip("/")
+    query = urlencode([
+        (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if not k.lower().startswith("utm_")
+    ])
+    return f"{host}{path}?{query}" if query else f"{host}{path}"
 
 
 async def news_search(query: str, url: str | None = None) -> dict:
@@ -50,9 +88,13 @@ async def news_search(query: str, url: str | None = None) -> dict:
             the user clicked a specific story in the Live Feed panel), pass
             its URL to pin the result to that one article rather than
             trusting the query text to find it again among near-duplicate
-            coverage. If none of the returned articles match, falls back to
-            the normal unfiltered top-5 behavior — an older clicked article
-            may simply be outside NewsAPI dev-tier's last-month window.
+            coverage. Matching ignores cosmetic differences (see
+            _normalize_article_url). If none of the returned articles match,
+            falls back to the normal unfiltered top-5 behavior — an older
+            clicked article may simply be outside NewsAPI dev-tier's
+            last-month window, or NewsAPI may only return another outlet's
+            copy — prefixed with a note saying so (_PIN_MISS_NOTE). The
+            dispatcher fetches the clicked URL itself either way (§14.19).
 
     Returns
     -------
@@ -62,6 +104,7 @@ async def news_search(query: str, url: str | None = None) -> dict:
                      results (caller decides what "no results" means —
                      see is_miss below)
       result_count : number of articles returned
+      pinned       : True when ``url`` was given and matched a result.
       is_miss      : True when NewsAPI itself reports no usable result
                      (status != "ok", or totalResults == 0) — the precise
                      "fall through to Brave" trigger condition from §4.1.
@@ -115,7 +158,11 @@ async def news_search(query: str, url: str | None = None) -> dict:
     # model would have no way to tell which one the user actually clicked.
     pinned = False
     if url:
-        matched = [a for a in articles if (a.get("url") or "").strip() == url]
+        wanted = _normalize_article_url(url)
+        matched = [
+            a for a in articles
+            if _normalize_article_url(a.get("url") or "") == wanted
+        ]
         if matched:
             articles = matched
             pinned = True
@@ -126,7 +173,7 @@ async def news_search(query: str, url: str | None = None) -> dict:
         description  = (article.get("description") or "").strip()
         source_name  = article.get("source", {}).get("name", "").strip()
         published_at = article.get("publishedAt", "").strip().split("T", 1)[0]
-        article_url  = article.get("url", "").strip()
+        article_url  = _clean_url(article.get("url") or "")
 
         # `content` is NewsAPI's own short body snippet (also truncated on
         # the dev tier) — surfaced only in the pinned single-article case
@@ -149,8 +196,16 @@ async def news_search(query: str, url: str | None = None) -> dict:
     result_text = search_format.format_results(
         results, per_result_budget=_NEWSAPI_SUMMARY_CHARS
     )
+    if url and not pinned:
+        result_text = _PIN_MISS_NOTE.format(url=_clean_url(url)) + "\n\n" + result_text
     logger.info(
-        "news_search: NewsAPI complete for query=%r results=%d result_chars=%d.",
-        query, len(articles), len(result_text),
+        "news_search: NewsAPI complete for query=%r results=%d result_chars=%d pinned=%s.",
+        query, len(articles), len(result_text), pinned if url else "n/a",
     )
-    return {"query": query, "result_text": result_text, "result_count": len(articles), "is_miss": False}
+    return {
+        "query":        query,
+        "result_text":  result_text,
+        "result_count": len(articles),
+        "is_miss":      False,
+        "pinned":       pinned,
+    }

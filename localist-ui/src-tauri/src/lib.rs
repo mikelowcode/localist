@@ -13,18 +13,39 @@
 // JSON; Tauri's capability system only gates what the webview can invoke
 // over IPC.
 
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
 use tauri::path::BaseDirectory;
 use tauri::Manager;
+use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
+
+// One folder for every log the desktop app produces (§7.30): this shell's
+// app.log, plus the sidecars' backend.log / mcp.log (written by the Python
+// side — backend/src/localist/log_file.py — which is told this same path
+// via LOCALIST_LOG_DIR). Settings → "Show logs" opens it.
+const LOG_MAX_BYTES: u128 = 5 * 1024 * 1024;
+const LOG_KEEP_FILES: usize = 3;
+
+fn log_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+    app.path()
+        .home_dir()
+        .ok()
+        .map(|home| home.join("Library").join("Logs").join("Localist"))
+}
 
 struct Sidecars {
     backend: Option<Child>,
     mcp: Option<Child>,
 }
 
-fn spawn_sidecar(app: &tauri::AppHandle, resource_relative: &str, label: &str) -> Option<Child> {
+fn spawn_sidecar(
+    app: &tauri::AppHandle,
+    resource_relative: &str,
+    label: &str,
+    log_dir: Option<&Path>,
+) -> Option<Child> {
     let path = match app.path().resolve(resource_relative, BaseDirectory::Resource) {
         Ok(p) => p,
         Err(e) => {
@@ -43,12 +64,17 @@ fn spawn_sidecar(app: &tauri::AppHandle, resource_relative: &str, label: &str) -
     // corpus (near-zero startup output) didn't trigger it either way. Null
     // stdio removes the inherited-fd variable entirely rather than relying
     // on this process always having a well-behaved stdout/stderr to give.
-    match Command::new(&path)
+    // Logging still reaches disk: each sidecar writes its own rotating log
+    // file (see log_dir above) rather than through these fds.
+    let mut command = Command::new(&path);
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    if let Some(dir) = log_dir {
+        command.env("LOCALIST_LOG_DIR", dir);
+    }
+    match command.spawn() {
         Ok(child) => {
             log::info!("{label}: started (pid {})", child.id());
             Some(child)
@@ -70,23 +96,41 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
+            // Release builds log too (§7.30) — before this, a sidecar that
+            // failed to start left no trace anywhere.
+            let logs = log_dir(app.handle());
+            let mut targets = Vec::new();
+            if let Some(dir) = &logs {
+                targets.push(Target::new(TargetKind::Folder {
+                    path: dir.clone(),
+                    file_name: Some("app".into()),
+                }));
             }
+            if cfg!(debug_assertions) {
+                targets.push(Target::new(TargetKind::Stdout));
+            }
+            app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .clear_targets()
+                    .targets(targets)
+                    .level(log::LevelFilter::Info)
+                    .max_file_size(LOG_MAX_BYTES)
+                    .rotation_strategy(RotationStrategy::KeepSome(LOG_KEEP_FILES))
+                    .build(),
+            )?;
+            log::info!("Localist {} starting", app.package_info().version);
 
             let backend = spawn_sidecar(
                 app.handle(),
                 "localist-backend/localist-backend",
                 "localist-backend",
+                logs.as_deref(),
             );
             let mcp = spawn_sidecar(
                 app.handle(),
                 "localist-mcp/localist-mcp",
                 "localist-mcp",
+                logs.as_deref(),
             );
             app.manage(Mutex::new(Sidecars { backend, mcp }));
 

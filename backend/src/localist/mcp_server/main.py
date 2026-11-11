@@ -171,6 +171,10 @@ logging.basicConfig(
     format = "%(asctime)s  %(levelname)-8s  %(name)-20s  %(message)s",
     datefmt = "%H:%M:%S",
 )
+# No-op basicConfig when the packaged launcher already installed its file
+# handler (§7.30) — apply the configured level in that case.
+from ..log_file import apply_configured_level  # noqa: E402
+apply_configured_level(os.environ.get("LOCALIST_LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("localist-mcp")
 
 

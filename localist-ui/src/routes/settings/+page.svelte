@@ -99,6 +99,7 @@
     void backendReady().then(() => {
       loadRetentionSettings();
       loadMemoryStats();
+      loadLogsStatus();
       void loadNewsPreferences().then(() => {
         homeCountryInput = $newsPreferences.home_country;
         localQueryInput  = $newsPreferences.local_query ?? '';
@@ -118,6 +119,54 @@
   // blocks keyed on it don't re-run on every 15s health poll. Same signal
   // backendReady() waits on: never set by the startup grace running out.
   $: backendUp = $health.ever_ok;
+
+  // Log files (§7.30) — the packaged app writes backend.log / mcp.log /
+  // app.log to ~/Library/Logs/Localist; "Show logs" asks the backend to
+  // open that folder in Finder (works in the desktop app and the web UI).
+  type LogFileInfo = { name: string; size: number; modified: string };
+  let logsDir = '~/Library/Logs/Localist';
+  let logsEnabled = false;
+  let logFiles: LogFileInfo[] = [];
+  let logsError: string | null = null;
+  let logsOpening = false;
+
+  async function loadLogsStatus() {
+    try {
+      const res = await fetch(apiUrl('/settings/logs'));
+      if (!res.ok) return;
+      const data = await res.json();
+      logsDir = data.dir;
+      logsEnabled = Boolean(data.enabled);
+      logFiles = data.files ?? [];
+    } catch {
+      // Keep the defaults — the button still reports a real failure.
+    }
+  }
+
+  async function handleShowLogs() {
+    logsError = null;
+    logsOpening = true;
+    try {
+      const res = await fetch(apiUrl('/settings/logs/open'), { method: 'POST' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        logsError = data.detail ?? `Couldn't open the log folder (HTTP ${res.status}).`;
+      }
+      await loadLogsStatus();
+    } catch {
+      logsError = "Couldn't reach the backend.";
+    } finally {
+      logsOpening = false;
+    }
+  }
+
+  function formatBytes(n: number): string {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  $: currentLogFiles = logFiles.filter((f) => /^(backend|mcp|app)\.log$/.test(f.name));
 
   // Corpus/chat-history staleness — fetched once on mount and again after a
   // re-embed completes, so the badges reflect the server's current
@@ -1358,6 +1407,35 @@
       {/if}
       {#if $githubWatchPinsError}
         <p class="card-hint" style="color:var(--error)">{$githubWatchPinsError}</p>
+      {/if}
+    </section>
+
+    <!-- Logs -->
+    <section class="settings-card">
+      <div class="card-title">Logs</div>
+      <p class="card-desc">
+        The desktop app keeps a log of what the backend and tools did, for
+        troubleshooting. Logs stay on this Mac and include your questions
+        and the pages fetched, never API keys.
+      </p>
+      <div class="card-value text-mono">{logsDir}</div>
+      {#if currentLogFiles.length > 0}
+        <p class="card-hint">
+          {currentLogFiles.map((f) => `${f.name} (${formatBytes(f.size)})`).join(' · ')}
+        </p>
+      {:else if !logsEnabled}
+        <p class="card-hint">
+          Running from source: logs go to the terminal, not to files.
+        </p>
+      {/if}
+      <button
+        type="button"
+        class="seg-btn news-save-btn"
+        disabled={!backendUp || logsOpening}
+        on:click={handleShowLogs}
+      >Show logs</button>
+      {#if logsError}
+        <p class="card-hint" style="color:var(--error)">{logsError}</p>
       {/if}
     </section>
 

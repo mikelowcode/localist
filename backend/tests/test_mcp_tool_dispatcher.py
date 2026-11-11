@@ -1936,6 +1936,125 @@ class TestSearchEnrichment:
         assert results[0].workflow_id == results[1].workflow_id == results[2].workflow_id
 
 
+
+class TestNewsSearchPinnedArticleFetch:
+    """
+    §14.19 (2026-11-11): a Live Feed click passes context["news_article_url"],
+    and that URL is fetched directly whether or not NewsAPI returned it.
+    Live case: NewsAPI's only result for a Verge headline was a Slashdot
+    firehose copy (403 on fetch), so the clicked article never reached the
+    model.
+    """
+
+    _CLICKED = "https://www.theverge.com/news/1030714/gta-vi-xbox-cloud-gaming-support"
+    _COPY = "https://slashdot.org/firehose.pl?op=view&id=186678444"
+
+    def _news_hit(self, arguments, url):
+        return json.dumps({
+            "query": arguments["query"],
+            "result_text": f"• Headline — Slashdot.org — 2026-11-10\n  Short.\n  [{url}]",
+            "result_count": 1, "is_miss": False,
+        }), False
+
+    def test_clicked_url_fetched_instead_of_search_result_copy(self, dispatcher: MCPToolDispatcher):
+        fetches: list[str] = []
+
+        async def fake_call(session, name, arguments):
+            if name == "news_search":
+                assert arguments["url"] == self._CLICKED
+                return self._news_hit(arguments, self._COPY)
+            assert name == "fetch_url"
+            fetches.append(arguments["url"])
+            return _fetch_url_ok(arguments["url"], "Rockstar Games is making GTA VI available.")
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["news_search"], instruction = "Tell me more",
+                context       = {"web_search_queries": ["GTA VI"], "news_article_url": self._CLICKED},
+            )
+
+        assert fetches == [self._CLICKED]
+        assert [r.tool_name for r in results] == ["news_search", "url_fetch"]
+        assert "Rockstar Games" in results[1].result
+        assert results[0].workflow_id == results[1].workflow_id is not None
+
+    def test_failed_clicked_fetch_falls_back_to_search_result_enrichment(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        fetches: list[str] = []
+
+        async def fake_call(session, name, arguments):
+            if name == "news_search":
+                # The pin-miss note quotes the clicked URL first — it must
+                # not be retried as an ordinary enrichment candidate.
+                text, err = self._news_hit(arguments, self._COPY)
+                data = json.loads(text)
+                data["result_text"] = f"Note: ({self._CLICKED}) not found.\n\n" + data["result_text"]
+                return json.dumps(data), err
+            if name != "fetch_url":  # url_fetch's own Ollama fallback tier (§14.16)
+                return "Error executing tool: unavailable", True
+            fetches.append(arguments["url"])
+            if arguments["url"] == self._CLICKED:
+                return "Error executing tool fetch_url: ERROR: http_client_error — 403", True
+            return _fetch_url_ok(arguments["url"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["news_search"], instruction = "Tell me more",
+                context       = {"news_article_url": self._CLICKED},
+            )
+
+        assert fetches == [self._CLICKED, self._COPY]
+        assert [r.tool_name for r in results] == ["news_search", "url_fetch"]
+
+    def test_clicked_url_fetched_when_newsapi_misses_and_brave_runs(
+        self, dispatcher: MCPToolDispatcher
+    ):
+        fetches: list[str] = []
+
+        async def fake_call(session, name, arguments):
+            if name == "news_search":
+                return json.dumps({
+                    "query": arguments["query"], "result_text": "", "result_count": 0, "is_miss": True,
+                }), False
+            if name == "web_search":
+                return json.dumps({
+                    "query": arguments["query"],
+                    "result_text": "• Title — example.com\n  Snippet.\n  [https://example.com/b]",
+                    "result_count": 1,
+                }), False
+            fetches.append(arguments["url"])
+            return _fetch_url_ok(arguments["url"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["news_search"], instruction = "Tell me more",
+                context       = {"news_article_url": self._CLICKED},
+            )
+
+        assert fetches == [self._CLICKED]
+        assert [r.tool_name for r in results] == [
+            "news_search", "news_search:brave_fallback", "url_fetch",
+        ]
+
+    def test_clicked_url_html_entities_unescaped_before_fetch(self, dispatcher: MCPToolDispatcher):
+        fetches: list[str] = []
+
+        async def fake_call(session, name, arguments):
+            if name == "news_search":
+                return self._news_hit(arguments, "https://example.com/other")
+            fetches.append(arguments["url"])
+            return _fetch_url_ok(arguments["url"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            dispatcher.dispatch(
+                tools_to_call = ["news_search"], instruction = "Tell me more",
+                context       = {"news_article_url": "https://example.com/a?x=1&amp;y=2"},
+            )
+
+        assert fetches == ["https://example.com/a?x=1&y=2"]
+
+
 class TestChart:
     """
     Coverage for MCPToolDispatcher._run_chart and its extraction pipeline

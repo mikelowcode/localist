@@ -105,6 +105,19 @@ This is automated as a build step in `.github/workflows/release-macos.yml`
 ("Re-sign .app and rebuild DMG") — a local `tauri build` still needs this
 run manually afterward, same as before CI picked it up.
 
+## Logs
+
+The sidecars' stdout/stderr go to `/dev/null` on purpose (see `spawn_sidecar` in `src/lib.rs`), so
+logging goes to files instead, all in `~/Library/Logs/Localist/`:
+
+- `backend.log` and `mcp.log`, written by the frozen launchers (`backend/packaging/run_*.py`) through
+  `localist.log_file`
+- `app.log`, written by this shell's `tauri_plugin_log` in debug and release builds
+
+Each file rotates at 5 MB, keeping 3 old copies. The shell passes the folder to both sidecars as
+`LOCALIST_LOG_DIR`. Settings → Logs → **Show logs** opens it in Finder. The level comes from
+`LOCALIST_LOG_LEVEL` in the packaged `.env`. Details are in architecture §7.30.
+
 ## Releasing a new version
 
 No auto-update path exists yet — every release is a fresh manual

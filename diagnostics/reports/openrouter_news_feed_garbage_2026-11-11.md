@@ -63,6 +63,7 @@ Every request came back HTTP 200 from provider `Nvidia`, with `finish_reason` an
 - **Side finding, not fixed here.** For the Verge item, NewsAPI's pinned-URL match returned a Slashdot
   aggregator copy, so the URL fetch never got the article. That's why oMLX also answered that it
   couldn't find the story.
+  *Fixed later the same day (§14.19): the clicked article is now fetched directly.*
 
 ## 5. Later the same day (guard live smokes)
 

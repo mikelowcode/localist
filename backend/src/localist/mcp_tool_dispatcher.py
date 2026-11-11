@@ -149,6 +149,7 @@ loop addition (2026-07-16).
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -1067,13 +1068,42 @@ class MCPToolDispatcher:
                 )
                 continue
 
-            if len(fetch_result.result) > _ENRICH_EXCERPT_CHARS:
-                excerpt = fetch_result.result[:_ENRICH_EXCERPT_CHARS].rsplit(" ", 1)[0] + "…"
-                fetch_result = replace(fetch_result, result=excerpt)
-
-            return fetch_result
+            return self._clip_enrichment(fetch_result)
 
         return None
+
+    @staticmethod
+    def _clip_enrichment(fetch_result: ToolResult) -> ToolResult:
+        if len(fetch_result.result) > _ENRICH_EXCERPT_CHARS:
+            excerpt = fetch_result.result[:_ENRICH_EXCERPT_CHARS].rsplit(" ", 1)[0] + "…"
+            fetch_result = replace(fetch_result, result=excerpt)
+        return fetch_result
+
+    async def _fetch_pinned_article(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        url:           str,
+        tried_urls:    set[str],
+    ) -> ToolResult | None:
+        """
+        Fetch a caller-pinned article URL (§14.19) — same silent-fail and
+        excerpt-clipping contract as _enrich_top_result. The URL is added to
+        tried_urls either way, so a failed fetch isn't retried as an
+        ordinary enrichment candidate (news_search's pin-miss note quotes
+        it at the top of its result text).
+        """
+        url = html.unescape(url.strip())
+        tried_urls.add(url)
+        fetch_result = await self._run_url_fetch(session, connect_error, "", {"fetch_url": url})
+        if not fetch_result.success:
+            logger.info(
+                "MCPToolDispatcher: pinned article fetch failed for url=%r — "
+                "falling back to search-result enrichment (%s).",
+                url, fetch_result.result,
+            )
+            return None
+        return self._clip_enrichment(fetch_result)
 
     async def _run_web_search(
         self,
@@ -1382,6 +1412,13 @@ class MCPToolDispatcher:
         pinned article's own URL is already in news_result.result, so
         enrichment fetches that same article's full text on top of
         NewsAPI's own short `content` field.
+
+        §14.19 (2026-11-11): when context["news_article_url"] is set, that
+        URL is fetched directly (_fetch_pinned_article) and used as the
+        enrichment on whichever tier answers — NewsAPI doesn't always
+        return the clicked article, and its top result may be another
+        outlet's copy. Search-result enrichment runs only if that fetch
+        fails.
         """
         query = self._derive_initial_query(instruction, context)
         article_url = context.get("news_article_url") or None
@@ -1389,8 +1426,22 @@ class MCPToolDispatcher:
         tried_urls: set[str] = set()
         results: list[ToolResult] = [news_result]
 
+        # §14.19 (2026-11-11): a caller-supplied article URL (Live Feed
+        # "Tell me more") is fetched directly, regardless of whether NewsAPI
+        # returned it — a NewsAPI search on the headline can surface only
+        # another outlet's copy (live: a 403-ing Slashdot repost of a Verge
+        # story), and enrichment's "first URL in the results" then never
+        # reaches the article the user actually clicked. Only when that
+        # fetch fails does the normal search-result enrichment run.
+        pinned_fetch = (
+            await self._fetch_pinned_article(session, connect_error, article_url, tried_urls)
+            if article_url else None
+        )
+
         if news_result.success:
-            enrichment = await self._enrich_top_result(session, connect_error, news_result, tried_urls)
+            enrichment = pinned_fetch or await self._enrich_top_result(
+                session, connect_error, news_result, tried_urls
+            )
             if enrichment is not None:
                 results.append(enrichment)
             if len(results) > 1:
@@ -1410,7 +1461,9 @@ class MCPToolDispatcher:
         brave_result = replace(brave_result, tool_name="news_search:brave_fallback")
         results.append(brave_result)
 
-        enrichment = await self._enrich_top_result(session, connect_error, brave_result, tried_urls)
+        enrichment = pinned_fetch or await self._enrich_top_result(
+            session, connect_error, brave_result, tried_urls
+        )
         if enrichment is not None:
             results.append(enrichment)
 

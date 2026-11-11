@@ -1461,3 +1461,72 @@ Phase 4 of the OpenRouter-backend plan; backend in §16.32–§16.34.
   - Key status configured.
   - Pinning Gemma 4 31B free and sending a message produced the "busy at its provider" error and
     `runtime_last_error.kind == "upstream_busy"`. Re-pinning Nemotron cleared it.
+
+### 7.30 Desktop Log Files and Settings → Logs (2026-11-11)
+
+**Problem.** Nothing the packaged app logged survived. The Tauri shell starts both frozen sidecars with
+stdout/stderr set to `/dev/null`. That was deliberate: inheriting LaunchServices' file descriptors
+crashed the backend at startup (`localist-ui/src-tauri/src/lib.rs`), and that choice is unchanged.
+`tauri_plugin_log` ran only in debug builds. Investigating the 2026-11-11 OpenRouter junk replies
+therefore needed a live diagnostic to learn what a log line would have said (§4.6.2).
+
+**Log folder.** Everything goes to `~/Library/Logs/Localist/`:
+
+| File | Written by | Rotation |
+|---|---|---|
+| `backend.log` | backend sidecar (`run_backend.py`) | 5 MB, `.1`–`.3` kept |
+| `mcp.log` | localist-mcp sidecar (`run_mcp_server.py`) | 5 MB, `.1`–`.3` kept |
+| `app.log` | Tauri shell (sidecar start/failure) | 5 MB, 3 dated `app_<date>.log` kept |
+
+The plugin's cleanup only touches its own `app_<date>.log` files, so it can share the folder with the
+sidecar logs.
+
+**Python side (`backend/src/localist/log_file.py`).**
+- `install_file_logging(name)` adds a `RotatingFileHandler` with full-date timestamps to the root
+  logger. It's idempotent, and returns `None` instead of raising when the folder can't be created.
+- **Folder.** The default is the folder above. `LOCALIST_LOG_DIR` overrides it, and the Tauri shell
+  sets it for both sidecars so the path is defined in one place.
+- **Called only by the frozen launchers,** before the app module is imported, so an import-time
+  failure in the bundle is logged too. `start_localist.sh` never calls it, so source runs still log
+  to the terminal.
+- **Uvicorn.** The launchers pass `log_config=None` and `access_log=False`. Uvicorn's own startup and
+  error lines then reach the file, and the UI's constant `/health` polling doesn't.
+- **Level.** A handler on the root logger makes each service's `basicConfig()` a no-op, including its
+  level. So `apply_configured_level()` sets the root level once the service has read `.env`. It does
+  nothing unless file logging is installed. A first version set it unconditionally, which made
+  importing `mcp_server.main` under pytest set the root logger to the dev `.env`'s DEBUG and broke 5
+  `caplog` tests.
+- **Noisy loggers held at INFO.** These are `sse_starlette`, `httpcore`, `mcp.client.sse`,
+  `mcp.server.sse` and `readability`. The packaged `.env` sets `LOCALIST_LOG_LEVEL=DEBUG`. Measured
+  live at DEBUG, one news lookup wrote about 35 KB, almost all of it `readability`'s node-scoring
+  trace and `mcp.server.sse`'s raw JSON-RPC dumps (full article text).
+
+**Tauri side (`lib.rs`).**
+- `tauri_plugin_log` now runs in release builds too, with a `Folder` target for `app.log` (plus
+  stdout in debug), 5 MB files and `KeepSome(3)`.
+- `spawn_sidecar` passes `LOCALIST_LOG_DIR` to both sidecars.
+
+**Settings → Logs card.**
+- Shows the folder (`~` for home), the current `backend.log`/`mcp.log`/`app.log` sizes, and a
+  **Show logs** button.
+- Explains that logs stay on the Mac and include questions and fetched pages, never API keys.
+- Running from source, it notes that logs go to the terminal.
+- **Endpoints.** `GET /settings/logs` returns `enabled` (whether this backend writes a file), `dir` and
+  `files`. `POST /settings/logs/open` runs `open <dir>`. It returns 404 "No log files yet." if the
+  folder doesn't exist, and 501 off macOS.
+- **Why a backend endpoint rather than the Tauri opener.** The same button then works in the browser
+  dev UI, and no path-scoped opener capability is needed.
+
+**Verified.**
+- `test_log_file.py`, 20 tests: handler, rotation settings, idempotence, unwritable folder, level
+  rules, file listing and the endpoints. Full suite 2037 → 2057.
+- `npm run check` clean, `cargo check` clean.
+- **Live, localist-mcp.** The real `run_mcp_server.py` ran from source on port 8013 with
+  `LOCALIST_LOG_DIR` set to a scratch folder. It wrote nothing to stdout. `mcp.log` held uvicorn's
+  startup lines, the NewsAPI request and the article fetch. None of the six configured keys appeared
+  in it.
+- **Live, backend.** `run_backend.py` created `backend.log` before the app loaded. It wasn't started
+  on 8001, because the installed app was running there.
+- **Not verified:** a packaged `.app` build (`app.log`, and Show logs opening Finder), which needs the
+  next release build.
+

@@ -858,6 +858,62 @@ class TestNewsSearchFormat:
 
         assert "This should not appear" not in result["result_text"]
 
+    def _article(self, url: str, title: str = "Story") -> dict:
+        return {
+            "title": title, "description": "Desc.", "source": {"name": "Src"},
+            "publishedAt": "2026-11-10T14:37:09Z", "url": url, "content": "Pinned body.",
+        }
+
+    @pytest.mark.parametrize("clicked,returned", [
+        ("https://www.theverge.com/news/1/x", "https://theverge.com/news/1/x/"),
+        ("http://example.com/a#comments", "https://example.com/a"),
+        ("https://example.com/a?utm_source=feed&id=7", "https://Example.com/a?id=7"),
+        ("https://example.com/a?x=1&amp;y=2", "https://example.com/a?x=1&y=2"),
+    ])
+    def test_pin_matches_cosmetically_different_urls(self, monkeypatch, clicked, returned):
+        monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
+        articles = [self._article("https://other.com/copy", "Copy"), self._article(returned)]
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=_newsapi_response(articles))):
+            result = asyncio.run(news_search.news_search("story", url=clicked))
+
+        assert result["pinned"] is True
+        assert result["result_count"] == 1
+        assert "other.com" not in result["result_text"]
+        assert result["result_text"].endswith("Pinned body.")
+
+    def test_pin_keeps_distinguishing_query_params(self, monkeypatch):
+        monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
+        articles = [self._article("https://slashdot.org/firehose.pl?op=view&id=2")]
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=_newsapi_response(articles))):
+            result = asyncio.run(news_search.news_search(
+                "story", url="https://slashdot.org/firehose.pl?op=view&id=1"))
+
+        assert result["pinned"] is False
+
+    def test_pin_miss_prefixes_note_naming_clicked_article(self, monkeypatch):
+        monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
+        clicked = "https://www.theverge.com/news/1030714/gta-vi"
+        articles = [self._article("https://slashdot.org/firehose.pl?op=view&amp;id=186678444", "Copy")]
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=_newsapi_response(articles))):
+            result = asyncio.run(news_search.news_search("gta vi", url=clicked))
+
+        text = result["result_text"]
+        assert result["pinned"] is False
+        assert text.startswith(f"Note: the article the user selected ({clicked}) was not among these results")
+        assert "Pinned body." not in text  # unpinned → no content line
+        # NewsAPI's HTML-escaped URL is cleaned before it's shown or fetched.
+        assert "[https://slashdot.org/firehose.pl?op=view&id=186678444]" in text
+        assert "&amp;" not in text
+
+    def test_no_note_without_pinned_url(self, monkeypatch):
+        monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
+        articles = [self._article("https://example.com/a")]
+        with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=_newsapi_response(articles))):
+            result = asyncio.run(news_search.news_search("story"))
+
+        assert result["pinned"] is False
+        assert not result["result_text"].startswith("Note:")
+
     def test_miss_returns_empty_result_text(self, monkeypatch):
         monkeypatch.setenv("NEWSAPI_API_KEY", "test-key")
         response = _newsapi_response([], total_results=0)
