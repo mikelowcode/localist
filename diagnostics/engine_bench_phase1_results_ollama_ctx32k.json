@@ -1,0 +1,469 @@
+{
+  "meta": {
+    "timestamp": "2026-11-12T13:22:22",
+    "machine": {
+      "ram_gb": 24,
+      "cpu": "Apple M6",
+      "macos": "27.0.1"
+    },
+    "ollama_version": "ollama version is 0.40.16",
+    "localist_backend_running": true,
+    "sizes": [
+      2000,
+      8000,
+      16000,
+      30000
+    ],
+    "trials": 3,
+    "max_output_tokens": 256,
+    "temperature": 0.2,
+    "ollama_num_ctx": 32768
+  },
+  "runs": [
+    {
+      "engine": "ollama_ctx32768",
+      "model": "gemma4:12b-mlx",
+      "load_info": {
+        "reported_size_gb": 7.8,
+        "reported_size_vram_gb": 7.8,
+        "context_length": 32768
+      },
+      "unloaded_baseline": {
+        "engine_footprint_mb": 18.0,
+        "sys_used_gb": 6.244,
+        "memorystatus_free_pct": 88
+      },
+      "loaded_idle": {
+        "engine_footprint_mb": 7676.0,
+        "sys_used_gb": 14.535,
+        "memorystatus_free_pct": 58
+      },
+      "load_wall_s": 2.57,
+      "load_engine_reported_s": 1.925,
+      "load_swapouts": 0,
+      "chars_per_token": 3.728,
+      "trials": [
+        {
+          "engine": "ollama_ctx32768",
+          "target_tokens": 2000,
+          "trial": 1,
+          "pre": {
+            "engine_footprint_mb": 8426.0,
+            "sys_used_gb": 15.284,
+            "memorystatus_free_pct": 55
+          },
+          "ttft_s": 2.88,
+          "total_s": 10.492,
+          "prompt_tokens": 1832,
+          "cached_tokens": null,
+          "prefill_s": 2.716,
+          "completion_tokens": 256,
+          "decode_s": 7.763,
+          "load_s": 0.001,
+          "thinking_chars": 0,
+          "reasoning_tokens": null,
+          "content_chars": 1307,
+          "finish_reason": "length",
+          "prefill_tok_s": 674.5,
+          "decode_tok_s": 32.98,
+          "ok": true,
+          "peak_engine_mb": 10258.0,
+          "peak_sys_used_gb": 17.64,
+          "min_free_pct": 50,
+          "retained": {
+            "engine_footprint_mb": 9105.0,
+            "sys_used_gb": 16.084,
+            "memorystatus_free_pct": 57
+          },
+          "swapins_delta": 20,
+          "swapouts_delta": 0
+        },
+        {
+          "engine": "ollama_ctx32768",
+          "target_tokens": 2000,
+          "trial": 2,
+          "pre": {
+            "engine_footprint_mb": 9105.0,
+            "sys_used_gb": 16.084,
+            "memorystatus_free_pct": 57
+          },
+          "ttft_s": 2.995,
+          "total_s": 10.624,
+          "prompt_tokens": 1890,
+          "cached_tokens": null,
+          "prefill_s": 2.821,
+          "completion_tokens": 256,
+          "decode_s": 7.789,
+          "load_s": 0.001,
+          "thinking_chars": 0,
+          "reasoning_tokens": null,
+          "content_chars": 1326,
+          "finish_reason": "length",
+          "prefill_tok_s": 670.0,
+          "decode_tok_s": 32.87,
+          "ok": true,
+          "peak_engine_mb": 11282.0,
+          "peak_sys_used_gb": 18.021,
+          "min_free_pct": 50,
+          "retained": {
+            "engine_footprint_mb": 9780.0,
+            "sys_used_gb": 16.469,
+            "memorystatus_free_pct": 58
+          },
+          "swapins_delta": 28,
+          "swapouts_delta": 0
+        },
+        {
+          "engine": "ollama_ctx32768",
+          "target_tokens": 2000,
+          "trial": 3,
+          "pre": {
+            "engine_footprint_mb": 9780.0,
+            "sys_used_gb": 16.458,
+            "memorystatus_free_pct": 58
+          },
+          "ttft_s": 2.996,
+          "total_s": 10.339,
+          "prompt_tokens": 1888,
+          "cached_tokens": null,
+          "prefill_s": 2.815,
+          "completion_tokens": 256,
+          "decode_s": 7.512,
+          "load_s": 0.001,
+          "thinking_chars": 0,
+          "reasoning_tokens": null,
+          "content_chars": 1311,
+          "finish_reason": "length",
+          "prefill_tok_s": 670.7,
+          "decode_tok_s": 34.08,
+          "ok": true,
+          "peak_engine_mb": 12306.0,
+          "peak_sys_used_gb": 18.136,
+          "min_free_pct": 50,
+          "retained": {
+            "engine_footprint_mb": 10258.0,
+            "sys_used_gb": 16.326,
+            "memorystatus_free_pct": 58
+          },
+          "swapins_delta": 16,
+          "swapouts_delta": 0
+        },
+        {
+          "engine": "ollama_ctx32768",
+          "target_tokens": 8000,
+          "trial": 1,
+          "pre": {
+            "engine_footprint_mb": 10258.0,
+            "sys_used_gb": 16.326,
+            "memorystatus_free_pct": 58
+          },
+          "ttft_s": 12.702,
+          "total_s": 20.973,
+          "prompt_tokens": 8008,
+          "cached_tokens": null,
+          "prefill_s": 12.465,
+          "completion_tokens": 256,
+          "decode_s": 8.477,
+          "load_s": 0.002,
+          "thinking_chars": 0,
+          "reasoning_tokens": null,
+          "content_chars": 1311,
+          "finish_reason": "length",
+          "prefill_tok_s": 642.4,
+          "decode_tok_s": 30.2,
+          "ok": true,
+          "peak_engine_mb": 13330.0,
+          "peak_sys_used_gb": 18.58,
+          "min_free_pct": 45,
+          "retained": {
+            "engine_footprint_mb": 11282.0,
+            "sys_used_gb": 15.851,
+            "memorystatus_free_pct": 58
+          },
+          "swapins_delta": 24,
+          "swapouts_delta": 0
+        },
+        {
+          "engine": "ollama_ctx32768",
+          "target_tokens": 8000,
+          "trial": 2,
+          "pre": {
+            "engine_footprint_mb": 11282.0,
+            "sys_used_gb": 15.838,
+            "memorystatus_free_pct": 58
+          },
+          "ttft_s": 11.935,
+          "total_s": 20.574,
+          "prompt_tokens": 7551,
+          "cached_tokens": null,
+          "prefill_s": 11.728,
+          "completion_tokens": 256,
+          "decode_s": 8.816,
+          "load_s": 0.005,
+          "thinking_chars": 0,
+          "reasoning_tokens": null,
+          "content_chars": 1313,
+          "finish_reason": "length",
+          "prefill_tok_s": 643.8,
+          "decode_tok_s": 29.04,
+          "ok": true,
+          "peak_engine_mb": 14355.0,
+          "peak_sys_used_gb": 18.217,
+          "min_free_pct": 48,
+          "retained": {
+            "engine_footprint_mb": 12307.0,
+            "sys_used_gb": 16.081,
+            "memorystatus_free_pct": 58
+          },
+          "swapins_delta": 108,
+          "swapouts_delta": 0
+        },
+        {
+          "engine": "ollama_ctx32768",
+          "target_tokens": 8000,
+          "trial": 3,
+          "pre": {
+            "engine_footprint_mb": 12307.0,
+            "sys_used_gb": 16.072,
+            "memorystatus_free_pct": 58
+          },
+          "ttft_s": 12.763,
+          "total_s": 21.345,
+          "prompt_tokens": 7934,
+          "cached_tokens": null,
+          "prefill_s": 12.531,
+          "completion_tokens": 256,
+          "decode_s": 8.782,
+          "load_s": 0.002,
+          "thinking_chars": 0,
+          "reasoning_tokens": null,
+          "content_chars": 1214,
+          "finish_reason": "length",
+          "prefill_tok_s": 633.1,
+          "decode_tok_s": 29.15,
+          "ok": true,
+          "peak_engine_mb": 15379.0,
+          "peak_sys_used_gb": 18.248,
+          "min_free_pct": 47,
+          "retained": {
+            "engine_footprint_mb": 12307.0,
+            "sys_used_gb": 15.946,
+            "memorystatus_free_pct": 58
+          },
+          "swapins_delta": 36,
+          "swapouts_delta": 0
+        },
+        {
+          "engine": "ollama_ctx32768",
+          "target_tokens": 16000,
+          "trial": 1,
+          "pre": {
+            "engine_footprint_mb": 12307.0,
+            "sys_used_gb": 15.934,
+            "memorystatus_free_pct": 58
+          },
+          "ttft_s": 35.164,
+          "total_s": 43.761,
+          "prompt_tokens": 19296,
+          "cached_tokens": null,
+          "prefill_s": 34.924,
+          "completion_tokens": 256,
+          "decode_s": 8.798,
+          "load_s": 0.003,
+          "thinking_chars": 0,
+          "reasoning_tokens": null,
+          "content_chars": 1377,
+          "finish_reason": "length",
+          "prefill_tok_s": 552.5,
+          "decode_tok_s": 29.1,
+          "ok": true,
+          "peak_engine_mb": 16403.0,
+          "peak_sys_used_gb": 18.537,
+          "min_free_pct": 47,
+          "retained": {
+            "engine_footprint_mb": 14355.0,
+            "sys_used_gb": 16.009,
+            "memorystatus_free_pct": 58
+          },
+          "swapins_delta": 140,
+          "swapouts_delta": 0
+        },
+        {
+          "engine": "ollama_ctx32768",
+          "target_tokens": 16000,
+          "trial": 2,
+          "pre": {
+            "engine_footprint_mb": 14355.0,
+            "sys_used_gb": 15.998,
+            "memorystatus_free_pct": 58
+          },
+          "ttft_s": 24.803,
+          "total_s": 34.474,
+          "prompt_tokens": 14602,
+          "cached_tokens": null,
+          "prefill_s": 24.648,
+          "completion_tokens": 256,
+          "decode_s": 9.785,
+          "load_s": 0.003,
+          "thinking_chars": 0,
+          "reasoning_tokens": null,
+          "content_chars": 1359,
+          "finish_reason": "length",
+          "prefill_tok_s": 592.4,
+          "decode_tok_s": 26.16,
+          "ok": true,
+          "peak_engine_mb": 16402.0,
+          "peak_sys_used_gb": 18.25,
+          "min_free_pct": 49,
+          "retained": {
+            "engine_footprint_mb": 15378.0,
+            "sys_used_gb": 16.516,
+            "memorystatus_free_pct": 58
+          },
+          "swapins_delta": 32,
+          "swapouts_delta": 0
+        },
+        {
+          "engine": "ollama_ctx32768",
+          "target_tokens": 16000,
+          "trial": 3,
+          "pre": {
+            "engine_footprint_mb": 15378.0,
+            "sys_used_gb": 16.514,
+            "memorystatus_free_pct": 58
+          },
+          "ttft_s": 25.105,
+          "total_s": 34.363,
+          "prompt_tokens": 14694,
+          "cached_tokens": null,
+          "prefill_s": 24.932,
+          "completion_tokens": 256,
+          "decode_s": 9.391,
+          "load_s": 0.003,
+          "thinking_chars": 0,
+          "reasoning_tokens": null,
+          "content_chars": 1236,
+          "finish_reason": "length",
+          "prefill_tok_s": 589.4,
+          "decode_tok_s": 27.26,
+          "ok": true,
+          "peak_engine_mb": 17426.0,
+          "peak_sys_used_gb": 17.922,
+          "min_free_pct": 20,
+          "retained": {
+            "engine_footprint_mb": 16402.0,
+            "sys_used_gb": 13.084,
+            "memorystatus_free_pct": 32
+          },
+          "swapins_delta": 3590,
+          "swapouts_delta": 39227
+        },
+        {
+          "engine": "ollama_ctx32768",
+          "target_tokens": 30000,
+          "trial": 1,
+          "pre": {
+            "engine_footprint_mb": 16402.0,
+            "sys_used_gb": 13.072,
+            "memorystatus_free_pct": 32
+          },
+          "ttft_s": 53.465,
+          "total_s": 63.103,
+          "prompt_tokens": 27650,
+          "cached_tokens": null,
+          "prefill_s": 53.066,
+          "completion_tokens": 256,
+          "decode_s": 9.977,
+          "load_s": 0.008,
+          "thinking_chars": 0,
+          "reasoning_tokens": null,
+          "content_chars": 1190,
+          "finish_reason": "length",
+          "prefill_tok_s": 521.0,
+          "decode_tok_s": 25.66,
+          "ok": true,
+          "peak_engine_mb": 19474.0,
+          "peak_sys_used_gb": 14.771,
+          "min_free_pct": 20,
+          "retained": {
+            "engine_footprint_mb": 16402.0,
+            "sys_used_gb": 12.932,
+            "memorystatus_free_pct": 31
+          },
+          "swapins_delta": 23182,
+          "swapouts_delta": 80988
+        },
+        {
+          "engine": "ollama_ctx32768",
+          "target_tokens": 30000,
+          "trial": 2,
+          "pre": {
+            "engine_footprint_mb": 16402.0,
+            "sys_used_gb": 12.922,
+            "memorystatus_free_pct": 31
+          },
+          "ttft_s": 51.109,
+          "total_s": 61.323,
+          "prompt_tokens": 27381,
+          "cached_tokens": null,
+          "prefill_s": 50.214,
+          "completion_tokens": 256,
+          "decode_s": 11.05,
+          "load_s": 0.005,
+          "thinking_chars": 0,
+          "reasoning_tokens": null,
+          "content_chars": 1317,
+          "finish_reason": "length",
+          "prefill_tok_s": 545.3,
+          "decode_tok_s": 23.17,
+          "ok": true,
+          "peak_engine_mb": 19475.0,
+          "peak_sys_used_gb": 14.652,
+          "min_free_pct": 20,
+          "retained": {
+            "engine_footprint_mb": 16403.0,
+            "sys_used_gb": 13.208,
+            "memorystatus_free_pct": 31
+          },
+          "swapins_delta": 18113,
+          "swapouts_delta": 69288
+        },
+        {
+          "engine": "ollama_ctx32768",
+          "target_tokens": 30000,
+          "trial": 3,
+          "pre": {
+            "engine_footprint_mb": 16403.0,
+            "sys_used_gb": 13.197,
+            "memorystatus_free_pct": 31
+          },
+          "ttft_s": 51.61,
+          "total_s": 60.003,
+          "prompt_tokens": 27969,
+          "cached_tokens": null,
+          "prefill_s": 51.163,
+          "completion_tokens": 256,
+          "decode_s": 8.782,
+          "load_s": 0.005,
+          "thinking_chars": 0,
+          "reasoning_tokens": null,
+          "content_chars": 1266,
+          "finish_reason": "length",
+          "prefill_tok_s": 546.7,
+          "decode_tok_s": 29.15,
+          "ok": true,
+          "peak_engine_mb": 19475.0,
+          "peak_sys_used_gb": 14.406,
+          "min_free_pct": 18,
+          "retained": {
+            "engine_footprint_mb": 16403.0,
+            "sys_used_gb": 12.695,
+            "memorystatus_free_pct": 33
+          },
+          "swapins_delta": 27574,
+          "swapouts_delta": 156800
+        }
+      ]
+    }
+  ]
+}

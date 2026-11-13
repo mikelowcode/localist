@@ -1016,7 +1016,7 @@ Both options are **superseded by the single-turn-request finding**, not rejected
 
 This contract is the canonical boundary between cached and per-turn content. It is enforced by an automated test (`tests/test_prompt_builder.py`, `test_pb_e_build_enforces_dynamic_suffix_slot_order`) so that any future change to slot order is a deliberate, reviewed decision rather than a silent regression.
 
-**Stable prefix** (system message, passed as `system=`): Slot 1a (identity) + Slot 1b (persona). Byte-identical for the lifetime of a session once persona is cached by `ControllerAgent._load_persona()` — **updated 2026-08-03:** and unchanged since the last assistant-name change, if any. Slot 1a's name is a user setting (`MemoryManager.get_assistant_name()`, default `"Localist"`, see Slot 1a above), not a true constant; changing it invalidates the persona cache (`ControllerAgent.invalidate_persona_cache()`) and forces a fresh substitution, which is a real full-prefix cache miss on the next request — the same cost class the wiki-page-update case already had, just now user-triggerable directly. No new slot is introduced. "Static rules" is not a separate artifact — it denotes invariant scaffolding that may be written directly into `persona.md` as plain prose, blended with voice and style content, with no internal section headers and no structural separation from the rest of the persona text. Persona may grow to absorb this kind of durable, non-instruction-dependent content, with no soft checkpoint or review threshold below the cap. The only constraint is the existing hard ceiling, `_CEIL_PERSONA = 500` tokens / 2000 chars in `prompt_builder.py`, which is unchanged and still governs KV-cache prefix stability. Current actual persona size: ~476 chars / ~119 tokens (roughly 24% of the cap) — substantial headroom (~381 tokens) exists.
+**Stable prefix** (system message, passed as `system=`): Slot 1a (identity) + Slot 1b (persona). Byte-identical for the lifetime of a session once persona is cached by `ControllerAgent._load_persona()` — **updated 2026-08-03:** and unchanged since the last assistant-name change, if any. Slot 1a's name is a user setting (`MemoryManager.get_assistant_name()`, default `"Localist"`, see Slot 1a above), not a true constant; changing it invalidates the persona cache (`ControllerAgent.invalidate_persona_cache()`) and forces a fresh substitution, which is a real full-prefix cache miss on the next request — the same cost class the wiki-page-update case already had, just now user-triggerable directly. No new slot is introduced. "Static rules" is not a separate artifact — it denotes invariant scaffolding that may be written directly into `persona.md` as plain prose, blended with voice and style content, with no internal section headers and no structural separation from the rest of the persona text. Persona may grow to absorb this kind of durable, non-instruction-dependent content, with no soft checkpoint or review threshold below the cap. The only constraint is the hard ceiling, `_CEIL_PERSONA` in `prompt_builder.py`. **Updated 2026-11-12 (§3.7e):** raised from 500 tokens / 2,000 chars to **1,200 tokens / 4,800 chars**, so the stable prefix can fill one full cache block on models whose block is 1,024 tokens (Gemma 4 12B). `_load_persona()`'s own character cut now follows the same ceiling. The persona size figures this paragraph used to quote (~119 tokens) are long out of date; §3.7e has current measurements.
 
 **Dynamic suffix** (user message): Slot 3a (episodic) → Slot 3b (profile) → Slot 4 (RAG) → Slot 5 (tool results) → Slot 6 (working memory) → Slot 7 (instruction). This order is unchanged from the existing implementation and is preserved deliberately — it reflects conceptual layering (contextualizers → evidence providers → conversation scaffolding → instruction), not cache eligibility. Episodic and profile facts are *not* eligible to move into the stable prefix: profile is re-scored per turn via live cosine similarity; episodic presence is gated by routing path and session state. Freezing either into the prefix would defeat their purpose.
 
@@ -1570,3 +1570,47 @@ shape, the True-path 3-tuple shape and text omission, chronological ordering, ce
 oldest-first trimming, the empty-turns case, and flattened/structured trim-count parity). §16.12's
 `OMLXRuntimeClient` changes add a further 4 tests (888 passed total) — see that section.
 
+
+---
+
+### 3.7e The Stable Prefix Must Fill a Cache Block: Gemma 4 12B and the 1,024-Token Block (2026-11-12)
+
+**Problem.** §3.7c's shared-prefix design (one identity + persona system message shared by the warm-up, the main call and the `working_state` call) silently stopped working when the daily model moved from Gemma 4 E4B to Gemma 4 12B.
+
+- oMLX caches whole blocks only, and forces the block size to a multiple of the model's sliding-attention window (`_align_block_size_with_rotating_window()` in oMLX's `scheduler.py`; it cannot be configured lower). Measured with `POST /admin/api/cache/probe`:
+
+  | Model | Sliding window | oMLX block |
+  |---|---|---|
+  | Gemma 4 E4B | 512 | 512 |
+  | Gemma 4 12B | 1,024 | 1,024 |
+
+- The shared system message was 520 tokens. On the E4B that filled one 512-token block (§3.7c). On the 12B it fills **no** block, so oMLX cached none of it: `cached_tokens` was 0 on every Localist call in the 2026-11-12 engine benchmark (`diagnostics/diag_engine_bench_phase2.py`).
+- Nothing reported this. The warm-up still logged "block 0 promoted to cache-resident tier".
+
+**Measured fix: one full block.** Same real main and `working_state` prompts, 6 turns, 2 repetitions (`diagnostics/diag_kv_levers_phase1.py`, part a):
+
+| Engine | System message | Main call, turns 2–6 | `working_state`, turns 2–6 | Cold first turn |
+|---|---|---|---|---|
+| oMLX | ~570 tokens (0 blocks) | 2.59 s | 1.85 s | 2.21 s |
+| oMLX | ~1,100 tokens (1 block) | **2.03 s** | **1.16 s** | 2.93 s |
+| oMLX | ~2,150 tokens (2 blocks) | 2.12 s | 1.25 s | 4.74 s |
+| Ollama | ~570 tokens | 1.75 s | 0.49 s | 2.45 s |
+| Ollama | ~1,100 tokens | 1.94 s | 0.79 s | 3.17 s |
+
+One block is the target: a second adds nothing and doubles the cold turn. Ollama caches token by token, so it already reused the whole system message; a longer one is neutral once warm. The cold cost is paid once per model load, not per conversation, because the system message is identical across conversations (and the boot warm-up pays it).
+
+Live check through the real backend, 4 chat turns on copies of the user's data (`diagnostics/diag_kv_levers_phase3_live.py`): oMLX cache efficiency over the run rose from **8.1% to 46.1%** (1,202 → 8,370 of ~15–18k prompt tokens), and the mean wait for the first streamed token fell from 3.69 s to 3.06 s.
+
+**What changed.**
+- `PromptBuilder._CEIL_PERSONA`: 500 → 1,200 tokens (§3.7a).
+- `ControllerAgent._load_persona()` cut every persona to `body[:2000]` on its own, which undid the ceiling raise before `PromptBuilder` saw it. Found in the live check, not by the unit tests. It now cuts at `PromptBuilder._CEIL_PERSONA * 4`; `test_kv1_load_persona_keeps_a_one_block_persona` fails against the old line.
+- `warmup.run_cache_warmup()` now returns `prefix_cache_status()` after its call: how many tokens of the shared system message the engine can reuse. Block engines are measured (`OMLXRuntimeClient.probe_prefix_cache()`, §16.36); local Ollama is token-level (estimated length); anything else is "unknown". When a block engine can cache **none** of it, the warm-up logs a WARNING naming the prefix length and block size. The status is kept on the controller (`controller.prefix_cache_status`), so it follows backend switches and model pins, which already rebuild the controller and re-run the warm-up.
+- `GET /settings/prefix-cache` returns it; Settings → Chat Model shows it (§7.31).
+- The persona text itself is user data (`wiki/persona.md`), so the code only makes room for it. A ~1,094-token draft for the user to edit was left at `~/Library/Application Support/Localist/persona-draft.md`, outside the wiki so it isn't indexed.
+
+**Not changed, by decision.** The 2026-11-12 benchmark also measured why so little else is reusable:
+- `[CURRENT DATETIME]` is the first thing in the user message (§3.2) and changes every call, so nothing after it is ever a cache hit on either engine. Only the system message (plus, on the oMLX path, the structured working-memory turns of §3.7d) precedes it.
+- §3.7d's structured turns add little: the 300-token working-memory window drops its oldest turn as the conversation grows, so that part of the prefix rarely repeats.
+- Moving `[SESSION FILES]` ahead of the timestamp cut the first-token wait on file-attached turns from ~8.5 s to ~2.5–3.5 s on both engines. Michael declined it: the slot is empty on ordinary chats and Live Feed turns, and it would mean reordering the prompt contract and its tests. Slot order is unchanged.
+
+**Keep in mind.** A future model with a larger sliding window gets a larger block, and the persona would again fall short. The warm-up WARNING and the Settings line exist so that shows up immediately instead of silently.

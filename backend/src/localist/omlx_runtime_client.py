@@ -719,6 +719,53 @@ class OMLXRuntimeClient:
     # Diagnostics
     # -----------------------------------------------------------------------
 
+    def probe_prefix_cache(self, system: str) -> dict | None:
+        """
+        How much of a shared system message oMLX's prefix cache can store
+        (§3.7e). oMLX caches whole blocks only, and the block size is forced
+        to a multiple of the model's sliding window (512 on Gemma 4 E4B,
+        1,024 on Gemma 4 12B), so a system message shorter than one block is
+        never cached at all.
+
+        Uses POST /admin/api/cache/probe, which tokenizes with the loaded
+        model's own chat template and reports `total_tokens` and
+        `block_size`; it needs the model loaded, so call it after an
+        inference (the startup warm-up does). Probes twice — the system
+        message plus a one-character user turn, then the user turn alone —
+        so the user turn's template tokens can be subtracted out.
+
+        Optional, duck-typed: not part of BaseRuntimeClient (a Protocol
+        method would break isinstance() for every mock runtime). Returns
+        {"prefix_tokens", "block_size"}, or None on any failure (endpoint
+        missing, auth required, model not loaded). Never raises.
+        """
+        def _probe(messages: list[dict]) -> dict | None:
+            try:
+                resp = requests.post(
+                    self._base_url + "/admin/api/cache/probe",
+                    json    = {"model_id": self._chat_model, "messages": messages},
+                    timeout = self._request_timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                logger.debug("probe_prefix_cache: probe failed (%s)", exc)
+                return None
+            if not isinstance(data.get("total_tokens"), int) or not isinstance(data.get("block_size"), int):
+                logger.debug("probe_prefix_cache: no token counts in probe response (%s)", data)
+                return None
+            return data
+
+        user_turn = {"role": "user", "content": "."}
+        with_system = _probe([{"role": "system", "content": system}, user_turn])
+        user_only   = _probe([user_turn])
+        if with_system is None or user_only is None:
+            return None
+        # user_only counts BOS + the user turn; BOS is part of the shared
+        # prefix, so add it back (1 token).
+        prefix_tokens = max(0, with_system["total_tokens"] - user_only["total_tokens"] + 1)
+        return {"prefix_tokens": prefix_tokens, "block_size": with_system["block_size"]}
+
     def health_check(self) -> dict:
         """
         Verify that the oMLX service is reachable and the configured

@@ -164,11 +164,15 @@ from .mcp_server.file_ops import set_project_root as _set_generated_file_root
 from .mcp_tool_dispatcher import MCPToolDispatcher, _MCP_SERVER_URL
 from .memory_manager import MemoryManager, EpisodicMemoryWriter, EpisodicMemoryReader
 from . import news_brief
+from .prompt_builder import PromptBuilder
 from .planner import (
     resolve_episodic_recall_floor,
     resolve_gate_tiers,
     resolve_profile_fact_threshold,
     resolve_rag_floor,
+)
+from .ollama_runtime_client import (
+    DEFAULT_KEEP_ALIVE, KEEP_ALIVE_CHOICES, OllamaRuntimeClient, normalize_keep_alive,
 )
 from .openrouter_runtime_client import validate_api_key as validate_openrouter_key
 from .runtime_factory import available_backends, create_runtime, embedding_host_for
@@ -224,6 +228,11 @@ class Settings(BaseSettings):
 
     # Ollama network (ollama backend only)
     ollama_url:       str = "http://localhost:11434"
+
+    # "Keep model loaded" (LOCALIST_OLLAMA_KEEP_ALIVE, §16.36): one of
+    # ollama_runtime_client.KEEP_ALIVE_CHOICES. "off" sends no keep_alive, so
+    # Ollama unloads after its own 5-minute idle default.
+    ollama_keep_alive: str = "off"
 
     # Shared network timeouts
     stream_timeout:   float = 60.0
@@ -515,8 +524,13 @@ def _build_controller(
     )
     # A backend can opt out (OpenRouter: each warm-up would spend one of the
     # free tier's daily requests, §16.34).
+    # The warm-up returns how much of the shared system-message prefix the
+    # engine can cache (§3.7e); kept on the controller so it follows the
+    # controller's lifecycle and GET /settings/prefix-cache reads the
+    # status for the backend actually serving requests.
+    controller.prefix_cache_status = None
     if getattr(runtime, "wants_cache_warmup", True):
-        _run_cache_warmup(controller, runtime, templates_dir)
+        controller.prefix_cache_status = _run_cache_warmup(controller, runtime, templates_dir)
     return wiki_agent, conversational_agent, controller
 
 
@@ -851,6 +865,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         embedding_model = _resolve_embedding_model(settings, settings.runtime_backend),
         omlx_url        = settings.omlx_url,
         ollama_url      = settings.ollama_url,
+        ollama_keep_alive = settings.ollama_keep_alive,
         request_timeout = settings.request_timeout,
         stream_timeout  = settings.stream_timeout,
     )
@@ -1746,6 +1761,37 @@ class AssistantNameRequest(BaseModel):
     assistant_name: str
 
 
+class OllamaKeepAliveResponse(BaseModel):
+    """Response body for GET/PUT /settings/ollama-keep-alive (§16.36)."""
+    keep_alive: str          # one of `choices`; "off" = Ollama's 5-minute default
+    choices:    list[str]
+    applied_live: bool = False   # True when the active backend is Ollama and took the change now
+
+
+class OllamaKeepAliveRequest(BaseModel):
+    """Payload accepted by PUT /settings/ollama-keep-alive."""
+    keep_alive: str
+
+
+class PrefixCacheStatusResponse(BaseModel):
+    """
+    Response body for GET /settings/prefix-cache (§3.7e): how much of the
+    shared system message (identity + persona) the active engine can reuse
+    from its prompt cache, as measured by the last warm-up. available=False
+    when no warm-up has run for the active controller (skipped, failed, or a
+    backend that opts out, like OpenRouter).
+    """
+    available:     bool
+    backend:       str | None = None
+    granularity:   str | None = None   # "block" | "token" | "unknown"
+    prefix_tokens: int | None = None
+    block_size:    int | None = None
+    full_blocks:   int | None = None
+    cached_tokens: int | None = None
+    measured:      bool = False        # True = engine-tokenized; False = estimate
+    persona_ceiling_tokens: int | None = None
+
+
 class ApiKeysStatusResponse(BaseModel):
     """Response body for GET/PUT /settings/api-keys — whether each key is
     configured, never the value itself. These are secrets and must never be
@@ -2306,6 +2352,7 @@ def _create_and_check_backend(settings: Settings, backend: str) -> tuple[BaseRun
         embedding_model = _resolve_embedding_model(settings, backend),
         omlx_url        = settings.omlx_url,
         ollama_url      = settings.ollama_url,
+        ollama_keep_alive = settings.ollama_keep_alive,
         request_timeout = settings.request_timeout,
         stream_timeout  = settings.stream_timeout,
     )
@@ -2330,6 +2377,7 @@ def _create_and_check_embedding_candidate(
         embedding_model = embedding_model,
         omlx_url        = settings.omlx_url,
         ollama_url      = settings.ollama_url,
+        ollama_keep_alive = settings.ollama_keep_alive,
         request_timeout = settings.request_timeout,
         stream_timeout  = settings.stream_timeout,
     )
@@ -3719,6 +3767,93 @@ async def put_assistant_name_setting(
         _state.controller.invalidate_persona_cache()
     name = await asyncio.to_thread(mm.get_assistant_name)
     return AssistantNameResponse(assistant_name=name)
+
+
+# ---------------------------------------------------------------------------
+# Ollama "Keep model loaded"  (Settings → Chat Model, §16.36)
+# ---------------------------------------------------------------------------
+
+def _apply_keep_alive_live(choice: str) -> bool:
+    """Set keep_alive on the active runtime if it's an Ollama client (it reads
+    the attribute on every request). Returns True when applied."""
+    runtime = _state.runtime
+    if isinstance(runtime, OllamaRuntimeClient):
+        runtime.keep_alive = choice
+        return True
+    return False
+
+
+@app.get(
+    "/settings/ollama-keep-alive",
+    response_model = OllamaKeepAliveResponse,
+    summary        = "Read the Ollama keep-model-loaded setting",
+)
+async def get_ollama_keep_alive() -> OllamaKeepAliveResponse:
+    settings = _require_settings()
+    try:
+        choice = normalize_keep_alive(settings.ollama_keep_alive)
+    except ValueError:
+        choice = DEFAULT_KEEP_ALIVE   # same fallback the runtime factory uses
+    return OllamaKeepAliveResponse(keep_alive=choice, choices=list(KEEP_ALIVE_CHOICES))
+
+
+@app.put(
+    "/settings/ollama-keep-alive",
+    response_model = OllamaKeepAliveResponse,
+    summary        = "Set how long Ollama keeps the chat model loaded",
+)
+async def put_ollama_keep_alive(request: OllamaKeepAliveRequest) -> OllamaKeepAliveResponse:
+    """
+    Persist the choice (Settings field + .env) and apply it to the active
+    runtime when that's Ollama, so the next request carries it. Any other
+    backend picks it up the next time an Ollama client is built (switch).
+    """
+    settings = _require_settings()
+    try:
+        choice = normalize_keep_alive(request.keep_alive)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        previous = normalize_keep_alive(settings.ollama_keep_alive)
+    except ValueError:
+        previous = DEFAULT_KEEP_ALIVE
+    settings.ollama_keep_alive = choice
+    _write_env_var(_PROJECT_ROOT, "LOCALIST_OLLAMA_KEEP_ALIVE", choice)
+    applied = _apply_keep_alive_live(choice)
+    # "off" sends no keep_alive, and Ollama keeps a loaded model's last-set
+    # duration when a request omits it — so a switch to "off" resets the
+    # loaded model's timer once, or it would stay on e.g. 4h until unloaded.
+    if applied and choice == "off" and previous != "off":
+        await asyncio.to_thread(_state.runtime.reset_keep_alive_to_default)
+    return OllamaKeepAliveResponse(
+        keep_alive=choice, choices=list(KEEP_ALIVE_CHOICES), applied_live=applied,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prompt-cache prefix status  (Settings → Chat Model, §3.7e)
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/settings/prefix-cache",
+    response_model = PrefixCacheStatusResponse,
+    summary        = "How much of the shared system message the engine can cache",
+)
+async def get_prefix_cache_status() -> PrefixCacheStatusResponse:
+    controller = _state.controller
+    status = getattr(controller, "prefix_cache_status", None) if controller is not None else None
+    if not status:
+        return PrefixCacheStatusResponse(available=False)
+    settings = _require_settings()
+    return PrefixCacheStatusResponse(
+        available              = True,
+        backend                = settings.runtime_backend.strip().lower(),
+        persona_ceiling_tokens = PromptBuilder._CEIL_PERSONA,
+        **{k: status.get(k) for k in (
+            "granularity", "prefix_tokens", "block_size", "full_blocks",
+            "cached_tokens", "measured",
+        )},
+    )
 
 
 # ---------------------------------------------------------------------------

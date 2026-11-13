@@ -1,0 +1,267 @@
+{
+  "meta": {
+    "timestamp": "2026-11-12T15:19:17",
+    "idle_s": 330,
+    "ollama_env": {
+      "OLLAMA_MODELS": "~/.ollama/models",
+      "OLLAMA_HOST": "0.0.0.0",
+      "OLLAMA_NO_CLOUD": "0"
+    }
+  },
+  "runs": [
+    {
+      "label": "default (none sent)",
+      "keep_alive": null,
+      "turns": [
+        {
+          "ttft_s": 2.175,
+          "prompt_tokens": 1403,
+          "cached_tokens": null,
+          "prefill_s": 2.035,
+          "load_s": 0.0,
+          "completion_tokens": 128,
+          "thinking_chars": 0,
+          "finish_reason": "length",
+          "turn": 1
+        },
+        {
+          "ttft_s": 2.275,
+          "prompt_tokens": 1457,
+          "cached_tokens": null,
+          "prefill_s": 2.113,
+          "load_s": 0.002,
+          "completion_tokens": 128,
+          "thinking_chars": 0,
+          "finish_reason": "length",
+          "turn": 2
+        },
+        {
+          "ttft_s": 3.022,
+          "prompt_tokens": 1355,
+          "cached_tokens": null,
+          "prefill_s": 1.989,
+          "load_s": 0.92,
+          "completion_tokens": 94,
+          "thinking_chars": 0,
+          "finish_reason": "stop",
+          "turn": 3
+        }
+      ],
+      "idle": [
+        {
+          "t_s": 30,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9153.0,
+          "sys_used_gb": 16.245
+        },
+        {
+          "t_s": 60,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9153.0,
+          "sys_used_gb": 16.277
+        },
+        {
+          "t_s": 91,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9153.0,
+          "sys_used_gb": 16.248
+        },
+        {
+          "t_s": 121,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9153.0,
+          "sys_used_gb": 16.32
+        },
+        {
+          "t_s": 151,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9142.0,
+          "sys_used_gb": 16.324
+        },
+        {
+          "t_s": 181,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9083.0,
+          "sys_used_gb": 16.375
+        },
+        {
+          "t_s": 212,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9083.0,
+          "sys_used_gb": 16.636
+        },
+        {
+          "t_s": 242,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9083.0,
+          "sys_used_gb": 16.65
+        },
+        {
+          "t_s": 272,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9081.0,
+          "sys_used_gb": 16.681
+        },
+        {
+          "t_s": 302,
+          "loaded": [],
+          "engine_footprint_mb": 18.0,
+          "sys_used_gb": 7.226
+        },
+        {
+          "t_s": 332,
+          "loaded": [],
+          "engine_footprint_mb": 18.0,
+          "sys_used_gb": 7.233
+        }
+      ]
+    },
+    {
+      "label": "keep_alive=30m",
+      "keep_alive": "30m",
+      "turns": [
+        {
+          "ttft_s": 3.103,
+          "prompt_tokens": 1495,
+          "cached_tokens": null,
+          "prefill_s": 2.185,
+          "load_s": 0.0,
+          "completion_tokens": 19,
+          "thinking_chars": 0,
+          "finish_reason": "stop",
+          "turn": 1
+        },
+        {
+          "ttft_s": 3.129,
+          "prompt_tokens": 1395,
+          "cached_tokens": null,
+          "prefill_s": 2.006,
+          "load_s": 0.003,
+          "completion_tokens": 24,
+          "thinking_chars": 0,
+          "finish_reason": "stop",
+          "turn": 2
+        },
+        {
+          "ttft_s": 1.686,
+          "prompt_tokens": 1587,
+          "cached_tokens": null,
+          "prefill_s": 1.558,
+          "load_s": 0.001,
+          "completion_tokens": 50,
+          "thinking_chars": 0,
+          "finish_reason": "stop",
+          "turn": 3
+        }
+      ],
+      "idle": [
+        {
+          "t_s": 30,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9164.0,
+          "sys_used_gb": 16.514
+        },
+        {
+          "t_s": 60,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9164.0,
+          "sys_used_gb": 16.51
+        },
+        {
+          "t_s": 91,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9164.0,
+          "sys_used_gb": 16.55
+        },
+        {
+          "t_s": 121,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9164.0,
+          "sys_used_gb": 16.534
+        },
+        {
+          "t_s": 151,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9153.0,
+          "sys_used_gb": 16.542
+        },
+        {
+          "t_s": 181,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9074.0,
+          "sys_used_gb": 16.538
+        },
+        {
+          "t_s": 212,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9074.0,
+          "sys_used_gb": 16.525
+        },
+        {
+          "t_s": 242,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9074.0,
+          "sys_used_gb": 16.526
+        },
+        {
+          "t_s": 272,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9074.0,
+          "sys_used_gb": 16.541
+        },
+        {
+          "t_s": 302,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9074.0,
+          "sys_used_gb": 16.535
+        },
+        {
+          "t_s": 332,
+          "loaded": [
+            "gemma4:12b-mlx"
+          ],
+          "engine_footprint_mb": 9074.0,
+          "sys_used_gb": 16.597
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "timestamp": "2026-11-12T16:19:26",
+  "label": "draft",
+  "prefix_cache": {
+    "available": true,
+    "backend": "omlx",
+    "granularity": "block",
+    "prefix_tokens": 1094,
+    "block_size": 1024,
+    "full_blocks": 1,
+    "cached_tokens": 1024,
+    "measured": true,
+    "persona_ceiling_tokens": 1200
+  },
+  "turns": [
+    {
+      "question": "What is the Localist build order?",
+      "first_token_s": 2.09,
+      "total_s": 18.86,
+      "answer_chars": 1181,
+      "error": null
+    },
+    {
+      "question": "Summarize the Localist design philosophy in three bullets.",
+      "first_token_s": 2.82,
+      "total_s": 12.02,
+      "answer_chars": 614,
+      "error": null
+    },
+    {
+      "question": "Which part of that matters most for running models locally?",
+      "first_token_s": 3.29,
+      "total_s": 17.41,
+      "answer_chars": 1065,
+      "error": null
+    },
+    {
+      "question": "Name one risk the build order doesn't address.",
+      "first_token_s": 4.03,
+      "total_s": 19.98,
+      "answer_chars": 1253,
+      "error": null
+    }
+  ],
+  "omlx_delta": {
+    "prompt_tokens": 18166,
+    "cached_tokens": 8370,
+    "requests": 9,
+    "cache_efficiency_pct": 46.1
+  }
+}

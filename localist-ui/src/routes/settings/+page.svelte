@@ -120,6 +120,92 @@
   // backendReady() waits on: never set by the startup grace running out.
   $: backendUp = $health.ever_ok;
 
+  // Ollama "Keep model loaded" (§16.36) and prompt-cache status (§3.7e),
+  // both shown in the Chat Model card. On a failed write the select snaps
+  // back to the server's last-known value (no optimistic update).
+  const KEEP_ALIVE_LABELS: Record<string, string> = {
+    off: 'Off (Ollama default: unload after 5 idle minutes)',
+    '15m': '15 minutes',
+    '30m': '30 minutes',
+    '1h': '1 hour',
+    '4h': '4 hours',
+    always: 'Always'
+  };
+  let keepAlive = 'off';
+  let keepAliveChoices: string[] = Object.keys(KEEP_ALIVE_LABELS);
+  let keepAliveSaving = false;
+  let keepAliveError: string | null = null;
+
+  async function loadKeepAlive() {
+    try {
+      const res = await fetch(apiUrl('/api/settings/ollama-keep-alive'));
+      if (!res.ok) return;
+      const data = await res.json();
+      keepAlive = data.keep_alive;
+      keepAliveChoices = data.choices ?? keepAliveChoices;
+    } catch {
+      // Keep the default; the control still reports a real failure on save.
+    }
+  }
+
+  async function onKeepAliveChange(e: Event) {
+    const select = e.currentTarget as HTMLSelectElement;
+    const previous = keepAlive;
+    keepAliveSaving = true;
+    keepAliveError = null;
+    try {
+      const res = await fetch(apiUrl('/api/settings/ollama-keep-alive'), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keep_alive: select.value })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail ?? `HTTP ${res.status}`);
+      keepAlive = data.keep_alive;
+    } catch (err) {
+      keepAliveError = err instanceof Error ? err.message : String(err);
+      keepAlive = previous;
+      select.value = previous;
+    } finally {
+      keepAliveSaving = false;
+    }
+  }
+
+  type PrefixCacheStatus = {
+    available: boolean;
+    backend?: string | null;
+    granularity?: 'block' | 'token' | 'unknown' | null;
+    prefix_tokens?: number | null;
+    block_size?: number | null;
+    full_blocks?: number | null;
+    cached_tokens?: number | null;
+    measured?: boolean;
+  };
+  let prefixCache: PrefixCacheStatus = { available: false };
+
+  async function loadPrefixCache() {
+    try {
+      const res = await fetch(apiUrl('/api/settings/prefix-cache'));
+      if (res.ok) prefixCache = await res.json();
+    } catch {
+      prefixCache = { available: false };
+    }
+  }
+
+  // The warm-up that measures this runs on every backend switch / model
+  // pin, so re-read when either changes. Primitives, so the 15s health
+  // poll doesn't re-trigger it (same pattern as backendUp).
+  $: activeBackendForCache = $modelConfig.backend;
+  $: activeChatModelForCache = $health.chat_model;
+  $: if (backendUp) {
+    void activeBackendForCache;
+    void activeChatModelForCache;
+    void loadPrefixCache();
+    void loadKeepAlive();
+  }
+
+  const fmt = (n: number | null | undefined) => (n ?? 0).toLocaleString();
+
   // Log files (§7.30) — the packaged app writes backend.log / mcp.log /
   // app.log to ~/Library/Logs/Localist; "Show logs" asks the backend to
   // open that folder in Finder (works in the desktop app and the web UI).
@@ -881,6 +967,49 @@
             <code>LOCALIST_CHAT_MODEL</code> in <code>.env</code> overrides the model picked here for every
             backend. Remove that line and restart to use per-backend choices.
           </p>
+        {/if}
+        {#if selectedUiBackend === 'ollama'}
+          <label class="field-label" for="ollama-keep-alive">Keep model loaded</label>
+          <select
+            id="ollama-keep-alive"
+            class="settings-input"
+            value={keepAlive}
+            disabled={keepAliveSaving}
+            on:change={onKeepAliveChange}
+          >
+            {#each keepAliveChoices as c}
+              <option value={c}>{KEEP_ALIVE_LABELS[c] ?? c}</option>
+            {/each}
+          </select>
+          <p class="field-hint">
+            When Ollama unloads an idle model it frees that memory, but the next message waits for a
+            reload and loses Ollama's prompt cache. Keeping it loaded makes that message faster, but
+            the model keeps using its full memory while idle.
+          </p>
+          {#if keepAliveError}
+            <p class="field-hint" style="color:var(--warning)">Couldn't save: {keepAliveError}</p>
+          {/if}
+        {/if}
+        {#if selectedUiBackend === $modelConfig.backend && prefixCache.available}
+          {#if prefixCache.granularity === 'block' && prefixCache.full_blocks === 0}
+            <p class="field-hint" style="color:var(--warning)">
+              Prompt cache: the shared system message (identity + persona) is
+              {fmt(prefixCache.prefix_tokens)} tokens, shorter than this model's
+              {fmt(prefixCache.block_size)}-token cache block, so none of it is cached. Lengthen
+              <code>persona.md</code> past {fmt(prefixCache.block_size)} tokens to speed up every reply.
+            </p>
+          {:else if prefixCache.granularity === 'block'}
+            <p class="field-hint">
+              Prompt cache: {fmt(prefixCache.cached_tokens)} of the shared system message's
+              {fmt(prefixCache.prefix_tokens)} tokens are reused on every reply
+              ({prefixCache.full_blocks} × {fmt(prefixCache.block_size)}-token block).
+            </p>
+          {:else if prefixCache.granularity === 'token'}
+            <p class="field-hint">
+              Prompt cache: the shared system message (~{fmt(prefixCache.prefix_tokens)} tokens) is
+              reused on every reply.
+            </p>
+          {/if}
         {/if}
         {#if selectedUiBackend === $modelConfig.backend}
           <p class="field-hint">Applies immediately — {RUNTIME_BACKEND_LABELS[selectedUiBackend]} is the active backend.</p>

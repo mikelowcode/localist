@@ -126,7 +126,7 @@ class PromptBuilder:
     SYSTEM MESSAGE
       Slot 1a [identity]        — _SYSTEM constant; always present; ~50 tokens
       Slot 1b [persona]         — wiki persona doc; injected when provided;
-                                  500-token ceiling; appended to system msg
+                                  1,200-token ceiling; appended to system msg
 
     USER MESSAGE (static-first ordering for KV-cache prefix reuse)
       Slot DT [CURRENT DATETIME] — current local datetime + trust directive;
@@ -211,7 +211,14 @@ class PromptBuilder:
     # Token ceilings (in tokens; multiply by 4 for char equivalent)
     # -----------------------------------------------------------------------
     _CEIL_SYSTEM:   int = 50    # hard; slot 1a is a constant so this is advisory
-    _CEIL_PERSONA:  int = 500   # slot 1b; persona injected into system msg
+    # Slot 1b; persona injected into the system msg. 1,200 (was 500): the
+    # system msg (identity + persona) is the one prefix every main_dispatch
+    # and working_state call shares, and block-based prefix caches only
+    # store whole blocks — oMLX's block is forced to a multiple of the
+    # model's sliding window (512 on Gemma 4 E4B, 1,024 on Gemma 4 12B), so
+    # a ~550-token system msg caches nothing on the 12B. 1,200 leaves room
+    # for a persona that fills one 1,024-token block. See §3.7e.
+    _CEIL_PERSONA:  int = 1200
     _CEIL_EPISODIC: int = 150   # slot 3a; episodic bullets
     _CEIL_PROFILE:  int = 100   # slot 3b; user profile facts
     _CEIL_RAG:      int = 800   # slot 4
@@ -278,7 +285,7 @@ class PromptBuilder:
         Return Slot 1: system prompt, optionally with persona appended.
 
         When persona is None or empty, returns the identity string only.
-        Otherwise appends the truncated persona (500-token ceiling) raw,
+        Otherwise appends the truncated persona (1,200-token ceiling) raw,
         separated by a double newline — no label is added.
         """
         system = self._system_message(assistant_name)
@@ -869,7 +876,7 @@ class PromptBuilder:
             20,000 tokens. Pass None or [] to omit.
         persona :
             Optional persona string (Slot 1b). Injected into the system
-            message when provided; 500-token ceiling enforced.
+            message when provided; 1,200-token ceiling enforced.
         assistant_name :
             Optional assistant name (Slot 1a). Interpolated into the
             identity template — callers resolve this from

@@ -2574,3 +2574,41 @@ One INFO log line per turn summarises the record.
 - Live (real ControllerAgent with `OpenRouterRuntimeClient`, temp DB, News Feed context):
   Lightning's turn recorded `finish_reason: "stop"`, 429→666 tokens, provider `Nvidia`. That is the
   main answer's numbers, not the `working_state` call that followed on the same client.
+
+### §16.36 — Ollama "Keep model loaded", prefix-cache probing, and the 2026-11-12 engine measurements
+
+**Why.** Part of the 2026-11-12 KV-cache work (§3.7e). Localist sent Ollama no `keep_alive`, so Ollama unloaded the chat model after its default 5 idle minutes. An unload also discards Ollama's prompt cache, so the next message paid a reload plus a full prefill. Measured on Gemma 4 12B (`diagnostics/diag_kv_levers_phase1.py`, part b): 3.02 s to the first token after a 5.5-minute gap (0.9 s of it reloading), against 1.69 s with `keep_alive: "30m"`, which held ~9.1 GB while idle. That is a trade of memory for responsiveness, so it is a user setting, **off by default**.
+
+**Setting.** `LOCALIST_OLLAMA_KEEP_ALIVE` (`Settings.ollama_keep_alive`), one of `ollama_runtime_client.KEEP_ALIVE_CHOICES`:
+
+| Choice | Sent as the request's top-level `keep_alive` |
+|---|---|
+| `off` (default) | nothing — Ollama's own default applies, exactly as before this setting |
+| `15m`, `30m`, `1h`, `4h` | the same string |
+| `always` | `-1` |
+
+- `OllamaRuntimeClient(keep_alive=…)` validates with `normalize_keep_alive()`. The public `keep_alive` attribute is read on every request, so `PUT /settings/ollama-keep-alive` updates the live client in place, with no controller rebuild (`applied_live` in the response).
+- `runtime_factory._make_ollama()` passes the setting at all three chat-client construction sites in `main.py`. An invalid hand-edited value logs a warning and falls back to `off` instead of failing startup. The embed-only Ollama client for chat-only backends (§16.32) doesn't take it: it never chats.
+- `GET /settings/ollama-keep-alive` returns the choice and the list of choices; Settings → Chat Model shows the control when Ollama is selected (§7.31).
+
+**Ollama keeps the last-set duration when a request omits `keep_alive`.** Confirmed live: a request with `"30m"`, then one with no `keep_alive`, left the model on 30 minutes; an explicit `"5m"` reset it. So a switch to `off` alone would leave a loaded model on its longer timer until it next unloaded. On a change from any other choice to `off`, the endpoint calls `OllamaRuntimeClient.reset_keep_alive_to_default()` once:
+- It checks `GET /api/ps` and acts only if the chat model is loaded, so it never loads a model just to set its timer.
+- It sends a prompt-less `POST /api/generate` with `keep_alive: "5m"` (`OLLAMA_DEFAULT_KEEP_ALIVE`), which only updates the timer (`done_reason: "load"`).
+- Local models only. It never raises; a failure logs a warning.
+- Limitation: an Ollama server started with a custom `OLLAMA_KEEP_ALIVE` gets 5 minutes for the model loaded at that moment, then its own default again after the next load.
+
+Live check through the real backend (`diagnostics/diag_kv_levers_phase3_live.py`): `30m` → `/api/ps` showed 29.9 minutes left; switching back to `off` → 4.9 minutes.
+
+**Prefix-cache probing (§3.7e).** Two optional, duck-typed client members. Like `last_completion` (§16.35), neither is in the `BaseRuntimeClient` Protocol, because a new Protocol method would make every `MagicMock` runtime fail `isinstance()`:
+- `OMLXRuntimeClient.probe_prefix_cache(system)` → `{"prefix_tokens", "block_size"}` or `None`. It calls `POST /admin/api/cache/probe` twice, once with the system message plus a one-character user turn and once with the user turn alone, and subtracts the second, adding back the shared BOS token. The probe needs the model loaded, so the warm-up calls it after its inference. It returns `None` on any failure, including oMLX's "model not loaded" 200 reply that has no token counts.
+- `OllamaRuntimeClient.prefix_cache_granularity`: `"token"` for local models (Ollama reuses a cached prefix token by token), `"unknown"` for cloud models.
+
+`warmup.prefix_cache_status()` accepts only real `int`/`str` values from these, so a mock runtime reads as "unknown".
+
+**Engine measurements behind this work (2026-11-12, Gemma 4 12B on a 24 GB M6).** Recorded here because they shaped what was and wasn't built. The two engines didn't run byte-identical weights: Ollama's `gemma4:12b-mlx` is nvfp4 (7.7 GB), oMLX's `gemma-4-12B-it-MLX-4bit` is MLX affine 4-bit (6.3 GB).
+- **Speed** (`diagnostics/diag_engine_bench_phase1.py`): prompt reading was the same on both, ~530–670 tok/s. Ollama generated ~1.5× faster (25–35 vs 17.6–19.4 tok/s).
+- **RAM:** both ~7.6–8.0 GB once loaded. Per 1k prompt tokens in a single request, Ollama grew ~175 MB and oMLX far less. At 28k tokens Ollama peaked at 19.5 GB and swapped; oMLX peaked at ~12.3 GB with no swap. `top` rounds per-process footprints above 10 GB to whole GB, so oMLX's figures there are ±1 GB.
+- **Ollama's reported `context_length` of 4096 doesn't truncate** with this MLX model: 28k-token prompts were processed whole, and `num_ctx` had no effect. That matches the earlier `num_ctx` finding.
+- **Prompt cache** (`diagnostics/diag_engine_bench_phase2.py`): both engines kept their cache through Localist's interleaved `working_state`/`implicit_extraction` calls and across three other conversations. Ollama is not limited to one cached sequence. After four other ~3k-token conversations, neither reused the first. Only oMLX survived a model unload (its SSD tier). Each extra conversation Ollama kept added ~0.6 GB.
+- **Ollama memory settings don't help:** `OLLAMA_NUM_PARALLEL` already defaults to 1, and `OLLAMA_KV_CACHE_TYPE=q8_0` with flash attention changed nothing measurable for the MLX runner. Measured against `ollama serve` started directly with each variable, verified to have served the requests; Ollama.app ignores a normal quit and respawns its own server.
+- **oMLX's 4-bit KV cache (`turboquant_kv`)** gave no measurable RAM saving, ~2% slower generation and slightly reworded answers, so it was not adopted.

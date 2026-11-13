@@ -1530,3 +1530,25 @@ sidecar logs.
 - **Not verified:** a packaged `.app` build (`app.log`, and Show logs opening Finder), which needs the
   next release build.
 
+
+### 7.31 Settings → Chat Model: Keep Model Loaded and Prompt-Cache Status (2026-11-12)
+
+Two additions to the Chat Model card (`localist-ui/src/routes/settings/+page.svelte`), from the 2026-11-12 KV-cache work (§3.7e, §16.36).
+
+**Keep model loaded** (shown when the selected backend is Ollama). A select bound to `GET`/`PUT /api/settings/ollama-keep-alive`: Off (the default, labelled with Ollama's 5-minute unload), 15 minutes, 30 minutes, 1 hour, 4 hours, Always.
+- On a failed save the select snaps back to the server's last value and shows the error; there's no optimistic update.
+- The hint states the trade: unloading frees memory but makes the next message wait for a reload and lose Ollama's prompt cache.
+- Switching back to Off also resets a loaded model's timer (§16.36).
+
+**Prompt-cache status** (shown for the active backend, once a warm-up has measured it). One line from `GET /api/settings/prefix-cache`:
+
+| Status | Line |
+|---|---|
+| Block engine, 0 full blocks | Warning colour: the shared system message is N tokens, shorter than this model's B-token block, so none of it is cached; lengthen `persona.md` past B tokens. |
+| Block engine, ≥1 block | "N of the shared system message's M tokens are reused on every reply (k × B-token block)." |
+| Token-level (local Ollama) | "The shared system message (~M tokens) is reused on every reply." |
+| Unknown / unavailable | nothing |
+
+Both are re-read when the active backend or chat model changes. The page reacts to primitive copies of `$modelConfig.backend` and `$health.chat_model`, so the 15-second health poll doesn't re-fetch them. Calls use the `/api/settings/...` form so they work through the Vite dev proxy as well as in the desktop app.
+
+**Not verified:** type-checked (`npm run check`, 0 errors) but not yet looked at in a browser or the packaged app.

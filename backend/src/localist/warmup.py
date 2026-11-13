@@ -104,11 +104,86 @@ def parse_warmup_fixture(path: Path) -> tuple[list[ToolResult], list[Turn]]:
     return tool_results, turns
 
 
+def prefix_cache_status(runtime: "BaseRuntimeClient", system_prompt: str) -> dict:
+    """
+    How much of the shared system message (identity + persona — the prefix
+    every main_dispatch and working_state call starts with) the active
+    engine can reuse from its prompt cache (§3.7e).
+
+    - Block-based engines (oMLX) expose probe_prefix_cache(); only whole
+      blocks are cached, so full_blocks == 0 means none of it ever is.
+    - Token-level engines (local Ollama) set prefix_cache_granularity =
+      "token": the whole prefix is reusable; its length is estimated
+      (Ollama has no tokenize endpoint).
+    - Anything else (hosted backends): "unknown", estimate only.
+
+    Never raises.
+    """
+    estimate = _WARMUP_BUILDER._estimate_tokens(system_prompt)
+    info = None
+    probe = getattr(runtime, "probe_prefix_cache", None)
+    if callable(probe):
+        try:
+            info = probe(system_prompt)
+        except Exception as exc:   # optional diagnostic — never fatal
+            logger.debug("prefix_cache_status: probe raised (%s)", exc)
+    # Strict type checks: anything but real ints (e.g. a mock runtime's
+    # auto-attributes) is treated as "no probe".
+    if (isinstance(info, dict)
+            and isinstance(info.get("prefix_tokens"), int)
+            and isinstance(info.get("block_size"), int)
+            and info["block_size"] > 0):
+        tokens, block = info["prefix_tokens"], info["block_size"]
+        full = tokens // block
+        return {
+            "granularity":   "block",
+            "prefix_tokens": tokens,
+            "block_size":    block,
+            "full_blocks":   full,
+            "cached_tokens": full * block,
+            "measured":      True,
+        }
+    granularity = getattr(runtime, "prefix_cache_granularity", None)
+    if granularity not in ("token", "block"):
+        granularity = "unknown"
+    return {
+        "granularity":   granularity,
+        "prefix_tokens": estimate,
+        "block_size":    None,
+        "full_blocks":   None,
+        "cached_tokens": estimate if granularity == "token" else None,
+        "measured":      False,
+    }
+
+
+def _log_prefix_cache_status(status: dict) -> None:
+    if status["granularity"] == "block" and status["full_blocks"] == 0:
+        logger.warning(
+            "Prompt cache: the shared system message (identity + persona) is "
+            "%d tokens, shorter than this model's %d-token cache block, so the "
+            "engine can't cache any of it — every call re-reads it. Lengthen "
+            "persona.md so the system message passes %d tokens (§3.7e).",
+            status["prefix_tokens"], status["block_size"], status["block_size"],
+        )
+    elif status["granularity"] == "block":
+        logger.info(
+            "Prompt cache: shared system message %d tokens, %d-token blocks — "
+            "%d block(s) / %d tokens cacheable.",
+            status["prefix_tokens"], status["block_size"],
+            status["full_blocks"], status["cached_tokens"],
+        )
+    else:
+        logger.info(
+            "Prompt cache: shared system message ~%d tokens (estimated), "
+            "%s-level caching.", status["prefix_tokens"], status["granularity"],
+        )
+
+
 def run_cache_warmup(
     controller:    Any,
     runtime:       "BaseRuntimeClient",
     templates_dir: Path,
-) -> None:
+) -> dict | None:
     """
     One-shot startup cache warm-up (§3.7c Lever 3).
 
@@ -116,6 +191,10 @@ def run_cache_warmup(
     warmup_fixture.md via PromptBuilder.build(). The KV-prefill promotes
     block 0 to a cache-resident tier (disk or hot). Any failure is logged
     as a warning; startup continues regardless. Never raises.
+
+    Returns prefix_cache_status() for the warmed system message (§3.7e) —
+    logged, and kept on the controller for GET /settings/prefix-cache — or
+    None when the warm-up was skipped or its call failed.
     """
     fixture_path = templates_dir / "warmup_fixture.md"
 
@@ -178,3 +257,10 @@ def run_cache_warmup(
             "Cache warm-up call failed (%s: %s) — startup continues normally.",
             type(exc).__name__, exc,
         )
+        return None
+
+    # Step 4 — report how much of the shared prefix the engine can cache.
+    # After the call, so a block-based engine has the model loaded to probe.
+    status = prefix_cache_status(runtime, system_prompt)
+    _log_prefix_cache_status(status)
+    return status

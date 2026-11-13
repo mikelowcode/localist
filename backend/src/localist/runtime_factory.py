@@ -84,13 +84,23 @@ def _make_omlx(kwargs: dict[str, Any]) -> BaseRuntimeClient:
 
 def _make_ollama(kwargs: dict[str, Any]) -> BaseRuntimeClient:
     """Construct an OllamaRuntimeClient from flattened settings kwargs."""
-    from .ollama_runtime_client import OllamaRuntimeClient
+    from .ollama_runtime_client import (
+        DEFAULT_KEEP_ALIVE, OllamaRuntimeClient, normalize_keep_alive,
+    )
+    # A bad hand-edited LOCALIST_OLLAMA_KEEP_ALIVE must not stop the backend
+    # from starting — fall back to "off" (Ollama's own default) and say so.
+    try:
+        keep_alive = normalize_keep_alive(kwargs.get("ollama_keep_alive"))
+    except ValueError as exc:
+        logger.warning("RuntimeFactory: %s — using %r.", exc, DEFAULT_KEEP_ALIVE)
+        keep_alive = DEFAULT_KEEP_ALIVE
     return OllamaRuntimeClient(
         chat_model      = kwargs.get("chat_model") or "",
         embedding_model = kwargs.get("embedding_model", ""),
         base_url        = kwargs.get("ollama_url",      "http://localhost:11434"),
         request_timeout = kwargs.get("request_timeout", 30.0),
         stream_timeout  = kwargs.get("stream_timeout",  60.0),
+        keep_alive      = keep_alive,
     )
 
 
@@ -179,6 +189,12 @@ def create_runtime(
 
         oMLX-specific keys:
             omlx_url (str) — base URL of the oMLX server
+
+        Ollama-specific keys:
+            ollama_url (str)        — base URL of the Ollama daemon
+            ollama_keep_alive (str) — "Keep model loaded" choice, one of
+                                      ollama_runtime_client.KEEP_ALIVE_CHOICES
+                                      ("off" = Ollama's own default)
 
     Returns
     -------

@@ -957,7 +957,12 @@ class ControllerAgent:
             )
             if persona_doc is not None:
                 parsed = parse_wiki_doc(persona_doc.content)
-                body = parsed.body[:2000]
+                # Character cap tied to PromptBuilder's persona ceiling (4
+                # chars/token), not a separate literal: a fixed [:2000] here
+                # silently undid the 500 -> 1,200-token ceiling raise (§3.7e),
+                # cutting every persona back to ~500 tokens before
+                # PromptBuilder ever saw it.
+                body = parsed.body[:PromptBuilder._CEIL_PERSONA * 4]
                 body = body.replace("LangSearch", provider_label)
                 self._persona_cache = body.replace("{{ASSISTANT_NAME}}", assistant_name)
                 self._persona_cache_name = assistant_name

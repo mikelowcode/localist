@@ -1,0 +1,170 @@
+{
+  "meta": {
+    "timestamp": "2026-11-12T15:55:05",
+    "ollama_env": {
+      "OLLAMA_NUM_PARALLEL": "1"
+    }
+  },
+  "profile": {
+    "engine": "ollama",
+    "model": "gemma4:12b-mlx",
+    "load_info": {
+      "reported_size_gb": 7.71,
+      "reported_size_vram_gb": 7.71,
+      "context_length": 4096
+    },
+    "unloaded_baseline": {
+      "engine_footprint_mb": 15.0,
+      "sys_used_gb": 6.99,
+      "memorystatus_free_pct": 84
+    },
+    "loaded_idle": {
+      "engine_footprint_mb": 7593.0,
+      "sys_used_gb": 15.667,
+      "memorystatus_free_pct": 53
+    },
+    "load_wall_s": 2.06,
+    "load_engine_reported_s": 1.507,
+    "load_swapouts": 0,
+    "chars_per_token": 3.73,
+    "trials": [
+      {
+        "engine": "ollama",
+        "target_tokens": 2000,
+        "trial": 1,
+        "pre": {
+          "engine_footprint_mb": 8342.0,
+          "sys_used_gb": 15.938,
+          "memorystatus_free_pct": 50
+        },
+        "ttft_s": 2.876,
+        "total_s": 10.642,
+        "prompt_tokens": 1835,
+        "cached_tokens": null,
+        "prefill_s": 2.711,
+        "completion_tokens": 256,
+        "decode_s": 7.925,
+        "load_s": 0.0,
+        "thinking_chars": 0,
+        "reasoning_tokens": null,
+        "content_chars": 1291,
+        "finish_reason": "length",
+        "prefill_tok_s": 676.9,
+        "decode_tok_s": 32.3,
+        "ok": true,
+        "peak_engine_mb": 10255.0,
+        "peak_sys_used_gb": 17.467,
+        "min_free_pct": 45,
+        "retained": {
+          "engine_footprint_mb": 9022.0,
+          "sys_used_gb": 15.31,
+          "memorystatus_free_pct": 54
+        },
+        "swapins_delta": 45,
+        "swapouts_delta": 0
+      },
+      {
+        "engine": "ollama",
+        "target_tokens": 8000,
+        "trial": 1,
+        "pre": {
+          "engine_footprint_mb": 9022.0,
+          "sys_used_gb": 15.38,
+          "memorystatus_free_pct": 53
+        },
+        "ttft_s": 12.791,
+        "total_s": 20.75,
+        "prompt_tokens": 8011,
+        "cached_tokens": null,
+        "prefill_s": 12.569,
+        "completion_tokens": 256,
+        "decode_s": 8.169,
+        "load_s": 0.001,
+        "thinking_chars": 0,
+        "reasoning_tokens": null,
+        "content_chars": 1288,
+        "finish_reason": "length",
+        "prefill_tok_s": 637.4,
+        "decode_tok_s": 31.34,
+        "ok": true,
+        "peak_engine_mb": 12303.0,
+        "peak_sys_used_gb": 17.758,
+        "min_free_pct": 42,
+        "retained": {
+          "engine_footprint_mb": 9703.0,
+          "sys_used_gb": 15.166,
+          "memorystatus_free_pct": 54
+        },
+        "swapins_delta": 330,
+        "swapouts_delta": 0
+      },
+      {
+        "engine": "ollama",
+        "target_tokens": 16000,
+        "trial": 1,
+        "pre": {
+          "engine_footprint_mb": 9703.0,
+          "sys_used_gb": 15.153,
+          "memorystatus_free_pct": 54
+        },
+        "ttft_s": 34.825,
+        "total_s": 43.538,
+        "prompt_tokens": 19309,
+        "cached_tokens": null,
+        "prefill_s": 34.603,
+        "completion_tokens": 256,
+        "decode_s": 8.917,
+        "load_s": 0.001,
+        "thinking_chars": 0,
+        "reasoning_tokens": null,
+        "content_chars": 1319,
+        "finish_reason": "length",
+        "prefill_tok_s": 558.0,
+        "decode_tok_s": 28.71,
+        "ok": true,
+        "peak_engine_mb": 13327.0,
+        "peak_sys_used_gb": 17.931,
+        "min_free_pct": 42,
+        "retained": {
+          "engine_footprint_mb": 11279.0,
+          "sys_used_gb": 15.225,
+          "memorystatus_free_pct": 54
+        },
+        "swapins_delta": 12,
+        "swapouts_delta": 0
+      }
+    ]
+  },
+  "retention": [
+    {
+      "conversation": 1,
+      "ttft_s": 5.416,
+      "prompt_tokens": 3527,
+      "engine_footprint_mb": 8462.0
+    },
+    {
+      "conversation": 2,
+      "ttft_s": 4.978,
+      "prompt_tokens": 2383,
+      "engine_footprint_mb": 9074.0
+    },
+    {
+      "conversation": 3,
+      "ttft_s": 4.574,
+      "prompt_tokens": 2013,
+      "engine_footprint_mb": 9758.0
+    },
+    {
+      "conversation": 4,
+      "ttft_s": 4.083,
+      "prompt_tokens": 1785,
+      "engine_footprint_mb": 10255.0
+    },
+    {
+      "conversation": "return to 1",
+      "ttft_s": 5.585,
+      "prompt_tokens": 3531,
+      "engine_footprint_mb": 11279.0
+    }
+  ]
+}

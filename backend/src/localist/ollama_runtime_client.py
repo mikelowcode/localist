@@ -66,12 +66,53 @@ _DEFAULT_BASE_URL = "http://localhost:11434"
 _CHAT_PATH  = "/api/chat"
 _TAGS_PATH  = "/api/tags"
 _EMBED_PATH = "/api/embed"
+_PS_PATH       = "/api/ps"
+_GENERATE_PATH = "/api/generate"
 
 # No default chat model — Ollama serves many models of wildly different size
 # (multi-GB local pulls vs. lightweight cloud models), so silently falling
 # back to one is never safe. Empty string means "not configured"; the
 # constructor raises ValueError rather than assuming a model.
 DEFAULT_CHAT_MODEL = ""
+
+# "Keep model loaded" setting (LOCALIST_OLLAMA_KEEP_ALIVE, Settings → Chat
+# Model, §16.36). Maps the stored choice to the value sent as the request's
+# top-level "keep_alive" field. "off" sends nothing, so Ollama applies its own
+# default (unload after 5 idle minutes) — exactly the behavior from before
+# this setting existed. An unload also discards Ollama's prompt cache, so the
+# first message after one pays a reload plus a full prefill (measured: 3.0s
+# vs 1.7s on Gemma 4 12B, diagnostics/diag_kv_levers_phase1.py part b).
+# Keeping the model loaded holds its RAM (~9 GB for that model) while idle.
+KEEP_ALIVE_CHOICES: dict[str, str | int | None] = {
+    "off":    None,
+    "15m":    "15m",
+    "30m":    "30m",
+    "1h":     "1h",
+    "4h":     "4h",
+    "always": -1,
+}
+DEFAULT_KEEP_ALIVE = "off"
+
+# Ollama's own default idle timeout (OLLAMA_KEEP_ALIVE unset). Used only to
+# reset a loaded model's timer when the setting goes back to "off": a request
+# that omits keep_alive keeps whatever duration was last set (confirmed live
+# 2026-11-12 — 30m, then an omitted request, still 30m), so without a reset a
+# switch to "off" wouldn't take effect until the model next unloaded.
+OLLAMA_DEFAULT_KEEP_ALIVE = "5m"
+
+
+def normalize_keep_alive(choice: str | None) -> str:
+    """
+    Validate a keep-alive choice. Empty/None means "off". Raises ValueError
+    for anything not in KEEP_ALIVE_CHOICES.
+    """
+    key = (choice or DEFAULT_KEEP_ALIVE).strip().lower()
+    if key not in KEEP_ALIVE_CHOICES:
+        raise ValueError(
+            f"Unknown keep-alive choice {choice!r}; expected one of: "
+            + ", ".join(KEEP_ALIVE_CHOICES)
+        )
+    return key
 
 # Ollama Cloud models are proxied through the *same* local daemon
 # (base_url stays http://localhost:11434 either way — confirmed live,
@@ -225,14 +266,24 @@ class OllamaRuntimeClient:
         base_url:        str   = _DEFAULT_BASE_URL,
         request_timeout: float = 30.0,
         stream_timeout:  float = 60.0,
+        keep_alive:      str   = DEFAULT_KEEP_ALIVE,
     ) -> None:
         self._chat_model      = chat_model
+        # Public: PUT /settings/ollama-keep-alive updates the live client in
+        # place (read on every request, never captured), so a change applies
+        # to the next request without a controller rebuild.
+        self.keep_alive       = normalize_keep_alive(keep_alive)
         self._embedding_model = embedding_model
         self._base_url        = base_url.rstrip("/")
         self._request_timeout = request_timeout
         self._stream_timeout  = stream_timeout
 
         self.is_local = not _is_cloud_model(chat_model)
+        # Local Ollama reuses a cached prompt prefix token by token (no block
+        # granularity), so the whole shared system message is reusable;
+        # read by warmup.prefix_cache_status() (§3.7e). Cloud models: not
+        # known from here.
+        self.prefix_cache_granularity = "token" if self.is_local else "unknown"
 
         # Per-thread record of how the last completion ended (§16.35).
         self._completions = CompletionRecorder()
@@ -243,11 +294,12 @@ class OllamaRuntimeClient:
 
         logger.info(
             "OllamaRuntimeClient initialised — chat: %s  embed: %s  base: %s  "
-            "is_local: %s",
+            "is_local: %s  keep_alive: %s",
             self._chat_model,
             self._embedding_model,
             self._base_url,
             self.is_local,
+            self.keep_alive,
         )
 
     # -----------------------------------------------------------------------
@@ -473,6 +525,9 @@ class OllamaRuntimeClient:
                 # client controls the context window; it doesn't.
             },
         }
+        keep_alive_value = KEEP_ALIVE_CHOICES.get(self.keep_alive)
+        if keep_alive_value is not None:
+            payload["keep_alive"] = keep_alive_value
 
         effective_timeout = timeout if timeout is not None else self._stream_timeout
 
@@ -553,6 +608,40 @@ class OllamaRuntimeClient:
     # -----------------------------------------------------------------------
     # Diagnostics
     # -----------------------------------------------------------------------
+
+    def reset_keep_alive_to_default(self) -> bool:
+        """
+        Put the loaded chat model back on Ollama's default 5-minute idle
+        timer (see OLLAMA_DEFAULT_KEEP_ALIVE). Called once when the "Keep
+        model loaded" setting changes to "off" — every later request omits
+        keep_alive, which keeps this reset value.
+
+        Only acts when the chat model is currently loaded (GET /api/ps), so
+        it never loads a model just to set its timer; the prompt-less
+        POST /api/generate it sends only updates keep_alive (Ollama answers
+        done_reason="load" and generates nothing). Local models only.
+        Returns True when a reset was sent. Never raises.
+        """
+        if not self.is_local or not self._chat_model:
+            return False
+        try:
+            loaded = requests.get(self._base_url + _PS_PATH, timeout=self._request_timeout).json()
+            names = {m.get("name") for m in loaded.get("models", [])} | {
+                m.get("model") for m in loaded.get("models", [])}
+            if self._chat_model not in names:
+                return False
+            resp = requests.post(
+                self._base_url + _GENERATE_PATH,
+                json    = {"model": self._chat_model, "keep_alive": OLLAMA_DEFAULT_KEEP_ALIVE},
+                timeout = self._request_timeout,
+            )
+            resp.raise_for_status()
+            logger.info("Ollama keep-alive reset to %s for %s.", OLLAMA_DEFAULT_KEEP_ALIVE, self._chat_model)
+            return True
+        except Exception as exc:
+            logger.warning("Ollama keep-alive reset failed (%s) — the model keeps its previous "
+                           "idle timer until it next unloads.", exc)
+            return False
 
     def health_check(self) -> dict:
         """

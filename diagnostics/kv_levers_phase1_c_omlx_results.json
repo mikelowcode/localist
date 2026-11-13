@@ -1,0 +1,352 @@
+{
+  "meta": {
+    "timestamp": "2026-11-12T15:27:10",
+    "sizes": [
+      2000,
+      8000,
+      16000,
+      30000
+    ],
+    "restored_to": false
+  },
+  "runs": {
+    "turboquant_off": {
+      "engine": "omlx",
+      "model": "gemma-4-12B-it-MLX-4bit",
+      "load_info": {
+        "reported_size_gb": 7.58,
+        "estimated_size_gb": 7.08,
+        "context_length": 262144,
+        "thinking_default": false
+      },
+      "unloaded_baseline": {
+        "engine_footprint_mb": 1260.0,
+        "sys_used_gb": 7.191,
+        "memorystatus_free_pct": 89
+      },
+      "loaded_idle": {
+        "engine_footprint_mb": 8497.0,
+        "sys_used_gb": 13.932,
+        "memorystatus_free_pct": 62
+      },
+      "load_wall_s": 4.31,
+      "load_engine_reported_s": 3.47,
+      "load_swapouts": 0,
+      "chars_per_token": 3.73,
+      "trials": [
+        {
+          "engine": "omlx",
+          "target_tokens": 2000,
+          "trial": 1,
+          "pre": {
+            "engine_footprint_mb": 10240.0,
+            "sys_used_gb": 16.928,
+            "memorystatus_free_pct": 55
+          },
+          "ttft_s": 2.932,
+          "total_s": 16.123,
+          "prompt_tokens": 1833,
+          "cached_tokens": 0,
+          "prefill_s": 2.92,
+          "completion_tokens": 256,
+          "decode_s": 13.19,
+          "load_s": null,
+          "thinking_chars": 0,
+          "reasoning_tokens": 0,
+          "content_chars": 1273,
+          "finish_reason": "length",
+          "prefill_tok_s": 627.7,
+          "decode_tok_s": 19.41,
+          "ok": true,
+          "peak_engine_mb": 11264.0,
+          "peak_sys_used_gb": 16.683,
+          "min_free_pct": 55,
+          "retained": {
+            "engine_footprint_mb": 9883.0,
+            "sys_used_gb": 15.122,
+            "memorystatus_free_pct": 62
+          },
+          "swapins_delta": 187,
+          "swapouts_delta": 0
+        },
+        {
+          "engine": "omlx",
+          "target_tokens": 8000,
+          "trial": 1,
+          "pre": {
+            "engine_footprint_mb": 9883.0,
+            "sys_used_gb": 15.122,
+            "memorystatus_free_pct": 62
+          },
+          "ttft_s": 12.507,
+          "total_s": 25.94,
+          "prompt_tokens": 8011,
+          "cached_tokens": 0,
+          "prefill_s": 12.47,
+          "completion_tokens": 256,
+          "decode_s": 13.43,
+          "load_s": null,
+          "thinking_chars": 0,
+          "reasoning_tokens": 0,
+          "content_chars": 1233,
+          "finish_reason": "length",
+          "prefill_tok_s": 642.4,
+          "decode_tok_s": 19.06,
+          "ok": true,
+          "peak_engine_mb": 12288.0,
+          "peak_sys_used_gb": 17.36,
+          "min_free_pct": 54,
+          "retained": {
+            "engine_footprint_mb": 9903.0,
+            "sys_used_gb": 14.171,
+            "memorystatus_free_pct": 62
+          },
+          "swapins_delta": 28,
+          "swapouts_delta": 0
+        },
+        {
+          "engine": "omlx",
+          "target_tokens": 16000,
+          "trial": 1,
+          "pre": {
+            "engine_footprint_mb": 9903.0,
+            "sys_used_gb": 14.161,
+            "memorystatus_free_pct": 62
+          },
+          "ttft_s": 32.483,
+          "total_s": 46.571,
+          "prompt_tokens": 19301,
+          "cached_tokens": 0,
+          "prefill_s": 32.44,
+          "completion_tokens": 256,
+          "decode_s": 14.09,
+          "load_s": null,
+          "thinking_chars": 0,
+          "reasoning_tokens": 0,
+          "content_chars": 1227,
+          "finish_reason": "length",
+          "prefill_tok_s": 595.0,
+          "decode_tok_s": 18.17,
+          "ok": true,
+          "peak_engine_mb": 12288.0,
+          "peak_sys_used_gb": 17.024,
+          "min_free_pct": 51,
+          "retained": {
+            "engine_footprint_mb": 9909.0,
+            "sys_used_gb": 13.672,
+            "memorystatus_free_pct": 59
+          },
+          "swapins_delta": 68,
+          "swapouts_delta": 0
+        },
+        {
+          "engine": "omlx",
+          "target_tokens": 30000,
+          "trial": 1,
+          "pre": {
+            "engine_footprint_mb": 9907.0,
+            "sys_used_gb": 13.652,
+            "memorystatus_free_pct": 59
+          },
+          "ttft_s": 50.328,
+          "total_s": 64.947,
+          "prompt_tokens": 27660,
+          "cached_tokens": 0,
+          "prefill_s": 50.25,
+          "completion_tokens": 256,
+          "decode_s": 14.62,
+          "load_s": null,
+          "thinking_chars": 0,
+          "reasoning_tokens": 0,
+          "content_chars": 1232,
+          "finish_reason": "length",
+          "prefill_tok_s": 550.4,
+          "decode_tok_s": 17.51,
+          "ok": true,
+          "peak_engine_mb": 12288.0,
+          "peak_sys_used_gb": 16.63,
+          "min_free_pct": 48,
+          "retained": {
+            "engine_footprint_mb": 12288.0,
+            "sys_used_gb": 17.143,
+            "memorystatus_free_pct": 53
+          },
+          "swapins_delta": 232,
+          "swapouts_delta": 0
+        }
+      ],
+      "quality": {
+        "omitted": "4 real Localist questions answered at temperature 0; text removed because it quotes the user's own conversations and memories. Off vs on: all reworded slightly, none wrong."
+      }
+    },
+    "turboquant_on": {
+      "engine": "omlx",
+      "model": "gemma-4-12B-it-MLX-4bit",
+      "load_info": {
+        "reported_size_gb": 7.56,
+        "estimated_size_gb": 7.08,
+        "context_length": 262144,
+        "thinking_default": false
+      },
+      "unloaded_baseline": {
+        "engine_footprint_mb": 1336.0,
+        "sys_used_gb": 6.083,
+        "memorystatus_free_pct": 88
+      },
+      "loaded_idle": {
+        "engine_footprint_mb": 8548.0,
+        "sys_used_gb": 13.636,
+        "memorystatus_free_pct": 61
+      },
+      "load_wall_s": 4.35,
+      "load_engine_reported_s": 2.94,
+      "load_swapouts": 0,
+      "chars_per_token": 3.728,
+      "trials": [
+        {
+          "engine": "omlx",
+          "target_tokens": 2000,
+          "trial": 1,
+          "pre": {
+            "engine_footprint_mb": 10240.0,
+            "sys_used_gb": 16.465,
+            "memorystatus_free_pct": 54
+          },
+          "ttft_s": 2.945,
+          "total_s": 16.543,
+          "prompt_tokens": 1834,
+          "cached_tokens": 0,
+          "prefill_s": 2.94,
+          "completion_tokens": 256,
+          "decode_s": 13.6,
+          "load_s": null,
+          "thinking_chars": 0,
+          "reasoning_tokens": 0,
+          "content_chars": 1347,
+          "finish_reason": "length",
+          "prefill_tok_s": 623.8,
+          "decode_tok_s": 18.82,
+          "ok": true,
+          "peak_engine_mb": 11264.0,
+          "peak_sys_used_gb": 16.559,
+          "min_free_pct": 55,
+          "retained": {
+            "engine_footprint_mb": 9927.0,
+            "sys_used_gb": 15.024,
+            "memorystatus_free_pct": 61
+          },
+          "swapins_delta": 876,
+          "swapouts_delta": 0
+        },
+        {
+          "engine": "omlx",
+          "target_tokens": 8000,
+          "trial": 1,
+          "pre": {
+            "engine_footprint_mb": 9927.0,
+            "sys_used_gb": 15.024,
+            "memorystatus_free_pct": 61
+          },
+          "ttft_s": 12.492,
+          "total_s": 26.581,
+          "prompt_tokens": 8005,
+          "cached_tokens": 0,
+          "prefill_s": 12.46,
+          "completion_tokens": 256,
+          "decode_s": 14.09,
+          "load_s": null,
+          "thinking_chars": 0,
+          "reasoning_tokens": 0,
+          "content_chars": 1273,
+          "finish_reason": "length",
+          "prefill_tok_s": 642.5,
+          "decode_tok_s": 18.17,
+          "ok": true,
+          "peak_engine_mb": 12288.0,
+          "peak_sys_used_gb": 17.275,
+          "min_free_pct": 52,
+          "retained": {
+            "engine_footprint_mb": 9923.0,
+            "sys_used_gb": 13.91,
+            "memorystatus_free_pct": 61
+          },
+          "swapins_delta": 16,
+          "swapouts_delta": 0
+        },
+        {
+          "engine": "omlx",
+          "target_tokens": 16000,
+          "trial": 1,
+          "pre": {
+            "engine_footprint_mb": 9923.0,
+            "sys_used_gb": 13.914,
+            "memorystatus_free_pct": 61
+          },
+          "ttft_s": 33.201,
+          "total_s": 47.526,
+          "prompt_tokens": 19294,
+          "cached_tokens": 0,
+          "prefill_s": 33.15,
+          "completion_tokens": 256,
+          "decode_s": 14.32,
+          "load_s": null,
+          "thinking_chars": 0,
+          "reasoning_tokens": 0,
+          "content_chars": 1318,
+          "finish_reason": "length",
+          "prefill_tok_s": 582.0,
+          "decode_tok_s": 17.88,
+          "ok": true,
+          "peak_engine_mb": 12288.0,
+          "peak_sys_used_gb": 16.564,
+          "min_free_pct": 50,
+          "retained": {
+            "engine_footprint_mb": 9923.0,
+            "sys_used_gb": 13.754,
+            "memorystatus_free_pct": 60
+          },
+          "swapins_delta": 27,
+          "swapouts_delta": 0
+        },
+        {
+          "engine": "omlx",
+          "target_tokens": 30000,
+          "trial": 1,
+          "pre": {
+            "engine_footprint_mb": 9921.0,
+            "sys_used_gb": 13.755,
+            "memorystatus_free_pct": 60
+          },
+          "ttft_s": 51.147,
+          "total_s": 65.684,
+          "prompt_tokens": 27645,
+          "cached_tokens": 0,
+          "prefill_s": 51.08,
+          "completion_tokens": 256,
+          "decode_s": 14.54,
+          "load_s": null,
+          "thinking_chars": 0,
+          "reasoning_tokens": 0,
+          "content_chars": 1198,
+          "finish_reason": "length",
+          "prefill_tok_s": 541.2,
+          "decode_tok_s": 17.61,
+          "ok": true,
+          "peak_engine_mb": 13312.0,
+          "peak_sys_used_gb": 17.239,
+          "min_free_pct": 48,
+          "retained": {
+            "engine_footprint_mb": 11264.0,
+            "sys_used_gb": 17.035,
+            "memorystatus_free_pct": 55
+          },
+          "swapins_delta": 8,
+          "swapouts_delta": 0
+        }
+      ],
+      "quality": {
+        "omitted": "4 real Localist questions answered at temperature 0; text removed because it quotes the user's own conversations and memories. Off vs on: all reworded slightly, none wrong."
+      }
+    }
+  }
+}

@@ -4,7 +4,7 @@ PromptBuilder unit tests — persona injection and slot ordering.
 Covers:
   PB-A — No persona: system message is identity constant only
   PB-B — Persona present: appended to system message; absent from user message
-  PB-C — Persona truncation at 500-token ceiling
+  PB-C — Persona truncation at 1,200-token ceiling
   PB-D — Slot ordering with all slots populated
 """
 
@@ -53,9 +53,9 @@ def test_pb_b_persona_appended_to_system_not_in_user():
 
 
 def test_pb_c_persona_truncated_at_ceiling():
-    """Persona longer than 500 tokens (2000 chars) is hard-truncated."""
+    """Persona longer than 1,200 tokens (4,800 chars) is hard-truncated."""
     pb = PromptBuilder()
-    long_persona = "word " * 600   # 3000 chars >> 2000-char (500-token) ceiling
+    long_persona = "word " * 1400   # 7000 chars >> 4,800-char (1,200-token) ceiling
     system_prompt, _ = pb.build(instruction="x", persona=long_persona, current_datetime=_FIXED_DT)
 
     assert len(system_prompt) < len(pb._system_message()) + len(long_persona)
