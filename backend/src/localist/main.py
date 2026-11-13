@@ -1763,7 +1763,7 @@ class AssistantNameRequest(BaseModel):
 
 class OllamaKeepAliveResponse(BaseModel):
     """Response body for GET/PUT /settings/ollama-keep-alive (§16.36)."""
-    keep_alive: str          # one of `choices`; "off" = Ollama's 5-minute default
+    keep_alive: str          # one of `choices`; "off" = Ollama's own default (OLLAMA_KEEP_ALIVE, else 5m)
     choices:    list[str]
     applied_live: bool = False   # True when the active backend is Ollama and took the change now
 

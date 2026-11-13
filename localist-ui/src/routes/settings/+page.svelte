@@ -124,7 +124,9 @@
   // both shown in the Chat Model card. On a failed write the select snaps
   // back to the server's last-known value (no optimistic update).
   const KEEP_ALIVE_LABELS: Record<string, string> = {
-    off: 'Off (Ollama default: unload after 5 idle minutes)',
+    off: "Off (use Ollama's own default: 5 idle minutes unless OLLAMA_KEEP_ALIVE is set)",
+    '1m': '1 minute',
+    '5m': '5 minutes',
     '15m': '15 minutes',
     '30m': '30 minutes',
     '1h': '1 hour',

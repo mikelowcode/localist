@@ -1535,7 +1535,7 @@ sidecar logs.
 
 Two additions to the Chat Model card (`localist-ui/src/routes/settings/+page.svelte`), from the 2026-11-12 KV-cache work (§3.7e, §16.36).
 
-**Keep model loaded** (shown when the selected backend is Ollama). A select bound to `GET`/`PUT /api/settings/ollama-keep-alive`: Off (the default, labelled with Ollama's 5-minute unload), 15 minutes, 30 minutes, 1 hour, 4 hours, Always.
+**Keep model loaded** (shown when the selected backend is Ollama). A select bound to `GET`/`PUT /api/settings/ollama-keep-alive`: Off (the default, labelled as Ollama's own default: 5 idle minutes unless `OLLAMA_KEEP_ALIVE` is set), 1 minute, 5 minutes (both added 2026-11-13), 15 minutes, 30 minutes, 1 hour, 4 hours, Always.
 - On a failed save the select snaps back to the server's last value and shows the error; there's no optimistic update.
 - The hint states the trade: unloading frees memory but makes the next message wait for a reload and lose Ollama's prompt cache.
 - Switching back to Off also resets a loaded model's timer (§16.36).

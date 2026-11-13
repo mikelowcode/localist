@@ -134,12 +134,13 @@ def test_kv2_infer_carries_keep_alive_too():
 
 @pytest.mark.parametrize("raw,expected", [
     (None, "off"), ("", "off"), ("OFF", "off"), (" 30m ", "30m"), ("always", "always"),
+    ("1m", "1m"), ("5M", "5m"),
 ])
 def test_kv2_normalize_accepts(raw, expected):
     assert normalize_keep_alive(raw) == expected
 
 
-@pytest.mark.parametrize("raw", ["5m", "forever", "-1", "yes"])
+@pytest.mark.parametrize("raw", ["2m", "forever", "-1", "yes"])
 def test_kv2_normalize_rejects(raw):
     with pytest.raises(ValueError):
         normalize_keep_alive(raw)
@@ -411,7 +412,9 @@ def _ps_response(names):
     return resp
 
 
-def test_kv8_reset_sends_default_when_model_loaded():
+def test_kv8_reset_sends_default_when_model_loaded(monkeypatch):
+    monkeypatch.delenv("OLLAMA_KEEP_ALIVE", raising=False)
+    monkeypatch.setattr(_ollama_mod, "_launchctl_getenv", lambda name: "")
     client = OllamaRuntimeClient(chat_model="gemma4:12b-mlx")
     with patch.object(_ollama_mod.requests, "get", return_value=_ps_response(["gemma4:12b-mlx"])), \
          patch.object(_ollama_mod.requests, "post") as mock_post:
@@ -445,3 +448,39 @@ def test_kv8_endpoint_resets_only_on_transition_to_off(api):
     assert calls == []
     client.put("/settings/ollama-keep-alive", json={"keep_alive": "off"})   # 4h -> off
     assert calls == [1]
+
+
+# ---------------------------------------------------------------------------
+# KV-9  the "off" reset honours the user's own OLLAMA_KEEP_ALIVE instead of
+#       overriding it with a hardcoded 5 minutes
+# ---------------------------------------------------------------------------
+
+def test_kv9_reset_sends_users_ollama_default(monkeypatch):
+    monkeypatch.setenv("OLLAMA_KEEP_ALIVE", "1m")
+    client = OllamaRuntimeClient(chat_model="gemma4:12b-mlx")
+    with patch.object(_ollama_mod.requests, "get", return_value=_ps_response(["gemma4:12b-mlx"])), \
+         patch.object(_ollama_mod.requests, "post") as mock_post:
+        assert client.reset_keep_alive_to_default() is True
+    assert mock_post.call_args.kwargs["json"] == {"model": "gemma4:12b-mlx", "keep_alive": "1m"}
+
+
+@pytest.mark.parametrize("env,launchctl,expected", [
+    ("1m", "", "1m"),            # process env wins
+    ("", "90s", "90s"),          # launchctl setenv (Ollama.app route)
+    ("1m", "30m", "1m"),         # process env checked first
+    ("", "", "5m"),              # neither set: Ollama's built-in default
+    ("60", "", 60),              # bare seconds -> int, the API rejects unitless strings
+    ("", "-1", -1),
+])
+def test_kv9_resolve_ollama_default(monkeypatch, env, launchctl, expected):
+    if env:
+        monkeypatch.setenv("OLLAMA_KEEP_ALIVE", env)
+    else:
+        monkeypatch.delenv("OLLAMA_KEEP_ALIVE", raising=False)
+    monkeypatch.setattr(_ollama_mod, "_launchctl_getenv", lambda name: launchctl)
+    assert _ollama_mod.resolve_ollama_default_keep_alive() == expected
+
+
+def test_kv9_payload_sends_1m_and_5m_choices():
+    for choice in ("1m", "5m"):
+        assert KEEP_ALIVE_CHOICES[choice] == choice

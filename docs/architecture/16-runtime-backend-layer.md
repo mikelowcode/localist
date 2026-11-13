@@ -2583,8 +2583,8 @@ One INFO log line per turn summarises the record.
 
 | Choice | Sent as the request's top-level `keep_alive` |
 |---|---|
-| `off` (default) | nothing — Ollama's own default applies, exactly as before this setting |
-| `15m`, `30m`, `1h`, `4h` | the same string |
+| `off` (default) | nothing — Ollama's own default applies (`OLLAMA_KEEP_ALIVE` if the user set one, else 5 minutes), exactly as before this setting |
+| `1m`, `5m`, `15m`, `30m`, `1h`, `4h` | the same string (`1m`/`5m` added 2026-11-13; `5m` pins 5 minutes even over a custom `OLLAMA_KEEP_ALIVE`) |
 | `always` | `-1` |
 
 - `OllamaRuntimeClient(keep_alive=…)` validates with `normalize_keep_alive()`. The public `keep_alive` attribute is read on every request, so `PUT /settings/ollama-keep-alive` updates the live client in place, with no controller rebuild (`applied_live` in the response).
@@ -2593,9 +2593,9 @@ One INFO log line per turn summarises the record.
 
 **Ollama keeps the last-set duration when a request omits `keep_alive`.** Confirmed live: a request with `"30m"`, then one with no `keep_alive`, left the model on 30 minutes; an explicit `"5m"` reset it. So a switch to `off` alone would leave a loaded model on its longer timer until it next unloaded. On a change from any other choice to `off`, the endpoint calls `OllamaRuntimeClient.reset_keep_alive_to_default()` once:
 - It checks `GET /api/ps` and acts only if the chat model is loaded, so it never loads a model just to set its timer.
-- It sends a prompt-less `POST /api/generate` with `keep_alive: "5m"` (`OLLAMA_DEFAULT_KEEP_ALIVE`), which only updates the timer (`done_reason: "load"`).
+- It sends a prompt-less `POST /api/generate` with `keep_alive` set to the user's own Ollama default, which only updates the timer (`done_reason: "load"`). `resolve_ollama_default_keep_alive()` reads `OLLAMA_KEEP_ALIVE` from the backend's environment, then from `launchctl getenv` (macOS — how Ollama.app picks up `OLLAMA_*` settings), else `OLLAMA_DEFAULT_KEEP_ALIVE` (`"5m"`). A bare integer is sent as an int (seconds): the API's `keep_alive` only parses strings with a unit.
 - Local models only. It never raises; a failure logs a warning.
-- Limitation: an Ollama server started with a custom `OLLAMA_KEEP_ALIVE` gets 5 minutes for the model loaded at that moment, then its own default again after the next load.
+- Until 2026-11-13 the reset always sent `"5m"`, overriding a custom `OLLAMA_KEEP_ALIVE` (e.g. `1m`) until the model next loaded. Remaining limitation: an `ollama serve` started by hand with a different value than the launchd/backend environment isn't visible to the resolver.
 
 Live check through the real backend (`diagnostics/diag_kv_levers_phase3_live.py`): `30m` → `/api/ps` showed 29.9 minutes left; switching back to `off` → 4.9 minutes.
 

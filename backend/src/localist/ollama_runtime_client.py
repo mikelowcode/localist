@@ -47,6 +47,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import subprocess
+import sys
 from typing import Generator, Iterator
 
 import requests
@@ -78,13 +82,16 @@ DEFAULT_CHAT_MODEL = ""
 # "Keep model loaded" setting (LOCALIST_OLLAMA_KEEP_ALIVE, Settings → Chat
 # Model, §16.36). Maps the stored choice to the value sent as the request's
 # top-level "keep_alive" field. "off" sends nothing, so Ollama applies its own
-# default (unload after 5 idle minutes) — exactly the behavior from before
-# this setting existed. An unload also discards Ollama's prompt cache, so the
+# default — OLLAMA_KEEP_ALIVE if the user set one, else unload after 5 idle
+# minutes — exactly the behavior from before this setting existed. "5m" pins
+# 5 minutes explicitly, overriding any OLLAMA_KEEP_ALIVE. An unload also discards Ollama's prompt cache, so the
 # first message after one pays a reload plus a full prefill (measured: 3.0s
 # vs 1.7s on Gemma 4 12B, diagnostics/diag_kv_levers_phase1.py part b).
 # Keeping the model loaded holds its RAM (~9 GB for that model) while idle.
 KEEP_ALIVE_CHOICES: dict[str, str | int | None] = {
     "off":    None,
+    "1m":     "1m",
+    "5m":     "5m",
     "15m":    "15m",
     "30m":    "30m",
     "1h":     "1h",
@@ -93,12 +100,51 @@ KEEP_ALIVE_CHOICES: dict[str, str | int | None] = {
 }
 DEFAULT_KEEP_ALIVE = "off"
 
-# Ollama's own default idle timeout (OLLAMA_KEEP_ALIVE unset). Used only to
+# Ollama's built-in idle timeout when OLLAMA_KEEP_ALIVE is unset. Used only to
 # reset a loaded model's timer when the setting goes back to "off": a request
 # that omits keep_alive keeps whatever duration was last set (confirmed live
 # 2026-11-12 — 30m, then an omitted request, still 30m), so without a reset a
-# switch to "off" wouldn't take effect until the model next unloaded.
+# switch to "off" wouldn't take effect until the model next unloaded. The
+# reset sends the user's own Ollama default when one is configured (see
+# resolve_ollama_default_keep_alive) and falls back to this otherwise.
 OLLAMA_DEFAULT_KEEP_ALIVE = "5m"
+
+_OLLAMA_KEEP_ALIVE_ENV = "OLLAMA_KEEP_ALIVE"
+_INT_SECONDS_RE = re.compile(r"^-?\d+$")
+
+
+def _launchctl_getenv(name: str) -> str:
+    """macOS: read a variable set with `launchctl setenv` (how Ollama.app
+    picks up OLLAMA_* settings). Empty string when unset, off macOS, or on
+    any failure."""
+    if sys.platform != "darwin":
+        return ""
+    try:
+        out = subprocess.run(
+            ["launchctl", "getenv", name],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+
+def resolve_ollama_default_keep_alive() -> str | int:
+    """
+    The idle timeout Ollama applies to a request that omits keep_alive:
+    OLLAMA_KEEP_ALIVE from this process's environment, then from
+    `launchctl getenv` (macOS), else Ollama's built-in 5 minutes. A bare
+    integer (Ollama reads it as seconds) is returned as an int, because the
+    API's keep_alive field only parses strings that carry a unit.
+
+    Assumes the Ollama server was started with the same environment — true
+    for Ollama.app plus `launchctl setenv`, the documented macOS route. An
+    `ollama serve` started by hand with a different value isn't visible here.
+    """
+    raw = os.environ.get(_OLLAMA_KEEP_ALIVE_ENV, "").strip() or _launchctl_getenv(_OLLAMA_KEEP_ALIVE_ENV)
+    if not raw:
+        return OLLAMA_DEFAULT_KEEP_ALIVE
+    return int(raw) if _INT_SECONDS_RE.match(raw) else raw
 
 
 def normalize_keep_alive(choice: str | None) -> str:
@@ -611,8 +657,9 @@ class OllamaRuntimeClient:
 
     def reset_keep_alive_to_default(self) -> bool:
         """
-        Put the loaded chat model back on Ollama's default 5-minute idle
-        timer (see OLLAMA_DEFAULT_KEEP_ALIVE). Called once when the "Keep
+        Put the loaded chat model back on Ollama's own default idle timer —
+        the user's OLLAMA_KEEP_ALIVE if set, else 5 minutes (see
+        resolve_ollama_default_keep_alive). Called once when the "Keep
         model loaded" setting changes to "off" — every later request omits
         keep_alive, which keeps this reset value.
 
@@ -630,13 +677,14 @@ class OllamaRuntimeClient:
                 m.get("model") for m in loaded.get("models", [])}
             if self._chat_model not in names:
                 return False
+            default = resolve_ollama_default_keep_alive()
             resp = requests.post(
                 self._base_url + _GENERATE_PATH,
-                json    = {"model": self._chat_model, "keep_alive": OLLAMA_DEFAULT_KEEP_ALIVE},
+                json    = {"model": self._chat_model, "keep_alive": default},
                 timeout = self._request_timeout,
             )
             resp.raise_for_status()
-            logger.info("Ollama keep-alive reset to %s for %s.", OLLAMA_DEFAULT_KEEP_ALIVE, self._chat_model)
+            logger.info("Ollama keep-alive reset to %s for %s.", default, self._chat_model)
             return True
         except Exception as exc:
             logger.warning("Ollama keep-alive reset failed (%s) — the model keeps its previous "
