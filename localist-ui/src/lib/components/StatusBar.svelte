@@ -1,7 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { connectivityLabel, health } from '$lib/stores/server';
-  import { runtimeBackendLabel } from '$lib/stores/model';
+  import { backendChip } from '$lib/stores/model';
   import { pendingCount } from '$lib/stores/episodes';
   import { toggleSidebarCollapsed } from '$lib/stores/sidebar';
 
@@ -46,7 +46,7 @@
         class:chip-degraded={$connectivityLabel === 'degraded'}
         class:chip-offline={$connectivityLabel === 'offline'}
         class:chip-checking={$connectivityLabel === 'checking'}
-        title="Backend: {$connectivityLabel}"
+        title="Backend: {$connectivityLabel}{$backendChip.title ? ` · ${$backendChip.title}` : ''}"
       >
         <span
           class="dot"
@@ -57,7 +57,7 @@
           class:dot-pulse={$connectivityLabel === 'checking' || $connectivityLabel === 'online'}
           aria-hidden="true"
         />
-        {$runtimeBackendLabel}{#if freeLeft !== null}<span
+        {$backendChip.label}{#if freeLeft !== null}<span
             class="free-left"
             title="Free OpenRouter requests left today (a chat turn uses about 2–3)"
           >&nbsp;· {freeLeft} free left</span>{/if}

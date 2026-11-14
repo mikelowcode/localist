@@ -1552,3 +1552,29 @@ Two additions to the Chat Model card (`localist-ui/src/routes/settings/+page.sve
 Both are re-read when the active backend or chat model changes. The page reacts to primitive copies of `$modelConfig.backend` and `$health.chat_model`, so the 15-second health poll doesn't re-fetch them. Calls use the `/api/settings/...` form so they work through the Vite dev proxy as well as in the desktop app.
 
 **Not verified:** type-checked (`npm run check`, 0 errors) but not yet looked at in a browser or the packaged app.
+
+### 7.32 Ollama Hybrid Inference: Settings Card, Local/Cloud Chip and Chat Notices (2026-11-14)
+
+UI for Ollama hybrid inference (§16.37): a local model until a conversation passes a token cap, then a cloud model.
+
+**Settings → "Hybrid Inference — Ollama"** (`localist-ui/src/routes/settings/+page.svelte`), a card below Chat Model, shown when the selected backend is Ollama. Bound to `GET`/`PUT /api/settings/ollama-hybrid`; every change saves at once, and a rejected save snaps the controls back and shows the error (no optimistic update).
+- **Move long conversations to Ollama Cloud** (checkbox). Turning it on the first time preselects the current chat model where it fits, else the first model of each kind.
+- **Local model** / **Cloud model** selects, listing only chat models Ollama serves (embedding-only models are left out by the backend). A saved model Ollama no longer serves shows as "(not found)".
+- **Move to cloud after**: 2,000 / 4,000 / 8,000 / 16,000 tokens, or Custom… (number field + Save, 1,000–100,000).
+- Hints: what the size counts, that a conversation stays on cloud until a new chat, the ~60,000-token cloud history per reply and its Ollama Cloud usage, and that a failed cloud reply comes from the local model.
+- Status line: "On — new chats use X and move to Y past N tokens" (noting the Chat Model choice above isn't used while on); "Saved, but not running" (warning) when on but not live; "Saved — takes effect when Ollama is the active backend" when another backend is active.
+- Re-read with the keep-alive and prefix-cache status, when the active backend or chat model changes. A save calls `checkHealth()` so the chip updates.
+
+**Appbar chip** (`StatusBar.svelte`, `backendChip` in `lib/stores/model.ts`). For Ollama it reads **Ollama Local** or **Ollama Cloud**:
+- Hybrid on (`/health` `hybrid`): the tier of the current conversation's latest reply (`metadata.hybrid.tier`), Local for a new chat. Conversations reopened from History keep it, since metadata is stored with each turn. Tooltip: the conversation's size against the cap and the model, or that cloud was unavailable and the local model answered.
+- Hybrid off: Cloud when the chat model's tag ends in `-cloud`.
+- Other backends: unchanged.
+
+**Chat replies** (`ChatPanel.svelte`):
+- On the reply that moved the conversation to cloud (`swapped`): "☁ Moved to Ollama Cloud (model): this conversation passed N tokens. It stays on cloud until you start a new chat."
+- When cloud failed and the local model answered (`fell_back`), in the warning colour: "Ollama Cloud was unavailable, so (model) answered this one. The next message tries the cloud model again."
+- The reply's provenance details gain a model chip, ☁ (cloud) or ⌂ (local), with the conversation size and cap on hover.
+
+`HealthState` gains `hybrid`, `hybrid_cloud_model`, `hybrid_cloud_model_found`, `hybrid_token_cap`; `Task.metadata` gains `hybrid`.
+
+**Verified:** `npm run check` (0 errors). The backend half was checked live (§16.37). The UI itself has not yet been looked at in a browser or the packaged app.

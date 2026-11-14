@@ -1,0 +1,60 @@
+{
+  "conversations": 26,
+  "user_turns": 126,
+  "final_size_p50": 1280,
+  "final_size_p75": 2325,
+  "final_size_p90": 3832,
+  "final_size_p99": 8939,
+  "final_size_max": 8939,
+  "per_cap": [
+    {
+      "cap": 2000,
+      "conversations_crossing": 5,
+      "share_conversations": 0.192,
+      "median_crossing_turn": 7,
+      "share_turns_on_cloud": 0.198
+    },
+    {
+      "cap": 4000,
+      "conversations_crossing": 1,
+      "share_conversations": 0.038,
+      "median_crossing_turn": 13,
+      "share_turns_on_cloud": 0.071
+    },
+    {
+      "cap": 8000,
+      "conversations_crossing": 1,
+      "share_conversations": 0.038,
+      "median_crossing_turn": 19,
+      "share_turns_on_cloud": 0.024
+    },
+    {
+      "cap": 12000,
+      "conversations_crossing": 0,
+      "share_conversations": 0.0,
+      "median_crossing_turn": null,
+      "share_turns_on_cloud": 0.0
+    },
+    {
+      "cap": 16000,
+      "conversations_crossing": 0,
+      "share_conversations": 0.0,
+      "median_crossing_turn": null,
+      "share_turns_on_cloud": 0.0
+    },
+    {
+      "cap": 24000,
+      "conversations_crossing": 0,
+      "share_conversations": 0.0,
+      "median_crossing_turn": null,
+      "share_turns_on_cloud": 0.0
+    },
+    {
+      "cap": 32000,
+      "conversations_crossing": 0,
+      "share_conversations": 0.0,
+      "median_crossing_turn": null,
+      "share_turns_on_cloud": 0.0
+    }
+  ]
+}

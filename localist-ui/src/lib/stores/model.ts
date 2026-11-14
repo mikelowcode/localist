@@ -1,6 +1,7 @@
 import { writable, derived } from 'svelte/store';
 import { browser } from '$app/environment';
 import { health } from './server';
+import { chatHistoryStore } from './chatHistory';
 
 export interface ModelState {
   backend: string;
@@ -57,3 +58,50 @@ export const runtimeBackendLabel = derived(modelConfig, ($m) =>
   RUNTIME_BACKEND_LABELS[$m.backend as RuntimeBackend] ?? $m.backend
 );
 
+
+// Ollama runs both local models and Ollama Cloud ("-cloud") models; the
+// tag is the part after ':'.
+export function isOllamaCloudModel(model: string): boolean {
+  const tag = model.includes(':') ? model.slice(model.indexOf(':') + 1) : model;
+  return tag.endsWith('-cloud');
+}
+
+export interface BackendChip {
+  label: string;
+  title: string;
+  cloud: boolean;
+}
+
+// The appbar status chip. For Ollama it says where this conversation is
+// answered: with hybrid inference on (backend §16.37) that's the tier of
+// the conversation's latest reply (a new chat starts local); otherwise
+// it's whether the chat model is an Ollama Cloud model.
+export const backendChip = derived(
+  [runtimeBackendLabel, modelConfig, health, chatHistoryStore],
+  ([$label, $m, $h, $turns]): BackendChip => {
+    if ($m.backend !== 'ollama') return { label: $label, title: '', cloud: false };
+
+    if ($h.hybrid) {
+      const last = [...$turns].reverse().find((t) => t.role === 'assistant' && t.metadata?.hybrid);
+      const info = last?.metadata?.hybrid;
+      const cloud = info?.tier === 'cloud';
+      const cap = ($h.hybrid_token_cap ?? info?.cap ?? 0).toLocaleString();
+      let title = info
+        ? `Hybrid: this conversation is about ${info.size.toLocaleString()} tokens; it moves to Ollama Cloud past ${cap}.`
+        : `Hybrid: new conversations start local and move to Ollama Cloud past ${cap} tokens.`;
+      if (info?.fell_back) title = 'Ollama Cloud was unavailable, so the local model answered the last reply.';
+      return {
+        label: cloud ? `${$label} Cloud` : `${$label} Local`,
+        title: `${title} Model: ${info?.model ?? $h.chat_model}`,
+        cloud
+      };
+    }
+
+    const cloud = isOllamaCloudModel($h.chat_model);
+    return {
+      label: cloud ? `${$label} Cloud` : `${$label} Local`,
+      title: $h.chat_model ? `Model: ${$h.chat_model}` : '',
+      cloud
+    };
+  }
+);

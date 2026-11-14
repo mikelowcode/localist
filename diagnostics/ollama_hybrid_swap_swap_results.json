@@ -1,0 +1,217 @@
+{
+  "local": "gemma4:12b-mlx",
+  "cloud": "gemma4:31b-cloud",
+  "embed_model": "nomic-embed-text:latest",
+  "keep_alive": "1m",
+  "steps": [
+    {
+      "step": "local turn 1",
+      "embed": {
+        "model": "nomic-embed-text:latest",
+        "total_s": 5.58,
+        "load_s": 5.552
+      },
+      "chat": {
+        "model": "gemma4:12b-mlx",
+        "ttft_s": 2.607,
+        "total_s": 4.416,
+        "prompt_eval_count": 1648,
+        "eval_count": 51,
+        "load_s": 0.001,
+        "prompt_eval_s": 2.437,
+        "done_reason": "stop"
+      },
+      "est_tokens": 1525,
+      "ps": [
+        {
+          "name": "nomic-embed-text:latest",
+          "size_gb": 0.34,
+          "context_length": 2048,
+          "expires_at": "2026-11-14T10:25:04.927004-08:00"
+        },
+        {
+          "name": "gemma4:12b-mlx",
+          "size_gb": 15.37,
+          "context_length": 4096,
+          "expires_at": "2026-11-14T10:21:09.343831-08:00"
+        }
+      ]
+    },
+    {
+      "step": "local turn 2",
+      "embed": {
+        "model": "nomic-embed-text:latest",
+        "total_s": 0.016,
+        "load_s": 0.005
+      },
+      "chat": {
+        "model": "gemma4:12b-mlx",
+        "ttft_s": 2.698,
+        "total_s": 5.064,
+        "prompt_eval_count": 3253,
+        "eval_count": 69,
+        "load_s": 0.0,
+        "prompt_eval_s": 2.5,
+        "done_reason": "stop"
+      },
+      "est_tokens": 3100,
+      "ps": [
+        {
+          "name": "nomic-embed-text:latest",
+          "size_gb": 0.34,
+          "context_length": 2048,
+          "expires_at": "2026-11-14T10:25:09.373063-08:00"
+        },
+        {
+          "name": "gemma4:12b-mlx",
+          "size_gb": 16.05,
+          "context_length": 4096,
+          "expires_at": "2026-11-14T10:21:14.438105-08:00"
+        }
+      ]
+    },
+    {
+      "step": "swap \u2192 cloud",
+      "embed": {
+        "model": "nomic-embed-text:latest",
+        "total_s": 0.013,
+        "load_s": 0.001
+      },
+      "chat": {
+        "model": "gemma4:31b-cloud",
+        "ttft_s": 0.493,
+        "total_s": 0.848,
+        "prompt_eval_count": 10721,
+        "eval_count": 96,
+        "load_s": 0.0,
+        "prompt_eval_s": 0.0,
+        "done_reason": "length"
+      },
+      "est_tokens": 10201,
+      "ps": [
+        {
+          "name": "nomic-embed-text:latest",
+          "size_gb": 0.34,
+          "context_length": 2048,
+          "expires_at": "2026-11-14T10:25:14.461431-08:00"
+        },
+        {
+          "name": "gemma4:12b-mlx",
+          "size_gb": 16.05,
+          "context_length": 4096,
+          "expires_at": "2026-11-14T10:21:14.438105-08:00"
+        }
+      ]
+    },
+    {
+      "step": "cloud turn 2",
+      "embed": {
+        "model": "nomic-embed-text:latest",
+        "total_s": 0.026,
+        "load_s": 0.003
+      },
+      "chat": {
+        "model": "gemma4:31b-cloud",
+        "ttft_s": 0.515,
+        "total_s": 0.638,
+        "prompt_eval_count": 10835,
+        "eval_count": 52,
+        "load_s": 0.0,
+        "prompt_eval_s": 0.0,
+        "done_reason": "stop"
+      },
+      "est_tokens": 10307,
+      "ps": [
+        {
+          "name": "nomic-embed-text:latest",
+          "size_gb": 0.34,
+          "context_length": 2048,
+          "expires_at": "2026-11-14T10:25:15.339631-08:00"
+        },
+        {
+          "name": "gemma4:12b-mlx",
+          "size_gb": 16.05,
+          "context_length": 4096,
+          "expires_at": "2026-11-14T10:21:14.438105-08:00"
+        }
+      ]
+    },
+    {
+      "step": "new chat \u2192 local warm",
+      "embed": {
+        "model": "nomic-embed-text:latest",
+        "total_s": 0.025,
+        "load_s": 0.003
+      },
+      "chat": {
+        "model": "gemma4:12b-mlx",
+        "ttft_s": 0.308,
+        "total_s": 3.223,
+        "prompt_eval_count": 71,
+        "eval_count": 96,
+        "load_s": 0.001,
+        "prompt_eval_s": 0.221,
+        "done_reason": "length"
+      },
+      "est_tokens": 28,
+      "ps": [
+        {
+          "name": "nomic-embed-text:latest",
+          "size_gb": 0.34,
+          "context_length": 2048,
+          "expires_at": "2026-11-14T10:25:16.007542-08:00"
+        },
+        {
+          "name": "gemma4:12b-mlx",
+          "size_gb": 16.16,
+          "context_length": 4096,
+          "expires_at": "2026-11-14T10:21:19.230707-08:00"
+        }
+      ]
+    },
+    {
+      "step": "ps after idle",
+      "ps": [
+        {
+          "name": "nomic-embed-text:latest",
+          "size_gb": 0.34,
+          "context_length": 2048,
+          "expires_at": "2026-11-14T10:25:16.007542-08:00"
+        }
+      ]
+    },
+    {
+      "step": "new chat \u2192 local cold",
+      "embed": {
+        "model": "nomic-embed-text:latest",
+        "total_s": 0.023,
+        "load_s": 0.003
+      },
+      "chat": {
+        "model": "gemma4:12b-mlx",
+        "ttft_s": 2.234,
+        "total_s": 4.984,
+        "prompt_eval_count": 67,
+        "eval_count": 96,
+        "load_s": 1.917,
+        "prompt_eval_s": 0.216,
+        "done_reason": "length"
+      },
+      "est_tokens": 27,
+      "ps": [
+        {
+          "name": "nomic-embed-text:latest",
+          "size_gb": 0.34,
+          "context_length": 2048,
+          "expires_at": "2026-11-14T10:26:29.270858-08:00"
+        },
+        {
+          "name": "gemma4:12b-mlx",
+          "size_gb": 7.81,
+          "context_length": 4096,
+          "expires_at": "2026-11-14T10:22:34.256071-08:00"
+        }
+      ]
+    }
+  ]
+}

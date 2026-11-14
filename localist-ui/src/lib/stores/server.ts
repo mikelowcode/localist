@@ -50,6 +50,13 @@ export interface HealthState {
   // by the next successful one. null for oMLX/Ollama.
   runtime_key_info: RuntimeKeyInfo | null;
   runtime_last_error: RuntimeLastError | null;
+  // Ollama hybrid inference (backend §16.37): true when the active runtime
+  // answers on the local model until a conversation passes the token cap,
+  // then on hybrid_cloud_model. chat_model is then the local model.
+  hybrid: boolean;
+  hybrid_cloud_model: string;
+  hybrid_cloud_model_found: boolean;
+  hybrid_token_cap: number | null;
 }
 
 export interface RuntimeKeyInfo {
@@ -97,7 +104,11 @@ const initialHealth: HealthState = {
   embedding_host: '',
   embedding_warning: null,
   runtime_key_info: null,
-  runtime_last_error: null
+  runtime_last_error: null,
+  hybrid: false,
+  hybrid_cloud_model: '',
+  hybrid_cloud_model_found: false,
+  hybrid_token_cap: null
 };
 
 export const health = writable<HealthState>(initialHealth);

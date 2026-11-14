@@ -431,6 +431,24 @@
                 <span class="placeholder-pulse">···</span>
               {/if}
 
+              <!-- Ollama hybrid inference (§16.37): say so on the reply that
+                   moved this conversation to cloud, and when cloud failed
+                   and the local model answered instead. -->
+              {#if turn.status === 'complete' && turn.metadata?.hybrid}
+                {@const h = turn.metadata.hybrid}
+                {#if h.fell_back}
+                  <p class="hybrid-notice hybrid-notice-warn">
+                    Ollama Cloud was unavailable, so <code>{h.model}</code> answered this one. The next
+                    message tries the cloud model again.
+                  </p>
+                {:else if h.swapped}
+                  <p class="hybrid-notice">
+                    ☁ Moved to Ollama Cloud (<code>{h.model}</code>): this conversation passed
+                    {h.cap.toLocaleString()} tokens. It stays on cloud until you start a new chat.
+                  </p>
+                {/if}
+              {/if}
+
               {#if turn.status === 'complete' && turn.metadata}
                 {@const p = turn.metadata}
                 {@const key = provKey(turn)}
@@ -463,6 +481,12 @@
                     {/if}
                     {#if p.grounded}
                       <span class="prov-chip prov-grounded">◈ grounded</span>
+                    {/if}
+                    {#if p.hybrid}
+                      <span
+                        class="prov-chip {p.hybrid.tier === 'cloud' ? 'prov-cloud' : 'prov-default'}"
+                        title="Conversation size {p.hybrid.size.toLocaleString()} tokens; moves to cloud past {p.hybrid.cap.toLocaleString()}"
+                      >{p.hybrid.tier === 'cloud' ? '☁' : '⌂'} {p.hybrid.model}</span>
                     {/if}
                     {#if turn.sources && turn.sources.length > 0}
                       {#each turn.sources as src}
@@ -964,6 +988,16 @@
   .prov-tool     { background: #1e1e1e;           color: #cf9a7e; border-color: #4a3020; }
   .prov-episodic-mem { background: #2a2218;       color: #cfb07e; border-color: #5a4a2d; }
   .prov-grounded { background: #1a2a1a;           color: #7ecf7e; border-color: #2d4a2d; }
+  .prov-cloud    { background: #1a1a2e;           color: #7ea8cf; border-color: #2d3a5a; }
+
+  .hybrid-notice {
+    margin: var(--sp-2) 0 0;
+    font-size: var(--text-xs);
+    line-height: 1.5;
+    color: var(--text-tertiary);
+  }
+  .hybrid-notice-warn { color: var(--warning); }
+  .hybrid-notice code { font-size: 10.5px; }
 
   .attach-btn {
     display: flex;

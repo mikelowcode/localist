@@ -1,0 +1,205 @@
+{
+  "local": "gemma4:12b-mlx",
+  "cloud": "gemma4:31b-cloud",
+  "results": [
+    {
+      "step": "warmup",
+      "model": "gemma4:12b-mlx",
+      "ttft_s": 2.337,
+      "total_s": 2.435,
+      "prompt_eval_count": 47,
+      "eval_count": 2,
+      "load_s": 2.021,
+      "prompt_eval_s": 0.209,
+      "done_reason": "stop",
+      "reply": "OK."
+    },
+    {
+      "model": "gemma4:12b-mlx",
+      "ttft_s": 3.37,
+      "total_s": 4.551,
+      "prompt_eval_count": 2147,
+      "eval_count": 35,
+      "load_s": 0.008,
+      "prompt_eval_s": 3.272,
+      "done_reason": "stop",
+      "reply": "This text defines the technical schema, taxonomy, and lifecycle rules for an \"Episodic Memory\" system designed to store sparse, high-value facts extracted from user conversations.",
+      "step": "sweep",
+      "target_tokens": 2000,
+      "est_tokens": 2022,
+      "est_over_actual": 0.942
+    },
+    {
+      "model": "gemma4:12b-mlx",
+      "ttft_s": 6.63,
+      "total_s": 7.993,
+      "prompt_eval_count": 4290,
+      "eval_count": 47,
+      "load_s": 0.005,
+      "prompt_eval_s": 6.521,
+      "done_reason": "stop",
+      "reply": "This text defines the **Episodic Memory Schema**, a technical specification for extracting, storing, and retrieving high-value, durable facts (called \"episodes\") from user conversations to provide long-term context for an AI agent.",
+      "step": "sweep",
+      "target_tokens": 4000,
+      "est_tokens": 4022,
+      "est_over_actual": 0.938
+    },
+    {
+      "model": "gemma4:12b-mlx",
+      "ttft_s": 13.411,
+      "total_s": 15.155,
+      "prompt_eval_count": 8504,
+      "eval_count": 47,
+      "load_s": 0.003,
+      "prompt_eval_s": 13.285,
+      "done_reason": "stop",
+      "reply": "This text defines the technical specifications and architectural rules for an **Episodic Memory System**, detailing how a model extracts, stores, and retrieves sparse, high-value facts (episodes) from conversations to provide persistent context across sessions.",
+      "step": "sweep",
+      "target_tokens": 8000,
+      "est_tokens": 8022,
+      "est_over_actual": 0.943
+    },
+    {
+      "model": "gemma4:12b-mlx",
+      "ttft_s": 29.219,
+      "total_s": 30.165,
+      "prompt_eval_count": 17118,
+      "eval_count": 31,
+      "load_s": 0.003,
+      "prompt_eval_s": 29.014,
+      "done_reason": "stop",
+      "reply": "This text defines the technical specifications and architectural rules for an **Episodic Memory** system and a **Unified Prompt Contract** for an AI research assistant.",
+      "step": "sweep",
+      "target_tokens": 16000,
+      "est_tokens": 16022,
+      "est_over_actual": 0.936
+    },
+    {
+      "model": "gemma4:12b-mlx",
+      "ttft_s": 67.755,
+      "total_s": 69.087,
+      "prompt_eval_count": 33832,
+      "eval_count": 39,
+      "load_s": 0.002,
+      "prompt_eval_s": 67.426,
+      "done_reason": "stop",
+      "reply": "The vault code is PERIWINKLE-4471.\n\nThe provided text details the architectural design and technical specifications for a sophisticated episodic memory and prompt engineering system for a research assistant.",
+      "step": "sweep",
+      "target_tokens": 32000,
+      "est_tokens": 32044,
+      "est_over_actual": 0.947,
+      "needle_recalled": true
+    },
+    {
+      "step": "ps_after",
+      "model": "gemma4:12b-mlx",
+      "ps": [
+        {
+          "name": "gemma4:12b-mlx",
+          "size_gb": 14.57,
+          "context_length": 4096,
+          "expires_at": "2026-11-14T10:20:47.053375-08:00"
+        }
+      ]
+    },
+    {
+      "step": "warmup",
+      "model": "gemma4:31b-cloud",
+      "ttft_s": 0.301,
+      "total_s": 0.381,
+      "prompt_eval_count": 46,
+      "eval_count": 2,
+      "load_s": 0.0,
+      "prompt_eval_s": 0.0,
+      "done_reason": "stop",
+      "reply": "OK"
+    },
+    {
+      "model": "gemma4:31b-cloud",
+      "ttft_s": 0.344,
+      "total_s": 0.457,
+      "prompt_eval_count": 2145,
+      "eval_count": 32,
+      "load_s": 0.0,
+      "prompt_eval_s": 0.0,
+      "done_reason": "stop",
+      "reply": "This text defines the technical schema, taxonomy, and lifecycle management rules for an episodic memory system designed to store high-value, durable facts extracted from conversations.",
+      "step": "sweep",
+      "target_tokens": 2000,
+      "est_tokens": 2022,
+      "est_over_actual": 0.943
+    },
+    {
+      "model": "gemma4:31b-cloud",
+      "ttft_s": 0.301,
+      "total_s": 0.487,
+      "prompt_eval_count": 4288,
+      "eval_count": 38,
+      "load_s": 0.0,
+      "prompt_eval_s": 0.0,
+      "done_reason": "stop",
+      "reply": "This text defines the technical schema, lifecycle rules, and retrieval mechanisms for an \"Episodic Memory\" system designed to store and recall high-value, typed facts from user conversations.",
+      "step": "sweep",
+      "target_tokens": 4000,
+      "est_tokens": 4022,
+      "est_over_actual": 0.938
+    },
+    {
+      "model": "gemma4:31b-cloud",
+      "ttft_s": 0.524,
+      "total_s": 0.617,
+      "prompt_eval_count": 8502,
+      "eval_count": 39,
+      "load_s": 0.0,
+      "prompt_eval_s": 0.0,
+      "done_reason": "stop",
+      "reply": "This text is a technical specification for an \"Episodic Memory Schema,\" detailing the database design, retrieval modes, and prompt integration for a long-term memory system in an AI agent.",
+      "step": "sweep",
+      "target_tokens": 8000,
+      "est_tokens": 8022,
+      "est_over_actual": 0.944
+    },
+    {
+      "model": "gemma4:31b-cloud",
+      "ttft_s": 0.829,
+      "total_s": 1.036,
+      "prompt_eval_count": 17120,
+      "eval_count": 47,
+      "load_s": 0.0,
+      "prompt_eval_s": 0.0,
+      "done_reason": "stop",
+      "reply": "This text is a technical specification for a local AI assistant's memory architecture and prompt engineering contract, detailing how episodic memories are stored and retrieved and how the system prompt is structured to optimize LLM performance and KV-cache efficiency.",
+      "step": "sweep",
+      "target_tokens": 16000,
+      "est_tokens": 16022,
+      "est_over_actual": 0.936
+    },
+    {
+      "model": "gemma4:31b-cloud",
+      "ttft_s": 1.328,
+      "total_s": 1.528,
+      "prompt_eval_count": 33806,
+      "eval_count": 42,
+      "load_s": 0.0,
+      "prompt_eval_s": 0.0,
+      "done_reason": "stop",
+      "reply": "This text is a technical architectural specification for a local AI assistant's episodic memory system and its unified prompt construction contract, focusing on data schemas, retrieval modes, and KV-cache optimization for inference performance.",
+      "step": "sweep",
+      "target_tokens": 32000,
+      "est_tokens": 32022,
+      "est_over_actual": 0.947
+    },
+    {
+      "step": "ps_after",
+      "model": "gemma4:31b-cloud",
+      "ps": [
+        {
+          "name": "gemma4:12b-mlx",
+          "size_gb": 14.57,
+          "context_length": 4096,
+          "expires_at": "2026-11-14T10:20:47.053375-08:00"
+        }
+      ]
+    }
+  ]
+}

@@ -568,6 +568,10 @@ to a small fixed budget regardless of what the active model can actually hold �
 (5 turns / 300 tokens) were sized for the 16GB Apple-Silicon local-inference case and applied
 identically even when Ollama Cloud (~128K real context) was active.
 
+**Exception (2026-11-14, §16.37):** `HybridOllamaRuntimeClient.is_local` is a property that follows the
+active tier of the current conversation, so it can differ between turns (and between concurrent
+requests). Every other client still sets it once at construction.
+
 **Per-backend derivation — grounded in live code, not assumed:**
 
 - **`OMLXRuntimeClient.is_local = True`, always.** oMLX only ever runs on-device; no branching.
@@ -2612,3 +2616,42 @@ Live check through the real backend (`diagnostics/diag_kv_levers_phase3_live.py`
 - **Prompt cache** (`diagnostics/diag_engine_bench_phase2.py`): both engines kept their cache through Localist's interleaved `working_state`/`implicit_extraction` calls and across three other conversations. Ollama is not limited to one cached sequence. After four other ~3k-token conversations, neither reused the first. Only oMLX survived a model unload (its SSD tier). Each extra conversation Ollama kept added ~0.6 GB.
 - **Ollama memory settings don't help:** `OLLAMA_NUM_PARALLEL` already defaults to 1, and `OLLAMA_KV_CACHE_TYPE=q8_0` with flash attention changed nothing measurable for the MLX runner. Measured against `ollama serve` started directly with each variable, verified to have served the requests; Ollama.app ignores a normal quit and respawns its own server.
 - **oMLX's 4-bit KV cache (`turboquant_kv`)** gave no measurable RAM saving, ~2% slower generation and slightly reworded answers, so it was not adopted.
+
+### §16.37 — Ollama hybrid inference: local until a conversation passes a token cap, then cloud (2026-11-14)
+
+**What.** With hybrid inference on, the Ollama backend answers on a local model (Gemma 4 12B) until a conversation grows past a user-set token cap (default 4,000), then answers that conversation on an Ollama Cloud model (`gemma4:31b-cloud`) for the rest of its life. A new conversation starts local again. Both models are served by the same Ollama daemon, so a swap is just a different `model` on the next request: no restart, no controller rebuild, and the embedding model is never touched. Off by default.
+
+**Why the cap measures the whole conversation, not the prompt sent.** Local Ollama reports no `max_model_len`, so `context_profile.py` falls back to 8,192 and the local history budget sits at its 300-token floor (§16.11). The prompt actually sent barely grows with the conversation, so a cap on it would almost never trip. `ControllerAgent._conversation_size()` sums `len(content)//4` over every `conversation_log` entry for the conversation (user turns, answers, agent/tool results; the new message is already logged) plus attached session files. Once a conversation moves to cloud it gets `CLOUD_PROFILE`'s 60,000-token history budget, which is the real gain: long conversations stop losing their earlier context.
+
+**Phase 0 measurements** (2026-11-14, `diagnostics/diag_ollama_hybrid_swap.py`, results in `diagnostics/ollama_hybrid_swap_*_results.json`):
+- **Prefill, nothing cached** (time to first token): local 12B 3.4 s at 2K tokens, 6.6 s at 4K, 13.4 s at 8K, 29.2 s at 16K, 67.8 s at 32K (~650 tok/s); cloud 0.3–1.3 s at every size. A needle at the start of the 32K prompt was recalled, so the local model doesn't truncate. `len//4` comes out ~6% under Ollama's `prompt_eval_count`.
+- **Swap:** local → cloud mid-conversation (10K tokens) 0.49 s to first token; back to a warm local model 0.31 s; to a cold one after a 1-minute keep-alive expired 2.2 s (1.9 s reload). The embedding model (`nomic-embed-text`) stayed loaded throughout and was never reloaded.
+- **Real conversation sizes** (26 conversations from chat history): p50 1.3K, p90 3.8K, max 8.9K tokens. A 4,000 cap moves ~4% of conversations and ~7% of turns to cloud; 2,000 would move 20% of turns, 8,000 only 2%. 4,000 was chosen: below it the local model is still quick on a cached turn, and above it the local model was already keeping only ~300 tokens of history.
+
+**Components** (`backend/src/localist/ollama_hybrid.py`):
+- `HybridOllamaRuntimeClient` wraps two `OllamaRuntimeClient`s (local, cloud) on one base URL and satisfies `BaseRuntimeClient`. Every call goes to the tier in a `ContextVar` set by `use_tier()`. `asyncio.to_thread` copies the caller's context, so every inference call a turn makes (routing classifiers, main answer, working state, episodic extraction) follows that conversation's tier; code that never sets one (warm-up, news brief, ingestion) runs local. `embed()` and `reset_keep_alive_to_default()` always go to the local client; the `keep_alive` setter applies to both. `last_completion` reports the client that served this thread's last call. Construction rejects an empty model, a cloud model as local, and a non-`-cloud` model as cloud.
+- **`is_local` follows the active tier** — the one client where it isn't fixed at construction (§16.7). That's what makes `profile_for()` give a cloud-tier conversation the cloud budget.
+- `ConversationTierTracker`: once a conversation's size exceeds the cap it is latched to cloud (it never moves back, even if its measured size drops). Thread-safe, bounded to 512 conversations; a forgotten conversation, or any after a restart, is re-measured on its next turn and goes straight back to cloud if still over. The cap is read on every decision, so a change applies next turn and leaves existing latches alone. Range 1,000–100,000; presets 2K/4K/8K/16K.
+- `list_chat_models(base_url)`: the served models that can chat (`POST /api/show` capabilities include `completion`), split local/cloud, for the Settings pickers. Embedding-only models are left out; a model whose capabilities can't be read is kept.
+
+**Per turn** (`controller_agent.py`). `_hybrid_turn_scope()` wraps `_execute()` (`handle_task`) and `_execute_plan()` (`handle_task_with_plan`): it measures the conversation, calls `decide_tier()`, and runs the block under `use_tier()`. The turn's info — `tier`, `model` (what answered), `size`, `cap`, `swapped` (this turn moved it to cloud), `fell_back` — goes into the reply's `metadata.hybrid`, via the answer guard's `diagnostics` (so the stream's early `done` event carries it) and `handle_task*`'s `metadata.setdefault` for other agents. `route_task()`, which the streaming endpoint runs before `handle_task_with_plan`, only reads the latch (`tracker.tier_of`) so it doesn't consume the turn's `swapped` signal; on the turn that crosses the cap its few small classifier calls run local.
+
+**Cloud failure.** If the cloud model fails before its first token:
+- A prompt ≤ the cap (episodic extraction, working state, classifiers) is retried on the local client inside `infer_stream()` (`last_fell_back`).
+- A larger one raises `CloudTierUnavailableError` (a `RuntimeError`) and sets `last_cloud_unavailable`, since `agent.run()` turns exceptions into a failed `AgentResult`. The answer guard (`_dispatch_conversational_with_answer_guard`, which now receives `build_kwargs`) sees that, sends the status "Cloud model unavailable — answering on the local model…", switches the rest of the turn to local (`switch_tier`), rebuilds the prompt with history re-fetched at the local budget (`_local_fallback_subtask`) and answers locally. Sending a 60K-token cloud prompt to a ~650 tok/s local prefill isn't a fallback.
+- Either way the conversation stays latched, so the next turn tries cloud again. A failure after the first token isn't retried.
+
+**Settings** (`main.py`). `LOCALIST_OLLAMA_HYBRID_ENABLED` / `_LOCAL_MODEL` / `_CLOUD_MODEL` / `_TOKEN_CAP` (`Settings.ollama_hybrid_*`), passed by `_ollama_hybrid_kwargs()` at the three chat-client construction sites. `runtime_factory._make_ollama()` builds the hybrid client when enabled; an invalid config logs a warning and builds the plain single-model client instead of failing startup.
+- `GET /settings/ollama-hybrid`: saved values, cap presets/range, `active` (the running runtime is the hybrid client), and `local_models` / `cloud_models` / `models_error` from `list_chat_models()`.
+- `PUT /settings/ollama-hybrid` (unset fields keep their value): 400 for a cloud model as local, a non-cloud model as cloud, a cap out of range, or turning on without both models / with a model Ollama doesn't serve / with a non-chat model; 502 when Ollama is unreachable on turning on. Nothing is persisted on a rejection. While Ollama is active, a cap-only change sets `tracker.cap` on the live client; turning on/off, a model change while on, or "on but not live" rebuilds via `_rebuild_active_controller()` — the live-rebuild helper factored out of the chat-model pin endpoint, which now uses it too. Saving models while off rebuilds nothing. With another backend active the settings are saved and apply on the next switch to Ollama.
+- `GET /health` gains `hybrid`, `hybrid_cloud_model`, `hybrid_cloud_model_found`, `hybrid_token_cap`; `chat_model` is the local model while hybrid is on.
+
+**Tests:** `test_ollama_hybrid.py` (client, tracker, fallback, model listing), `test_ollama_hybrid_wiring.py` (factory, controller tier per turn, metadata, local rebuild on cloud failure, route latch, keep-alive), `test_ollama_hybrid_settings.py` (endpoints, health).
+
+**Live check (2026-11-14, real backend + Ollama, `/task/stream`).** Turning hybrid on through `PUT` rebuilt the controller live (`active: true`) and `/health` reported it. A conversation: short question → local (17 tokens, 4.6 s first token, cold load); a long pasted excerpt → **cloud, swapped** (4,099 tokens, 3.3 s); a follow-up → cloud (4,197, 0.55 s), which recalled a name from the conversation's first message; a new chat → local (13 tokens, 2.1 s). The embedding model stayed loaded throughout. Not exercised live: cloud failure (covered by tests).
+
+**Known limits.**
+- Size uses `len//4`, ~6% under Ollama's real count; the cap is a user-chosen threshold, so that's acceptable.
+- The latch lives in memory: after a restart a conversation is re-measured, which gives the same answer unless the cap was raised.
+- `LOCALIST_CHAT_MODEL_OLLAMA` isn't used for chat while hybrid is on (Settings says so).
+- The local model is not unloaded on a swap to cloud; "Keep model loaded" decides when it goes (with 1 minute, about a minute after the swap).

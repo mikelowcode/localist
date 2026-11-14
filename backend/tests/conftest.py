@@ -75,5 +75,24 @@ def _clean_search_provider_env(monkeypatch):
         # alone spend it — OpenRouterRuntimeClient/_make_openrouter read it
         # from os.environ.
         "OPENROUTER_API_KEY", "LOCALIST_CHAT_MODEL_OPENROUTER",
+        # 2026-11-14: turning on Ollama hybrid inference in the dev backend
+        # (§16.37) wrote these to backend/.env, and 11 tests then built their
+        # Settings with hybrid already on.
+        "LOCALIST_OLLAMA_HYBRID_ENABLED", "LOCALIST_OLLAMA_HYBRID_LOCAL_MODEL",
+        "LOCALIST_OLLAMA_HYBRID_CLOUD_MODEL", "LOCALIST_OLLAMA_HYBRID_TOKEN_CAP",
     ):
         monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _settings_ignore_dev_env_file(monkeypatch):
+    """
+    main.Settings reads backend/.env directly (env_file=".env", resolved
+    against the working directory) on top of the environment, so deleting
+    variables above doesn't stop a value saved by the dev backend from
+    reaching a test's Settings. Confirmed 2026-11-14: Ollama hybrid
+    settings saved through the dev backend failed 11 tests. No test should
+    depend on the developer's .env, so Settings ignores it under pytest.
+    """
+    from localist import main
+    monkeypatch.setitem(main.Settings.model_config, "env_file", None)

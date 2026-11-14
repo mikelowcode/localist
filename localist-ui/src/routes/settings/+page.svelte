@@ -173,6 +173,111 @@
     }
   }
 
+  // Ollama hybrid inference (§16.37): local model until a conversation
+  // passes the token cap, then the cloud model. Every change saves at once
+  // (PUT /settings/ollama-hybrid); on a failed save the controls snap back
+  // to the last saved values.
+  type HybridSettings = {
+    enabled: boolean;
+    local_model: string;
+    cloud_model: string;
+    token_cap: number;
+    cap_presets: number[];
+    cap_min: number;
+    cap_max: number;
+    active: boolean;
+    local_models: string[];
+    cloud_models: string[];
+    models_error: string | null;
+  };
+  let hybrid: HybridSettings | null = null;
+  let hybridSaving = false;
+  let hybridError: string | null = null;
+  let hybridCapCustom = false;
+  let hybridCapInput = '';
+
+  function syncHybridCapControls(h: HybridSettings) {
+    hybridCapCustom = !h.cap_presets.includes(h.token_cap);
+    hybridCapInput = String(h.token_cap);
+  }
+
+  async function loadHybrid() {
+    try {
+      const res = await fetch(apiUrl('/api/settings/ollama-hybrid'));
+      if (!res.ok) return;
+      hybrid = await res.json();
+      if (hybrid) syncHybridCapControls(hybrid);
+    } catch {
+      // Card stays hidden until the backend answers.
+    }
+  }
+
+  async function saveHybrid(patch: Partial<Pick<HybridSettings, 'enabled' | 'local_model' | 'cloud_model' | 'token_cap'>>) {
+    const saved = hybrid;
+    if (!saved) return;
+    hybridSaving = true;
+    hybridError = null;
+    try {
+      const res = await fetch(apiUrl('/api/settings/ollama-hybrid'), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail ?? `HTTP ${res.status}`);
+      // PUT doesn't re-list models; keep the lists from the last GET.
+      const next: HybridSettings = {
+        ...data,
+        local_models: saved.local_models,
+        cloud_models: saved.cloud_models,
+        models_error: saved.models_error
+      };
+      hybrid = next;
+      syncHybridCapControls(next);
+      void checkHealth();   // the appbar chip reads hybrid status from /health
+    } catch (err) {
+      hybridError = err instanceof Error ? err.message : String(err);
+      hybrid = { ...saved };   // re-render: controls snap back to saved values
+      syncHybridCapControls(saved);
+    } finally {
+      hybridSaving = false;
+    }
+  }
+
+  function onHybridToggle(e: Event) {
+    if (!hybrid) return;
+    const on = (e.currentTarget as HTMLInputElement).checked;
+    if (!on) return void saveHybrid({ enabled: false });
+    // First time on: preselect sensible models — the current chat model
+    // when it fits, else the first of each kind.
+    const local =
+      hybrid.local_model ||
+      (hybrid.local_models.includes($health.chat_model) ? $health.chat_model : hybrid.local_models[0] ?? '');
+    const cloud =
+      hybrid.cloud_model ||
+      (hybrid.cloud_models.includes($health.chat_model) ? $health.chat_model : hybrid.cloud_models[0] ?? '');
+    void saveHybrid({ enabled: true, local_model: local, cloud_model: cloud });
+  }
+
+  function onHybridCapSelect(e: Event) {
+    const value = (e.currentTarget as HTMLSelectElement).value;
+    if (value === 'custom') {
+      hybridCapCustom = true;
+      return;
+    }
+    hybridCapCustom = false;
+    void saveHybrid({ token_cap: Number(value) });
+  }
+
+  function saveHybridCustomCap() {
+    const n = Number(hybridCapInput.replace(/[, ]/g, ''));
+    if (!Number.isInteger(n)) {
+      hybridError = 'Enter a whole number of tokens.';
+      return;
+    }
+    void saveHybrid({ token_cap: n });
+  }
+
   type PrefixCacheStatus = {
     available: boolean;
     backend?: string | null;
@@ -204,6 +309,7 @@
     void activeChatModelForCache;
     void loadPrefixCache();
     void loadKeepAlive();
+    void loadHybrid();
   }
 
   const fmt = (n: number | null | undefined) => (n ?? 0).toLocaleString();
@@ -1021,6 +1127,132 @@
       </div>
     </section>
 
+    <!-- Ollama hybrid inference (§16.37) -->
+    {#if selectedUiBackend === 'ollama' && hybrid}
+      <section class="settings-card">
+        <div class="card-title">Hybrid Inference — Ollama</div>
+        <p class="card-desc">
+          Answer on a local model, and move a conversation to an Ollama Cloud model once it grows past
+          a token limit. Each new chat starts local again. Embeddings always stay on this Mac.
+        </p>
+        <div class="field-group">
+          <label class="checkbox-row">
+            <input
+              type="checkbox"
+              checked={hybrid.enabled}
+              disabled={hybridSaving}
+              on:change={onHybridToggle}
+            />
+            Move long conversations to Ollama Cloud
+          </label>
+
+          <label class="field-label" for="hybrid-local-model">Local model</label>
+          <select
+            id="hybrid-local-model"
+            class="settings-input"
+            value={hybrid.local_model}
+            disabled={hybridSaving || hybrid.local_models.length === 0}
+            on:change={(e) => saveHybrid({ local_model: e.currentTarget.value })}
+          >
+            <option value="" disabled>
+              {hybrid.local_models.length ? 'Select a local model…' : 'No local chat models in Ollama'}
+            </option>
+            {#if hybrid.local_model && !hybrid.local_models.includes(hybrid.local_model)}
+              <option value={hybrid.local_model}>{hybrid.local_model} (not found)</option>
+            {/if}
+            {#each hybrid.local_models as m}
+              <option value={m}>{m}</option>
+            {/each}
+          </select>
+
+          <label class="field-label" for="hybrid-cloud-model">Cloud model</label>
+          <select
+            id="hybrid-cloud-model"
+            class="settings-input"
+            value={hybrid.cloud_model}
+            disabled={hybridSaving || hybrid.cloud_models.length === 0}
+            on:change={(e) => saveHybrid({ cloud_model: e.currentTarget.value })}
+          >
+            <option value="" disabled>
+              {hybrid.cloud_models.length ? 'Select a cloud model…' : 'No cloud models in Ollama'}
+            </option>
+            {#if hybrid.cloud_model && !hybrid.cloud_models.includes(hybrid.cloud_model)}
+              <option value={hybrid.cloud_model}>{hybrid.cloud_model} (not found)</option>
+            {/if}
+            {#each hybrid.cloud_models as m}
+              <option value={m}>{m}</option>
+            {/each}
+          </select>
+
+          <label class="field-label" for="hybrid-cap">Move to cloud after</label>
+          <select
+            id="hybrid-cap"
+            class="settings-input"
+            value={hybridCapCustom ? 'custom' : String(hybrid.token_cap)}
+            disabled={hybridSaving}
+            on:change={onHybridCapSelect}
+          >
+            {#each hybrid.cap_presets as c}
+              <option value={String(c)}>{fmt(c)} tokens</option>
+            {/each}
+            <option value="custom">Custom…</option>
+          </select>
+          {#if hybridCapCustom}
+            <div class="field-row">
+              <input
+                class="settings-input"
+                type="number"
+                min={hybrid.cap_min}
+                max={hybrid.cap_max}
+                step="500"
+                aria-label="Custom token limit"
+                bind:value={hybridCapInput}
+                disabled={hybridSaving}
+                on:keydown={(e) => e.key === 'Enter' && saveHybridCustomCap()}
+              />
+              <button
+                type="button"
+                class="btn-secondary"
+                disabled={hybridSaving || hybridCapInput === String(hybrid.token_cap)}
+                on:click={saveHybridCustomCap}
+              >
+                Save
+              </button>
+            </div>
+            <p class="field-hint">Between {fmt(hybrid.cap_min)} and {fmt(hybrid.cap_max)} tokens.</p>
+          {/if}
+
+          <p class="field-hint">
+            A conversation's size counts every message, answer and tool result in it, plus attached
+            files. Once it moves to cloud it stays there until you start a new chat. Cloud replies can
+            carry up to about 60,000 tokens of history each, which counts toward your Ollama Cloud
+            usage. If the cloud model fails, that reply comes from the local model instead.
+          </p>
+          {#if hybrid.models_error}
+            <p class="field-hint" style="color:var(--warning)">{hybrid.models_error}</p>
+          {/if}
+          {#if hybridError}
+            <p class="field-hint" style="color:var(--warning)">Couldn't save: {hybridError}</p>
+          {/if}
+          {#if hybrid.enabled}
+            {#if $modelConfig.backend !== 'ollama'}
+              <p class="field-hint">Saved — takes effect when Ollama is the active backend.</p>
+            {:else if hybrid.active}
+              <p class="field-hint">
+                On — new chats use <code>{hybrid.local_model}</code> and move to
+                <code>{hybrid.cloud_model}</code> past {fmt(hybrid.token_cap)} tokens. The Chat Model
+                choice above isn't used while this is on.
+              </p>
+            {:else}
+              <p class="field-hint" style="color:var(--warning)">
+                Saved, but not running — check that Ollama serves both models.
+              </p>
+            {/if}
+          {/if}
+        </div>
+      </section>
+    {/if}
+
     <!-- Embedding model, for the active backend (§16.25, §16.27) -->
     <section class="settings-card">
       <div class="card-title">
@@ -1644,7 +1876,8 @@
     color: var(--text-tertiary);
     line-height: 1.6;
   }
-  .card-hint code {
+  .card-hint code,
+  .field-hint code {
     font-size: 10.5px;
   }
 

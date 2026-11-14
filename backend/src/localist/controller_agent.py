@@ -28,8 +28,10 @@ Layer placement
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import threading
 import re
 import time
 import uuid
@@ -57,6 +59,7 @@ from .paths import get_backend_root
 from .prompt_builder import PromptBuilder, Turn, EpisodeBullet, RagSource, UserProfileFact, GraphQueryResult, GraphNeighborhood, GraphLinkEntry, WorkingMemoryState
 from .context_profile import profile_for
 from .omlx_runtime_client import OMLXRuntimeClient
+from .ollama_hybrid import TIER_LOCAL, HybridOllamaRuntimeClient
 from .memory_manager import (
     EpisodicMemoryWriter,
     EpisodicMemoryReader,
@@ -888,6 +891,11 @@ class ControllerAgent:
         self._profile_lines:      list[str]        = []
         self._profile_embeddings: list[list[float]] = []
 
+        # Hybrid inference (§16.37): this thread's current turn — the tier
+        # decision and whether the cloud model fell back to local. Set by
+        # _hybrid_turn_scope(), read by the answer guard and handle_task*.
+        self._hybrid_turn = threading.local()
+
         if not agents:
             logger.warning("ControllerAgent initialized with no sub-agents.")
 
@@ -1186,6 +1194,111 @@ class ControllerAgent:
     # Public API (called by FastAPI)
     # -----------------------------------------------------------------------
 
+    # -----------------------------------------------------------------------
+    # Hybrid inference (§16.37)
+    # -----------------------------------------------------------------------
+
+    def _hybrid(self) -> HybridOllamaRuntimeClient | None:
+        runtime = self._runtime
+        return runtime if isinstance(runtime, HybridOllamaRuntimeClient) else None
+
+    @staticmethod
+    def _conversation_size(memory: _AnyMemory, mem_key: str) -> int:
+        """
+        Whole-conversation size in tokens (len//4, as PromptBuilder): every
+        logged entry for `mem_key` — user turns, answers, agent/tool
+        results; the new message is already logged — plus attached session
+        files. Deliberately not the prompt actually sent: local Ollama's
+        history budget is a 300-token floor (context_profile.py), so the
+        sent prompt barely grows with the conversation.
+        """
+        try:
+            entries = memory.get_context_window(task_id=mem_key, limit=None)
+        except Exception as exc:
+            logger.debug("Hybrid: conversation size read failed (%s).", exc)
+            entries = []
+        size = sum(len(str(e.get("content", ""))) // 4 for e in entries)
+        size += sum(len(sf.content) // 4 for sf in _session_files.get_files())
+        return size
+
+    @contextlib.contextmanager
+    def _hybrid_turn_scope(self, memory: _AnyMemory, mem_key: str):
+        """
+        Decide this turn's tier and run the block on it. Yields the turn's
+        hybrid info dict (None when the runtime isn't hybrid): tier and
+        model that answered, conversation size, cap, swapped (this turn
+        moved the conversation to cloud), fell_back (cloud failed, local
+        answered). Every inference call inside — routing, main answer,
+        working state, episodic extraction — follows the tier, because the
+        tier lives in a ContextVar and the block runs on this thread.
+        """
+        hybrid = self._hybrid()
+        if hybrid is None:
+            self._hybrid_turn.info = None
+            yield None
+            return
+        decision = hybrid.decide_tier(mem_key, self._conversation_size(memory, mem_key))
+        info: dict[str, Any] = {
+            "tier":      decision.tier,
+            "model":     decision.model,
+            "size":      decision.size,
+            "cap":       decision.cap,
+            "swapped":   decision.swapped,
+            "fell_back": False,
+        }
+        self._hybrid_turn.info = info
+        logger.info(
+            "Hybrid: conversation %s — %d tokens, cap %d → %s (%s)%s.",
+            mem_key, decision.size, decision.cap, decision.tier, decision.model,
+            " [moved to cloud]" if decision.swapped else "",
+        )
+        try:
+            with hybrid.use_tier(decision.tier):
+                yield info
+        finally:
+            self._hybrid_turn.info = None
+
+    def _local_fallback_subtask(
+        self,
+        subtask:      SubTask,
+        build_kwargs: dict[str, Any],
+        memory:       _AnyMemory,
+        mem_key:      str,
+    ) -> tuple[SubTask, list[Turn]]:
+        """
+        Rebuild the main-answer subtask for the local model after the cloud
+        model failed: same prompt slots, but history re-fetched at the local
+        tier's budget (the caller has already switched the tier to local,
+        so profile_for() returns the local profile). Returns the new subtask
+        and the local-budget working turns.
+        """
+        profile = profile_for(self._runtime)
+        try:
+            entries = memory.get_context_window(
+                task_id    = mem_key,
+                limit      = profile.working_memory_limit,
+                max_tokens = profile.working_memory_tokens,
+            )
+            turns = [Turn(role=e["role"], content=e["content"]) for e in entries]
+        except Exception as exc:
+            logger.debug("Hybrid: local working memory fetch failed (%s).", exc)
+            turns = []
+        system_prompt, user_prompt = _PROMPT_BUILDER.build(**{
+            **build_kwargs,
+            "working_memory":         turns or None,
+            "working_memory_ceiling": profile.working_memory_tokens,
+        })
+        return SubTask(
+            subtask_id  = subtask.subtask_id,
+            agent_name  = subtask.agent_name,
+            instruction = subtask.instruction,
+            context     = {
+                **subtask.context,
+                "_prebuilt_prompt": user_prompt,
+                "_prebuilt_system": system_prompt,
+            },
+        ), turns
+
     def handle_task(self, task_dict: dict[str, Any]) -> dict[str, Any]:
         """
         Entry point called by FastAPI.
@@ -1223,7 +1336,10 @@ class ControllerAgent:
         )
 
         try:
-            result = self._execute(task, memory)
+            with self._hybrid_turn_scope(memory, mem_key) as hybrid_info:
+                result = self._execute(task, memory)
+            if hybrid_info is not None:
+                result.metadata.setdefault("hybrid", dict(hybrid_info))
         except Exception as exc:
             logger.exception("Unhandled exception in controller for task %s.", task.task_id)
             result = ControllerResult(
@@ -1245,7 +1361,16 @@ class ControllerAgent:
         Must be called inside asyncio.to_thread — some priority branches
         invoke embed_fn and/or runtime.infer() which are blocking calls.
         """
-        return self._planner.route(instruction=instruction, context=context)
+        hybrid = self._hybrid()
+        if hybrid is None:
+            return self._planner.route(instruction=instruction, context=context)
+        # Routing runs before handle_task_with_plan() decides this turn's
+        # tier, so its few small classifier calls follow the conversation's
+        # existing latch rather than re-deciding (which would consume the
+        # "swapped" signal before the turn that owns it).
+        key = context.get("conversation_id") or context.get("session_id")
+        with hybrid.use_tier(hybrid.tracker.tier_of(key)):
+            return self._planner.route(instruction=instruction, context=context)
 
     def handle_task_with_plan(
         self,
@@ -1294,13 +1419,16 @@ class ControllerAgent:
         )
 
         try:
-            result = self._execute_plan(
-                task, plan, memory,
-                on_token=on_token,
-                on_status=on_status,
-                on_answer_ready=on_answer_ready,
-                on_answer_reset=on_answer_reset,
-            )
+            with self._hybrid_turn_scope(memory, mem_key) as hybrid_info:
+                result = self._execute_plan(
+                    task, plan, memory,
+                    on_token=on_token,
+                    on_status=on_status,
+                    on_answer_ready=on_answer_ready,
+                    on_answer_reset=on_answer_reset,
+                )
+            if hybrid_info is not None:
+                result.metadata.setdefault("hybrid", dict(hybrid_info))
         except Exception as exc:
             logger.exception("Unhandled exception in controller for task %s.", task.task_id)
             result = ControllerResult(
@@ -2135,6 +2263,7 @@ class ControllerAgent:
                 had_tool_results = bool(_build_kwargs["tool_results"]),
                 on_status        = on_status,
                 on_answer_reset  = on_answer_reset,
+                build_kwargs     = _build_kwargs,
             )
         else:
             results = self._dispatch([subtask], memory, mem_key)
@@ -2577,6 +2706,7 @@ class ControllerAgent:
         had_tool_results:  bool = False,
         on_status:         Callable[[str], None] | None = None,
         on_answer_reset:   Callable[[], None]    | None = None,
+        build_kwargs:      dict[str, Any]        | None = None,
     ) -> list[AgentResult]:
         """
         Dispatch a single conversational_agent subtask with a floor against
@@ -2658,6 +2788,39 @@ class ControllerAgent:
             return dict(record) if isinstance(record, dict) else None
 
         result = _run(subtask)
+
+        # Hybrid inference (§16.37): the cloud model failed before its first
+        # token on a prompt too large to hand to the local model as-is.
+        # Rebuild the prompt at the local history budget and answer locally;
+        # the rest of this turn (post-answer hooks too) stays local. The
+        # conversation stays latched to cloud, so the next turn tries cloud
+        # again. Small calls that fell back inside the client report via
+        # last_fell_back instead.
+        hybrid      = self._hybrid()
+        hybrid_info = getattr(self._hybrid_turn, "info", None)
+        if (
+            hybrid is not None
+            and result.status == TaskStatus.FAILED
+            and hybrid.last_cloud_unavailable
+            and build_kwargs is not None
+        ):
+            logger.warning(
+                "_execute_plan: cloud model %s unavailable for subtask %s (%s) "
+                "— answering on %s with local-sized history.",
+                hybrid.cloud_model, subtask.subtask_id, result.error, hybrid.local_model,
+            )
+            if on_status is not None:
+                on_status("Cloud model unavailable — answering on the local model…")
+            hybrid.switch_tier(TIER_LOCAL)
+            subtask, working_turns = self._local_fallback_subtask(
+                subtask, build_kwargs, memory, mem_key,
+            )
+            result = _run(subtask)
+            if hybrid_info is not None:
+                hybrid_info.update(fell_back=True, tier=TIER_LOCAL, model=hybrid.local_model)
+        elif hybrid is not None and hybrid.last_fell_back and hybrid_info is not None:
+            hybrid_info.update(fell_back=True, tier=TIER_LOCAL, model=hybrid.local_model)
+
         first_completion = _completion()
         final_completion = first_completion
         reason = _verdict(result, had_tool_results)
@@ -2801,6 +2964,9 @@ class ControllerAgent:
                 final_completion.get("completion_tokens"),
                 final_completion.get("provider"), reason,
             )
+
+        if hybrid_info is not None:
+            result.diagnostics["hybrid"] = dict(hybrid_info)
 
         memory.add_agent_result(result, task_id=mem_key)
         return [result]

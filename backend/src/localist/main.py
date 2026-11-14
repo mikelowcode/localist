@@ -171,6 +171,11 @@ from .planner import (
     resolve_profile_fact_threshold,
     resolve_rag_floor,
 )
+from .ollama_hybrid import (
+    HYBRID_TOKEN_CAP_PRESETS, MAX_HYBRID_TOKEN_CAP, MIN_HYBRID_TOKEN_CAP,
+    HybridOllamaRuntimeClient, list_chat_models, validate_token_cap,
+)
+from .ollama_runtime_client import _is_cloud_model
 from .ollama_runtime_client import (
     DEFAULT_KEEP_ALIVE, KEEP_ALIVE_CHOICES, OllamaRuntimeClient, normalize_keep_alive,
 )
@@ -233,6 +238,15 @@ class Settings(BaseSettings):
     # ollama_runtime_client.KEEP_ALIVE_CHOICES. "off" sends no keep_alive, so
     # Ollama unloads after its own 5-minute idle default.
     ollama_keep_alive: str = "off"
+
+    # Hybrid inference (LOCALIST_OLLAMA_HYBRID_*, §16.37), Ollama only: answer
+    # on the local model until a conversation passes token_cap tokens, then
+    # on the cloud model for the rest of that conversation. Off by default;
+    # both models must be set for it to take effect (runtime_factory).
+    ollama_hybrid_enabled:     bool = False
+    ollama_hybrid_local_model: str  = ""
+    ollama_hybrid_cloud_model: str  = ""
+    ollama_hybrid_token_cap:   int  = 4_000
 
     # Shared network timeouts
     stream_timeout:   float = 60.0
@@ -353,6 +367,17 @@ def _configure_embedding_source(
         "in keyword-only mode."
     )
     return None
+
+
+def _ollama_hybrid_kwargs(settings: Settings) -> dict[str, Any]:
+    """Hybrid-inference settings for create_runtime() (§16.37); the Ollama
+    factory reads them, every other backend ignores them."""
+    return {
+        "ollama_hybrid_enabled":     settings.ollama_hybrid_enabled,
+        "ollama_hybrid_local_model": settings.ollama_hybrid_local_model,
+        "ollama_hybrid_cloud_model": settings.ollama_hybrid_cloud_model,
+        "ollama_hybrid_token_cap":   settings.ollama_hybrid_token_cap,
+    }
 
 
 def _create_and_check_embedder(
@@ -866,6 +891,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         omlx_url        = settings.omlx_url,
         ollama_url      = settings.ollama_url,
         ollama_keep_alive = settings.ollama_keep_alive,
+        **_ollama_hybrid_kwargs(settings),
         request_timeout = settings.request_timeout,
         stream_timeout  = settings.stream_timeout,
     )
@@ -1212,6 +1238,14 @@ class HealthResponse(BaseModel):
     # cleared by the next success. None for oMLX/Ollama.
     runtime_key_info:   dict[str, Any] | None = None
     runtime_last_error: dict[str, Any] | None = None
+    # Ollama hybrid inference (§16.37): True when the active runtime is the
+    # hybrid client. chat_model above is then its local model; the chat
+    # view's status chip reads each reply's metadata.hybrid.tier for which
+    # one answered.
+    hybrid:                   bool       = False
+    hybrid_cloud_model:       str        = ""
+    hybrid_cloud_model_found: bool       = False
+    hybrid_token_cap:         int | None = None
 
 
 class AgentsResponse(BaseModel):
@@ -1773,6 +1807,35 @@ class OllamaKeepAliveRequest(BaseModel):
     keep_alive: str
 
 
+class OllamaHybridResponse(BaseModel):
+    """Response body for GET/PUT /settings/ollama-hybrid (§16.37)."""
+    enabled:      bool
+    local_model:  str
+    cloud_model:  str
+    token_cap:    int
+    cap_presets:  list[int]
+    cap_min:      int
+    cap_max:      int
+    # True when the running chat runtime is the hybrid client — false while
+    # another backend is active, or if the saved settings didn't build one.
+    active:       bool
+    applied_live: bool = False   # PUT only: the change took effect now
+    # Chat models Ollama serves, for the two pickers (GET only; embedding-
+    # only models left out). models_error is set when Ollama can't be read.
+    local_models: list[str] = Field(default_factory=list)
+    cloud_models: list[str] = Field(default_factory=list)
+    models_error: str | None = None
+
+
+class OllamaHybridRequest(BaseModel):
+    """Payload accepted by PUT /settings/ollama-hybrid. Unset fields keep
+    their saved value."""
+    enabled:     bool | None = None
+    local_model: str  | None = None
+    cloud_model: str  | None = None
+    token_cap:   int  | None = None
+
+
 class PrefixCacheStatusResponse(BaseModel):
     """
     Response body for GET /settings/prefix-cache (§3.7e): how much of the
@@ -2251,6 +2314,10 @@ async def get_health() -> HealthResponse:
         embedding_warning           = embedding_warning,
         runtime_key_info            = raw.get("key_info"),
         runtime_last_error          = raw.get("last_error"),
+        hybrid                      = bool(raw.get("hybrid", False)),
+        hybrid_cloud_model          = str(raw.get("cloud_model") or ""),
+        hybrid_cloud_model_found    = bool(raw.get("cloud_model_found", False)),
+        hybrid_token_cap            = raw.get("token_cap"),
     )
 
 
@@ -2353,6 +2420,7 @@ def _create_and_check_backend(settings: Settings, backend: str) -> tuple[BaseRun
         omlx_url        = settings.omlx_url,
         ollama_url      = settings.ollama_url,
         ollama_keep_alive = settings.ollama_keep_alive,
+        **_ollama_hybrid_kwargs(settings),
         request_timeout = settings.request_timeout,
         stream_timeout  = settings.stream_timeout,
     )
@@ -2378,6 +2446,7 @@ def _create_and_check_embedding_candidate(
         omlx_url        = settings.omlx_url,
         ollama_url      = settings.ollama_url,
         ollama_keep_alive = settings.ollama_keep_alive,
+        **_ollama_hybrid_kwargs(settings),
         request_timeout = settings.request_timeout,
         stream_timeout  = settings.stream_timeout,
     )
@@ -2552,6 +2621,52 @@ async def get_runtime_backend_models(
     )
 
 
+async def _rebuild_active_controller(
+    settings: Settings, backend: str, unreachable_detail: str,
+) -> dict:
+    """
+    Rebuild the runtime client and controller for the active `backend` from
+    the current settings and swap them in, under _runtime_switch_lock.
+    Raises HTTP 502 (unreachable_detail, formatted with {base_url}) without
+    swapping when the backend isn't reachable. Returns the health dict.
+    Used by the chat-model pin and Ollama hybrid settings endpoints.
+    """
+    async with _runtime_switch_lock:
+        candidate_runtime, health = await asyncio.to_thread(
+            _create_and_check_backend, settings, backend,
+        )
+
+        if not health.get("reachable"):
+            raise HTTPException(
+                status_code = 502,
+                detail      = unreachable_detail.format(base_url=health.get("base_url")),
+            )
+
+        memory_manager = _require_memory_manager()
+        # Deliberately NOT re-derived from candidate_runtime — a chat-backend switch changes
+        # inference only, never the embedding source. Re-coupling this would risk silently
+        # dropping a working embedder when switching to a backend that doesn't wire embeddings
+        # (oMLX today, per §16.4's open gap), even though nothing about embeddings was supposed
+        # to change. See docs/architecture/16-runtime-backend-layer.md §16.5.
+        embed_fn = memory_manager.embed_fn
+        # Read fresh from _state, not captured once — the embedding source
+        # itself isn't re-derived here either (see comment above), but this
+        # follows the same "always resolve from _state at request time" rule
+        # as _state.runtime, in case that ever changes.
+        embedding_model_name = _state.active_embedding_model_name
+
+        wiki_agent, _conversational_agent, controller = await asyncio.to_thread(
+            _build_controller,
+            settings, candidate_runtime, memory_manager, embed_fn,
+            _PROJECT_ROOT, _state.templates_dir, embedding_model_name,
+        )
+
+        _state.runtime    = candidate_runtime
+        _state.wiki_agent = wiki_agent
+        _state.controller = controller
+    return health
+
+
 @app.post(
     "/settings/runtime-backend/{backend}/chat-model",
     response_model = ChatModelPinResponse,
@@ -2574,43 +2689,12 @@ async def set_runtime_backend_chat_model(
 
     applied_live = False
     if normalized == settings.runtime_backend.strip().lower():
-        async with _runtime_switch_lock:
-            candidate_runtime, health = await asyncio.to_thread(
-                _create_and_check_backend, settings, normalized,
-            )
-
-            if not health.get("reachable"):
-                raise HTTPException(
-                    status_code = 502,
-                    detail      = (
-                        f"Chat model pin saved for {normalized!r}, but it is not "
-                        f"reachable at {health.get('base_url')!r} — live rebuild skipped."
-                    ),
-                )
-
-            memory_manager = _require_memory_manager()
-            # Deliberately NOT re-derived from candidate_runtime — a chat-backend switch changes
-            # inference only, never the embedding source. Re-coupling this would risk silently
-            # dropping a working embedder when switching to a backend that doesn't wire embeddings
-            # (oMLX today, per §16.4's open gap), even though nothing about embeddings was supposed
-            # to change. See docs/architecture/16-runtime-backend-layer.md §16.5.
-            embed_fn = memory_manager.embed_fn
-            # Read fresh from _state, not captured once — the embedding source
-            # itself isn't re-derived here either (see comment above), but this
-            # follows the same "always resolve from _state at request time" rule
-            # as _state.runtime, in case that ever changes.
-            embedding_model_name = _state.active_embedding_model_name
-
-            wiki_agent, _conversational_agent, controller = await asyncio.to_thread(
-                _build_controller,
-                settings, candidate_runtime, memory_manager, embed_fn,
-                _PROJECT_ROOT, _state.templates_dir, embedding_model_name,
-            )
-
-            _state.runtime    = candidate_runtime
-            _state.wiki_agent = wiki_agent
-            _state.controller = controller
-            applied_live = True
+        await _rebuild_active_controller(
+            settings, normalized,
+            f"Chat model pin saved for {normalized!r}, but it is not reachable "
+            "at {base_url!r} — live rebuild skipped.",
+        )
+        applied_live = True
 
     return ChatModelPinResponse(
         backend      = normalized,
@@ -3777,7 +3861,7 @@ def _apply_keep_alive_live(choice: str) -> bool:
     """Set keep_alive on the active runtime if it's an Ollama client (it reads
     the attribute on every request). Returns True when applied."""
     runtime = _state.runtime
-    if isinstance(runtime, OllamaRuntimeClient):
+    if isinstance(runtime, (OllamaRuntimeClient, HybridOllamaRuntimeClient)):
         runtime.keep_alive = choice
         return True
     return False
@@ -3828,6 +3912,150 @@ async def put_ollama_keep_alive(request: OllamaKeepAliveRequest) -> OllamaKeepAl
     return OllamaKeepAliveResponse(
         keep_alive=choice, choices=list(KEEP_ALIVE_CHOICES), applied_live=applied,
     )
+
+
+# ---------------------------------------------------------------------------
+# Ollama hybrid inference  (Settings → Chat Model, §16.37)
+# ---------------------------------------------------------------------------
+
+_HYBRID_ENV = {
+    "enabled":     "LOCALIST_OLLAMA_HYBRID_ENABLED",
+    "local_model": "LOCALIST_OLLAMA_HYBRID_LOCAL_MODEL",
+    "cloud_model": "LOCALIST_OLLAMA_HYBRID_CLOUD_MODEL",
+    "token_cap":   "LOCALIST_OLLAMA_HYBRID_TOKEN_CAP",
+}
+
+
+def _ollama_hybrid_response(settings: Settings, applied_live: bool = False) -> OllamaHybridResponse:
+    try:
+        cap = validate_token_cap(settings.ollama_hybrid_token_cap)
+    except ValueError:
+        cap = 4_000          # same fallback the runtime factory ends up with
+    return OllamaHybridResponse(
+        enabled      = settings.ollama_hybrid_enabled,
+        local_model  = settings.ollama_hybrid_local_model,
+        cloud_model  = settings.ollama_hybrid_cloud_model,
+        token_cap    = cap,
+        cap_presets  = list(HYBRID_TOKEN_CAP_PRESETS),
+        cap_min      = MIN_HYBRID_TOKEN_CAP,
+        cap_max      = MAX_HYBRID_TOKEN_CAP,
+        active       = isinstance(_state.runtime, HybridOllamaRuntimeClient),
+        applied_live = applied_live,
+    )
+
+
+def _ollama_chat_models(settings: Settings) -> dict:
+    """The configured Ollama's chat models, split local/cloud
+    (ollama_hybrid.list_chat_models). Blocking — run via asyncio.to_thread."""
+    return list_chat_models(settings.ollama_url)
+
+
+@app.get(
+    "/settings/ollama-hybrid",
+    response_model = OllamaHybridResponse,
+    summary        = "Read the Ollama hybrid inference settings",
+)
+async def get_ollama_hybrid() -> OllamaHybridResponse:
+    settings = _require_settings()
+    response = _ollama_hybrid_response(settings)
+    found = await asyncio.to_thread(_ollama_chat_models, settings)
+    response.local_models = found["local"]
+    response.cloud_models = found["cloud"]
+    if not found["reachable"]:
+        response.models_error = f"Ollama isn't reachable at {settings.ollama_url} — start it to pick models."
+    return response
+
+
+@app.put(
+    "/settings/ollama-hybrid",
+    response_model = OllamaHybridResponse,
+    summary        = "Set Ollama hybrid inference (local model, cloud model, token cap)",
+)
+async def put_ollama_hybrid(request: OllamaHybridRequest) -> OllamaHybridResponse:
+    """
+    Validate, persist (Settings fields + .env) and apply. While Ollama is the
+    active backend: a cap-only change updates the live hybrid client in
+    place (conversations already on cloud stay there); turning hybrid on or
+    off, or changing either model, rebuilds the controller like a chat-model
+    pin does. Any other backend picks the settings up on the next switch to
+    Ollama.
+    """
+    settings = _require_settings()
+
+    enabled = settings.ollama_hybrid_enabled if request.enabled is None else request.enabled
+    local   = (settings.ollama_hybrid_local_model if request.local_model is None else request.local_model).strip()
+    cloud   = (settings.ollama_hybrid_cloud_model if request.cloud_model is None else request.cloud_model).strip()
+    try:
+        cap = validate_token_cap(
+            settings.ollama_hybrid_token_cap if request.token_cap is None else request.token_cap
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Models may be saved while hybrid is off, but must make sense if set,
+    # and must all be valid and served before it can be turned on.
+    if local and _is_cloud_model(local):
+        raise HTTPException(status_code=400, detail=f"{local!r} is a cloud model — pick a local model.")
+    if cloud and not _is_cloud_model(cloud):
+        raise HTTPException(status_code=400, detail=f"{cloud!r} is not an Ollama Cloud (\"-cloud\") model.")
+    if enabled:
+        if not local or not cloud:
+            raise HTTPException(status_code=400, detail="Choose both a local and a cloud model to turn on hybrid inference.")
+        found = await asyncio.to_thread(_ollama_chat_models, settings)
+        if not found.get("reachable"):
+            raise HTTPException(
+                status_code = 502,
+                detail      = f"Ollama isn't reachable at {settings.ollama_url!r} — can't check the models.",
+            )
+        missing = [m for m in (local, cloud) if m not in found.get("models", [])]
+        if missing:
+            raise HTTPException(
+                status_code = 400,
+                detail      = f"Not served by Ollama: {', '.join(missing)}. Pull it first (ollama pull …).",
+            )
+        not_chat = [m for m in (local, cloud) if m not in found["local"] + found["cloud"]]
+        if not_chat:
+            raise HTTPException(
+                status_code = 400,
+                detail      = f"Not a chat model: {', '.join(not_chat)}.",
+            )
+
+    previous = (
+        settings.ollama_hybrid_enabled, settings.ollama_hybrid_local_model,
+        settings.ollama_hybrid_cloud_model,
+    )
+    for field, value in (("enabled", enabled), ("local_model", local),
+                         ("cloud_model", cloud), ("token_cap", cap)):
+        setattr(settings, f"ollama_hybrid_{field}", value)
+        _write_env_var(
+            _PROJECT_ROOT, _HYBRID_ENV[field],
+            ("true" if value else "false") if isinstance(value, bool) else str(value),
+        )
+
+    applied_live = False
+    if settings.runtime_backend.strip().lower() == "ollama":
+        runtime = _state.runtime
+        # Rebuild only when the hybrid client itself changes: turned on or
+        # off, a model swapped while on, or on but not live (e.g. it was
+        # saved while another backend was active, or failed to build).
+        prev_enabled, prev_local, prev_cloud = previous
+        if enabled != prev_enabled or (
+            enabled and ((local, cloud) != (prev_local, prev_cloud)
+                         or not isinstance(runtime, HybridOllamaRuntimeClient))
+        ):
+            await _rebuild_active_controller(
+                settings, "ollama",
+                "Hybrid settings saved, but Ollama isn't reachable at {base_url!r} "
+                "— live rebuild skipped.",
+            )
+            applied_live = True
+        elif isinstance(runtime, HybridOllamaRuntimeClient):
+            runtime.tracker.cap = cap
+            applied_live = True
+        else:
+            applied_live = True     # hybrid off and staying off: nothing to apply
+
+    return _ollama_hybrid_response(settings, applied_live)
 
 
 # ---------------------------------------------------------------------------

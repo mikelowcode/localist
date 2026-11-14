@@ -43,6 +43,17 @@ export interface Task {
     grounded?:         boolean;
     file_op_deferred?: boolean;
     pending_diffs?:    PendingDiff[];
+    // Ollama hybrid inference (backend §16.37): which tier answered this
+    // reply. swapped = this turn moved the conversation to cloud;
+    // fell_back = cloud failed and the local model answered instead.
+    hybrid?: {
+      tier:      'local' | 'cloud';
+      model:     string;
+      size:      number;
+      cap:       number;
+      swapped:   boolean;
+      fell_back: boolean;
+    };
     chart?: {
       png_path: string;
       chart_config: {

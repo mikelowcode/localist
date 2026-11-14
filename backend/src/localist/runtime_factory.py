@@ -94,6 +94,30 @@ def _make_ollama(kwargs: dict[str, Any]) -> BaseRuntimeClient:
     except ValueError as exc:
         logger.warning("RuntimeFactory: %s — using %r.", exc, DEFAULT_KEEP_ALIVE)
         keep_alive = DEFAULT_KEEP_ALIVE
+
+    # Hybrid inference (§16.37): local model until a conversation passes the
+    # token cap, then the cloud model. An incomplete or invalid hybrid
+    # config must not stop the backend from starting either — fall back to
+    # the plain single-model client below and say why.
+    if kwargs.get("ollama_hybrid_enabled"):
+        from .ollama_hybrid import DEFAULT_HYBRID_TOKEN_CAP, HybridOllamaRuntimeClient
+        try:
+            return HybridOllamaRuntimeClient.build(
+                local_model     = kwargs.get("ollama_hybrid_local_model") or "",
+                cloud_model     = kwargs.get("ollama_hybrid_cloud_model") or "",
+                token_cap       = kwargs.get("ollama_hybrid_token_cap") or DEFAULT_HYBRID_TOKEN_CAP,
+                embedding_model = kwargs.get("embedding_model", ""),
+                base_url        = kwargs.get("ollama_url",      "http://localhost:11434"),
+                request_timeout = kwargs.get("request_timeout", 30.0),
+                stream_timeout  = kwargs.get("stream_timeout",  60.0),
+                keep_alive      = keep_alive,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "RuntimeFactory: hybrid inference is on but its settings are "
+                "invalid (%s) — using the single chat model instead.", exc,
+            )
+
     return OllamaRuntimeClient(
         chat_model      = kwargs.get("chat_model") or "",
         embedding_model = kwargs.get("embedding_model", ""),
@@ -195,6 +219,12 @@ def create_runtime(
             ollama_keep_alive (str) — "Keep model loaded" choice, one of
                                       ollama_runtime_client.KEEP_ALIVE_CHOICES
                                       ("off" = Ollama's own default)
+            ollama_hybrid_enabled (bool)    — hybrid inference on (§16.37);
+                                              builds a HybridOllamaRuntimeClient
+            ollama_hybrid_local_model (str) — local (non "-cloud") model
+            ollama_hybrid_cloud_model (str) — "-cloud" model
+            ollama_hybrid_token_cap (int)   — conversation size that moves
+                                              a conversation to cloud
 
     Returns
     -------

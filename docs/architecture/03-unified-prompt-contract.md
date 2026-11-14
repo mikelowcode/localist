@@ -553,6 +553,12 @@ why the signature had to change) and threads the result into both
 | **Local** (oMLX, Ollama serving a locally-resident model) | None (unbounded, as of §16.11) | `max_model_len − 27,000`, floored at 300 (§16.11) |
 | **Cloud** (Ollama Cloud — model tag ends `-cloud`) | None (unbounded) | 60,000 |
 
+**Hybrid inference (2026-11-14, §16.37):** with Ollama hybrid inference on, the profile follows the
+conversation's tier per turn — `HybridOllamaRuntimeClient.is_local` reflects which model the turn runs
+on — so a conversation is on the Local row until its whole size passes the user's token cap, then on
+the Cloud row for the rest of its life. If the cloud model fails before answering, the turn's prompt
+is rebuilt at the Local row's budget and answered locally.
+
 **Corrected 2026-07-19 (§16.11) — the RAM-tiered mechanism this paragraph
 described through §16.9 is retired, not extended.** It measured the wrong
 layer: oMLX manages its own paged KV cache and memory dynamically
