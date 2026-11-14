@@ -219,6 +219,16 @@ def make_conv_agent(answer="Test answer."):
 # 6.4 — ControllerAgent integration
 # ---------------------------------------------------------------------------
 
+
+@pytest.fixture(autouse=True)
+def _search_key_saved(monkeypatch):
+    """§14.20: url_fetch/web_search fallbacks branch on whether the active
+    SEARCH_PROVIDER has a key (_search_key_available, read from os.environ).
+    Pin the "key saved" case so results don't depend on whether an earlier
+    test's import loaded the real backend/.env. No-key tests delenv it."""
+    monkeypatch.setenv("SEARCH_PROVIDER", "brave")
+    monkeypatch.setenv("BRAVE_API_KEY", "test-placeholder")
+
 class TestControllerToolIntegration:
 
     def test_tool_results_slot_present_in_prompt(self, mm):

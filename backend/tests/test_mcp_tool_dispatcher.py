@@ -73,6 +73,16 @@ from localist.prompt_builder import ToolResult
 _FAKE_SESSION = object()
 
 
+@pytest.fixture(autouse=True)
+def _search_key_saved(monkeypatch):
+    """§14.20: url_fetch/web_search fallbacks branch on whether the active
+    SEARCH_PROVIDER has a key (_search_key_available, read from os.environ).
+    Pin the "key saved" case so results don't depend on whether an earlier
+    test's import loaded the real backend/.env. No-key tests delenv it."""
+    monkeypatch.setenv("SEARCH_PROVIDER", "brave")
+    monkeypatch.setenv("BRAVE_API_KEY", "test-placeholder")
+
+
 @pytest.fixture()
 def dispatcher(tmp_path) -> MCPToolDispatcher:
     rt = MagicMock(spec=["infer"])
@@ -436,7 +446,16 @@ class TestUrlFetchOllamaFallback:
     ordinary is_error=True tool-level failure — indistinguishable from a
     transport/HTTP failure by the time it reaches the dispatcher. Test 3
     below uses that exact real error text as its fixture.
+
+    §14.20 (2026-11-14): Ollama is now the fallback only when no key is
+    saved for the active SEARCH_PROVIDER, so every test here clears it;
+    the key-saved path is TestUrlFetchSearchFallback. Transient fetcher
+    errors (503 below) get one local retry before any fallback.
     """
+
+    @pytest.fixture(autouse=True)
+    def _no_search_key(self, monkeypatch):
+        monkeypatch.delenv("BRAVE_API_KEY", raising=False)
 
     @staticmethod
     def _fetch_success(url: str, cleaned_text: str = "Real article body text.") -> tuple[str, bool]:
@@ -496,7 +515,10 @@ class TestUrlFetchOllamaFallback:
                 context       = {},
             )
 
-        assert [c.args[1] for c in mock_call.call_args_list] == ["fetch_url", "ollama_web_fetch"]
+        # 503 is transient: one local retry before the Ollama fallback.
+        assert [c.args[1] for c in mock_call.call_args_list] == [
+            "fetch_url", "fetch_url", "ollama_web_fetch",
+        ]
         assert len(results) == 1
         assert results[0].tool_name == "url_fetch:ollama_fallback"
         assert results[0].success is True
@@ -656,6 +678,233 @@ class TestUrlFetchOllamaFallback:
             )
 
         assert results[0].tool_name == "url_fetch:ollama_fallback"
+
+
+class TestUrlFetchSearchFallback:
+    """
+    §14.20 (2026-11-14): with a key saved for the active SEARCH_PROVIDER
+    (the module's autouse _search_key_saved fixture), a failed url_fetch
+    never calls Ollama Cloud web_fetch. A direct url_fetch searches for the
+    URL, then reads the first *different* page the search found with the
+    local fetcher, else returns the snippets; the News Feed pin and the
+    research loop just report the local failure (they already have search
+    results of their own to fall back on). With no key, Ollama takes the
+    fallback slot — see TestUrlFetchOllamaFallback.
+    """
+
+    _URL = "https://www.example.com/news/story-123"
+    _BLOCKED = ("Error executing tool fetch_url: ERROR: http_client_error — "
+                "Target returned HTTP 403.", True)
+
+    @staticmethod
+    def _search_hit(query: str, urls: list[str]) -> tuple[str, bool]:
+        text = "\n\n".join(f"• Story copy {i} — site\n  Snippet {i}.\n  [{u}]" for i, u in enumerate(urls))
+        return json.dumps({"query": query, "result_text": text, "result_count": len(urls)}), False
+
+    def _dispatch(self, dispatcher, fake_call):
+        calls: list[tuple[str, dict]] = []
+
+        async def recording(session, name, arguments):
+            calls.append((name, dict(arguments)))
+            return await fake_call(session, name, arguments)
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=recording):
+            results = dispatcher.dispatch(
+                tools_to_call = ["url_fetch"],
+                instruction   = f"summarize {self._URL}",
+                context       = {},
+            )
+        return results, calls
+
+    def test_search_fallback_reads_a_different_copy(self, dispatcher: MCPToolDispatcher):
+        copy = "https://mirror.example.org/story-123"
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return self._search_hit(arguments["query"], [copy])
+            assert name == "fetch_url"
+            if arguments["url"] == self._URL:
+                return self._BLOCKED
+            return _fetch_url_ok(arguments["url"], "Mirrored story body.")
+
+        results, calls = self._dispatch(dispatcher, fake_call)
+
+        assert [n for n, _ in calls] == ["fetch_url", "web_search", "fetch_url"]
+        assert calls[1][1]["query"] == self._URL
+        assert calls[2][1]["url"] == copy
+        assert len(results) == 1
+        r = results[0]
+        assert r.tool_name == "url_fetch:search_fallback"
+        assert r.success is True
+        assert r.result.startswith(f"NOTE: The requested page ({self._URL}) could not be read")
+        assert "http_client_error" in r.result
+        assert "NOT that page" in r.result
+        assert "Mirrored story body." in r.result
+
+    def test_search_hit_for_the_same_page_is_skipped(self, dispatcher: MCPToolDispatcher):
+        """Brave usually returns the requested page itself first, often
+        spelled slightly differently (no www., trailing slash, utm_*) —
+        refetching it would just fail again."""
+        variants = [
+            "https://example.com/news/story-123/",
+            "http://www.example.com/news/story-123?utm_source=x",
+        ]
+        copy = "https://mirror.example.org/story-123"
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return self._search_hit(arguments["query"], [*variants, copy])
+            assert name == "fetch_url"
+            if arguments["url"] != copy:
+                return self._BLOCKED
+            return _fetch_url_ok(arguments["url"])
+
+        results, calls = self._dispatch(dispatcher, fake_call)
+
+        assert [a.get("url") for n, a in calls if n == "fetch_url"] == [self._URL, copy]
+        assert results[0].tool_name == "url_fetch:search_fallback"
+
+    def test_copy_unreadable_returns_snippets(self, dispatcher: MCPToolDispatcher):
+        copy = "https://mirror.example.org/story-123"
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return self._search_hit(arguments["query"], [copy])
+            assert name == "fetch_url"
+            return self._BLOCKED
+
+        results, calls = self._dispatch(dispatcher, fake_call)
+
+        assert [n for n, _ in calls] == ["fetch_url", "web_search", "fetch_url"]
+        r = results[0]
+        assert r.tool_name == "url_fetch:search_fallback"
+        assert r.success is True
+        assert "NOT that page" in r.result
+        assert "web search results about that page" in r.result
+        assert "Snippet 0." in r.result
+
+    def test_search_finds_nothing_reports_fetcher_error_first(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return json.dumps({
+                    "query": arguments["query"], "result_text": "No results found.", "result_count": 0,
+                }), False
+            assert name == "fetch_url"
+            return self._BLOCKED
+
+        results, calls = self._dispatch(dispatcher, fake_call)
+
+        assert [n for n, _ in calls] == ["fetch_url", "web_search"]
+        r = results[0]
+        assert r.tool_name == "url_fetch"
+        assert r.success is False
+        assert r.result.startswith("ERROR: http_client_error")
+        assert "Web search fallback also failed: No results found." in r.result
+
+    def test_transient_error_retried_before_search(self, dispatcher: MCPToolDispatcher):
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return self._search_hit(arguments["query"], ["https://mirror.example.org/s"])
+            assert name == "fetch_url"
+            if arguments["url"] == self._URL:
+                return "Error executing tool fetch_url: ERROR: timeout — Request timed out.", True
+            return _fetch_url_ok(arguments["url"])
+
+        results, calls = self._dispatch(dispatcher, fake_call)
+
+        assert [n for n, _ in calls] == ["fetch_url", "fetch_url", "web_search", "fetch_url"]
+        assert results[0].tool_name == "url_fetch:search_fallback"
+
+    def test_never_calls_ollama_even_with_ollama_key(self, dispatcher: MCPToolDispatcher, monkeypatch):
+        monkeypatch.setenv("OLLAMA_API_KEY", "test-placeholder")
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return json.dumps({"query": "", "result_text": "No results found.", "result_count": 0}), False
+            assert name == "fetch_url"
+            return self._BLOCKED
+
+        _, calls = self._dispatch(dispatcher, fake_call)
+
+        names = [n for n, _ in calls]
+        assert "ollama_web_fetch" not in names
+        assert "ollama_web_search" not in names
+
+    def test_langsearch_key_counts_for_langsearch_provider(self, dispatcher: MCPToolDispatcher, monkeypatch):
+        monkeypatch.setenv("SEARCH_PROVIDER", "langsearch")
+        monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+        monkeypatch.setenv("LANGSEARCH_API_KEY", "test-placeholder")
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return self._search_hit(arguments["query"], ["https://mirror.example.org/s"])
+            assert name == "fetch_url"
+            return self._BLOCKED if arguments["url"] == self._URL else _fetch_url_ok(arguments["url"])
+
+        results, _ = self._dispatch(dispatcher, fake_call)
+        assert results[0].tool_name == "url_fetch:search_fallback"
+
+    @pytest.mark.parametrize("env", [
+        {"SEARCH_PROVIDER": "langsearch", "BRAVE_API_KEY": "test-placeholder"},  # wrong provider's key
+        {"SEARCH_PROVIDER": "brave", "BRAVE_API_KEY": "   "},                    # blank
+        {"SEARCH_PROVIDER": "bing", "BRAVE_API_KEY": "test-placeholder"},        # unknown provider
+    ])
+    def test_no_usable_key_uses_ollama(self, dispatcher: MCPToolDispatcher, monkeypatch, env):
+        monkeypatch.delenv("LANGSEARCH_API_KEY", raising=False)
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+
+        async def fake_call(session, name, arguments):
+            if name == "fetch_url":
+                return self._BLOCKED
+            assert name == "ollama_web_fetch"
+            return _fetch_url_ok(arguments["url"], "word " * 100)
+
+        results, calls = self._dispatch(dispatcher, fake_call)
+
+        assert [n for n, _ in calls] == ["fetch_url", "ollama_web_fetch"]
+        assert results[0].tool_name == "url_fetch:ollama_fallback"
+
+    def test_key_saved_mid_session_applies_to_next_request(self, dispatcher: MCPToolDispatcher, monkeypatch):
+        """Settings' PUT /settings/api-keys updates os.environ in place; the
+        check is read per call, so no restart is needed."""
+        monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+
+        async def fake_call(session, name, arguments):
+            if name == "fetch_url":
+                return self._BLOCKED
+            if name == "web_search":
+                return self._search_hit(arguments["query"], [])
+            return _fetch_url_ok(arguments["url"], "word " * 100)
+
+        _, before = self._dispatch(dispatcher, fake_call)
+        monkeypatch.setenv("BRAVE_API_KEY", "test-placeholder")
+        _, after = self._dispatch(dispatcher, fake_call)
+
+        assert [n for n, _ in before] == ["fetch_url", "ollama_web_fetch"]
+        assert [n for n, _ in after] == ["fetch_url", "web_search"]
+
+    def test_search_fallback_false_reports_local_failure(self, dispatcher: MCPToolDispatcher):
+        """The research loop's candidate fetch (search_fallback=False): with
+        a key saved, a failed fetch neither searches nor calls Ollama."""
+        names: list[str] = []
+
+        async def fake_call(session, name, arguments):
+            names.append(name)
+            return self._BLOCKED
+
+        async def run():
+            return await dispatcher._run_url_fetch(
+                _FAKE_SESSION, None, "", {"fetch_url": self._URL}, search_fallback=False,
+            )
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            result = asyncio.run(run())
+
+        assert names == ["fetch_url"]
+        assert result.tool_name == "url_fetch"
+        assert result.success is False
+        assert result.result.startswith("ERROR: http_client_error")
 
 
 class TestWebSearch:
@@ -1830,7 +2079,8 @@ class TestSearchEnrichment:
                 }), False
             assert name == "fetch_url"
             fetch_attempts.append(arguments["url"])
-            return "Error executing tool fetch_url: ERROR: connection_error", True
+            # Non-transient (§14.20), so each URL is fetched exactly once.
+            return "Error executing tool fetch_url: ERROR: http_client_error — 403", True
 
         with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
             results = dispatcher.dispatch(
@@ -1839,6 +2089,130 @@ class TestSearchEnrichment:
 
         assert len(fetch_attempts) == _ENRICH_MAX_ATTEMPTS
         assert fetch_attempts == urls[:_ENRICH_MAX_ATTEMPTS]
+        assert len(results) == 1
+
+    # -- §14.20 (2026-11-14): local-only enrichment with transient retry --
+
+    @staticmethod
+    def _two_url_search(arguments) -> tuple[str, bool]:
+        return json.dumps({
+            "query": arguments["query"],
+            "result_text": (
+                "• Title — example.com\n  Snippet.\n  [https://example.com/a]\n\n"
+                "• Title 2 — example.com\n  Snippet 2.\n  [https://example.com/b]"
+            ),
+            "result_count": 2,
+        }), False
+
+    @pytest.mark.parametrize("code", ["timeout", "connection_error", "http_server_error"])
+    def test_enrichment_transient_error_retried_then_succeeds(
+        self, dispatcher: MCPToolDispatcher, code: str
+    ):
+        calls: list[tuple[str, str]] = []
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return self._two_url_search(arguments)
+            calls.append((name, arguments["url"]))
+            if len(calls) == 1:
+                return f"Error executing tool fetch_url: ERROR: {code} — boom", True
+            return _fetch_url_ok(arguments["url"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"], instruction = "ignored", context = {},
+            )
+
+        assert calls == [("fetch_url", "https://example.com/a"), ("fetch_url", "https://example.com/a")]
+        assert len(results) == 2
+        assert results[1].tool_name == "url_fetch"
+        assert results[1].success is True
+
+    def test_enrichment_transient_twice_moves_to_next_url(self, dispatcher: MCPToolDispatcher):
+        calls: list[tuple[str, str]] = []
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return self._two_url_search(arguments)
+            calls.append((name, arguments["url"]))
+            if arguments["url"] == "https://example.com/a":
+                return "Error executing tool fetch_url: ERROR: timeout — Request timed out.", True
+            return _fetch_url_ok(arguments["url"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"], instruction = "ignored", context = {},
+            )
+
+        assert calls == [
+            ("fetch_url", "https://example.com/a"),
+            ("fetch_url", "https://example.com/a"),
+            ("fetch_url", "https://example.com/b"),
+        ]
+        assert len(results) == 2
+        assert results[1].success is True
+        assert "example.com/b" in results[1].result
+
+    @pytest.mark.parametrize("code", ["http_client_error", "extraction_failed", "javascript_required"])
+    def test_enrichment_permanent_error_not_retried(self, dispatcher: MCPToolDispatcher, code: str):
+        calls: list[tuple[str, str]] = []
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return self._two_url_search(arguments)
+            calls.append((name, arguments["url"]))
+            if arguments["url"] == "https://example.com/a":
+                return f"Error executing tool fetch_url: ERROR: {code} — nope", True
+            return _fetch_url_ok(arguments["url"])
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"], instruction = "ignored", context = {},
+            )
+
+        assert calls == [("fetch_url", "https://example.com/a"), ("fetch_url", "https://example.com/b")]
+        assert results[1].success is True
+
+    def test_enrichment_never_calls_ollama_web_fetch(self, dispatcher: MCPToolDispatcher, monkeypatch):
+        """Even with an Ollama key configured, a fully failed enrichment
+        makes no ollama_web_fetch call — only local fetch_url attempts."""
+        monkeypatch.setenv("OLLAMA_API_KEY", "placeholder")
+        tool_names: list[str] = []
+
+        async def fake_call(session, name, arguments):
+            tool_names.append(name)
+            if name == "web_search":
+                return self._two_url_search(arguments)
+            return "Error executing tool fetch_url: ERROR: connection_error — down", True
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"], instruction = "ignored", context = {},
+            )
+
+        assert "ollama_web_fetch" not in tool_names
+        assert tool_names.count("fetch_url") == 4  # 2 URLs x (attempt + 1 retry)
+        assert len(results) == 1
+        assert results[0].success is True
+
+    def test_enrichment_stops_when_mcp_unreachable(self, dispatcher: MCPToolDispatcher):
+        """localist-mcp dying mid-turn: the first failed fetch reports it
+        unreachable, and enrichment gives up rather than trying (and
+        retrying) every remaining candidate against a dead session."""
+        fetch_calls: list[str] = []
+
+        async def fake_call(session, name, arguments):
+            if name == "web_search":
+                return self._two_url_search(arguments)
+            fetch_calls.append(arguments["url"])
+            raise ConnectionError("session closed")
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"], instruction = "ignored", context = {},
+            )
+
+        assert fetch_calls == ["https://example.com/a"]
         assert len(results) == 1
 
     def test_web_search_enrichment_excerpt_truncated(self, dispatcher: MCPToolDispatcher):
@@ -2053,6 +2427,96 @@ class TestNewsSearchPinnedArticleFetch:
             )
 
         assert fetches == ["https://example.com/a?x=1&y=2"]
+
+
+class TestPinAndWebSearchKeyGate:
+    """§14.20: the News Feed pin's fetch and web_search itself follow the
+    same search-key rule as url_fetch."""
+
+    _CLICKED = "https://www.theverge.com/news/1030714/example-story"
+    _COPY = "https://example.org/copy-of-story"
+
+    def _news_hit(self, arguments):
+        return json.dumps({
+            "query": arguments["query"],
+            "result_text": f"• Headline — Example — 2026-11-10\n  Short.\n  [{self._COPY}]",
+            "result_count": 1, "is_miss": False,
+        }), False
+
+    def _run_pin(self, dispatcher, names: list[str]):
+        async def fake_call(session, name, arguments):
+            names.append(name)
+            if name == "news_search":
+                return self._news_hit(arguments)
+            if name == "ollama_web_fetch":
+                return _fetch_url_ok(arguments["url"], "Ollama copy of the clicked story. " * 10)
+            assert name == "fetch_url"
+            if arguments["url"] == self._CLICKED:
+                return "Error executing tool fetch_url: ERROR: http_client_error — 403", True
+            return _fetch_url_ok(arguments["url"], "Search result copy.")
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            return dispatcher.dispatch(
+                tools_to_call = ["news_search"], instruction = "Tell me more",
+                context       = {"news_article_url": self._CLICKED},
+            )
+
+    def test_pin_with_key_falls_back_to_search_results_not_ollama(self, dispatcher: MCPToolDispatcher):
+        names: list[str] = []
+        results = self._run_pin(dispatcher, names)
+
+        assert names == ["news_search", "fetch_url", "fetch_url"]
+        assert [r.tool_name for r in results] == ["news_search", "url_fetch"]
+        assert "Search result copy." in results[1].result
+
+    def test_pin_without_key_uses_ollama(self, dispatcher: MCPToolDispatcher, monkeypatch):
+        monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+        names: list[str] = []
+        results = self._run_pin(dispatcher, names)
+
+        assert names == ["news_search", "fetch_url", "ollama_web_fetch"]
+        assert [r.tool_name for r in results] == ["news_search", "url_fetch:ollama_fallback"]
+        assert "Ollama copy" in results[1].result
+
+    def test_web_search_without_key_skips_brave_call(self, dispatcher: MCPToolDispatcher, monkeypatch):
+        monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+        monkeypatch.delenv("WEB_SEARCH_PROVIDER", raising=False)
+
+        async def fake_call(session, name, arguments):
+            assert name == "ollama_web_search"
+            return json.dumps({
+                "query": arguments["query"], "result_text": "• Ollama hit\n  body\n", "result_count": 1,
+            }), False
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call) as mock_call:
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"], instruction = "latest oMLX release", context = {},
+            )
+
+        assert [c.args[1] for c in mock_call.call_args_list] == ["ollama_web_search"]
+        assert results[0].tool_name == "web_search:ollama_fallback"
+        assert results[0].success is True
+
+    def test_web_search_without_key_names_missing_key_when_ollama_fails(
+        self, dispatcher: MCPToolDispatcher, monkeypatch,
+    ):
+        monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+        monkeypatch.delenv("WEB_SEARCH_PROVIDER", raising=False)
+
+        async def fake_call(session, name, arguments):
+            assert name == "ollama_web_search"
+            return "Error executing tool ollama_web_search: ERROR: OLLAMA_API_KEY not configured", True
+
+        with patch.object(MCPToolDispatcher, "_call_mcp_tool", side_effect=fake_call):
+            results = dispatcher.dispatch(
+                tools_to_call = ["web_search"], instruction = "latest oMLX release", context = {},
+            )
+
+        r = results[0]
+        assert r.success is False
+        assert r.tool_name == "web_search:ollama_fallback"
+        assert r.result.startswith("ERROR: BRAVE_API_KEY not configured")
+        assert "OLLAMA_API_KEY not configured" in r.result
 
 
 class TestChart:

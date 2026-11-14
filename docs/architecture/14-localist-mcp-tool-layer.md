@@ -222,6 +222,12 @@ Phase 1. Internally:
   single unwrapped `ToolResult` as before. No feature flag: unlike the
   research loop, this has no inference cost, just one bounded (10s
   default timeout) network call.
+  **Local-only since 2026-11-14 (§14.20):** enrichment fetches go through
+  `_fetch_url_local_with_retry()`, not `_run_url_fetch()`. A candidate
+  gets one retry on a transient error (`timeout`, `connection_error`,
+  `http_server_error`), then enrichment moves to the next result URL. It
+  never calls Ollama Cloud `web_fetch`, and it stops at once if
+  localist-mcp is unreachable.
 - **Any other tool name** — Planner never routes `tools_to_call` to
   anything but the three above (see §4.2's priority tree), so this is an
   unreachable-in-practice defensive path. Produces an inline
@@ -1611,6 +1617,11 @@ Same scoping doc, Track B (§5): a fallback-only tier underneath `url_fetch`, no
 config toggle, no Planner visibility — `url_fetch` is only ever routed by the same regex/context
 resolution it always used (§14.3).
 
+> **Narrowed 2026-11-14 (§14.20).** This tier now runs only when no key is saved for the active
+> `SEARCH_PROVIDER`. With a key, a direct `url_fetch` falls back to a web search for the URL
+> instead, and enrichment, the News Feed pin and the research loop never call Ollama. The text
+> below describes the original 2026-07-31 design.
+
 **The scoping doc's premise about a "port-8002 fetcher microservice" is stale.** That microservice
 was already retired (§5, §14.1) — `url_fetch` calls the in-process `fetch_url` MCP tool
 (`mcp_server/url_fetch.py`), a verbatim port of the old Fetcher's `/extract` path. The fallback was
@@ -1822,7 +1833,8 @@ Found while investigating that day's OpenRouter junk replies (§4.6.2). Report:
   way, so the pin-miss note (which quotes it) can't lead to fetching it twice.
 - Excerpt clipping is shared with `_enrich_top_result` (`_clip_enrichment`).
 - The fetch goes through `_run_url_fetch`, so the §14.16 Ollama fallback still applies. It uses no
-  NewsAPI quota.
+  NewsAPI quota. *(Since §14.20, 2026-11-14: only when no search key is saved. With one, a failed
+  pin fetch falls straight to search-result enrichment.)*
 
 **Tests.** `test_mcp_server.py`:
 - the normalised-match cases
@@ -1840,4 +1852,113 @@ Found while investigating that day's OpenRouter junk replies (§4.6.2). Report:
 **Live.** The real dispatcher ran against this code's localist-mcp on a spare port (8013). NewsAPI
 again returned only the Slashdot copy. The result now opened with the pin-miss note, the Slashdot link
 read `&id=`, and the second tool result was the Verge article itself. No model requests were used.
+
+### 14.20 Ollama Cloud `web_fetch` Kept to a Minimum (2026-11-14)
+
+**Problem.** While testing the v0.1.7 draft, Michael's Ollama Cloud usage history showed many
+`web_fetch` calls. The Planner never chooses Ollama. Every call was §14.16's fallback after the
+local `fetch_url` failed. Most came from search enrichment (§14.3): each successful search tried up
+to 3 result URLs, and each failed one went through `_run_url_fetch()`, so Ollama was called first.
+With up to 3 queries a turn, that's as many as 9 Ollama fetches for one search turn. News portals
+that 403 non-browser requests make this common.
+
+**Rule.** Ollama `web_fetch` runs only when no key is saved for the active `SEARCH_PROVIDER`.
+The local `fetch_url` always goes first.
+- `_search_key_available()` maps `langsearch` → `LANGSEARCH_API_KEY` and `brave` → `BRAVE_API_KEY`
+  (`_SEARCH_PROVIDER_KEY_ENV`). A blank key, or an unknown provider, counts as no key.
+- The check reads `os.environ` on every call. `PUT /settings/api-keys` updates the backend's
+  environment, so saving or clearing a key in Settings applies to the next request without a
+  restart.
+
+**Transient retry.** `_fetch_url_local_with_retry()` runs `fetch_url` once more when the first
+error is `timeout`, `connection_error` or `http_server_error` (`_TRANSIENT_FETCH_ERROR_CODES`, read
+from the `ERROR: <code> —` prefix). It doesn't retry `http_client_error`, `extraction_failed` or
+`javascript_required`, which fail the same way a second time. It never calls Ollama. Every path
+below starts with it.
+
+**What follows a failed local fetch.**
+
+| Path | Search key saved | No search key |
+|---|---|---|
+| Direct `url_fetch` | `_run_url_search_fallback()` (below) | Ollama `web_fetch` (§14.16) |
+| News Feed pin (`_fetch_pinned_article`, §14.19) | Search-result enrichment, as before | Ollama `web_fetch` |
+| Research loop candidate fetch (§18) | Fails cleanly; the loop's next search round continues | Ollama `web_fetch` |
+| Enrichment (`_enrich_top_result`, §14.3) | Next result URL, up to `_ENRICH_MAX_ATTEMPTS = 3` | same; never Ollama |
+
+`_run_url_fetch()` gained a keyword argument, `search_fallback`. It's `True` for the direct dispatch
+and `False` for the pin and the research loop, which already have search results to fall back on.
+The `_MCP_UNREACHABLE_PREFIX` rule is unchanged: no fallback runs when localist-mcp itself is down,
+and enrichment stops at once.
+
+**`_run_url_search_fallback()`.**
+- Searches for the URL itself through `_execute_brave_web_search_query()`, which uses the
+  `web_search` MCP tool, Brave or LangSearch. It skips `_execute_web_search_query()`, so an empty
+  search can't become an Ollama web search either.
+- Fetches the first result at a different page with the local fetcher plus retry. This is often a
+  syndicated or mirrored copy. Hits that are the same page spelled differently are skipped, using
+  §14.19's `_normalize_article_url()` (imported from `mcp_server/news_search.py`).
+- If no other copy can be read, the search snippets are the result.
+- Successful results are tagged `url_fetch:search_fallback` with `success=True`. They open with
+  `_SEARCH_FALLBACK_NOTE`: "NOTE: The requested page (…) could not be read (<fetcher error>). The
+  text below is NOT that page.", then say whether it's another page or search results. This keeps
+  the model from presenting a copy as the requested page.
+- If the search finds nothing, the result is `success=False`, tagged `url_fetch`. It leads with the
+  fetcher's own error (the §14.17 rule) and adds "(Web search fallback also failed: …)".
+- Controller Step 3b matches only `web_search*`, `news_search*` and `research`, so the new tag
+  doesn't affect corpus fallback.
+
+**`web_search` with no key.** With `WEB_SEARCH_PROVIDER=brave` and no key for the active provider,
+`_execute_web_search_query()` skips the `web_search` call, which could only fail, and goes straight
+to `_run_ollama_web_search()`. The tag stays `web_search:ollama_fallback`. If Ollama also fails, the
+result starts with `ERROR: <KEY> not configured (Ollama Cloud fallback also failed: …)`, so the
+missing search key is still named first.
+
+**Worst case.** One enrichment query whose 3 URLs all time out twice takes about 60 s, against
+about 30 s plus 3 Ollama calls before. Blocked and paywalled pages don't retry. A direct fetch that
+times out twice and then searches and fetches a copy takes about 30 s.
+
+**Tests** (`test_mcp_tool_dispatcher.py`).
+- An autouse `_search_key_saved` fixture (also in `test_tool_dispatcher_phase6.py`) sets
+  `SEARCH_PROVIDER=brave` and a placeholder `BRAVE_API_KEY`. Before it, whether a key was present
+  depended on test order: importing `main` loads the real `backend/.env`. 38 tests failed in the
+  full run but passed alone.
+- `TestUrlFetchOllamaFallback` clears the key, and its 503 test now expects the retry.
+- `TestSearchEnrichment` covers:
+  - the transient retry
+  - retry then next URL
+  - no retry on permanent errors
+  - no Ollama even with `OLLAMA_API_KEY` set
+  - the stop when localist-mcp is unreachable
+
+  The old "gives up after 3" test uses a 403 now.
+- `TestUrlFetchSearchFallback` covers:
+  - reading a different copy
+  - skipping same-page variants
+  - snippets when the copy fails
+  - search finds nothing
+  - retry before search
+  - no Ollama calls
+  - a LangSearch key under `langsearch`
+  - wrong-provider, blank and unknown-provider keys falling back to Ollama
+  - a key saved mid-session
+  - `search_fallback=False`
+- `TestPinAndWebSearchKeyGate` covers:
+  - the pin with and without a key
+  - `web_search` skipping the call that's sure to fail
+  - the missing-key error wording
+
+2180 → 2205 tests.
+
+**Live (2026-11-14).**
+- **Setup:** a dev backend on port 8011 and this code's localist-mcp on port 8013, using copies of
+  the packaged DB and wiki. The real DB's checksum was unchanged afterwards. Ollama hybrid was on,
+  and the turn ran on the local tier.
+- **Request:** "Summarize this page: https://www.investopedia.com/terms/i/inflation.asp" (403 to the
+  fetcher).
+- **Tool calls:** exactly three, `fetch_url` (403, not retried) → `web_search` (Brave, query = the
+  URL, 3 results) → `fetch_url` on `federalreserve.gov/faqs/economy_14419.htm` (655 words). The
+  backend log showed `falling back to a web search for it` and `search fallback read … in place of
+  …`. The MCP log had no Ollama calls.
+- **Reply:** the model said Investopedia returned 403 and that it summarized the Federal Reserve page
+  instead, citing that URL.
 

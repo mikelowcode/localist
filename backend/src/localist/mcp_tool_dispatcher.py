@@ -72,11 +72,18 @@ success", confirmed by reading the actual extraction code rather than
 assumed. ollama_web_fetch's MCP-layer response is pre-normalized to
 fetch_url's own dict shape (mcp_server/ollama_web_fetch.py), so both
 tiers share one result-formatting helper (_format_fetch_result_text) —
-nothing downstream needs to branch on which tier answered. Since
-_run_url_fetch is the single call point shared by the direct "url_fetch"
-tool dispatch, _enrich_top_result's web_search follow-up fetch, and
-_run_research_loop's candidate-URL fetch, all three transparently gain
-Ollama coverage from this one change.
+nothing downstream needs to branch on which tier answered.
+
+§14.20 (2026-11-14) narrowed that tier: Ollama Cloud web_fetch now runs
+only when no key is saved for the active SEARCH_PROVIDER
+(_search_key_available). Every fetch first gets one local retry on a
+transient error (_fetch_url_local_with_retry). With a key saved, a direct
+"url_fetch" falls back to a web search for the URL
+(_run_url_search_fallback, tagged "url_fetch:search_fallback"), while
+_fetch_pinned_article and _run_research_loop (search_fallback=False) just
+report the local failure — they have search results of their own to fall
+back on. _enrich_top_result never uses _run_url_fetch: it is local-only,
+moving to the next search-result URL instead, and never calls Ollama.
 
 web_search (Phase 3): ports ToolDispatcher._run_web_search's query
 resolution verbatim (explicit context["web_search_queries"], else derived
@@ -166,6 +173,7 @@ from mcp.client.sse import sse_client
 
 from .chart_tool_schema import KNOWN_TOOL_NAMES, SYSTEM_PROMPT_FEWSHOT, validate_chart_arguments
 from .json_envelope_repair import repair_envelope
+from .mcp_server.news_search import _normalize_article_url
 from .prompt_builder import ToolResult
 
 logger = logging.getLogger(__name__)
@@ -234,6 +242,33 @@ _ENRICH_EXCERPT_CHARS: int = 3000
 # perfectly fetchable URLs a few lines below. _enrich_top_result now tries
 # up to this many candidate URLs (in result order) before giving up.
 _ENRICH_MAX_ATTEMPTS: int = 3
+
+# 2026-11-14 (§14.20): fetch_url error codes worth one immediate retry of
+# the same URL — failures that can clear on their own. Everything else
+# (http_client_error 4xx bot blocks, extraction_failed paywalls,
+# javascript_required app shells) fails identically a second time, so a
+# retry would only add latency. Codes are mcp_server/url_fetch.py's
+# FetchUrlError taxonomy, read off the "ERROR: <code> — ..." prefix.
+_TRANSIENT_FETCH_ERROR_CODES: frozenset[str] = frozenset(
+    {"timeout", "connection_error", "http_server_error"}
+)
+_FETCH_ERROR_CODE_RE = re.compile(r"^ERROR:\s*([a-z_]+)")
+
+# §14.20: the key each SEARCH_PROVIDER value (mcp_server/web_search.py,
+# default "langsearch") needs. With no key saved for the active provider,
+# Ollama Cloud web_fetch takes url_fetch's fallback slot; with one, a web
+# search does and Ollama is never called (_run_url_fetch).
+_SEARCH_PROVIDER_KEY_ENV: dict[str, str] = {
+    "langsearch": "LANGSEARCH_API_KEY",
+    "brave":      "BRAVE_API_KEY",
+}
+
+# Leads every url_fetch:search_fallback result (§14.20) so the model never
+# presents a search hit or another site's copy as the requested page.
+_SEARCH_FALLBACK_NOTE: str = (
+    "NOTE: The requested page ({url}) could not be read ({error}). "
+    "The text below is NOT that page."
+)
 
 # 2026-10-21 (§14.17): Ollama Cloud web_fetch can "succeed" on a page the
 # fetcher already rejected by returning the unrendered shell itself — live,
@@ -425,6 +460,36 @@ def _normalize_mcp_error_text(text: str) -> str:
 # localist-mcp and failed there", since only the latter should trigger a
 # fallback).
 _MCP_UNREACHABLE_PREFIX = "ERROR: localist-mcp unreachable"
+
+
+def _is_transient_fetch_error(result_text: str) -> bool:
+    """
+    True when a failed url_fetch ToolResult's text carries a fetch_url
+    error code worth retrying (_TRANSIENT_FETCH_ERROR_CODES). localist-mcp
+    being unreachable is never transient here — its prefix has no
+    FetchUrlError code, and retrying a dead session can't help.
+    """
+    match = _FETCH_ERROR_CODE_RE.match(result_text)
+    return bool(match) and match.group(1) in _TRANSIENT_FETCH_ERROR_CODES
+
+
+def _search_key_available() -> bool:
+    """
+    True when the active SEARCH_PROVIDER has its API key set (§14.20).
+    Read fresh on every call: PUT /settings/api-keys updates this process's
+    os.environ, so a key saved (or cleared) in Settings applies to the
+    next request without a restart. An unknown SEARCH_PROVIDER counts as
+    no key — mcp_server/web_search.py rejects it anyway.
+    """
+    key_env = _active_search_key_env()
+    return bool(key_env and os.environ.get(key_env, "").strip())
+
+
+def _active_search_key_env() -> str | None:
+    """The env var holding the active SEARCH_PROVIDER's key, or None for an
+    unknown provider."""
+    provider = os.environ.get("SEARCH_PROVIDER", "langsearch").lower()
+    return _SEARCH_PROVIDER_KEY_ENV.get(provider)
 
 
 def _format_fetch_result_text(url: str, data: dict) -> str:
@@ -786,28 +851,39 @@ class MCPToolDispatcher:
 
     async def _run_url_fetch(
         self,
-        session:       ClientSession | None,
-        connect_error: Exception | None,
-        instruction:   str,
-        context:       dict[str, Any],
+        session:         ClientSession | None,
+        connect_error:   Exception | None,
+        instruction:     str,
+        context:         dict[str, Any],
+        *,
+        search_fallback: bool = True,
     ) -> ToolResult:
         """
         Resolve the target URL (context["fetch_url"] override, else the
-        first http(s):// URL in the instruction), then fetch it via the
-        in-process fetch_url tool, falling back to Ollama Cloud
-        (_run_ollama_url_fetch) when that fails — see this module's
-        docstring ("url_fetch / Ollama Cloud") for the precise fallback
-        trigger and why there's no separate empty-result check needed
-        here. The fallback is skipped when the failure is localist-mcp
-        itself being unreachable, same suppression rule
-        _execute_web_search_query uses.
+        first http(s):// URL in the instruction) and fetch it with the
+        local fetch_url tool, retrying once on a transient error
+        (_fetch_url_local_with_retry). When that still fails, what comes
+        next depends on whether a web-search key is saved (§14.20,
+        2026-11-14 — Ollama Cloud web_fetch is kept to a minimum):
 
-        When both tiers fail, the result leads with the fetcher's own
-        error and carries the fallback's as secondary detail (§14.17). The
-        fetcher's diagnosis is the one that describes the target page
-        (e.g. an HTTP 200 JavaScript shell); returning only the
-        fallback's error once led the model to report a "404" for a page
-        that had actually loaded.
+          - Search key saved for the active SEARCH_PROVIDER
+            (_search_key_available): if search_fallback is True (the
+            direct "url_fetch" dispatch), search for the URL and use what
+            that finds (_run_url_search_fallback). If False
+            (_fetch_pinned_article, _run_research_loop — callers that
+            already have search results of their own to fall back on),
+            return the local failure as-is. Ollama is never called.
+          - No search key: Ollama Cloud web_fetch takes the fallback slot
+            (_run_ollama_url_fetch), as before §14.20.
+
+        No fallback runs when localist-mcp itself is unreachable — same
+        suppression rule _execute_web_search_query uses. Whenever every
+        tier fails, the result leads with the fetcher's own error and
+        carries the fallback's as secondary detail (§14.17): the fetcher's
+        diagnosis is the one that describes the target page (e.g. an HTTP
+        200 JavaScript shell); returning only the fallback's error once
+        led the model to report a "404" for a page that had actually
+        loaded.
         """
         url: str = context.get("fetch_url", "")
         if not url:
@@ -825,13 +901,18 @@ class MCPToolDispatcher:
                 success    = False,
             )
 
-        fetch_result = await self._execute_fetcher_url_fetch(session, connect_error, url)
+        fetch_result = await self._fetch_url_local_with_retry(session, connect_error, url)
         if fetch_result.success or fetch_result.result.startswith(_MCP_UNREACHABLE_PREFIX):
             return fetch_result
 
+        if _search_key_available():
+            if not search_fallback:
+                return fetch_result
+            return await self._run_url_search_fallback(session, connect_error, url, fetch_result)
+
         logger.info(
-            "MCPToolDispatcher: url_fetch (fetcher) failed for url=%r — "
-            "falling back to Ollama Cloud.",
+            "MCPToolDispatcher: url_fetch (fetcher) failed for url=%r and no "
+            "web-search key is saved — falling back to Ollama Cloud.",
             url,
         )
         fallback = await self._run_ollama_url_fetch(session, connect_error, url)
@@ -849,6 +930,79 @@ class MCPToolDispatcher:
                 ),
             )
         return replace(fallback, tool_name="url_fetch:ollama_fallback")
+
+    async def _run_url_search_fallback(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        url:           str,
+        fetch_result:  ToolResult,
+    ) -> ToolResult:
+        """
+        Search-based fallback for a direct url_fetch the local fetcher
+        couldn't read (§14.20). Searches for the URL itself with the
+        web_search MCP tool (Brave or LangSearch, per SEARCH_PROVIDER —
+        called via _execute_brave_web_search_query directly, so an empty
+        search can't turn into an Ollama web search either), then fetches
+        the first result that's a different page — often a syndicated or
+        mirrored copy of the same article — with the local fetcher. If that
+        fails too, the search snippets themselves are the result.
+
+        Every successful result opens with _SEARCH_FALLBACK_NOTE so the
+        model knows it did not read the requested page itself, and is
+        tagged "url_fetch:search_fallback". If the search finds nothing,
+        the fetcher's own error leads (§14.17) with the search's as
+        secondary detail, success=False, tagged "url_fetch".
+        """
+        logger.info(
+            "MCPToolDispatcher: url_fetch (fetcher) failed for url=%r — "
+            "falling back to a web search for it.",
+            url,
+        )
+        search = await self._execute_brave_web_search_query(session, connect_error, url)
+        if not search.success:
+            logger.info(
+                "MCPToolDispatcher: url_fetch search fallback found nothing for url=%r (%s).",
+                url, search.result,
+            )
+            return replace(
+                fetch_result,
+                result = f"{fetch_result.result} (Web search fallback also failed: {search.result})",
+            )
+
+        note = _SEARCH_FALLBACK_NOTE.format(url=url, error=fetch_result.result)
+        target = _normalize_article_url(url)
+        tried: set[str] = {url}
+        candidate = self._extract_first_url(search.result, tried)
+        while candidate is not None and _normalize_article_url(candidate) == target:
+            tried.add(candidate)
+            candidate = self._extract_first_url(search.result, tried)
+
+        if candidate is not None:
+            copy = await self._fetch_url_local_with_retry(session, connect_error, candidate)
+            if copy.success:
+                logger.info(
+                    "MCPToolDispatcher: url_fetch search fallback read %r in place of %r.",
+                    candidate, url,
+                )
+                return ToolResult(
+                    tool_name  = "url_fetch:search_fallback",
+                    parameters = fetch_result.parameters,
+                    result     = f"{note} It is from a different page the search found:\n\n{copy.result}",
+                    success    = True,
+                )
+            logger.info(
+                "MCPToolDispatcher: url_fetch search fallback could not read %r either (%s) — "
+                "returning the search snippets.",
+                candidate, copy.result,
+            )
+
+        return ToolResult(
+            tool_name  = "url_fetch:search_fallback",
+            parameters = fetch_result.parameters,
+            result     = f"{note} It is web search results about that page:\n\n{search.result}",
+            success    = True,
+        )
 
     async def _execute_fetcher_url_fetch(
         self,
@@ -1028,12 +1182,22 @@ class MCPToolDispatcher:
     ) -> ToolResult | None:
         """
         Best-effort depth boost for one successful web_search/news_search
-        result: follow up with a single fetch_url call on the first URL
-        found in its result text, so the model gets real article text
-        instead of relying solely on the search provider's own short
-        snippet (Brave's `description` in particular is a short meta
-        description, not a summary — no truncation-cap tuning can lengthen
-        it, only a real fetch can).
+        result: follow up with a fetch_url call on the first URL found in
+        its result text, so the model gets real article text instead of
+        relying solely on the search provider's own short snippet (Brave's
+        `description` in particular is a short meta description, not a
+        summary — no truncation-cap tuning can lengthen it, only a real
+        fetch can).
+
+        Local fetcher only (§14.20, 2026-11-14): each candidate goes
+        through _fetch_url_local_with_retry — one retry on a transient
+        error, never the Ollama Cloud web_fetch fallback _run_url_fetch
+        uses. Enrichment is the highest-volume fetch caller (up to
+        _ENRICH_MAX_ATTEMPTS per query, up to _MAX_WEB_QUERIES queries per
+        turn), and a failed candidate's real fallback is simply the next
+        search-result URL, which costs nothing extra. If localist-mcp
+        itself is unreachable, enrichment stops at once — every later
+        candidate would fail the same way.
 
         Silent-fail by design — unlike _run_research_loop's candidate
         fetch (whose failure is itself diagnostic information for the
@@ -1057,20 +1221,43 @@ class MCPToolDispatcher:
                 return None
             tried_urls.add(url)
 
-            fetch_result = await self._run_url_fetch(
-                session, connect_error, "", {"fetch_url": url}
-            )
-            if not fetch_result.success:
+            fetch_result = await self._fetch_url_local_with_retry(session, connect_error, url)
+            if fetch_result.success:
+                return self._clip_enrichment(fetch_result)
+            if fetch_result.result.startswith(_MCP_UNREACHABLE_PREFIX):
                 logger.info(
-                    "MCPToolDispatcher: enrichment fetch failed for url=%r — "
-                    "trying next candidate, if any (%s).",
-                    url, fetch_result.result,
+                    "MCPToolDispatcher: enrichment stopped — localist-mcp unreachable (%s).",
+                    fetch_result.result,
                 )
-                continue
-
-            return self._clip_enrichment(fetch_result)
+                return None
+            logger.info(
+                "MCPToolDispatcher: enrichment fetch failed for url=%r — "
+                "trying next candidate, if any (%s).",
+                url, fetch_result.result,
+            )
 
         return None
+
+    async def _fetch_url_local_with_retry(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        url:           str,
+    ) -> ToolResult:
+        """
+        Fetch one URL with the local fetch_url tool, retrying it once when
+        the first failure is transient (_TRANSIENT_FETCH_ERROR_CODES).
+        Never calls Ollama Cloud — callers decide what comes next (§14.20).
+        Returns the last attempt's ToolResult, tagged "url_fetch".
+        """
+        result = await self._execute_fetcher_url_fetch(session, connect_error, url)
+        if result.success or not _is_transient_fetch_error(result.result):
+            return result
+        logger.info(
+            "MCPToolDispatcher: fetch_url transient failure for url=%r — retrying once (%s).",
+            url, result.result,
+        )
+        return await self._execute_fetcher_url_fetch(session, connect_error, url)
 
     @staticmethod
     def _clip_enrichment(fetch_result: ToolResult) -> ToolResult:
@@ -1095,7 +1282,11 @@ class MCPToolDispatcher:
         """
         url = html.unescape(url.strip())
         tried_urls.add(url)
-        fetch_result = await self._run_url_fetch(session, connect_error, "", {"fetch_url": url})
+        # search_fallback=False (§14.20): news_search's own results are this
+        # path's fallback — the caller enriches from them on a miss.
+        fetch_result = await self._run_url_fetch(
+            session, connect_error, "", {"fetch_url": url}, search_fallback=False,
+        )
         if not fetch_result.success:
             logger.info(
                 "MCPToolDispatcher: pinned article fetch failed for url=%r — "
@@ -1219,6 +1410,27 @@ class MCPToolDispatcher:
         if provider == "ollama":
             primary = await self._run_ollama_web_search(session, connect_error, query)
             return replace(primary, tool_name="web_search:ollama_primary")
+
+        # §14.20: with no key saved for the active SEARCH_PROVIDER the
+        # web_search tool can only fail ("ERROR: <KEY> not configured"), so
+        # skip that call and go straight to Ollama Cloud. Same tag and the
+        # same final result as before — one wasted round-trip fewer.
+        if not _search_key_available():
+            key_env = _active_search_key_env()
+            logger.info(
+                "MCPToolDispatcher: web_search — no %s saved; using Ollama Cloud for query=%r.",
+                key_env, query,
+            )
+            fallback = await self._run_ollama_web_search(session, connect_error, query)
+            if not fallback.success and not fallback.result.startswith(_MCP_UNREACHABLE_PREFIX):
+                fallback = replace(
+                    fallback,
+                    result = (
+                        f"ERROR: {key_env} not configured "
+                        f"(Ollama Cloud fallback also failed: {fallback.result})"
+                    ),
+                )
+            return replace(fallback, tool_name="web_search:ollama_fallback")
 
         brave_result = await self._execute_brave_web_search_query(session, connect_error, query)
         if brave_result.success or brave_result.result.startswith(_MCP_UNREACHABLE_PREFIX):
@@ -2089,9 +2301,12 @@ class MCPToolDispatcher:
                 # Search snippet alone was inconclusive but pointed at a
                 # page — pull the full page before giving up on this query.
                 tried_urls.add(candidate_url)
+                # search_fallback=False (§14.20): the loop's next search
+                # round is this fetch's fallback.
                 fetch_result = await self._run_url_fetch(
                     session, connect_error, instruction,
                     {**context, "fetch_url": candidate_url},
+                    search_fallback=False,
                 )
                 fetch_result.workflow_id = workflow_id
                 results.append(fetch_result)
