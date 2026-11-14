@@ -180,3 +180,30 @@ jobs:
           body_path: ${{ runner.temp }}/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The step above only sets the notes when it creates the release. When
+      # a tag is moved and the release already exists, it uploads the new DMG
+      # but keeps the old notes (2026-11-14: v0.1.7's Draft kept its 11-13
+      # notes and missed the Hybrid inference bullet). Overwrite them while
+      # the release is still a draft, never once it's published, so hand
+      # edits to a live release survive. GitHub's generated notes (the "Full
+      # Changelog" link, plus any merged PRs) are appended as before.
+      - name: Refresh draft release notes
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]; then
+            echo "$TAG is published; leaving its notes alone."
+            exit 0
+          fi
+          FULL="$RUNNER_TEMP/release-notes-full.md"
+          {
+            cat "$RUNNER_TEMP/release-notes.md"
+            echo
+            gh api "repos/$GH_REPO/releases/generate-notes" -f tag_name="$TAG" --jq .body
+          } > "$FULL"
+          gh release edit "$TAG" --notes-file "$FULL"
+          echo "Draft notes for $TAG refreshed."
