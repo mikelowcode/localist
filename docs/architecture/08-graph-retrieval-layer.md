@@ -876,6 +876,35 @@ returned answer is the fallback message and `grounded=False`/`sources=[]` for th
 unexplained.** Both halves of the two-prompt plan (gate calibration; generation-time backstop) are
 implemented and verified to the extent each could be.
 
+**Update 2026-08-05 — `think=True` piloted as a candidate mitigation for the mechanism itself;
+inconclusive, not pursued further.** Separately from the generation-time backstop above (which
+closes user-facing impact but leaves the mechanism unexplained), a live pilot tested whether
+re-enabling `OllamaRuntimeClient`'s native `thinking` field (hardcoded off since the fix described
+in §4.6.2's 2026-08-04 update) changes the fabrication rate specifically — on the theory that
+giving the model room to reason before committing to output might reduce its tendency to reach for
+this malformed string. Scoped narrowly: tool *selection* in this codebase is fully deterministic
+(`planner.py`'s P1–P6 ladder, resolved before any inference runs), so thinking has no mechanism to
+affect *which* tools get called — only whether the model, on a `tools=[]` turn, still fabricates
+the tool-call-shaped string is testable at all.
+
+`diagnostics/diag_ollama_thinking_fabrication_repro.py` (new, read-only) ran 40 live trials against
+`gemma4:e4b-mlx` — 20 at `think=false` (baseline), 20 at `think=true` (treatment) — same 10
+ungrounded, search-shaped instructions (modeled on this item's own reference fabrication strings'
+topic shape, not the original historical instructions, which weren't retained anywhere
+retrievable), `temp=0.30`, `max_tokens=1024`, using the real `_is_fabricated_toolcall()` detector
+directly, not a reimplementation. **Result: 0/20 fabrications in both conditions** — the failure
+mode didn't reproduce even once in the baseline arm at this N, so no fabrication-rate comparison
+could actually be made either way. This is a "too rare to detect at this sample size" result, not
+evidence that thinking has no effect. Confirmed real and unrelated to the fabrication question:
+`think=true` cost ~3.4x mean wall time (10.25s → 35.29s) and reproduced §4.6.2's known
+budget-exhaustion failure mode live — 20% of treatment trials hit `done_reason="length"` (reasoning
+tokens, mean 1,998 chars, exhausted the 1,024-token budget before the answer finished), 5% returned
+fully empty content. Given a confirmed, substantial cost against an unconfirmed and likely-rare
+benefit, this line of investigation was not pursued further (no larger sweep run, no code change
+made). Raw trial data: `diagnostics/ollama_thinking_fabrication_repro_results.csv`. This update
+closes only the "would re-enabling thinking help" question for Open Item 11 — the item's own
+mechanism remains open and unexplained, unaffected by this result.
+
 ---
 
 **Open Item 12 — Removal of Priority 4a (`_priority4a_identity()`). CLOSED 2026-06-26.**
