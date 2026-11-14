@@ -2,7 +2,7 @@
 
 Companion to diag_compare_embedding_models.py. Investigates ONLY the narrow true-negative/true-positive score band; the 0.028 corpus-miss is out of scope and considered closed. Corpus duplication (Finding 2) is written up separately — see the accompanying prose report, not this script.
 
-Corpus: 16 real documents from /Users/michaelfilanc/Projects/lora-app-demo/backend/localist_memory.db
+Corpus: 16 real documents from backend/localist_memory.db
 
 ## True-negative queries (8) — top-1 score against real corpus
 

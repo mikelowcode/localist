@@ -48,7 +48,6 @@ methodology actually detects a *known* truncation boundary before trusting
 a "cloud passes cleanly" result.
 
 Run from the project root:
-    cd /Users/michaelfilanc/Projects/lora-app-demo
     python3 diagnostics/diag_ollama_num_ctx_probe.py
 """
 

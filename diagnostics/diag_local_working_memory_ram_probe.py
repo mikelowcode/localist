@@ -33,7 +33,6 @@ Methodology notes (read before trusting the numbers)
   failure mode as an outright OOM/Metal-cap crash.
 
 Run from the project root (backend venv active, both local backends up):
-    cd /Users/michaelfilanc/Projects/lora-app-demo
     source backend/.venv/bin/activate
     python3 diagnostics/diag_local_working_memory_ram_probe.py
 """

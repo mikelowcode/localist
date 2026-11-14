@@ -32,7 +32,6 @@ review, it does not write to backend/wiki/. Re-run with the constant
 flipped only after reviewing the output.
 
 Run from the project root:
-    cd /Users/michaelfilanc/Projects/lora-app-demo
     python3 diagnostics/diag_wiki_agent_diff_only.py
 """
 

@@ -39,7 +39,6 @@ Constraints (same as v1)
   the pre-Lever3 reference.
 
 Run from the project root:
-    cd /Users/michaelfilanc/Projects/lora-app-demo
     python3 diagnostics/diag_lever3_prewarm.py
 """
 

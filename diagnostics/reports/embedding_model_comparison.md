@@ -1,6 +1,6 @@
 # Embedding Model Comparison — MLX (embeddinggemma) vs. Ollama (nomic-embed-text)
 
-Corpus: 16 documents from /Users/michaelfilanc/Projects/lora-app-demo/backend/localist_memory.db
+Corpus: 16 documents from backend/localist_memory.db
 MLX vectors: 16  |  Ollama vectors: 16
 
 **Observational only — no threshold conclusions drawn here.** This report exists to compare score distributions and rankings; any similarity-threshold change is a separate follow-up decision.

@@ -4,7 +4,7 @@ Third diagnostic in this series. Reuses the exact 8 true-positive / 8 true-negat
 
 **Observational only.** memory_manager.py's content[:500] truncation is unmodified; no re-index of the real database occurred; no threshold or ceiling value is changed by this script.
 
-Corpus: 16 real documents from /Users/michaelfilanc/Projects/lora-app-demo/backend/localist_memory.db
+Corpus: 16 real documents from backend/localist_memory.db
 
 ## MLX — gap vs. truncation length
 

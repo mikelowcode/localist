@@ -47,7 +47,6 @@ should show similar TTFT for the same total length, since prompt-eval cost
 is a function of token count either way.
 
 Run from the project root:
-    cd /Users/michaelfilanc/Projects/lora-app-demo
     python3 diagnostics/diag_ollama_cloud_prefix_cache_probe.py
 """
 

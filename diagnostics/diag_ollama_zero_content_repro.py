@@ -75,7 +75,6 @@ Output
 
 Run from the project root (Ollama must already be reachable at
 localhost:11434 with both models present):
-    cd /Users/michaelfilanc/Projects/lora-app-demo
     python3 diagnostics/diag_ollama_zero_content_repro.py
 """
 
