@@ -628,6 +628,55 @@ class TestControllerToolIntegration:
         assert "Zylophonic" in prompt
         assert rt.infer.call_count == 2
 
+    def test_wikipedia_double_miss_triggers_corpus_fallback(self, mm, tmp_path, monkeypatch):
+        """
+        §14.21: Wikipedia misses, then its web_search fallback (retagged
+        "wikipedia_search:web_fallback") also fails — Step 3b's corpus
+        fallback must still fire, same guarantee as the news_search chain.
+        """
+        monkeypatch.delenv("LOCALIST_WIKIPEDIA_ENABLED", raising=False)
+        doc_path    = tmp_path / "zylophonic-history.md"
+        doc_content = "Zylophonic widget history and origins"
+        doc_path.write_text(doc_content, encoding="utf-8")
+        mm.index_document(doc_path, "raw", content=doc_content, embed=False)
+
+        rt = MagicMock(spec=["infer", "embed"])
+        rt.embed.return_value = [0.0] * 768
+        rt.infer.side_effect = ["no", "NONE"]
+
+        async def fake_open_session(stack):
+            return object()
+
+        async def fake_call_mcp_tool(session, name, arguments):
+            if name == "wikipedia_search":
+                return json.dumps({
+                    "query": arguments["query"], "result_text": "", "result_count": 0,
+                    "is_miss": True, "best_match": None,
+                }), False
+            assert name == "web_search"
+            return (
+                "Error executing tool web_search: ERROR: BRAVE_API_KEY not configured"
+            ), True
+
+        conv = make_conv_agent("Here is what I found.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+
+        with patch(
+            "localist.mcp_tool_dispatcher.MCPToolDispatcher._open_session",
+            side_effect=fake_open_session,
+        ), patch(
+            "localist.mcp_tool_dispatcher.MCPToolDispatcher._call_mcp_tool",
+            side_effect=fake_call_mcp_tool,
+        ):
+            ctrl.handle_task({
+                "instruction": "what does wikipedia say about Zylophonic widget history",
+                "context":     {"project_context": "LORA"},
+            })
+
+        prompt = conv._received[0].context["_prebuilt_prompt"]
+        assert "[CONTEXT]" in prompt
+        assert "Zylophonic" in prompt
+
 
 # ---------------------------------------------------------------------------
 # MCP follow-up (2026-07-03) — session reuse, live over real SSE

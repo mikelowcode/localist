@@ -34,7 +34,7 @@ import httpx
 import lxml.html
 from readability import Document
 
-from . import msn_resolve
+from . import msn_resolve, wikipedia
 
 logger = logging.getLogger(__name__)
 
@@ -278,8 +278,19 @@ async def fetch_url(url: str, timeout: float = 10.0) -> dict:
     pages are JavaScript shells, but MSN's content API names the original
     publisher. A resolved result carries an extra "via" key; anything the
     resolver can't handle falls through to the normal fetch below.
+
+    Wikipedia article URLs (§14.21, _fetch_wikipedia_article) are read
+    through the free Action API instead of scraped: clean plain text, the
+    whole article, reference/link sections dropped, the linked #section
+    first. Any API failure falls through to the normal fetch.
     """
     clamped = _clamp_timeout(timeout)
+
+    wiki_ref = wikipedia.parse_article_url(url)
+    if wiki_ref is not None:
+        resolved = await _fetch_wikipedia_article(url, wiki_ref, clamped)
+        if resolved is not None:
+            return resolved
 
     msn_ref = msn_resolve.parse_article_url(url)
     if msn_ref is not None:
@@ -325,6 +336,28 @@ async def _fetch_and_extract(url: str, timeout: float) -> dict:
         "word_count":        content.word_count,
         "fetch_duration_ms": raw.fetch_duration_ms,
     }
+
+
+# ---------------------------------------------------------------------------
+# Wikipedia articles (§14.21)
+# ---------------------------------------------------------------------------
+
+async def _fetch_wikipedia_article(
+    url:     str,
+    ref:     wikipedia.ArticleRef,
+    timeout: float,
+) -> dict | None:
+    """wikipedia.fetch_article plus fetch_url's fetch_duration_ms; None → normal fetch."""
+    start = time.perf_counter()
+    article = await wikipedia.fetch_article(ref, timeout)
+    if article is None:
+        logger.info("fetch_url: Wikipedia API gave nothing for %s — normal fetch.", url)
+        return None
+    logger.debug(
+        "fetch_url: %s read via Wikipedia API as %r (%d words).",
+        url, article["title"], article["word_count"],
+    )
+    return {**article, "fetch_duration_ms": (time.perf_counter() - start) * 1000}
 
 
 # ---------------------------------------------------------------------------

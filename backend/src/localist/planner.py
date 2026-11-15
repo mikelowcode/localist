@@ -105,8 +105,8 @@ class RoutingPlan:
         when a deterministic P3/P3-news/P3b/compound match populated it,
         "classifier_fallback" when the feature-flagged P6-fallthrough
         tool-need classifier populated it (active mode only),
-        "slash_command" when a leading "/chart"/"/research" token (Priority
-        0) forced it, or None when tools_to_call is empty or was set by a
+        "slash_command" when a leading "/chart"/"/research"/"/wikipedia"
+        token (Priority 0) forced it, or None when tools_to_call is empty or was set by a
         code path that predates this attribution (e.g. P3c never sets
         tools_to_call, so it stays None there too).
     file_op_deferred :
@@ -391,6 +391,20 @@ _GITHUB_RELEASE_KEYWORDS: frozenset[str] = frozenset({
 # positive risk (matching inside an unrelated word); accepted tradeoff:
 # a rare bare "hn" used as some other two-letter token in an otherwise
 # unrelated instruction would still misroute here.
+# Priority 3-wikipedia — wikipedia_search trigger keywords (§14.21). Only
+# the full word "wikipedia": bare "wiki" means the user's OWN wiki here
+# (ingest, diff-only updates, pinned wiki pages — P1/P1b/P1c and the RAG
+# corpus), so matching it would hijack those requests. _any_whole_word's
+# \b anchoring still matches "wikipedia's".
+_WIKIPEDIA_KEYWORDS: frozenset[str] = frozenset({
+    "wikipedia",
+})
+
+# Kill switch for the keyword route above (default on; §14.21). Read at
+# call time, same rationale as _RESEARCH_LOOP_ENV_VAR. "/wikipedia" ignores
+# it — see _SLASH_COMMAND_TOOL_MAP.
+_WIKIPEDIA_ENV_VAR: str = "LOCALIST_WIKIPEDIA_ENABLED"
+
 _HACKER_NEWS_KEYWORDS: frozenset[str] = frozenset({
     "hacker news",
     "hackernews",
@@ -541,8 +555,12 @@ _CHART_KEYWORDS: frozenset[str] = frozenset({
 # enter tools_to_call at all — see _RESEARCH_LOOP_ENV_VAR below). See
 # _priority0_slash_command().
 _SLASH_COMMAND_TOOL_MAP: dict[str, str] = {
-    "/chart":    "chart",
-    "/research": "research",
+    "/chart":     "chart",
+    "/research":  "research",
+    # §14.21: forces wikipedia_search regardless of
+    # LOCALIST_WIKIPEDIA_ENABLED, same "explicit command wins" rule as
+    # /research and its flag.
+    "/wikipedia": "wikipedia_search",
 }
 
 # Diagnostic Slot 1 — canonical template groups for semantic search-intent scoring.
@@ -1472,6 +1490,7 @@ class Planner:
     _GITHUB_KEYWORDS:        frozenset[str]    = _GITHUB_KEYWORDS
     _GITHUB_RELEASE_KEYWORDS: frozenset[str]   = _GITHUB_RELEASE_KEYWORDS
     _HACKER_NEWS_KEYWORDS:   frozenset[str]    = _HACKER_NEWS_KEYWORDS
+    _WIKIPEDIA_KEYWORDS:     frozenset[str]    = _WIKIPEDIA_KEYWORDS
     _FILE_OP_KEYWORDS:       frozenset[str]    = _FILE_OP_KEYWORDS
     _CHART_KEYWORDS:         frozenset[str]    = _CHART_KEYWORDS
     _GATE1_ENV_VAR:          str               = _GATE1_ENV_VAR
@@ -1867,6 +1886,15 @@ class Planner:
         # disjoint keyword sets — both must stay before generic P3 and
         # after P3c, same as P3-news documents above).
         plan = self._priority3_github(instruction, lowered)
+        if plan is not None:
+            return plan
+
+        # Priority 3-wikipedia — the instruction names Wikipedia (§14.21).
+        # After the HN/news/GitHub checks so a request ABOUT Wikipedia
+        # through one of those sources ("news about wikipedia", "github
+        # repo for a wikipedia client") keeps going there; before generic
+        # P3 so it wins over a plain web_search.
+        plan = self._priority3_wikipedia(instruction, lowered)
         if plan is not None:
             return plan
 
@@ -2885,6 +2913,63 @@ class Planner:
             fetch_episodic     = False,
             fetch_rag          = False,
             tools_to_call      = ["github_search"],
+            compound           = True,
+            priority           = 3,
+            tool_signal_source = "keyword",
+        )
+
+    @staticmethod
+    def _wikipedia_enabled() -> bool:
+        """
+        LOCALIST_WIKIPEDIA_ENABLED, read at call time. Default ON (§14.21:
+        free public API, no key) — only an explicit "false"/"0"/"no"/"off"
+        disables the keyword route.
+        """
+        raw = os.environ.get(_WIKIPEDIA_ENV_VAR, "true").strip().lower()
+        return raw not in ("false", "0", "no", "off")
+
+    def _priority3_wikipedia(self, instruction: str, lowered: str) -> RoutingPlan | None:
+        """
+        Priority 3-wikipedia — the instruction names Wikipedia ("what does
+        wikipedia say about X", "search wikipedia for X", "X on wikipedia").
+        Wins over a web_search-only P3 match; loses to P1/P2, P3c and the
+        HN/news/GitHub checks (route()'s call order).
+
+        Returns None (deferring to normal priority evaluation) if:
+          - LOCALIST_WIKIPEDIA_ENABLED is off, OR
+          - file_op or url_fetch keywords/a raw URL are present (inline
+            guard, same as P3-news/P3-github — a pasted wikipedia.org link
+            is a url_fetch, handled by fetch_url), OR
+          - no _WIKIPEDIA_KEYWORDS match.
+
+        On match, routes to wikipedia_search only; the dispatcher reads the
+        best match and falls back to web_search on a miss
+        (MCPToolDispatcher._run_wikipedia_search).
+        """
+        if not self._wikipedia_enabled():
+            return None
+
+        # Inline file_op/url_fetch guard — keep in sync with the copies in
+        # _priority3_news/_priority3_github/_priority3c_graph_query.
+        if (
+            self._any_whole_word(_FILE_OP_KEYWORDS, lowered)
+            or any(p.search(instruction) for p in _FILE_OP_PATH_PATTERNS)
+            or self._any_whole_word(_FETCH_KEYWORDS, lowered)
+            or re.search(r"https?://", lowered)
+        ):
+            return None
+
+        wiki_kw = self._any_whole_word(_WIKIPEDIA_KEYWORDS, lowered)
+        if not wiki_kw:
+            return None
+
+        logger.debug("Planner: Priority 3-wikipedia — wikipedia_search signal detected (%r).", wiki_kw)
+
+        return RoutingPlan(
+            agent              = "conversational_agent",
+            fetch_episodic     = False,
+            fetch_rag          = False,
+            tools_to_call      = ["wikipedia_search"],
             compound           = True,
             priority           = 3,
             tool_signal_source = "keyword",

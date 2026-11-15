@@ -1962,3 +1962,160 @@ times out twice and then searches and fetches a copy takes about 30 s.
 - **Reply:** the model said Investopedia returned 403 and that it summarized the Federal Reserve page
   instead, citing that URL.
 
+
+### 14.21 Wikipedia — Free Public API Lookups, Link Reading, and Research Background (2026-11-15)
+
+**Goal.** Use Wikipedia to enrich searches and research mode without an account. Wikimedia
+Enterprise (free account, JWT auth, 50k On-demand requests/month) was considered and set aside. Its
+free tier refreshes On-demand data only every two weeks, and every open-source user would need their
+own account. Its only extras are infobox JSON and credibility scores.
+
+The free public **Action API** (`https://<lang>.wikipedia.org/w/api.php`) covers everything below,
+and is live. Since March 2026, Wikimedia enforces 200 requests/min for an unauthenticated client
+with a compliant User-Agent, against 10/min for a bare IP. That is plenty for one user.
+
+**Good-citizen rules** (`mcp_server/wikipedia.py`):
+- User-Agent `Localist (https://github.com/mikelowcode/localist) httpx/<v>`. It names the public
+  repo, never a person. There is no version number, because `pyproject.toml`'s version isn't the
+  release version.
+- At most 3 requests in flight. This is one `asyncio.Semaphore` per event loop, since a module-level
+  one breaks across `asyncio.run()` calls.
+- On HTTP 429: one retry after `Retry-After` (5 s if absent), only when the wait is ≤ 5 s.
+  Otherwise it fails at once. An optional source never stalls a turn for longer than that.
+- Every Wikipedia-derived result carries `Source: Wikipedia — <url> (CC BY-SA 4.0)`.
+
+**Settings** (`backend/.env.example`):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOCALIST_WIKIPEDIA_ENABLED` | `true` | Master switch: the keyword route, research-loop use and the background summary. `/wikipedia` ignores it. |
+| `WIKIPEDIA_LANG` | `en` | Edition for `wikipedia_search`/`wikipedia_read` (localist-mcp). Invalid values fall back to `en`. A pasted link always uses its own language. |
+| `LOCALIST_WIKIPEDIA_ENRICH` | `false` | Background summary on ordinary `web_search` turns (Phase 4). Off on the replay's evidence. |
+
+#### 14.21.1 Tools (Phase 1)
+
+Each tool makes one Action API request.
+
+**`wikipedia_search(query)`**
+- `generator=search`, top 5, each with its plain-text intro (`exintro`), short description,
+  canonical URL and disambiguation flag.
+- Returns the usual `{query, result_text, result_count, is_miss}` plus `best_match`
+  (`{title, url, description, summary, disambiguation}`).
+- The best match comes first, with up to 1,200 characters; the other hits get 200 characters each.
+- A disambiguation best match says so, and the other hits serve as candidates.
+
+**`wikipedia_read(title)`**
+- Follows redirects.
+- Returns `intro`, the section headings, `content` (plain text with `== Heading ==` markers, capped
+  at 6,000 characters), `kind` (`article` | `disambiguation`) and up to 10 `references`.
+- References are the article's external links in citation order. Archive copies and Wikimedia's own
+  sites are removed, and duplicates are dropped.
+
+Article URLs are emitted with `(`/`)` percent-encoded. That was needed before §14.21.3 fixed
+`_URL_RE`, and it's harmless now.
+
+#### 14.21.2 Explicit route and `/wikipedia` (Phase 2)
+
+**Planner.** `_priority3_wikipedia` (§4.2) matches the whole word **"wikipedia"** only. Bare "wiki"
+means the user's own wiki (P1/P1b/P1c, RAG). It runs after the Hacker News, news and GitHub checks,
+so "news about wikipedia" stays news, and before generic P3. It has the same inline file-op/URL
+guard as the other source checks, so a pasted wikipedia.org link stays a `url_fetch`.
+`/wikipedia <topic>` is a P0 slash command.
+
+**Dispatcher: `MCPToolDispatcher._run_wikipedia_search()`.**
+1. `_derive_wikipedia_query()` strips `/wikipedia`, the Wikipedia framing ("what does wikipedia say
+   about", "search wikipedia for", "according to wikipedia") and leading filler.
+2. Search, then `wikipedia_read` the best match, unless it is a disambiguation page. The read is
+   formatted as title, `[url]`, a body capped at 4,000 characters, 5 cited sources and the
+   attribution. A failed read keeps the search result alone.
+3. On a miss, a tool error or localist-mcp being unreachable, it falls back to `web_search` on the
+   same topic, retagged `wikipedia_search:web_fallback`, with normal enrichment. Step 3b's corpus
+   fallback in `controller_agent.py` counts only that retagged result's failure.
+4. A bare `/wikipedia` makes no calls and returns an error asking for a topic.
+
+An older localist-mcp without the tool ("Unknown tool") falls back cleanly; this was seen live.
+
+#### 14.21.3 Wikipedia links read through the API, and URLs with parentheses (Phase 3)
+
+`fetch_url` resolves Wikipedia article links before the normal fetch, the same way as §14.17's MSN
+resolver:
+- Matched links: `*.wikipedia.org/wiki/<Title>` and `/w/index.php?title=`, desktop or mobile
+  (`wikipedia.parse_article_url`).
+- `Special:`/`File:`/`Talk:`/… pages, `oldid`/`diff` revisions and non-view actions are skipped.
+- `wikipedia.fetch_article()` returns `fetch_url`'s shape, using the link's own language and
+  following redirects to the canonical URL.
+- The article text is cleaned up before it's returned:
+  - It is the whole article in plain text.
+  - Reference and link sections are dropped (English, German, French, Spanish, Italian and
+    Portuguese names), plus any heading-only sections at the end.
+  - A `#fragment` that names a section moves that section and its subsections to right after the
+    lead, so later prompt truncation can't cut it.
+- `via` reads `Wikipedia API; last edited YYYY-MM-DD[; linked section "…" shown first]`, and the
+  text ends with the attribution line.
+- Any API failure falls through to the normal scrape.
+
+Every caller of `fetch_url` benefits without changes: pasted links, search enrichment, News Feed
+pins and research-loop fetches.
+
+**`_URL_RE`** now keeps parentheses that open and close inside a URL (`…/wiki/Mercury_(planet)`).
+The 2026-07-16 blanket `)` exclusion had cut that to `…/Mercury_(planet`, a different page. An
+unbalanced `)` still ends the match, as with `(https://…)` in prose and Markdown links. This also
+fixes Brave and LangSearch results that link to such pages.
+
+#### 14.21.4 Background summary on `web_search` turns (Phase 4, off by default)
+
+**The rule.** `localist/wikipedia_match.decide()` is deterministic. A summary attaches only when all
+of these hold:
+- the best match isn't a disambiguation page;
+- every content word of the title (minus a "(qualifier)") is in the query;
+- the title covers at least 50% of the query's content words;
+- the query has no freshness word (latest, today, price, news, weather, schedule, update, …).
+
+**When the flag is on**, `_wikipedia_background()` runs alongside the first query's search
+(`asyncio.gather`), so it adds no latency. It appends a `wikipedia_summary` result labelled
+"encyclopedic; may not cover recent events". It is skipped when the same article was already read
+in full that turn, which is common, because a web search usually ranks the Wikipedia page first.
+It is silent on any miss or error.
+
+**Replay.** `diagnostics/diag_wikipedia_enrich_replay.py` and
+`diagnostics/reports/wikipedia_enrich_replay_2026-11-15.md`:
+
+| Set | Summary attached | Wrong article |
+|---|---|---|
+| Real searches | 1 of 9 | — |
+| All 120 user requests, as if they were searches | 2 | 0 |
+| Synthetic encyclopedic requests | 24 of 30 | 0 |
+| Synthetic requests that need no summary | 4 of 30 | 2 |
+
+That is ~6% wrong articles overall, with little reach on real use. Default off, confirmed by the
+user on 2026-11-15.
+
+#### 14.21.5 Research loop (Phase 5)
+
+See §18.11.
+
+#### 14.21.6 UI (Phase 6)
+
+`ChatPanel.svelte` labels these turns "P3 · Wikipedia" and "P0 · /wikipedia". P0 turns had no label
+case before this and showed "P6 · Inference"; they are now labelled by command (`/research`,
+`/chart`, `/wikipedia`). `tips.ts` lists `/wikipedia` and the "wikipedia" keyword.
+
+#### 14.21.7 Tests and live verification
+
+- `tests/test_mcp_wikipedia.py`: tools, rate limiting, link parsing, article arrangement and the
+  `fetch_url` resolver.
+- `tests/test_wikipedia_routing.py`: Planner route, P0, query derivation, dispatcher fallback,
+  `_URL_RE`, match rule, background, and the research loop.
+- One controller test in `tests/test_tool_dispatcher_phase6.py`: the double miss reaches the corpus
+  fallback. Checked by mutation: it fails without the Step 3b clause.
+
+2205 → 2381 tests.
+
+**Live, 2026-11-15** (this code's localist-mcp on :8013, since the packaged app holds :8003):
+- **Hit, disambiguation and miss→web paths:** "the transistor" was read in full; "mercury" was
+  flagged as a disambiguation page.
+- **Pasted links:** `en.m.…/Mercury_(planet)`, `#Comparison_with_vacuum_tubes`, `/wiki/UK` → United
+  Kingdom, and de/fr/it editions. All took ~300–400 ms with no scraping.
+- **Search enrichment:** it read the Wikipedia top hit through the API.
+- **`/research`:** two runs against gemma4:31b-cloud.
+- **Ollama:** no Ollama Cloud web calls in any `.env`-loaded run.

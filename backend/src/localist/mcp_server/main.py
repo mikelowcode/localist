@@ -16,7 +16,10 @@ search, file/README/directory content, and release notes, read-only, no
 archive/CLI capability; see mcp_server/github.py), and hacker_news_search
 (on-demand Hacker News story search via Algolia's HN Search API — the
 chat-callable counterpart to backend/hacker_news.py's Live Feed panel
-data source; see mcp_server/hacker_news.py), ollama_web_search
+data source; see mcp_server/hacker_news.py), wikipedia_search/
+wikipedia_read (Wikipedia's free public Action API — search with the best
+match's intro, and a full article read with its cited reference URLs; no
+key; see mcp_server/wikipedia.py), ollama_web_search
 (Ollama Cloud's web search API — a second provider underneath the
 Planner-facing web_search tool; the dispatcher decides fallback/primary
 orchestration between it and Brave/LangSearch, see
@@ -84,6 +87,12 @@ Configuration
                                corresponding account permission exists).
   (no key needed for hacker_news_search — Algolia's HN Search API is
    public and unauthenticated; see mcp_server/hacker_news.py.)
+  WIKIPEDIA_LANG                Wikipedia language edition for
+                               wikipedia_search / wikipedia_read (default
+                               "en"). No key needed — the free public
+                               Action API, identified by a User-Agent
+                               naming the public repo; see
+                               mcp_server/wikipedia.py.
   LOCALIST_MCP_UPLOAD_ROOT      Sandbox root for ocr_extract's temp uploaded
                                images/PDFs. Leave blank to default to
                                backend/ (parent of this package), same
@@ -162,6 +171,7 @@ from . import (
     ollama_web_search as _ollama_web_search,
     url_fetch as _url_fetch,
     web_search as _web_search,
+    wikipedia as _wikipedia,
 )
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -270,6 +280,18 @@ async def github_release(owner: str, repo: str, tag: str | None = None) -> dict:
 async def hacker_news_search(query: str, url: str | None = None) -> dict:
     """Search Hacker News stories via Algolia's HN Search API. Pass url to pin the result to one already-known story."""
     return await _hacker_news.hacker_news_search(query, url)
+
+
+@mcp.tool()
+async def wikipedia_search(query: str) -> dict:
+    """Search Wikipedia (free public API, WIKIPEDIA_LANG, default en). Returns the top matches plus the best match's intro, flagged when it is a disambiguation page."""
+    return await _wikipedia.wikipedia_search(query)
+
+
+@mcp.tool()
+async def wikipedia_read(title: str) -> dict:
+    """Read one Wikipedia article by title (redirects followed): intro, section headings, capped plain-text body, and up to 10 cited reference URLs."""
+    return await _wikipedia.wikipedia_read(title)
 
 
 @mcp.tool()

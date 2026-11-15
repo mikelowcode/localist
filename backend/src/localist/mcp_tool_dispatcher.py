@@ -166,13 +166,14 @@ from contextlib import AsyncExitStack
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 
 from .chart_tool_schema import KNOWN_TOOL_NAMES, SYSTEM_PROMPT_FEWSHOT, validate_chart_arguments
 from .json_envelope_repair import repair_envelope
+from . import wikipedia_match
 from .mcp_server.news_search import _normalize_article_url
 from .prompt_builder import ToolResult
 
@@ -203,7 +204,14 @@ _FILE_OP_TOOL_MAP: dict[str, str] = {
 # pattern also backs _run_url_fetch's instruction-text extraction, where a
 # user pasting a bracket- or paren-wrapped URL would hit the identical bug,
 # just not yet observed live.
-_URL_RE = re.compile(r"https?://[^\s\"'>\]\)]+")
+#
+# 2026-11-15 (§14.21): ")" is allowed again when it closes a "(" opened
+# inside the URL itself. Wikipedia titles carry parentheses
+# ("…/wiki/Mercury_(planet)"), and the blanket exclusion cut that to
+# "…/Mercury_(planet" — a different page. An unbalanced ")" (the one
+# wrapping "(https://…)" in prose) still ends the match, as before.
+_URL_CHAR = r"[^\s\"'>\]()]"
+_URL_RE = re.compile(rf"https?://(?:{_URL_CHAR}|\({_URL_CHAR}*\))+")
 
 # github_release repo resolution — specifically the *bracketed* [{url}]
 # line search_format.py's docstring documents as load-bearing, not "the
@@ -322,12 +330,108 @@ _RESEARCH_REFORMULATE_SYSTEM_PROMPT: str = (
     "nothing else."
 )
 
+# §14.21 Phase 5 / §18: the two prompts above are price/spec-shaped (the
+# gate even asks for "a specific number"), so a "/research <topic>" that
+# isn't about price or specs could never pass and always exhausted the loop
+# with "without finding concrete pricing information". A deterministic
+# check (_research_kind) now keeps those prompts — unchanged, as tuned in
+# the §18.9 QA pass — for price/spec requests only, and gives every other
+# request the factual pair below.
+_RESEARCH_PRICING_RE = re.compile(
+    r"\b(?:prices?|priced|pricing|costs?|costing|how much|cheap(?:er|est)?|"
+    r"expensive|fees?|charges?|subscriptions?|per month|monthly|msrp|tiers?|"
+    r"specs?|specifications?|benchmarks?|going rate)\b|\$\s?\d",
+    re.IGNORECASE,
+)
+
+_RESEARCH_FACT_GATE_SYSTEM_PROMPT: str = (
+    "You are a fact-extraction classifier, not a conversational assistant. "
+    "You will be given the ORIGINAL QUESTION the user asked, and a block of "
+    "search-result or page TEXT. Decide whether the TEXT contains concrete, "
+    "specific information that directly answers the ORIGINAL QUESTION. Text "
+    "about a different person, thing, or event with a similar name, or that "
+    "only mentions the topic without answering what was asked, does NOT "
+    "count. Respond with exactly one word: yes or no."
+)
+
+_RESEARCH_FACT_REFORMULATE_SYSTEM_PROMPT: str = (
+    "You are a search-query rewriter, not a conversational assistant. "
+    "The previous web search did not surface a direct answer. Given the "
+    "original request, the queries already tried, and any background "
+    "provided, write ONE new, more specific search query likely to surface "
+    "a page that answers it (use the subject's precise name and the key "
+    "terms of the question). Respond with the query text only, nothing else."
+)
+
+# Up to this many of a confidently-matched Wikipedia article's cited links
+# are read when a round's own search/page doesn't answer (§14.21 Phase 5).
+_RESEARCH_MAX_CITATIONS: int = 2
+
+# A leading slash command is the user's routing choice, not search text.
+_LEADING_SLASH_COMMAND_RE = re.compile(r"^\s*/(?:research|wikipedia|chart)\b\s*", re.IGNORECASE)
+
 # Filler prefixes stripped when deriving a single query from the
 # instruction — ported verbatim from ToolDispatcher._run_web_search.
 _WEB_SEARCH_FILLER_PREFIXES: tuple[str, ...] = (
     "what are the ", "what is the ", "what is ", "find the ",
     "search for ", "look up ", "tell me about ",
 )
+
+# wikipedia_search query derivation (§14.21) — strip the "Wikipedia"
+# framing so the search is for the topic alone: "what does wikipedia say
+# about the transistor" -> "the transistor". Applied in order; the last
+# pattern removes any leftover bare mention.
+_WIKIPEDIA_SLASH_RE = re.compile(r"^\s*/wikipedia\b", re.IGNORECASE)
+_WIKIPEDIA_FRAMING_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\bwhat (?:does|did|do) wikipedia(?:'s)? (?:say|says|have to say|know)"
+        r"(?: about| on| regarding)?\b", re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:search|check|look (?:up|in)|ask|use) (?:on )?wikipedia"
+        r"(?: for| about| on)?\b", re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:the )?wikipedia(?:'s)? (?:page|article|entry|summary|definition)"
+        r"(?: for| on| about| of)?\b", re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:according to|on|from|in|via|using|per) wikipedia\b", re.IGNORECASE),
+    re.compile(r"\bwikipedia(?:'s)?\b", re.IGNORECASE),
+)
+_WIKIPEDIA_LEADING_FILLER_RE = re.compile(
+    r"^(?:please |can you |could you |pull up |show me |give me |get me |get |find |"
+    r"look up |tell me about |tell me |what is |what are |what's |who is |who was |"
+    r"who are |summari[sz]e |explain )+",
+    re.IGNORECASE,
+)
+
+# wikipedia_read body cap in the prompt — the tool already caps at 6000;
+# a little above web_search enrichment's _ENRICH_EXCERPT_CHARS since the
+# user asked for Wikipedia specifically.
+_WIKIPEDIA_READ_PROMPT_CHARS: int = 4000
+_WIKIPEDIA_REFERENCES_SHOWN: int = 5
+
+# Phase 4 (§14.21): a Wikipedia background summary alongside web_search
+# results, only on a confident match (localist.wikipedia_match). Off by
+# default — the 2026-11-15 replay (diagnostics/reports/
+# wikipedia_enrich_replay_2026-11-15.md) found 2 wrong articles in 31
+# attachments and 1 attachment in 9 real searches. Read at call time.
+# LOCALIST_WIKIPEDIA_ENABLED=false turns this off too.
+_WIKIPEDIA_ENRICH_ENV_VAR: str = "LOCALIST_WIKIPEDIA_ENRICH"
+_WIKIPEDIA_SUMMARY_PROMPT_CHARS: int = 1200
+
+
+def _wikipedia_globally_enabled() -> bool:
+    """LOCALIST_WIKIPEDIA_ENABLED (default on) — the master switch."""
+    return os.environ.get("LOCALIST_WIKIPEDIA_ENABLED", "true").strip().lower() not in (
+        "false", "0", "no", "off",
+    )
+
+
+def _wikipedia_enrich_enabled() -> bool:
+    if os.environ.get("LOCALIST_WIKIPEDIA_ENABLED", "true").strip().lower() in ("false", "0", "no", "off"):
+        return False
+    return os.environ.get(_WIKIPEDIA_ENRICH_ENV_VAR, "false").strip().lower() in ("true", "1", "yes", "on")
 
 # github_release — bare version/tag extraction from an instruction, e.g.
 # "fetch the oMLX 0.5.3 release notes" -> "0.5.3". Optional leading "v"
@@ -649,6 +753,10 @@ class MCPToolDispatcher:
                 elif tool_name == "hacker_news_search":
                     results.append(
                         await self._run_hacker_news_search(session, connect_error, instruction, ctx)
+                    )
+                elif tool_name == "wikipedia_search":
+                    results.extend(
+                        await self._run_wikipedia_search(session, connect_error, instruction, ctx)
                     )
                 elif tool_name == "research":
                     results.extend(
@@ -1335,18 +1443,129 @@ class MCPToolDispatcher:
         queries = raw_queries[:_MAX_WEB_QUERIES]
         tried_urls: set[str] = set()
         results: list[ToolResult] = []
-        for query in queries:
-            search_result = await self._execute_web_search_query(session, connect_error, query)
+        background: ToolResult | None = None
+        for i, query in enumerate(queries):
+            if i == 0 and session is not None and _wikipedia_enrich_enabled():
+                # §14.21 Phase 4: the Wikipedia lookup runs alongside the
+                # first query's search, so it adds no latency of its own.
+                search_result, background = await asyncio.gather(
+                    self._execute_web_search_query(session, connect_error, query),
+                    self._wikipedia_background(session, query),
+                )
+            else:
+                search_result = await self._execute_web_search_query(session, connect_error, query)
             results.append(search_result)
             enrichment = await self._enrich_top_result(session, connect_error, search_result, tried_urls)
             if enrichment is not None:
                 results.append(enrichment)
+        if background is not None and not self._article_already_read(background, results):
+            results.append(background)
 
         if len(results) > len(queries):
             workflow_id = str(uuid.uuid4())
             results = [replace(r, workflow_id=workflow_id) for r in results]
 
         return results
+
+    @staticmethod
+    def _article_already_read(background: ToolResult, results: list[ToolResult]) -> bool:
+        """
+        True when a url_fetch in this turn already read the same Wikipedia
+        article in full (the search's top hit was that page; §14.21 Phase 3
+        reads it through the API) — the summary would only repeat its lead.
+        """
+        match = re.search(r"^\[(https?://\S+)\]$", background.result, re.MULTILINE)
+        if not match:
+            return False
+        key = lambda u: unquote(u.split("#", 1)[0]).replace(" ", "_").rstrip("/").lower()  # noqa: E731
+        want = key(match.group(1))
+        for r in results:
+            if r.tool_name.startswith("url_fetch") and r.success:
+                src = re.search(r"^Source: (\S+)$", r.result, re.MULTILINE)
+                if src and key(src.group(1)) == want:
+                    return True
+        return False
+
+    async def _wikipedia_background(
+        self,
+        session: ClientSession | None,
+        query:   str,
+    ) -> ToolResult | None:
+        """
+        A "wikipedia_summary" ToolResult for `query` when Wikipedia's best
+        match passes localist.wikipedia_match.decide(), else None. Never
+        raises and never reports a failure: the background is optional, so
+        a miss, an API error or an unreachable localist-mcp is just None.
+        """
+        match = await self._wikipedia_confident_match(session, query)
+        return self._wikipedia_summary_result(match, query) if match else None
+
+    async def _wikipedia_citations(
+        self,
+        session: ClientSession | None,
+        title:   str,
+    ) -> list[str]:
+        """The matched article's cited source URLs (wikipedia_read's
+        filtered references), or [] on any failure."""
+        if session is None or not title:
+            return []
+        data = await self._call_wikipedia_tool(
+            session, None, "wikipedia_read", {"title": title}, f"title={title!r}",
+        )
+        if not isinstance(data, dict):
+            return []
+        return [u for u in data.get("references") or [] if isinstance(u, str) and u]
+
+    async def _wikipedia_confident_match(
+        self,
+        session: ClientSession | None,
+        query:   str,
+    ) -> dict[str, Any] | None:
+        """wikipedia_search's best_match for `query` when it passes
+        localist.wikipedia_match.decide(), else None. Never raises."""
+        if session is None or not query.strip():
+            return None
+        try:
+            data = await self._call_wikipedia_tool(
+                session, None, "wikipedia_search", {"query": query}, f"query={query!r}",
+            )
+        except Exception as exc:  # defensive: _call_wikipedia_tool already catches
+            logger.debug("MCPToolDispatcher: wikipedia background failed (%s).", exc)
+            return None
+        if not isinstance(data, dict) or data.get("is_miss"):
+            return None
+        best = data.get("best_match") or {}
+        decision = wikipedia_match.decide(
+            query, best.get("title", ""), bool(best.get("disambiguation")),
+        )
+        logger.info(
+            "MCPToolDispatcher: wikipedia background query=%r best=%r -> %s (coverage %.2f).",
+            query, best.get("title"), decision.reason, decision.coverage,
+        )
+        if not decision.attach:
+            return None
+        return best
+
+    @staticmethod
+    def _wikipedia_summary_result(best: dict[str, Any], query: str) -> ToolResult | None:
+        """Format a confident best_match as the "wikipedia_summary" result."""
+        summary = (best.get("summary") or "").strip()
+        if not summary:
+            return None
+        if len(summary) > _WIKIPEDIA_SUMMARY_PROMPT_CHARS:
+            summary = summary[:_WIKIPEDIA_SUMMARY_PROMPT_CHARS].rsplit(" ", 1)[0] + "…"
+        url = best.get("url", "")
+        text = (
+            f"Wikipedia background (encyclopedic; may not cover recent events): "
+            f"{best.get('title', '')}\n[{url}]\n{summary}\n\n"
+            f"Source: Wikipedia — {url} (CC BY-SA 4.0)"
+        )
+        return ToolResult(
+            tool_name  = "wikipedia_summary",
+            parameters = f"query={query!r}",
+            result     = text,
+            success    = True,
+        )
 
     async def _execute_web_search_query(
         self,
@@ -2216,6 +2435,223 @@ class MCPToolDispatcher:
         )
 
     # -----------------------------------------------------------------------
+    # wikipedia_search — served by localist-mcp (§14.21)
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _derive_wikipedia_query(instruction: str, context: dict[str, Any]) -> str:
+        """
+        The topic to search Wikipedia for. context["wikipedia_query"] wins
+        when a caller supplies one; otherwise the instruction minus a
+        leading "/wikipedia", every "Wikipedia" framing phrase, leading
+        filler ("tell me about", "who was", ...) and edge punctuation.
+        Returns "" when nothing is left (a bare "/wikipedia").
+        """
+        explicit = (context.get("wikipedia_query") or "").strip()
+        if explicit:
+            return explicit[:200]
+
+        text = _WIKIPEDIA_SLASH_RE.sub(" ", instruction)
+        for pattern in _WIKIPEDIA_FRAMING_RES:
+            text = pattern.sub(" ", text)
+        text = re.sub(r"\s+", " ", text).strip(" \t\n,.;:!?-—\"'")
+        text = _WIKIPEDIA_LEADING_FILLER_RE.sub("", text).strip(" ,.;:!?-—\"'")
+        return text[:200]
+
+    async def _run_wikipedia_search(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        instruction:   str,
+        context:       dict[str, Any],
+    ) -> list[ToolResult]:
+        """
+        Wikipedia lookup for an instruction that names Wikipedia (Planner
+        P3-wikipedia) or starts with "/wikipedia" (P0).
+
+          1. wikipedia_search on the derived topic.
+          2. Hit: when the best match is an article (not a disambiguation
+             page), wikipedia_read it and append the body + cited sources
+             as a second result — the same "search, then read the top hit"
+             shape as web_search's enrichment. A failed read keeps the
+             search result alone.
+          3. Miss, tool error, or localist-mcp unreachable: fall back to
+             web_search on the same topic, retagged
+             tool_name="wikipedia_search:web_fallback" (provenance, same
+             convention as news_search:brave_fallback), with the usual
+             enrichment. The failed Wikipedia result is returned too, so
+             the model is told Wikipedia had nothing and the answer comes
+             from the web.
+
+        Every result is returned (not just the winner); a workflow_id is
+        stamped when more than one is.
+        """
+        query = self._derive_wikipedia_query(instruction, context)
+        if not query:
+            return [ToolResult(
+                tool_name  = "wikipedia_search",
+                parameters = "query=''",
+                result     = "ERROR: no topic given — ask e.g. '/wikipedia the transistor'.",
+                success    = False,
+            )]
+
+        params_str = f"query={query!r}"
+        results: list[ToolResult] = []
+        search_result = await self._call_wikipedia_tool(
+            session, connect_error, "wikipedia_search", {"query": query}, params_str,
+        )
+
+        data: dict[str, Any] | None = None
+        if isinstance(search_result, dict):
+            data = search_result
+            if data.get("is_miss", False):
+                search_tr = ToolResult(
+                    tool_name  = "wikipedia_search",
+                    parameters = params_str,
+                    result     = f"ERROR: no Wikipedia article matched {query!r}.",
+                    success    = False,
+                )
+            else:
+                search_tr = ToolResult(
+                    tool_name  = "wikipedia_search",
+                    parameters = params_str,
+                    result     = data.get("result_text", ""),
+                    success    = True,
+                )
+        else:
+            search_tr = search_result   # an error ToolResult
+        results.append(search_tr)
+
+        if search_tr.success:
+            best = (data or {}).get("best_match") or {}
+            title = best.get("title") or ""
+            if title and not best.get("disambiguation"):
+                read_tr = await self._run_wikipedia_read(session, connect_error, title)
+                if read_tr is not None:
+                    results.append(read_tr)
+        else:
+            logger.info(
+                "MCPToolDispatcher: wikipedia_search miss/failure for query=%r — "
+                "falling back to web_search.",
+                query,
+            )
+            fallback = await self._execute_web_search_query(session, connect_error, query)
+            fallback = replace(fallback, tool_name="wikipedia_search:web_fallback")
+            results.append(fallback)
+            enrichment = await self._enrich_top_result(session, connect_error, fallback, set())
+            if enrichment is not None:
+                results.append(enrichment)
+
+        if len(results) > 1:
+            workflow_id = str(uuid.uuid4())
+            results = [replace(r, workflow_id=workflow_id) for r in results]
+        return results
+
+    async def _call_wikipedia_tool(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        name:          str,
+        arguments:     dict[str, Any],
+        params_str:    str,
+    ) -> dict[str, Any] | ToolResult:
+        """
+        Call one Wikipedia MCP tool. Returns the parsed JSON dict, or an
+        ERROR ToolResult (tool_name=name) for unreachable/tool-error/
+        unparseable — the same three failure shapes every other runner
+        here produces.
+        """
+        if session is None:
+            return ToolResult(
+                tool_name  = name,
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {connect_error}",
+                success    = False,
+            )
+        try:
+            text, is_error = await self._call_mcp_tool(session, name, arguments)
+        except Exception as exc:
+            logger.warning(
+                "MCPToolDispatcher: localist-mcp unreachable for %s %s: %s",
+                name, params_str, exc,
+            )
+            return ToolResult(
+                tool_name  = name,
+                parameters = params_str,
+                result     = f"ERROR: localist-mcp unreachable — {exc}",
+                success    = False,
+            )
+        if is_error:
+            return ToolResult(
+                tool_name  = name,
+                parameters = params_str,
+                result     = _normalize_mcp_error_text(text),
+                success    = False,
+            )
+        try:
+            data = json.loads(text)
+        except Exception as exc:
+            return ToolResult(
+                tool_name  = name,
+                parameters = params_str,
+                result     = f"ERROR: failed to parse {name} response — {exc}",
+                success    = False,
+            )
+        if not isinstance(data, dict):
+            return ToolResult(
+                tool_name  = name,
+                parameters = params_str,
+                result     = f"ERROR: unexpected {name} response shape",
+                success    = False,
+            )
+        return data
+
+    async def _run_wikipedia_read(
+        self,
+        session:       ClientSession | None,
+        connect_error: Exception | None,
+        title:         str,
+    ) -> ToolResult | None:
+        """
+        Read the best-match article and format it for the prompt: title,
+        [url] line, body (capped at _WIKIPEDIA_READ_PROMPT_CHARS), up to
+        _WIKIPEDIA_REFERENCES_SHOWN cited sources, and the CC BY-SA
+        attribution line. Returns None on any failure — the search result
+        already carries the intro, so a failed read is not worth an ERROR
+        in the prompt.
+        """
+        params_str = f"title={title!r}"
+        data = await self._call_wikipedia_tool(
+            session, connect_error, "wikipedia_read", {"title": title}, params_str,
+        )
+        if not isinstance(data, dict):
+            logger.info(
+                "MCPToolDispatcher: wikipedia_read failed for %r — keeping the "
+                "search result alone: %s", title, data.result,
+            )
+            return None
+
+        content = (data.get("content") or "").strip()
+        if not content:
+            return None
+        if len(content) > _WIKIPEDIA_READ_PROMPT_CHARS:
+            content = content[:_WIKIPEDIA_READ_PROMPT_CHARS].rsplit(" ", 1)[0] + "…"
+
+        url = data.get("url") or ""
+        lines = [f"Wikipedia article: {data.get('title') or title}", f"[{url}]", "", content]
+        refs = (data.get("references") or [])[:_WIKIPEDIA_REFERENCES_SHOWN]
+        if refs:
+            lines += ["", "Cited sources:"] + [f"- {r}" for r in refs]
+        lines += ["", data.get("attribution") or f"Source: Wikipedia — {url} (CC BY-SA 4.0)"]
+
+        return ToolResult(
+            tool_name  = "wikipedia_read",
+            parameters = params_str,
+            result     = "\n".join(lines),
+            success    = True,
+        )
+
+    # -----------------------------------------------------------------------
     # research — bounded search / evaluate / reformulate / fetch loop
     # -----------------------------------------------------------------------
 
@@ -2276,24 +2712,56 @@ class MCPToolDispatcher:
         workflow_id = str(uuid.uuid4())
 
         query = self._derive_initial_query(instruction, context)
+        kind = self._research_kind(instruction)
+
+        # §14.21 Phase 5 — Wikipedia, for factual requests only (a price/
+        # spec request keeps the §18.9-tuned path exactly as it was).
+        use_wikipedia = (
+            kind == "factual" and session is not None and _wikipedia_globally_enabled()
+        )
+        background_hint = ""
+        citations: list[str] = []
+        citations_used = 0
 
         for iteration in range(_MAX_RESEARCH_ITERATIONS):
             tried_queries.append(query)
-            search_result = await self._execute_web_search_query(
-                session, connect_error, query
-            )
+            if iteration == 0 and use_wikipedia:
+                # The lookup runs alongside the first search — no added latency.
+                search_result, match = await asyncio.gather(
+                    self._execute_web_search_query(session, connect_error, query),
+                    self._wikipedia_confident_match(session, query),
+                )
+            else:
+                search_result = await self._execute_web_search_query(
+                    session, connect_error, query
+                )
+                match = None
             search_result.workflow_id = workflow_id
             results.append(search_result)
 
+            if match is not None:
+                background = self._wikipedia_summary_result(match, query)
+                if background is not None:
+                    background.workflow_id = workflow_id
+                    results.append(background)
+                background_hint = " — ".join(
+                    x for x in (match.get("title", ""), match.get("description", "")) if x
+                )
+                citations = await self._wikipedia_citations(session, match.get("title", ""))
+                logger.info(
+                    "MCPToolDispatcher: research loop — Wikipedia background %r, "
+                    "%d citation candidate(s).", match.get("title"), len(citations),
+                )
+
             if not search_result.success:
-                # Provider/connectivity failure, not a "no pricing found"
+                # Provider/connectivity failure, not a "no answer found"
                 # outcome — stop the loop, let controller_agent's Step 3b
                 # corpus fallback take over exactly as it does for a plain
                 # web_search failure today.
                 connectivity_failed = True
                 break
 
-            gate_pass = await self._evaluate_pricing_gate(instruction, search_result.result)
+            gate_pass = await self._evaluate_research_gate(kind, instruction, search_result.result)
 
             candidate_url = self._extract_first_url(search_result.result, tried_urls)
 
@@ -2311,29 +2779,53 @@ class MCPToolDispatcher:
                 fetch_result.workflow_id = workflow_id
                 results.append(fetch_result)
                 if fetch_result.success:
-                    gate_pass = await self._evaluate_pricing_gate(instruction, fetch_result.result)
+                    gate_pass = await self._evaluate_research_gate(kind, instruction, fetch_result.result)
+
+            if not gate_pass and citations_used < _RESEARCH_MAX_CITATIONS:
+                # §14.21 Phase 5: next, one of the matched article's cited
+                # sources — vetted pages, often the primary source itself.
+                citation = next((u for u in citations if u not in tried_urls), None)
+                if citation:
+                    citations_used += 1
+                    tried_urls.add(citation)
+                    cite_result = await self._run_url_fetch(
+                        session, connect_error, instruction,
+                        {**context, "fetch_url": citation},
+                        search_fallback=False,
+                    )
+                    cite_result = replace(
+                        cite_result,
+                        tool_name   = "url_fetch:wikipedia_citation",
+                        workflow_id = workflow_id,
+                    )
+                    results.append(cite_result)
+                    if cite_result.success:
+                        gate_pass = await self._evaluate_research_gate(kind, instruction, cite_result.result)
 
             if gate_pass:
                 logger.info(
-                    "MCPToolDispatcher: research loop — pricing found after "
+                    "MCPToolDispatcher: research loop (%s) — answer found after "
                     "%d iteration(s), queries=%s.",
-                    iteration + 1, tried_queries,
+                    kind, iteration + 1, tried_queries,
                 )
-                return results
+                return self._drop_repeated_background(results)
 
             if iteration == _MAX_RESEARCH_ITERATIONS - 1:
                 break
 
-            query = await self._reformulate_query(instruction, tried_queries)
+            query = await self._reformulate_query(
+                instruction, tried_queries, kind, background_hint,
+            )
             if query in tried_queries:
                 # Reformulation degenerated to a repeat — stop rather than
                 # spend another round-trip on a query we know fails.
                 break
 
+        what = "concrete pricing information" if kind == "pricing" else "a direct answer"
         logger.info(
-            "MCPToolDispatcher: research loop — exhausted %d iteration(s) "
-            "without concrete pricing, queries=%s.",
-            len(tried_queries), tried_queries,
+            "MCPToolDispatcher: research loop (%s) — exhausted %d iteration(s) "
+            "without %s, queries=%s.",
+            kind, len(tried_queries), what, tried_queries,
         )
         if not connectivity_failed:
             results.append(ToolResult(
@@ -2341,13 +2833,21 @@ class MCPToolDispatcher:
                 parameters  = f"queries={tried_queries!r}",
                 result      = (
                     f"ERROR: research loop exhausted {len(tried_queries)} "
-                    f"iteration(s) without finding concrete pricing "
-                    f"information (queries tried: {tried_queries})."
+                    f"iteration(s) without finding {what} "
+                    f"(queries tried: {tried_queries})."
                 ),
                 success     = False,
                 workflow_id = workflow_id,
             ))
-        return results
+        return self._drop_repeated_background(results)
+
+    def _drop_repeated_background(self, results: list[ToolResult]) -> list[ToolResult]:
+        """Remove the wikipedia_summary when the same article was read in
+        full later in the turn (see _article_already_read)."""
+        return [
+            r for r in results
+            if not (r.tool_name == "wikipedia_summary" and self._article_already_read(r, results))
+        ]
 
     def _derive_initial_query(self, instruction: str, context: dict[str, Any]) -> str:
         # Reuse the exact same resolution order _run_web_search already
@@ -2357,12 +2857,44 @@ class MCPToolDispatcher:
         raw_queries: list[str] = context.get("web_search_queries") or []
         if raw_queries:
             return raw_queries[0]
-        derived = instruction.strip()
+        derived = _LEADING_SLASH_COMMAND_RE.sub("", instruction).strip()
         for filler in _WEB_SEARCH_FILLER_PREFIXES:
             if derived.lower().startswith(filler):
                 derived = derived[len(filler):]
                 break
         return derived[:120]
+
+    @staticmethod
+    def _research_kind(instruction: str) -> str:
+        """"pricing" for a price/spec request, else "factual" (see
+        _RESEARCH_PRICING_RE). Deterministic, no inference."""
+        return "pricing" if _RESEARCH_PRICING_RE.search(instruction) else "factual"
+
+    async def _evaluate_fact_gate(self, instruction: str, text: str) -> bool:
+        """The factual counterpart of _evaluate_pricing_gate: same bounded
+        yes/no call, timeout and fail-to-"no" posture, without the
+        "specific number" requirement."""
+        try:
+            raw = self._runtime.infer(
+                system      = _RESEARCH_FACT_GATE_SYSTEM_PROMPT,
+                prompt      = (
+                    f"Original question:\n\n{instruction}\n\n"
+                    f"Text:\n\n{text[:3000]}\n\n"
+                    f"Does the text directly answer the original question (yes/no):"
+                ),
+                max_tokens  = 10,
+                temperature = 0.1,
+                timeout     = _RESEARCH_CLASSIFIER_TIMEOUT,
+            )
+            return raw.strip().lower().startswith("yes")
+        except Exception as exc:
+            logger.debug("MCPToolDispatcher: research fact gate check failed (%s).", exc)
+            return False
+
+    async def _evaluate_research_gate(self, kind: str, instruction: str, text: str) -> bool:
+        if kind == "pricing":
+            return await self._evaluate_pricing_gate(instruction, text)
+        return await self._evaluate_fact_gate(instruction, text)
 
     async def _evaluate_pricing_gate(self, instruction: str, text: str) -> bool:
         """Single bounded yes/no inference call. Never raises — a failed
@@ -2396,14 +2928,31 @@ class MCPToolDispatcher:
             logger.debug("MCPToolDispatcher: research gate check failed (%s).", exc)
             return False
 
-    async def _reformulate_query(self, instruction: str, tried: list[str]) -> str:
+    async def _reformulate_query(
+        self,
+        instruction: str,
+        tried:       list[str],
+        kind:        str = "pricing",
+        background:  str = "",
+    ) -> str:
+        if kind == "pricing":
+            system = _RESEARCH_REFORMULATE_SYSTEM_PROMPT
+            prompt = (
+                f"Original request: {instruction}\n"
+                f"Queries already tried: {tried}\n\nNew query:"
+            )
+        else:
+            system = _RESEARCH_FACT_REFORMULATE_SYSTEM_PROMPT
+            hint = f"Background (Wikipedia): {background}\n" if background else ""
+            prompt = (
+                f"Original request: {instruction}\n"
+                f"{hint}"
+                f"Queries already tried: {tried}\n\nNew query:"
+            )
         try:
             raw = self._runtime.infer(
-                system      = _RESEARCH_REFORMULATE_SYSTEM_PROMPT,
-                prompt      = (
-                    f"Original request: {instruction}\n"
-                    f"Queries already tried: {tried}\n\nNew query:"
-                ),
+                system      = system,
+                prompt      = prompt,
                 max_tokens  = 40,
                 temperature = 0.3,
                 timeout     = _RESEARCH_CLASSIFIER_TIMEOUT,

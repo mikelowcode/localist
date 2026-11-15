@@ -1673,6 +1673,9 @@ class ControllerAgent:
             (r.tool_name.startswith("web_search") and not r.success)
             or r.tool_name == "research"
             or (r.tool_name.startswith("news_search") and not r.success)
+            # §14.21: only the web fallback counts — a Wikipedia miss alone
+            # is already covered by that fallback's own search.
+            or (r.tool_name == "wikipedia_search:web_fallback" and not r.success)
             for r in dispatched_tool_results
         )
         if _web_search_failed and self._memory_manager is not None:

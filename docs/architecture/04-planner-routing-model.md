@@ -20,10 +20,10 @@ All lower priorities are skipped.
 
 | | |
 |---|---|
-| **Condition** | Instruction, after stripping surrounding whitespace and lowercasing, either equals or begins with a leading `/chart` or `/research` token (`_SLASH_COMMAND_TOOL_MAP`, `Planner._priority0_slash_command()`). A mid-sentence occurrence (not a leading token) does not match. |
+| **Condition** | Instruction, after stripping surrounding whitespace and lowercasing, either equals or begins with a leading `/chart`, `/research` or `/wikipedia` token (`_SLASH_COMMAND_TOOL_MAP`, `Planner._priority0_slash_command()`). A mid-sentence occurrence (not a leading token) does not match. |
 | **Action** | Route directly to `ConversationalAgent` with `tools_to_call = [<mapped tool>]`, `compound = True`, `priority = 0`, `tool_signal_source = "slash_command"`. Runs before `_detect_compound()` and every other priority — nothing below Priority 0 is evaluated once it matches. |
-| **Rationale** | An explicit, user-invoked escape hatch to force a specific tool regardless of what the normal detection paths would otherwise decide. `/chart` bypasses `_CHART_KEYWORDS` keyword matching entirely (fires even on a bare `/chart` with no data). `/research` bypasses **both** the `research_intent` semantic-upgrade threshold and `LOCALIST_RESEARCH_LOOP_ENABLED` (§18.2) — the research loop runs even when that flag is off, since the user asked for it directly. |
-| **Notes** | The leading slash token is deliberately **not** stripped from the instruction text passed downstream in this version — `task.instruction` is used as-is by dispatch-time argument/query derivation and prompt slots. Live-tested and found not to cause observable extraction/query-derivation problems for either command; revisit only if a future case shows otherwise. `tool_signal_source` joins the existing `"keyword"`/`"classifier_fallback"` provenance values (§15.1) — same field, one more value, not a parallel mechanism. Full research-loop-side detail and live verification (including a real `/research` request executing the loop with the flag off) at §18.2. |
+| **Rationale** | An explicit, user-invoked escape hatch to force a specific tool regardless of what the normal detection paths would otherwise decide. `/chart` bypasses `_CHART_KEYWORDS` keyword matching entirely (fires even on a bare `/chart` with no data). `/research` bypasses **both** the `research_intent` semantic-upgrade threshold and `LOCALIST_RESEARCH_LOOP_ENABLED` (§18.2) — the research loop runs even when that flag is off, since the user asked for it directly. `/wikipedia` (2026-11-15) forces `wikipedia_search` regardless of `LOCALIST_WIKIPEDIA_ENABLED`, by the same rule (§14.21.2). |
+| **Notes** | *(2026-11-15: query derivation now strips it — `_derive_initial_query()` for research/web search and `_derive_wikipedia_query()` for `/wikipedia`, §18.11/§14.21.2; the instruction itself still reaches prompt slots unchanged.)* The leading slash token is deliberately **not** stripped from the instruction text passed downstream in this version — `task.instruction` is used as-is by dispatch-time argument/query derivation and prompt slots. Live-tested and found not to cause observable extraction/query-derivation problems for either command; revisit only if a future case shows otherwise. `tool_signal_source` joins the existing `"keyword"`/`"classifier_fallback"` provenance values (§15.1) — same field, one more value, not a parallel mechanism. Full research-loop-side detail and live verification (including a real `/research` request executing the loop with the flag off) at §18.2. |
 
 ---
 
@@ -56,6 +56,17 @@ All lower priorities are skipped.
 | **Rationale** | `news`/`headlines`/`breaking` etc. describe a fundamentally different retrieval need than generic web search — a purpose-built news index with publish dates and source attribution, not Brave's general-purpose ranking. Runs before Priority 3 so a news match wins outright rather than merging with a `web_search`-only Priority 3 match on the same turn (e.g. "recent" + "news" in the same instruction routes to `news_search` only, not `["web_search", "news_search"]`). Still loses to Priority 3c (graph-query, §8) and everything above it — same ordering rule §8 already documents for Priority 3c relative to Priority 3. |
 | **Notes** | `"news"` moved out of `_WEB_SEARCH_KEYWORDS` into `_NEWS_KEYWORDS` as part of this change — see the 2026-07-22 update below. The `news_search` MCP tool itself (NewsAPI, falling back to the existing Brave-backed `web_search` tool on a miss) is documented at §14.9; nothing beyond the tool name reaches the Planner — the fallback chain lives entirely inside `MCPToolDispatcher`. A semantic `news_request` secondary signal (mirroring `lookup_request`/`explicit_search_action`, §10) is scoped but deliberately not built yet — no threshold has been tuned against real utterances, and guessing one was explicitly rejected during scoping. |
 
+
+---
+
+**PRIORITY 3-WIKIPEDIA — INSTRUCTION NAMES WIKIPEDIA** *(added 2026-11-15)*
+
+| | |
+|---|---|
+| **Condition** | `LOCALIST_WIKIPEDIA_ENABLED` is not off (default on, read per call), and the whole word `"wikipedia"` (`_WIKIPEDIA_KEYWORDS`, via `_any_whole_word()`, so `"wikipedia's"` matches too) is present. The same inline file_op/url_fetch/raw-URL guard as Priority 3-news, so a pasted wikipedia.org link stays a `url_fetch` (§14.21.3 reads it through the API). |
+| **Action** | Route to `ConversationalAgent` with `tools_to_call = ["wikipedia_search"]`, `compound = True`, `priority = 3`, `tool_signal_source = "keyword"`. |
+| **Rationale** | Naming Wikipedia is an explicit source choice. The dispatcher searches, reads the best article with its cited sources, and falls back to `web_search` on a miss (§14.21.2). |
+| **Notes** | Bare `"wiki"` never matches — it means the user's own wiki (P1/P1b/P1c, RAG). Order: after P3-hacker-news, P3-news, P3-github-release and P3-github, so a request *about* Wikipedia through one of those sources stays there ("news about wikipedia", "github repo for a wikipedia client"); before generic Priority 3. `_priority3_wikipedia()`; tests in `tests/test_wikipedia_routing.py`. |
 ---
 
 **PRIORITY 3 — TOOL SIGNAL**

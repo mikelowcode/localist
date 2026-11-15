@@ -24,6 +24,13 @@ export const tips: Tip[] = [
 		example: '/research the history of the transistor',
 		description: 'Forces the research tool directly, bypassing the usual gating.'
 	},
+	{
+		id: 'slash-wikipedia',
+		category: 'slash-command',
+		trigger: '/wikipedia',
+		example: '/wikipedia the transistor',
+		description: 'Looks the topic up on Wikipedia and reads the best-matching article; falls back to a web search if nothing matches.'
+	},
 
 	// Ingest
 	{
@@ -152,6 +159,15 @@ export const tips: Tip[] = [
 		trigger: 'hacker news / hn / y combinator',
 		example: "what's trending on hacker news today",
 		description: 'Fetches top stories from Hacker News.'
+	},
+
+	// Wikipedia
+	{
+		id: 'wikipedia',
+		category: 'keyword',
+		trigger: 'wikipedia',
+		example: 'what does wikipedia say about the Apollo program',
+		description: 'Reads the matching Wikipedia article and its cited sources. Only the full word "wikipedia" counts — "wiki" still means your own wiki.'
 	},
 
 	// Factual query

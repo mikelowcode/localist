@@ -311,6 +311,9 @@
     file_op_deferred?: boolean;
   }): { label: string; cls: string } {
     const fired       = p.tools_fired ?? [];
+    // §14.21: an instruction naming Wikipedia routes to wikipedia_search
+    // alone (planner.py _priority3_wikipedia).
+    if (fired.includes('wikipedia_search')) return { label: 'P3 · Wikipedia', cls: 'prov-web' };
     const hasWebSearch = fired.includes('web_search');
     const hasFileOp    = fired.includes('file_op') || !!p.file_op_deferred;
     const hasUrlFetch  = fired.includes('url_fetch');
@@ -322,6 +325,17 @@
       if (hasUrlFetch)  return { label: 'P3 · Page fetch',     cls: 'prov-tool' };
     }
     return { label: 'P3 · Tool', cls: 'prov-tool' };
+  }
+
+  // Priority 0 is a leading slash command (planner.py
+  // _priority0_slash_command) — label it by the tool it forced. Before
+  // this, P0 turns fell through to the "P6 · Inference" default.
+  function p0Provenance(p: { tools_fired?: string[] }): { label: string; cls: string } {
+    const fired = p.tools_fired ?? [];
+    if (fired.includes('wikipedia_search')) return { label: 'P0 · /wikipedia', cls: 'prov-web' };
+    if (fired.includes('research'))         return { label: 'P0 · /research',  cls: 'prov-web' };
+    if (fired.includes('chart'))            return { label: 'P0 · /chart',     cls: 'prov-tool' };
+    return { label: 'P0 · Command', cls: 'prov-tool' };
   }
 
   // Collapsed-by-default provenance disclosure — one pill per assistant
@@ -343,6 +357,7 @@
     file_op_deferred?: boolean;
   }): { label: string; cls: string } {
     switch (p.priority) {
+      case 0:  return p0Provenance(p);
       case 1:  return { label: 'P1 · Direct',        cls: 'prov-direct' };
       case 2:  return { label: 'P2 · Memory write',  cls: 'prov-memory' };
       case 3:  return p3Provenance(p);

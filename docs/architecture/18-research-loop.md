@@ -529,3 +529,60 @@ result; two separate `dispatch()` calls get different ids; a plain
 `test_controller_phase4.py::TestWorkflowStepsMetadata` (metadata
 populated on a research turn, omitted entirely on a non-research turn and
 on a plain-`web_search` turn without a `workflow_id`).
+
+### 18.11 Fact Questions and Wikipedia Background (2026-11-15)
+
+**Bug.** The gate's user prompt asked whether the text answered the question **"with a specific
+number"**, and `_RESEARCH_REFORMULATE_SYSTEM_PROMPT` steered rewrites toward pricing pages. That is
+right for the `research_intent` upgrade, which is pricing and specs (§18.2). But a `/research`
+request on any other subject could almost never pass. It burned all `_MAX_RESEARCH_ITERATIONS` and
+ended with "without finding concrete pricing information".
+
+**Fix: two kinds** (`MCPToolDispatcher._research_kind()`, deterministic).
+- `_RESEARCH_PRICING_RE` matches price, cost, how much, fees, subscription, monthly, tiers, specs,
+  benchmarks, going rate, `$<digit>`, ….
+- **`pricing`** keeps the §18.9-tuned prompts and path unchanged. It makes no Wikipedia calls.
+  Every existing research test is pricing-shaped and passes unchanged.
+- **`factual`** gets `_RESEARCH_FACT_GATE_SYSTEM_PROMPT`, which asks whether the text directly
+  answers the question, about the same subject, with no number requirement. It also gets
+  `_RESEARCH_FACT_REFORMULATE_SYSTEM_PROMPT`. On exhaustion the synthetic result says "without
+  finding a direct answer". The `research` tool name and Step 3b handling are unchanged.
+- `_evaluate_research_gate(kind, …)` picks the gate. `_evaluate_pricing_gate` itself is unchanged.
+
+**Also.** `_derive_initial_query()` now strips a leading `/research`, `/wikipedia` or `/chart`.
+Before this, the P0 command word went into the search query.
+
+**Wikipedia** (factual kind, `LOCALIST_WIKIPEDIA_ENABLED`; §14.21):
+- **Background.** On iteration 0, `_wikipedia_confident_match()` runs alongside the first search
+  (`asyncio.gather`) and uses §14.21.4's `wikipedia_match.decide()`. On a match:
+  - a `wikipedia_summary` result is appended;
+  - "title — description" is passed to every factual reformulation as `Background (Wikipedia): …`;
+  - `_wikipedia_citations()` reads the article's filtered reference URLs.
+- **Citations.** In each round, after the search snippet and the top page both fail the gate, the
+  next untried citation is fetched (`search_fallback=False`, §14.20). It is retagged
+  `url_fetch:wikipedia_citation` and gated. There are at most `_RESEARCH_MAX_CITATIONS = 2` per
+  loop. Results carry the loop's `workflow_id`, so the Episode Browsing step view (§18.10) shows
+  them.
+- **Duplicates.** `_drop_repeated_background()` removes the summary when the same article was read
+  in full later in the turn.
+- **Failures.** Any Wikipedia miss or error is silent; the loop runs as before.
+
+The research loop's own flag (`LOCALIST_RESEARCH_LOOP_ENABLED`, default off) and `/research` are
+unchanged. Wikipedia here runs only when research mode runs.
+
+**Tests.** `tests/test_wikipedia_routing.py` covers:
+- `TestResearchKind`;
+- `TestDeriveInitialQuerySlash`;
+- `TestResearchLoopWikipedia`: background then citation answers, citation cap, background reaching
+  the reformulate prompt, a first-search answer, no match, a Wikipedia error, the master switch
+  off, a pricing request never touching Wikipedia, and the duplicate summary dropped.
+
+**Live (2026-11-15, gemma4:31b-cloud, Brave).**
+
+| Request | Result |
+|---|---|
+| `/research the history of the transistor` | Matched *History of the transistor*, 10 citations; answered in round 1 by the article read (1.8 s), summary dropped as a duplicate. |
+| `/research the Treaty of Versailles` | Snippet plus summary; round 1 (1.5 s). |
+| `/research who first demonstrated a working point-contact transistor and when` | No summary (*Transistor*, coverage 0.17); answered in round 1 by the Computer History Museum page. |
+
+The citation step wasn't needed live; it is unit-tested only.
