@@ -1578,3 +1578,35 @@ UI for Ollama hybrid inference (§16.37): a local model until a conversation pas
 `HealthState` gains `hybrid`, `hybrid_cloud_model`, `hybrid_cloud_model_found`, `hybrid_token_cap`; `Task.metadata` gains `hybrid`.
 
 **Verified:** `npm run check` (0 errors). The backend half was checked live (§16.37). The UI itself has not yet been looked at in a browser or the packaged app.
+
+### 7.33 Settings → Wikipedia, and Route Labels for Slash Commands (2026-11-15/16)
+
+**Settings → Wikipedia** (`localist-ui/src/routes/settings/+page.svelte`, after API Keys; backend §14.21.8)
+- **Two labelled checkboxes**, in the style the Hybrid card uses for a card with several controls:
+  - **Use Wikipedia** (`enabled`). Its hint covers the keyword, `/wikipedia` and `/research` use. It
+    also says two things that are true either way: Wikipedia links are always read through the API
+    (localist-mcp's `fetch_url` resolver ignores the switch), and `/wikipedia` still works when the
+    switch is off.
+  - **Background summary on web searches** (`enrich`). Its hint warns it can occasionally pick the
+    wrong article, which is why it's off by default (§14.21.4). The row is disabled and muted (new
+    `.checkbox-row.muted`) while Use Wikipedia is off, and the hint says so. Its saved value is kept
+    and restored when Wikipedia is switched back on.
+- **Loading.** The card loads from `GET /api/settings/wikipedia` in the same `backendUp` block as
+  keep-alive and hybrid, and stays hidden until the backend answers.
+- **Saving.**
+  - Each tick sends `PUT` with just that field.
+  - The update is optimistic: the box changes at once and reverts on failure with "Couldn't save: …".
+  - On success the card says "Saved — applies from your next message". Both flags are read per
+    request, so there is no restart or reload.
+
+**Chat route labels** (`ChatPanel.svelte`, 2026-11-15)
+- `priorityInfo()` had no Priority 0 case, so `/research` and `/chart` replies fell through to "P6 ·
+  Inference".
+- New `p0Provenance()` labels them "P0 · /research", "P0 · /chart" and "P0 · /wikipedia".
+  `p3Provenance()` labels a `wikipedia_search` turn "P3 · Wikipedia".
+- `tips.ts` lists `/wikipedia` and the "wikipedia" keyword.
+
+**Verified.**
+- `npm run check` (0 errors) and `npm run build`.
+- The backend round trip was checked live (§14.21.8).
+- The card itself has not been looked at in a browser; check it in the v0.1.8 draft build.

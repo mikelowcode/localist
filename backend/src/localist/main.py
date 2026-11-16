@@ -142,7 +142,7 @@ import httpx
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # ---------------------------------------------------------------------------
@@ -1805,6 +1805,18 @@ class OllamaKeepAliveResponse(BaseModel):
 class OllamaKeepAliveRequest(BaseModel):
     """Payload accepted by PUT /settings/ollama-keep-alive."""
     keep_alive: str
+
+
+class WikipediaSettingsResponse(BaseModel):
+    """Response body for GET/PUT /settings/wikipedia (§14.21.8)."""
+    enabled: bool   # LOCALIST_WIKIPEDIA_ENABLED — master switch (default on)
+    enrich:  bool   # LOCALIST_WIKIPEDIA_ENRICH — background summary on web searches (default off)
+
+
+class WikipediaSettingsRequest(BaseModel):
+    """Payload accepted by PUT /settings/wikipedia. Omitted fields are left as they are."""
+    enabled: StrictBool | None = None   # strict: "yes"/1 are rejected, not coerced
+    enrich:  StrictBool | None = None
 
 
 class OllamaHybridResponse(BaseModel):
@@ -3912,6 +3924,73 @@ async def put_ollama_keep_alive(request: OllamaKeepAliveRequest) -> OllamaKeepAl
     return OllamaKeepAliveResponse(
         keep_alive=choice, choices=list(KEEP_ALIVE_CHOICES), applied_live=applied,
     )
+
+
+# ---------------------------------------------------------------------------
+# Wikipedia  (Settings → Wikipedia, §14.21.8)
+# ---------------------------------------------------------------------------
+#
+# Both flags are read from os.environ on every request, in this process
+# (planner.Planner._wikipedia_enabled, mcp_tool_dispatcher's
+# _wikipedia_globally_enabled / _wikipedia_enrich_enabled) — localist-mcp
+# never reads them. So a PUT applies from the next message: write .env for
+# the next start, and os.environ for now. No reload or restart.
+
+_WIKIPEDIA_ENV = {
+    "enabled": "LOCALIST_WIKIPEDIA_ENABLED",
+    "enrich":  "LOCALIST_WIKIPEDIA_ENRICH",
+}
+_ENV_FALSE = ("false", "0", "no", "off")
+_ENV_TRUE  = ("true", "1", "yes", "on")
+
+
+def _wikipedia_flag(field: str) -> bool:
+    """Read one flag the way its consumers do: "enabled" is on unless
+    explicitly false; "enrich" is off unless explicitly true."""
+    raw = os.environ.get(_WIKIPEDIA_ENV[field], "").strip().lower()
+    if field == "enabled":
+        return raw not in _ENV_FALSE
+    return raw in _ENV_TRUE
+
+
+def _wikipedia_settings_response() -> WikipediaSettingsResponse:
+    return WikipediaSettingsResponse(
+        enabled = _wikipedia_flag("enabled"),
+        enrich  = _wikipedia_flag("enrich"),
+    )
+
+
+@app.get(
+    "/settings/wikipedia",
+    response_model = WikipediaSettingsResponse,
+    summary        = "Read the Wikipedia settings",
+)
+async def get_wikipedia_settings() -> WikipediaSettingsResponse:
+    return _wikipedia_settings_response()
+
+
+@app.put(
+    "/settings/wikipedia",
+    response_model = WikipediaSettingsResponse,
+    summary        = "Turn Wikipedia, and its background summary on web searches, on or off",
+)
+async def put_wikipedia_settings(request: WikipediaSettingsRequest) -> WikipediaSettingsResponse:
+    """
+    Persist each supplied flag to .env (the app's own .env in the packaged
+    app — _PROJECT_ROOT is Application Support there) and set it in
+    os.environ, so the next message follows it. `enrich` is stored as asked
+    even while `enabled` is off; the dispatcher only acts on it when both
+    are on, and keeping it means switching Wikipedia back on restores it.
+    """
+    for field in ("enabled", "enrich"):
+        value = getattr(request, field)
+        if value is None:
+            continue
+        text = "true" if value else "false"
+        _write_env_var(_PROJECT_ROOT, _WIKIPEDIA_ENV[field], text)
+        os.environ[_WIKIPEDIA_ENV[field]] = text
+        logger.info("Settings: %s=%s (Wikipedia).", _WIKIPEDIA_ENV[field], text)
+    return _wikipedia_settings_response()
 
 
 # ---------------------------------------------------------------------------

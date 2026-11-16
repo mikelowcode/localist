@@ -1988,9 +1988,9 @@ with a compliant User-Agent, against 10/min for a bare IP. That is plenty for on
 
 | Variable | Default | Effect |
 |---|---|---|
-| `LOCALIST_WIKIPEDIA_ENABLED` | `true` | Master switch: the keyword route, research-loop use and the background summary. `/wikipedia` ignores it. |
+| `LOCALIST_WIKIPEDIA_ENABLED` | `true` | Master switch: the keyword route, research-loop use and the background summary. `/wikipedia` ignores it. Settings → Wikipedia → Use Wikipedia (§14.21.8). |
 | `WIKIPEDIA_LANG` | `en` | Edition for `wikipedia_search`/`wikipedia_read` (localist-mcp). Invalid values fall back to `en`. A pasted link always uses its own language. |
-| `LOCALIST_WIKIPEDIA_ENRICH` | `false` | Background summary on ordinary `web_search` turns (Phase 4). Off on the replay's evidence. |
+| `LOCALIST_WIKIPEDIA_ENRICH` | `false` | Background summary on ordinary `web_search` turns (Phase 4). Off on the replay's evidence. Settings → Wikipedia → Background summary (§14.21.8). |
 
 #### 14.21.1 Tools (Phase 1)
 
@@ -2119,3 +2119,56 @@ case before this and showed "P6 · Inference"; they are now labelled by command 
 - **Search enrichment:** it read the Wikipedia top hit through the API.
 - **`/research`:** two runs against gemma4:31b-cloud.
 - **Ollama:** no Ollama Cloud web calls in any `.env`-loaded run.
+
+#### 14.21.8 Settings → Wikipedia (2026-11-16)
+
+The two backend flags can be switched without editing `.env`. This matters most for the packaged app,
+whose `.env` is `~/Library/Application Support/Localist/.env`. The language stays `.env`-only
+(`WIKIPEDIA_LANG`) until someone asks for another edition.
+
+**`GET /settings/wikipedia`** (`main.py`) returns `{enabled, enrich}`, read from `os.environ` the way
+the consumers read it:
+- `enabled` is on unless it is `false`/`0`/`no`/`off`;
+- `enrich` is off unless it is `true`/`1`/`yes`/`on`.
+
+**`PUT /settings/wikipedia`**
+- Takes either field. An omitted field is left alone. Fields are `StrictBool`, so `"yes"` or `1` gets
+  a 422 and nothing is written.
+- Writes each supplied flag to `_PROJECT_ROOT/.env` with `_write_env_var()`, which replaces the
+  existing line and keeps the rest. In the packaged app `get_backend_root()` is Application Support,
+  so this is the app's own `.env`.
+- Sets the flag in `os.environ`. Both flags are read per request, in the backend process only
+  (`Planner._wikipedia_enabled`, `_wikipedia_globally_enabled`, `_wikipedia_enrich_enabled`), so the
+  next message follows the change. localist-mcp never reads them, so no reload or restart is needed.
+- `enrich` is stored as asked even while `enabled` is off. It only acts when both are on, and keeping
+  it means switching Wikipedia back on restores it.
+
+The UI is in §7.33. Tests: `tests/test_wikipedia_settings.py` (16).
+
+**Live (2026-11-16).**
+
+*Setup.* An isolated root, `LOCALIST_BACKEND_ROOT` pointed at a copy of `.env` redirected to copies
+of the DB, wiki and raw folders. Backend on :8011, localist-mcp on :8013, Ollama hybrid (local tier).
+Checksums of the real `.env` and DB were unchanged afterwards, and there were no Ollama web calls.
+
+*Use Wikipedia.*
+
+| Switch | Request | Route | Tools |
+|---|---|---|---|
+| Off | "what does wikipedia say about the transistor" | P4 | none |
+| On (same request) | "what does wikipedia say about the transistor" | P3 | `wikipedia_search` → `wikipedia_read` |
+
+The copied `.env` showed `LOCALIST_WIKIPEDIA_ENABLED` flip each time.
+
+*Background summary.*
+
+| Switch | Request | Steps |
+|---|---|---|
+| On | "search for the Hubble Space Telescope" | `web_search` → `url_fetch` → `wikipedia_summary` (match, coverage 1.00; Brave's top hit wasn't Wikipedia) |
+| Off | same | `web_search` → `url_fetch`, zero lookups |
+
+**Observed, not fixed.** With Use Wikipedia off, the model still answered "Wikipedia defines a
+transistor as…" from its own knowledge. The question named Wikipedia, and nothing told the model it
+hadn't been consulted. This is an attribution risk, not a routing bug. A possible follow-up: when the
+instruction names Wikipedia and no Wikipedia result reached the prompt, add a line saying Wikipedia
+was not consulted.

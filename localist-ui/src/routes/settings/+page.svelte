@@ -173,6 +173,50 @@
     }
   }
 
+  // Wikipedia (§14.21.8): two backend switches, read fresh on every request,
+  // so a change applies from the next message. The card stays hidden until
+  // the backend answers.
+  type WikipediaSettings = { enabled: boolean; enrich: boolean };
+  let wikipedia: WikipediaSettings | null = null;
+  let wikipediaSaving = false;
+  let wikipediaError: string | null = null;
+  let wikipediaSaved: string | null = null;
+
+  async function loadWikipedia() {
+    try {
+      const res = await fetch(apiUrl('/api/settings/wikipedia'));
+      if (!res.ok) return;
+      wikipedia = await res.json();
+    } catch {
+      // Card stays hidden until the backend answers.
+    }
+  }
+
+  async function saveWikipedia(patch: Partial<WikipediaSettings>) {
+    if (!wikipedia) return;
+    const previous = wikipedia;
+    wikipedia = { ...wikipedia, ...patch };   // optimistic, reverted on failure
+    wikipediaSaving = true;
+    wikipediaError = null;
+    wikipediaSaved = null;
+    try {
+      const res = await fetch(apiUrl('/api/settings/wikipedia'), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : `HTTP ${res.status}`);
+      wikipedia = data;
+      wikipediaSaved = 'Saved — applies from your next message.';
+    } catch (err) {
+      wikipediaError = err instanceof Error ? err.message : String(err);
+      wikipedia = previous;
+    } finally {
+      wikipediaSaving = false;
+    }
+  }
+
   // Ollama hybrid inference (§16.37): local model until a conversation
   // passes the token cap, then the cloud model. Every change saves at once
   // (PUT /settings/ollama-hybrid); on a failed save the controls snap back
@@ -310,6 +354,7 @@
     void loadPrefixCache();
     void loadKeepAlive();
     void loadHybrid();
+    void loadWikipedia();
   }
 
   const fmt = (n: number | null | undefined) => (n ?? 0).toLocaleString();
@@ -1608,6 +1653,53 @@
       {/if}
     </section>
 
+    <!-- Wikipedia (§14.21.8) -->
+    {#if wikipedia}
+      <section class="settings-card">
+        <div class="card-title">Wikipedia</div>
+        <p class="card-desc">
+          Uses Wikipedia's free public API — no account or key. Answers built on it credit Wikipedia
+          (CC BY-SA).
+        </p>
+        <div class="field-group">
+          <label class="checkbox-row">
+            <input
+              type="checkbox"
+              checked={wikipedia.enabled}
+              disabled={wikipediaSaving}
+              on:change={(e) => saveWikipedia({ enabled: e.currentTarget.checked })}
+            />
+            Use Wikipedia
+          </label>
+          <p class="field-hint">
+            Look things up on Wikipedia when you mention it or type <code>/wikipedia</code>, and use it
+            for background in <code>/research</code>. Wikipedia links are always read through its API.
+            <code>/wikipedia</code> still works when this is off.
+          </p>
+
+          <label class="checkbox-row" class:muted={!wikipedia.enabled}>
+            <input
+              type="checkbox"
+              checked={wikipedia.enrich}
+              disabled={wikipediaSaving || !wikipedia.enabled}
+              on:change={(e) => saveWikipedia({ enrich: e.currentTarget.checked })}
+            />
+            Background summary on web searches
+          </label>
+          <p class="field-hint">
+            Add a short Wikipedia summary to ordinary web searches when one article clearly matches.
+            It can occasionally pick the wrong article, so it's off by default.
+            {#if !wikipedia.enabled}Turn on Use Wikipedia to change this.{/if}
+          </p>
+        </div>
+        {#if wikipediaError}
+          <p class="field-hint" style="color:var(--warning)">Couldn't save: {wikipediaError}</p>
+        {:else if wikipediaSaved}
+          <p class="card-hint">{wikipediaSaved}</p>
+        {/if}
+      </section>
+    {/if}
+
     <!-- Data retention (chat history + episodes — independent as of §20.12) -->
     <section class="settings-card">
       <div class="card-title">Data Retention</div>
@@ -1908,6 +2000,12 @@
     font-size: var(--text-sm);
     color: var(--text-secondary);
     cursor: pointer;
+  }
+
+  /* A row that depends on another setting that's currently off. */
+  .checkbox-row.muted {
+    color: var(--text-tertiary);
+    cursor: default;
   }
 
   .field-row {
