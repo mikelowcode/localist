@@ -2167,8 +2167,54 @@ The copied `.env` showed `LOCALIST_WIKIPEDIA_ENABLED` flip each time.
 | On | "search for the Hubble Space Telescope" | `web_search` → `url_fetch` → `wikipedia_summary` (match, coverage 1.00; Brave's top hit wasn't Wikipedia) |
 | Off | same | `web_search` → `url_fetch`, zero lookups |
 
-**Observed, not fixed.** With Use Wikipedia off, the model still answered "Wikipedia defines a
-transistor as…" from its own knowledge. The question named Wikipedia, and nothing told the model it
+**Observed, then fixed in §14.21.9.** With Use Wikipedia off, the model still answered "Wikipedia
+defines a transistor as…" from its own knowledge. The question named Wikipedia, and nothing told the model it
 hadn't been consulted. This is an attribution risk, not a routing bug. A possible follow-up: when the
 instruction names Wikipedia and no Wikipedia result reached the prompt, add a line saying Wikipedia
 was not consulted.
+
+#### 14.21.9 "Wikipedia not consulted" Note (2026-11-16)
+
+**Problem.** A request that names Wikipedia can be answered with no Wikipedia text in the prompt:
+Use Wikipedia off, a Wikipedia miss, or a route that never looked. The model then credited Wikipedia
+for its own knowledge ("Wikipedia defines…"), as seen live in §14.21.8.
+
+**Fix.** `controller_agent._wikipedia_not_consulted(instruction, results)` adds one line to the
+existing `[TOOL FAILED]` slot (§4.6, Slot 5a). That slot has its own 150-token budget, so it survives
+truncation, and it's the shape the model already hedges on.
+
+The note is added when both of these hold:
+- the instruction names Wikipedia (`\bwikipedia\b`);
+- no successful result in the turn contains `wikipedia.org`. A Wikipedia tool result, an API-read
+  link, a background summary, and a Wikipedia page among web-search hits all count as Wikipedia text,
+  so the model may legitimately cite them.
+
+There are two wordings:
+- **Use Wikipedia off** (`_WIKIPEDIA_TURNED_OFF`): "not used — Wikipedia is turned off in Settings…
+  You may mention it can be turned on in Settings → Wikipedia." The first draft used the generic
+  wording, and live the model then reported "the `wikipedia()` tool failed", which is wrong when the
+  user switched it off.
+- **Otherwise** (`_WIKIPEDIA_NOT_CONSULTED`): "no Wikipedia text was provided for this reply. Do not
+  say or imply that Wikipedia says, defines or states anything; say which source you are using
+  instead."
+
+The note is added to the prompt only, in both the main build and the non-answer retry build. It is
+never added to `dispatched_tool_results`, so metadata, the step view and Step 3b are unaffected.
+
+**Tests.**
+- `tests/test_wikipedia_settings.py::TestWikipediaNotConsultedRule`: named or not named, each kind of
+  Wikipedia text, a failed lookup, the turned-off wording, and rendering in the slot.
+- Two end-to-end prompt tests in `tests/test_tool_dispatcher_phase6.py`. The "off" test fails when
+  the note is removed (mutation-checked).
+
+2397 → 2415 tests.
+
+**Live (2026-11-16)**, on the same isolated setup as §14.21.8, Ollama hybrid local tier:
+
+| Case | Model's answer |
+|---|---|
+| Off, first wording (3 runs) | "I cannot provide information from Wikipedia… From my general knowledge…" every time, but it reported a tool failure |
+| Off, final wording (2 runs) | "…because Wikipedia is turned off in your Settings. [You can turn it on in Settings → Wikipedia.] From my general knowledge…" |
+| On, made-up topic | "Wikipedia does not have an entry for…", then the web results |
+
+The real `.env` and DB were unchanged, and there were no Ollama web calls.

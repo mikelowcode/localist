@@ -74,7 +74,7 @@ from .episodic_extractor import (
     process_implicit_extraction,
     process_working_state_update,
 )
-from .mcp_tool_dispatcher import MCPToolDispatcher
+from .mcp_tool_dispatcher import MCPToolDispatcher, _wikipedia_globally_enabled
 from .prompt_builder import ToolResult as _ToolResult
 from .wiki_doc import load_wiki_doc, parse_wiki_doc
 from . import session_files as _session_files
@@ -379,6 +379,55 @@ def _file_op_confirmation_line(result: "_ToolResult", fallback_path: str | None)
     if reason.startswith("ERROR:"):
         reason = reason[len("ERROR:"):].strip()
     return f"\n\n*(Could not save — {reason})*"
+
+
+# §14.21.9 (2026-11-16): a request that names Wikipedia, answered with no
+# Wikipedia text in the prompt (Use Wikipedia off, a miss, or a route that
+# never looked), led the model to write "Wikipedia defines …" from its own
+# knowledge — seen live with the switch off. When that's the case, one line
+# goes into the [TOOL FAILED] slot (its own budget, so it survives
+# truncation; the shape the model already hedges on). Prompt-only: never
+# added to dispatched_tool_results, so metadata, the step view and Step 3b
+# are unaffected.
+_WIKIPEDIA_MENTION_RE = re.compile(r"\bwikipedia\b", re.IGNORECASE)
+_WIKIPEDIA_NOT_CONSULTED = _ToolResult(
+    tool_name  = "wikipedia",
+    parameters = "",
+    result     = (
+        "ERROR: no Wikipedia text was provided for this reply. Do not say or "
+        "imply that Wikipedia says, defines or states anything; say which "
+        "source you are using instead (e.g. general knowledge)."
+    ),
+    success    = False,
+)
+# Same note when the user switched Wikipedia off: "failed" would be wrong
+# (live, 2026-11-16, the model reported "the wikipedia() tool failed").
+_WIKIPEDIA_TURNED_OFF = _ToolResult(
+    tool_name  = "wikipedia",
+    parameters = "",
+    result     = (
+        "ERROR: not used — Wikipedia is turned off in Settings, so no Wikipedia "
+        "text was provided. Do not say or imply that Wikipedia says, defines or "
+        "states anything; say which source you are using instead (e.g. general "
+        "knowledge). You may mention it can be turned on in Settings → Wikipedia."
+    ),
+    success    = False,
+)
+
+
+def _wikipedia_not_consulted(instruction: str, results: list) -> list:
+    """A one-line [TOOL FAILED] note when `instruction` names Wikipedia and no
+    successful result carries Wikipedia text (any "wikipedia.org" — a
+    Wikipedia tool result, an API-read link, or a Wikipedia page among web
+    search hits all do); else []. Says "turned off" when
+    LOCALIST_WIKIPEDIA_ENABLED is off."""
+    if not _WIKIPEDIA_MENTION_RE.search(instruction or ""):
+        return []
+    if any(r.success and "wikipedia.org" in (r.result or "") for r in results):
+        return []
+    if not _wikipedia_globally_enabled():
+        return [_WIKIPEDIA_TURNED_OFF]
+    return [_WIKIPEDIA_NOT_CONSULTED]
 
 
 # Narrow, mechanical mitigation for one specific symptom of Open Item 2
@@ -2148,7 +2197,7 @@ class ControllerAgent:
             tool_failures    = [
                 r for r in dispatched_tool_results
                 if r.result.startswith("ERROR:")
-            ] or None,
+            ] + _wikipedia_not_consulted(task.instruction, dispatched_tool_results) or None,
             graph_result     = graph_result             or None,
             graph_neighborhood = graph_neighborhood,
             working_state    = working_state,
@@ -2876,7 +2925,7 @@ class ControllerAgent:
                             tool_failures    = [
                                 r for r in retry_tool_results
                                 if r.result.startswith("ERROR:")
-                            ] or None,
+                            ] + _wikipedia_not_consulted(task.instruction, retry_tool_results) or None,
                             graph_result     = graph_result   or None,
                             graph_neighborhood = graph_neighborhood,
                             working_state    = working_state,

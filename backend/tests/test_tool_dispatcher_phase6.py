@@ -628,6 +628,56 @@ class TestControllerToolIntegration:
         assert "Zylophonic" in prompt
         assert rt.infer.call_count == 2
 
+    def _wikipedia_prompt(self, mm, monkeypatch, enabled, wiki_text):
+        """Run one "what does wikipedia say…" turn end to end and return the
+        prompt the conversational agent received (§14.21.9)."""
+        monkeypatch.setenv("LOCALIST_WIKIPEDIA_ENABLED", enabled)
+        rt = MagicMock(spec=["infer", "embed"])
+        rt.embed.return_value = [0.0] * 768
+        rt.infer.return_value = "NONE"
+
+        async def fake_open_session(stack):
+            return object()
+
+        async def fake_call_mcp_tool(session, name, arguments):
+            if name == "wikipedia_search":
+                url = "https://en.wikipedia.org/wiki/Transistor"
+                return json.dumps({
+                    "query": arguments["query"], "result_count": 1, "is_miss": False,
+                    "result_text": f"• Transistor — Wikipedia\n  {wiki_text}\n  [{url}]",
+                    "best_match": {"title": "Transistor", "url": url, "description": "",
+                                   "summary": wiki_text, "disambiguation": False},
+                }), False
+            if name == "wikipedia_read":
+                return "Error executing tool wikipedia_read: ERROR: wikipedia_read failed — x", True
+            return json.dumps({"query": arguments.get("query", ""), "result_text": "• hit — example.com",
+                               "result_count": 1}), False
+
+        conv = make_conv_agent("Here is what I found.")
+        ctrl = ControllerAgent(runtime=rt, agents=[conv], memory_manager=mm)
+        with patch(
+            "localist.mcp_tool_dispatcher.MCPToolDispatcher._open_session",
+            side_effect=fake_open_session,
+        ), patch(
+            "localist.mcp_tool_dispatcher.MCPToolDispatcher._call_mcp_tool",
+            side_effect=fake_call_mcp_tool,
+        ):
+            ctrl.handle_task({
+                "instruction": "what does wikipedia say about the transistor",
+                "context":     {"project_context": "LORA"},
+            })
+        return conv._received[0].context["_prebuilt_prompt"]
+
+    def test_wikipedia_off_prompt_says_not_consulted(self, mm, monkeypatch):
+        prompt = self._wikipedia_prompt(mm, monkeypatch, "false", "A transistor is a device.")
+        assert "[TOOL FAILED]" in prompt
+        assert "Wikipedia is turned off in Settings, so no Wikipedia text was provided" in prompt
+
+    def test_wikipedia_on_prompt_has_no_not_consulted_note(self, mm, monkeypatch):
+        prompt = self._wikipedia_prompt(mm, monkeypatch, "true", "A transistor is a device.")
+        assert "A transistor is a device." in prompt
+        assert "no Wikipedia text was provided" not in prompt
+
     def test_wikipedia_double_miss_triggers_corpus_fallback(self, mm, tmp_path, monkeypatch):
         """
         §14.21: Wikipedia misses, then its web_search fallback (retagged

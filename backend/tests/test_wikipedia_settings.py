@@ -155,3 +155,73 @@ def test_non_boolean_rejected_and_nothing_written(api, payload):
     assert resp.status_code == 422
     assert _env(tmp_path) == ""
     assert ENABLED not in main.os.environ and ENRICH not in main.os.environ
+
+
+# ---------------------------------------------------------------------------
+# §14.21.9 — "Wikipedia not consulted" prompt note
+# ---------------------------------------------------------------------------
+
+from localist.controller_agent import (  # noqa: E402
+    _WIKIPEDIA_NOT_CONSULTED, _WIKIPEDIA_TURNED_OFF, _wikipedia_not_consulted,
+)
+from localist.prompt_builder import PromptBuilder, ToolResult  # noqa: E402
+
+
+def _tr(name, result, success=True):
+    return ToolResult(tool_name=name, parameters="", result=result, success=success)
+
+
+class TestWikipediaNotConsultedRule:
+
+    @pytest.fixture(autouse=True)
+    def _wikipedia_on(self, monkeypatch):
+        monkeypatch.delenv(ENABLED, raising=False)
+
+    @pytest.mark.parametrize("value", ["false", "off", "0"])
+    def test_turned_off_wording_when_switched_off(self, monkeypatch, value):
+        monkeypatch.setenv(ENABLED, value)
+        note = _wikipedia_not_consulted("what does wikipedia say about x", [])
+        assert note == [_WIKIPEDIA_TURNED_OFF]
+        assert "turned off in Settings" in note[0].result
+        assert "failed" not in note[0].result.lower()
+
+    @pytest.mark.parametrize("instruction", [
+        "what does Wikipedia say about the transistor",
+        "according to wikipedia, who was Ada Lovelace?",
+        "WIKIPEDIA's take on CRISPR",
+    ])
+    def test_note_when_named_and_no_wikipedia_text(self, instruction):
+        assert _wikipedia_not_consulted(instruction, []) == [_WIKIPEDIA_NOT_CONSULTED]
+        assert _wikipedia_not_consulted(instruction, [_tr("web_search", "• hit — example.com\n  [https://example.com]")]) \
+            == [_WIKIPEDIA_NOT_CONSULTED]
+
+    @pytest.mark.parametrize("instruction", [
+        "what does my wiki say about the transistor", "who was Ada Lovelace", "",
+    ])
+    def test_no_note_when_wikipedia_not_named(self, instruction):
+        assert _wikipedia_not_consulted(instruction, []) == []
+
+    @pytest.mark.parametrize("result", [
+        _tr("wikipedia_search", "• Transistor — Wikipedia\n  [https://en.wikipedia.org/wiki/Transistor]"),
+        _tr("wikipedia_read", "Wikipedia article: Transistor\n[https://en.wikipedia.org/wiki/Transistor]"),
+        _tr("url_fetch", "Title: Transistor\nSource: https://en.wikipedia.org/wiki/Transistor\nVia: Wikipedia API"),
+        _tr("web_search", "• Transistor - Wikipedia — en.wikipedia.org\n  [https://en.wikipedia.org/wiki/Transistor]"),
+        _tr("wikipedia_summary", "Wikipedia background …\n[https://en.wikipedia.org/wiki/X]"),
+    ])
+    def test_no_note_when_wikipedia_text_present(self, result):
+        assert _wikipedia_not_consulted("what does wikipedia say about it", [result]) == []
+
+    def test_failed_wikipedia_result_still_gets_note(self):
+        miss = _tr("wikipedia_search", "ERROR: no Wikipedia article matched 'x'.", success=False)
+        assert _wikipedia_not_consulted("what does wikipedia say about x", [miss]) == [_WIKIPEDIA_NOT_CONSULTED]
+
+    def test_renders_in_tool_failed_slot(self):
+        from datetime import datetime
+        _, user_prompt = PromptBuilder().build(
+            instruction="what does wikipedia say about the transistor",
+            current_datetime=datetime.now().astimezone(),
+            tool_failures=[_WIKIPEDIA_NOT_CONSULTED],
+        )
+        assert "[TOOL FAILED]" in user_prompt
+        assert "wikipedia(): FAILED — no Wikipedia text was provided for this reply." in user_prompt
+        assert "Do not say or imply that Wikipedia says" in user_prompt
