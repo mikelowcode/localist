@@ -44,15 +44,15 @@ _SUBSCRIPTIONS_PER_PAGE: int = 100
 # this key never does).
 _WATCH_FEED_ERROR_KEY: str = "_error"
 
-_TOKEN_MISSING_MESSAGE: str = "No GitHub token yet. Add one in Settings → API Keys."
+_TOKEN_MISSING_MESSAGE: str = "No GitHub token yet. Add one in Settings → Advanced → API Keys."
 _TOKEN_REJECTED_MESSAGE: str = (
     "GitHub rejected your token. It may have expired or been revoked. "
-    "Update it in Settings → API Keys."
+    "Update it in Settings → Advanced → API Keys."
 )
 _TOKEN_FORBIDDEN_MESSAGE: str = (
     "GitHub refused this token. Localist needs a classic token with no scopes "
     "selected; fine-grained tokens can't read your watched repos. "
-    "Update it in Settings → API Keys."
+    "Update it in Settings → Advanced → API Keys."
 )
 # Save-time versions of the two above, for validate_token(): the user is
 # already on the API Keys card, so these say what happened to the save instead

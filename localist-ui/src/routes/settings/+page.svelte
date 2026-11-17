@@ -31,6 +31,7 @@
   import { theme } from '$lib/stores/theme';
   import { fontSize, FONT_SIZES } from '$lib/stores/fontSize';
   import { browser } from '$app/environment';
+  import { page } from '$app/stores';
   import {
     retentionSettings,
     retentionSettingsLoading,
@@ -81,8 +82,74 @@
   import { openGithubWatch, fetchGithubWatchPreview } from '$lib/stores/githubWatch';
   import { openExternal } from '$lib/openExternal';
 
+  // General | Advanced tabs (§7.34). General holds everyday choices and on/off
+  // preferences; Advanced holds keys, integrations, the server URL and logs.
+  // The last tab picked is remembered per browser; a link to a card's anchor
+  // (e.g. the model banner's /settings#openrouter-key-input) opens whichever
+  // tab holds that card.
+  type SettingsTab = 'general' | 'advanced';
+  const SETTINGS_TABS: { value: SettingsTab; label: string }[] = [
+    { value: 'general', label: 'General' },
+    { value: 'advanced', label: 'Advanced' }
+  ];
+  const SETTINGS_TAB_KEY = 'localist-settings-tab';
+  const ADVANCED_ANCHORS = new Set([
+    'langsearch-key-input',
+    'brave-key-input',
+    'newsapi-key-input',
+    'github-token-input',
+    'openrouter-key-input',
+    'pinned-repo-input',
+    'news-home-country',
+    'news-local-query',
+    'backend-url'
+  ]);
+
+  function tabForHash(hash: string): SettingsTab | null {
+    const id = hash.replace(/^#/, '');
+    if (!id) return null;
+    return ADVANCED_ANCHORS.has(id) ? 'advanced' : 'general';
+  }
+
+  function initialSettingsTab(): SettingsTab {
+    if (!browser) return 'general';
+    const fromHash = tabForHash(window.location.hash);
+    if (fromHash) return fromHash;
+    try {
+      return localStorage.getItem(SETTINGS_TAB_KEY) === 'advanced' ? 'advanced' : 'general';
+    } catch {
+      return 'general';
+    }
+  }
+
+  let settingsTab: SettingsTab = initialSettingsTab();
+
+  function setSettingsTab(t: SettingsTab) {
+    settingsTab = t;
+    try {
+      localStorage.setItem(SETTINGS_TAB_KEY, t);
+    } catch {
+      /* storage unavailable — the tab just isn't remembered */
+    }
+  }
+
+  // Anchor links followed while Settings is already open (or right after it
+  // opens): switch to the tab that holds the target, then scroll to it once
+  // it has rendered.
+  async function revealAnchor(hash: string) {
+    const t = tabForHash(hash);
+    if (!t) return;
+    settingsTab = t;
+    await tick();
+    document.getElementById(hash.slice(1))?.scrollIntoView({ block: 'center' });
+  }
+  $: if (browser) void revealAnchor($page.url.hash);
+
   const GITHUB_NEW_TOKEN_URL = 'https://github.com/settings/tokens/new?description=Localist';
   const OPENROUTER_KEYS_URL = 'https://openrouter.ai/settings/keys';
+  const LANGSEARCH_KEYS_URL = 'https://langsearch.com/api-keys';
+  const BRAVE_KEYS_URL = 'https://api-dashboard.search.brave.com/app/keys';
+  const NEWSAPI_REGISTER_URL = 'https://newsapi.org/register';
 
   const EVICTION_PRESETS: { value: EvictionPreset; label: string }[] = [
     { value: '7d',      label: '7 days' },
@@ -962,6 +1029,13 @@
     openExternal(GITHUB_NEW_TOKEN_URL);
   }
 
+  // Key-page links open in the system browser (desktop app) rather than
+  // inside the webview — same as the GitHub/OpenRouter links.
+  function openKeyPage(event: MouseEvent, url: string) {
+    event.preventDefault();
+    openExternal(url);
+  }
+
   function handleCreateOpenrouterKey(event: MouseEvent) {
     event.preventDefault();
     openExternal(OPENROUTER_KEYS_URL);
@@ -977,922 +1051,937 @@
 
     <BackendWaitingNote subject="settings" />
 
-    <!-- Runtime backend -->
-    <section class="settings-card">
-      <div class="card-title">Runtime Backend</div>
-      <div class="segmented">
-        {#each RUNTIME_BACKENDS as b}
-          <button
-            type="button"
-            class="seg-btn"
-            class:active={$modelConfig.backend === b}
-            class:previewing={selectedUiBackend === b && selectedUiBackend !== $modelConfig.backend}
-            disabled={$runtimeBackendSwitchLoading}
-            on:click={() => selectRuntimeBackend(b)}
-          >{RUNTIME_BACKEND_LABELS[b]}</button>
-        {/each}
-        {#if $runtimeBackendSwitchLoading}
-          <span class="spinner" aria-hidden="true" />
-        {/if}
-      </div>
-      <p class="card-hint">
-        Live-switches the active backend via <code>POST /settings/runtime-backend</code>
-        (docs/architecture/16-runtime-backend-layer.md §16.5) — health-checked before anything
-        changes, and persisted to <code>.env</code> so it survives a restart. Switching takes a
-        few seconds (mostly model-load time on the new backend); in-flight requests keep running
-        on the backend that was active when they started.
-      </p>
-      {#if $runtimeBackendSwitchWarning}
-        <p class="card-hint" style="color:var(--warning)">{$runtimeBackendSwitchWarning}</p>
-      {/if}
-      {#if $runtimeBackendSwitchError}
-        <p class="card-hint" style="color:var(--error)">{$runtimeBackendSwitchError}</p>
-      {/if}
-    </section>
-
-    <!-- Memory re-embed -->
-    <section class="settings-card">
-      <div class="card-title">Re-embed Memory</div>
-      <p class="card-hint">
-        Embeds wiki/raw documents, chat history and episodes that have no vector for the active
-        embedding model yet, via <code>POST /memory/reembed</code> (docs/architecture/16-runtime-backend-layer.md §16.26).
-        Vectors are kept per model, so switching back to a model you've used before needs nothing;
-        this is only needed when switching to a model that hasn't embedded everything yet — until
-        then, document retrieval and chat-history search fall back to keyword-only ranking. Items that fail
-        are retried automatically; any still failing are reported below, and running it again
-        redoes only those. Also re-runs semantic-gating threshold calibration for the active
-        model (see the Embedding Model card's trust badge below) — useful to retry a model that
-        calibrated poorly, or after the calibration method itself improves.
-      </p>
-      {#if corpusStale || chatTurnsStale}
-        <div class="stale-badges">
-          {#if corpusStale}
-            <span class="badge badge-warning">
-              Document embeddings out of date — re-ranking is running keyword-only.
-            </span>
-          {/if}
-          {#if chatTurnsStale}
-            <span class="badge badge-warning">
-              Chat history embeddings out of date — history search is running keyword-only.
-            </span>
-          {/if}
-        </div>
-      {/if}
-      <div class="field-row">
+    <div class="segmented settings-tabs" role="tablist" aria-label="Settings sections">
+      {#each SETTINGS_TABS as t}
         <button
           type="button"
-          class="btn-secondary"
-          disabled={$reembedLoading}
-          on:click={handleReembedCorpus}
-        >
-          {#if $reembedLoading}
-            <span class="spinner" aria-hidden="true" />
-            Re-embedding…
-          {:else}
-            Re-embed Memory Now
-          {/if}
-        </button>
-      </div>
-      {#if reembedResult}
-        <p class="card-hint">{reembedResult}</p>
-      {/if}
-      {#if reembedWarning}
-        <p class="card-hint" style="color:var(--warning)">{reembedWarning}</p>
-      {/if}
-      {#if $reembedError}
-        <p class="card-hint" style="color:var(--error)">{$reembedError}</p>
-      {/if}
-    </section>
+          role="tab"
+          class="seg-btn"
+          class:active={settingsTab === t.value}
+          aria-selected={settingsTab === t.value}
+          on:click={() => setSettingsTab(t.value)}
+        >{t.label}</button>
+      {/each}
+    </div>
 
-    <!-- Chat model -->
-    <section class="settings-card">
-      <div class="card-title">Chat Model — {RUNTIME_BACKEND_LABELS[selectedUiBackend]}</div>
-      <div class="field-group">
-        {#if selectedIsHosted}
-          <label class="checkbox-row">
-            <input type="checkbox" bind:checked={freeModelsOnly} />
-            Free models only
-          </label>
-        {/if}
-        <select
-          id="chat-model"
-          aria-label={`Chat model for ${RUNTIME_BACKEND_LABELS[selectedUiBackend]}`}
-          class="settings-input"
-          disabled={$runtimeBackendSwitchLoading || availableModels.length === 0}
-          on:change={onChatModelSelectChange}
-        >
-          {#if chatModelMissing}
-            <option value="" disabled selected>
-              {chatModel} ({selectedIsHosted ? 'not in this list' : 'not found on this backend'})
-            </option>
-          {:else}
-            <option value="" disabled selected={!chatModel}>
-              {availableModels.length ? 'Select a model…' : 'No models reported by this backend'}
-            </option>
-          {/if}
-          {#each availableModels as m}
-            <option value={m} selected={m === chatModel}>{modelOptionLabel(m)}</option>
-          {/each}
-        </select>
-        {#if selectedIsHosted && modelsError}
-          <p class="field-hint" style="color:var(--warning)">
-            {modelsError}
-            {#if !$apiKeysStatus.openrouter_api_key_set}Add a key under API Keys below.{/if}
-          </p>
-        {/if}
-        {#if selectedIsHosted}
-          <p class="field-hint">
-            Chat goes over the internet to OpenRouter and the model's provider; memory and document
-            search stay on this Mac. Only models that support tools are listed.
-            {#if chatModelIsFree}
-              Free models allow 50 requests a day (1,000 after a one-time $10 credit purchase on
-              OpenRouter); a chat turn uses about 2–3.
-              {#if freeRequestsLeft !== null}<strong>{freeRequestsLeft} left today.</strong>{/if}
-            {/if}
-          </p>
-          <p class="field-hint" style="color:var(--warning)">
-            Providers of free models may use your prompts for training. Pick a paid model if that
-            matters for what you ask.
-          </p>
-        {/if}
-        {#if chatModelSource === 'override'}
-          <p class="field-hint" style="color:var(--warning)">
-            <code>LOCALIST_CHAT_MODEL</code> in <code>.env</code> overrides the model picked here for every
-            backend. Remove that line and restart to use per-backend choices.
-          </p>
-        {/if}
-        {#if selectedUiBackend === 'ollama'}
-          <label class="field-label" for="ollama-keep-alive">Keep model loaded</label>
-          <select
-            id="ollama-keep-alive"
-            class="settings-input"
-            value={keepAlive}
-            disabled={keepAliveSaving}
-            on:change={onKeepAliveChange}
-          >
-            {#each keepAliveChoices as c}
-              <option value={c}>{KEEP_ALIVE_LABELS[c] ?? c}</option>
-            {/each}
-          </select>
-          <p class="field-hint">
-            When Ollama unloads an idle model it frees that memory, but the next message waits for a
-            reload and loses Ollama's prompt cache. Keeping it loaded makes that message faster, but
-            the model keeps using its full memory while idle.
-          </p>
-          {#if keepAliveError}
-            <p class="field-hint" style="color:var(--warning)">Couldn't save: {keepAliveError}</p>
-          {/if}
-        {/if}
-        {#if selectedUiBackend === $modelConfig.backend && prefixCache.available}
-          {#if prefixCache.granularity === 'block' && prefixCache.full_blocks === 0}
-            <p class="field-hint" style="color:var(--warning)">
-              Prompt cache: the shared system message (identity + persona) is
-              {fmt(prefixCache.prefix_tokens)} tokens, shorter than this model's
-              {fmt(prefixCache.block_size)}-token cache block, so none of it is cached. Lengthen
-              <code>persona.md</code> past {fmt(prefixCache.block_size)} tokens to speed up every reply.
-            </p>
-          {:else if prefixCache.granularity === 'block'}
-            <p class="field-hint">
-              Prompt cache: {fmt(prefixCache.cached_tokens)} of the shared system message's
-              {fmt(prefixCache.prefix_tokens)} tokens are reused on every reply
-              ({prefixCache.full_blocks} × {fmt(prefixCache.block_size)}-token block).
-            </p>
-          {:else if prefixCache.granularity === 'token'}
-            <p class="field-hint">
-              Prompt cache: the shared system message (~{fmt(prefixCache.prefix_tokens)} tokens) is
-              reused on every reply.
-            </p>
-          {/if}
-        {/if}
-        {#if selectedUiBackend === $modelConfig.backend}
-          <p class="field-hint">Applies immediately — {RUNTIME_BACKEND_LABELS[selectedUiBackend]} is the active backend.</p>
-        {:else}
-          <p class="field-hint">Saved for {RUNTIME_BACKEND_LABELS[selectedUiBackend]} — takes effect the next time you switch to it.</p>
-        {/if}
-      </div>
-    </section>
-
-    <!-- Ollama hybrid inference (§16.37) -->
-    {#if selectedUiBackend === 'ollama' && hybrid}
+    {#if settingsTab === 'general'}
+      <!-- Runtime backend -->
       <section class="settings-card">
-        <div class="card-title">Hybrid Inference — Ollama</div>
-        <p class="card-desc">
-          Answer on a local model, and move a conversation to an Ollama Cloud model once it grows past
-          a token limit. Each new chat starts local again. Embeddings always stay on this Mac.
+        <div class="card-title">Runtime Backend</div>
+        <div class="segmented">
+          {#each RUNTIME_BACKENDS as b}
+            <button
+              type="button"
+              class="seg-btn"
+              class:active={$modelConfig.backend === b}
+              class:previewing={selectedUiBackend === b && selectedUiBackend !== $modelConfig.backend}
+              disabled={$runtimeBackendSwitchLoading}
+              on:click={() => selectRuntimeBackend(b)}
+            >{RUNTIME_BACKEND_LABELS[b]}</button>
+          {/each}
+          {#if $runtimeBackendSwitchLoading}
+            <span class="spinner" aria-hidden="true" />
+          {/if}
+        </div>
+        <p class="card-hint">
+          Switches the engine that runs chat, without a restart. Localist checks the new backend
+          works before switching and remembers your choice. It takes a few seconds; a reply already in
+          progress finishes on the old backend.
         </p>
+        {#if $runtimeBackendSwitchWarning}
+          <p class="card-hint" style="color:var(--warning)">{$runtimeBackendSwitchWarning}</p>
+        {/if}
+        {#if $runtimeBackendSwitchError}
+          <p class="card-hint" style="color:var(--error)">{$runtimeBackendSwitchError}</p>
+        {/if}
+      </section>
+
+      <!-- Chat model -->
+      <section class="settings-card">
+        <div class="card-title">Chat Model — {RUNTIME_BACKEND_LABELS[selectedUiBackend]}</div>
         <div class="field-group">
-          <label class="checkbox-row">
-            <input
-              type="checkbox"
-              checked={hybrid.enabled}
-              disabled={hybridSaving}
-              on:change={onHybridToggle}
-            />
-            Move long conversations to Ollama Cloud
-          </label>
-
-          <label class="field-label" for="hybrid-local-model">Local model</label>
-          <select
-            id="hybrid-local-model"
-            class="settings-input"
-            value={hybrid.local_model}
-            disabled={hybridSaving || hybrid.local_models.length === 0}
-            on:change={(e) => saveHybrid({ local_model: e.currentTarget.value })}
-          >
-            <option value="" disabled>
-              {hybrid.local_models.length ? 'Select a local model…' : 'No local chat models in Ollama'}
-            </option>
-            {#if hybrid.local_model && !hybrid.local_models.includes(hybrid.local_model)}
-              <option value={hybrid.local_model}>{hybrid.local_model} (not found)</option>
-            {/if}
-            {#each hybrid.local_models as m}
-              <option value={m}>{m}</option>
-            {/each}
-          </select>
-
-          <label class="field-label" for="hybrid-cloud-model">Cloud model</label>
-          <select
-            id="hybrid-cloud-model"
-            class="settings-input"
-            value={hybrid.cloud_model}
-            disabled={hybridSaving || hybrid.cloud_models.length === 0}
-            on:change={(e) => saveHybrid({ cloud_model: e.currentTarget.value })}
-          >
-            <option value="" disabled>
-              {hybrid.cloud_models.length ? 'Select a cloud model…' : 'No cloud models in Ollama'}
-            </option>
-            {#if hybrid.cloud_model && !hybrid.cloud_models.includes(hybrid.cloud_model)}
-              <option value={hybrid.cloud_model}>{hybrid.cloud_model} (not found)</option>
-            {/if}
-            {#each hybrid.cloud_models as m}
-              <option value={m}>{m}</option>
-            {/each}
-          </select>
-
-          <label class="field-label" for="hybrid-cap">Move to cloud after</label>
-          <select
-            id="hybrid-cap"
-            class="settings-input"
-            value={hybridCapCustom ? 'custom' : String(hybrid.token_cap)}
-            disabled={hybridSaving}
-            on:change={onHybridCapSelect}
-          >
-            {#each hybrid.cap_presets as c}
-              <option value={String(c)}>{fmt(c)} tokens</option>
-            {/each}
-            <option value="custom">Custom…</option>
-          </select>
-          {#if hybridCapCustom}
-            <div class="field-row">
-              <input
-                class="settings-input"
-                type="number"
-                min={hybrid.cap_min}
-                max={hybrid.cap_max}
-                step="500"
-                aria-label="Custom token limit"
-                bind:value={hybridCapInput}
-                disabled={hybridSaving}
-                on:keydown={(e) => e.key === 'Enter' && saveHybridCustomCap()}
-              />
-              <button
-                type="button"
-                class="btn-secondary"
-                disabled={hybridSaving || hybridCapInput === String(hybrid.token_cap)}
-                on:click={saveHybridCustomCap}
-              >
-                Save
-              </button>
-            </div>
-            <p class="field-hint">Between {fmt(hybrid.cap_min)} and {fmt(hybrid.cap_max)} tokens.</p>
+          {#if selectedIsHosted}
+            <label class="checkbox-row">
+              <input type="checkbox" bind:checked={freeModelsOnly} />
+              Free models only
+            </label>
           {/if}
-
-          <p class="field-hint">
-            A conversation's size counts every message, answer and tool result in it, plus attached
-            files. Once it moves to cloud it stays there until you start a new chat. Cloud replies can
-            carry up to about 60,000 tokens of history each, which counts toward your Ollama Cloud
-            usage. If the cloud model fails, that reply comes from the local model instead.
-          </p>
-          {#if hybrid.models_error}
-            <p class="field-hint" style="color:var(--warning)">{hybrid.models_error}</p>
-          {/if}
-          {#if hybridError}
-            <p class="field-hint" style="color:var(--warning)">Couldn't save: {hybridError}</p>
-          {/if}
-          {#if hybrid.enabled}
-            {#if $modelConfig.backend !== 'ollama'}
-              <p class="field-hint">Saved — takes effect when Ollama is the active backend.</p>
-            {:else if hybrid.active}
-              <p class="field-hint">
-                On — new chats use <code>{hybrid.local_model}</code> and move to
-                <code>{hybrid.cloud_model}</code> past {fmt(hybrid.token_cap)} tokens. The Chat Model
-                choice above isn't used while this is on.
-              </p>
+          <select
+            id="chat-model"
+            aria-label={`Chat model for ${RUNTIME_BACKEND_LABELS[selectedUiBackend]}`}
+            class="settings-input"
+            disabled={$runtimeBackendSwitchLoading || availableModels.length === 0}
+            on:change={onChatModelSelectChange}
+          >
+            {#if chatModelMissing}
+              <option value="" disabled selected>
+                {chatModel} ({selectedIsHosted ? 'not in this list' : 'not found on this backend'})
+              </option>
             {:else}
+              <option value="" disabled selected={!chatModel}>
+                {availableModels.length ? 'Select a model…' : 'No models reported by this backend'}
+              </option>
+            {/if}
+            {#each availableModels as m}
+              <option value={m} selected={m === chatModel}>{modelOptionLabel(m)}</option>
+            {/each}
+          </select>
+          {#if selectedIsHosted && modelsError}
+            <p class="field-hint" style="color:var(--warning)">
+              {modelsError}
+              {#if !$apiKeysStatus.openrouter_api_key_set}Add a key under API Keys below.{/if}
+            </p>
+          {/if}
+          {#if selectedIsHosted}
+            <p class="field-hint">
+              Chat goes over the internet to OpenRouter and the model's provider; memory and document
+              search stay on this Mac. Only models that support tools are listed.
+              {#if chatModelIsFree}
+                Free models allow 50 requests a day (1,000 after a one-time $10 credit purchase on
+                OpenRouter); a chat turn uses about 2–3.
+                {#if freeRequestsLeft !== null}<strong>{freeRequestsLeft} left today.</strong>{/if}
+              {/if}
+            </p>
+            <p class="field-hint" style="color:var(--warning)">
+              Providers of free models may use your prompts for training. Pick a paid model if that
+              matters for what you ask.
+            </p>
+          {/if}
+          {#if chatModelSource === 'override'}
+            <p class="field-hint" style="color:var(--warning)">
+              A chat model set in your <code>.env</code> file (<code>LOCALIST_CHAT_MODEL</code>) overrides this
+              choice on every backend. Remove that line and restart to choose a model per backend.
+            </p>
+          {/if}
+          {#if selectedUiBackend === 'ollama'}
+            <label class="field-label" for="ollama-keep-alive">Keep model loaded</label>
+            <select
+              id="ollama-keep-alive"
+              class="settings-input"
+              value={keepAlive}
+              disabled={keepAliveSaving}
+              on:change={onKeepAliveChange}
+            >
+              {#each keepAliveChoices as c}
+                <option value={c}>{KEEP_ALIVE_LABELS[c] ?? c}</option>
+              {/each}
+            </select>
+            <p class="field-hint">
+              When Ollama unloads an idle model it frees that memory, but the next message waits for a
+              reload and loses Ollama's prompt cache. Keeping it loaded makes that message faster, but
+              the model keeps using its full memory while idle.
+            </p>
+            {#if keepAliveError}
+              <p class="field-hint" style="color:var(--warning)">Couldn't save: {keepAliveError}</p>
+            {/if}
+          {/if}
+          {#if selectedUiBackend === $modelConfig.backend && prefixCache.available}
+            {#if prefixCache.granularity === 'block' && prefixCache.full_blocks === 0}
               <p class="field-hint" style="color:var(--warning)">
-                Saved, but not running — check that Ollama serves both models.
+                Prompt cache: the assistant's instructions are {fmt(prefixCache.prefix_tokens)} tokens, too
+                short for this model to cache, so every reply reads them again. A <code>persona.md</code> longer
+                than {fmt(prefixCache.block_size)} tokens would make replies faster.
+              </p>
+            {:else if prefixCache.granularity === 'block'}
+              <p class="field-hint">
+                Prompt cache: {fmt(prefixCache.cached_tokens)} of the assistant's
+                {fmt(prefixCache.prefix_tokens)} instruction tokens are reused on every reply, which makes
+                replies faster.
+              </p>
+            {:else if prefixCache.granularity === 'token'}
+              <p class="field-hint">
+                Prompt cache: the assistant's instructions (~{fmt(prefixCache.prefix_tokens)} tokens) are
+                reused on every reply, which makes replies faster.
               </p>
             {/if}
+          {/if}
+          {#if selectedUiBackend === $modelConfig.backend}
+            <p class="field-hint">Applies immediately — {RUNTIME_BACKEND_LABELS[selectedUiBackend]} is the active backend.</p>
+          {:else}
+            <p class="field-hint">Saved for {RUNTIME_BACKEND_LABELS[selectedUiBackend]} — takes effect the next time you switch to it.</p>
           {/if}
         </div>
       </section>
-    {/if}
 
-    <!-- Embedding model, for the active backend (§16.25, §16.27) -->
-    <section class="settings-card">
-      <div class="card-title">
-        Embedding Model — {embeddingHostLabel}
-        {#if worstGateTier}
-          <span
-            class="badge {GATE_TIER_BADGE_CLASS[worstGateTier]}"
-            title={gateTierTooltip}
-          >
-            {GATE_TIER_LABEL[worstGateTier]}
-          </span>
-        {/if}
-      </div>
-      <div class="field-group">
-        <select
-          id="embedding-model"
-          aria-label={`Embedding model for ${embeddingHostLabel}`}
-          class="settings-input"
-          disabled={$embeddingModelSwitchLoading}
-          on:change={onEmbeddingModelSelectChange}
-        >
-          <option value="" selected={!$health.embedding_model}>
-            None — keyword-only fallback
-          </option>
-          {#if embeddingCandidates.length}
-            <optgroup label="Embedding models">
-              {#each embeddingCandidates as m}
-                <option value={m} selected={m === $health.embedding_model}>{m}</option>
-              {/each}
-            </optgroup>
-          {/if}
-          {#if otherModels.length}
-            <optgroup label="Other models">
-              {#each otherModels as m}
-                <option value={m} selected={m === $health.embedding_model}>{m}</option>
-              {/each}
-            </optgroup>
-          {/if}
-        </select>
-        {#if embeddingHostIsSeparate}
-          <p class="field-hint">
-            {activeBackendLabel} only does chat, so embeddings run on this Mac through
-            {embeddingHostLabel}. If {embeddingHostLabel} isn't running, memory and document search
-            fall back to keyword matching until it starts.
+      <!-- Ollama hybrid inference (§16.37) -->
+      {#if selectedUiBackend === 'ollama' && hybrid}
+        <section class="settings-card">
+          <div class="card-title">Hybrid Inference — Ollama</div>
+          <p class="card-desc">
+            Answer on a local model, and move a conversation to an Ollama Cloud model once it grows past
+            a token limit. Each new chat starts local again. Embeddings always stay on this Mac.
           </p>
-        {/if}
-        {#if embeddingsFromOtherBackend}
-          <p class="field-hint" style="color:var(--warning)">
-            Embeddings still come from {embeddingsFromOtherBackend}
-            ({$health.active_embedding_model_name}) — pick a model here to use {embeddingHostLabel}'s own.
-          </p>
-        {/if}
-        <p class="field-hint">
-          Routes embeddings through {embeddingHostLabel}'s
-          <code>{embeddingHost === 'omlx' ? '/v1/embeddings' : '/api/embed'}</code> via
-          <code>POST /settings/embedding-model</code>; leave it unset to run in keyword-only (BM25)
-          mode instead. Saved for {embeddingHostLabel} only — each backend keeps its own choice, and
-          switching backends switches to it. Vectors are kept per model, so going back to a model
-          that has already embedded everything needs no re-embed; a model that hasn't leaves
-          documents and chat history keyword-only until "Re-embed Memory Now" fills the gaps
-          (episodes fill themselves). A model used for the first time is calibrated for semantic
-          gating automatically. The badge shows the least-trusted tier across the four gates it
-          drives — hover for the per-gate breakdown.
+          <div class="field-group">
+            <label class="checkbox-row">
+              <input
+                type="checkbox"
+                checked={hybrid.enabled}
+                disabled={hybridSaving}
+                on:change={onHybridToggle}
+              />
+              Move long conversations to Ollama Cloud
+            </label>
+
+            <label class="field-label" for="hybrid-local-model">Local model</label>
+            <select
+              id="hybrid-local-model"
+              class="settings-input"
+              value={hybrid.local_model}
+              disabled={hybridSaving || hybrid.local_models.length === 0}
+              on:change={(e) => saveHybrid({ local_model: e.currentTarget.value })}
+            >
+              <option value="" disabled>
+                {hybrid.local_models.length ? 'Select a local model…' : 'No local chat models in Ollama'}
+              </option>
+              {#if hybrid.local_model && !hybrid.local_models.includes(hybrid.local_model)}
+                <option value={hybrid.local_model}>{hybrid.local_model} (not found)</option>
+              {/if}
+              {#each hybrid.local_models as m}
+                <option value={m}>{m}</option>
+              {/each}
+            </select>
+
+            <label class="field-label" for="hybrid-cloud-model">Cloud model</label>
+            <select
+              id="hybrid-cloud-model"
+              class="settings-input"
+              value={hybrid.cloud_model}
+              disabled={hybridSaving || hybrid.cloud_models.length === 0}
+              on:change={(e) => saveHybrid({ cloud_model: e.currentTarget.value })}
+            >
+              <option value="" disabled>
+                {hybrid.cloud_models.length ? 'Select a cloud model…' : 'No cloud models in Ollama'}
+              </option>
+              {#if hybrid.cloud_model && !hybrid.cloud_models.includes(hybrid.cloud_model)}
+                <option value={hybrid.cloud_model}>{hybrid.cloud_model} (not found)</option>
+              {/if}
+              {#each hybrid.cloud_models as m}
+                <option value={m}>{m}</option>
+              {/each}
+            </select>
+
+            <label class="field-label" for="hybrid-cap">Move to cloud after</label>
+            <select
+              id="hybrid-cap"
+              class="settings-input"
+              value={hybridCapCustom ? 'custom' : String(hybrid.token_cap)}
+              disabled={hybridSaving}
+              on:change={onHybridCapSelect}
+            >
+              {#each hybrid.cap_presets as c}
+                <option value={String(c)}>{fmt(c)} tokens</option>
+              {/each}
+              <option value="custom">Custom…</option>
+            </select>
+            {#if hybridCapCustom}
+              <div class="field-row">
+                <input
+                  class="settings-input"
+                  type="number"
+                  min={hybrid.cap_min}
+                  max={hybrid.cap_max}
+                  step="500"
+                  aria-label="Custom token limit"
+                  bind:value={hybridCapInput}
+                  disabled={hybridSaving}
+                  on:keydown={(e) => e.key === 'Enter' && saveHybridCustomCap()}
+                />
+                <button
+                  type="button"
+                  class="btn-secondary"
+                  disabled={hybridSaving || hybridCapInput === String(hybrid.token_cap)}
+                  on:click={saveHybridCustomCap}
+                >
+                  Save
+                </button>
+              </div>
+              <p class="field-hint">Between {fmt(hybrid.cap_min)} and {fmt(hybrid.cap_max)} tokens.</p>
+            {/if}
+
+            <p class="field-hint">
+              A conversation's size counts every message, answer and tool result in it, plus attached
+              files. Once it moves to cloud it stays there until you start a new chat. Cloud replies can
+              carry up to about 60,000 tokens of history each, which counts toward your Ollama Cloud
+              usage. If the cloud model fails, that reply comes from the local model instead.
+            </p>
+            {#if hybrid.models_error}
+              <p class="field-hint" style="color:var(--warning)">{hybrid.models_error}</p>
+            {/if}
+            {#if hybridError}
+              <p class="field-hint" style="color:var(--warning)">Couldn't save: {hybridError}</p>
+            {/if}
+            {#if hybrid.enabled}
+              {#if $modelConfig.backend !== 'ollama'}
+                <p class="field-hint">Saved — takes effect when Ollama is the active backend.</p>
+              {:else if hybrid.active}
+                <p class="field-hint">
+                  On — new chats use <code>{hybrid.local_model}</code> and move to
+                  <code>{hybrid.cloud_model}</code> past {fmt(hybrid.token_cap)} tokens. The Chat Model
+                  choice above isn't used while this is on.
+                </p>
+              {:else}
+                <p class="field-hint" style="color:var(--warning)">
+                  Saved, but not running — check that Ollama serves both models.
+                </p>
+              {/if}
+            {/if}
+          </div>
+        </section>
+      {/if}
+
+      <!-- Assistant name -->
+      <section class="settings-card">
+        <div class="card-title">Assistant Name</div>
+        <p class="card-desc">
+          What the assistant calls itself in chat. Takes effect on your next message.
         </p>
-      </div>
-      {#if $embeddingModelSwitchLoading}
-        <span class="spinner" aria-hidden="true" />
-      {/if}
-      {#if embeddingModelResult}
-        <p class="card-hint">{embeddingModelResult}</p>
-      {/if}
-      {#if $embeddingModelSwitchError}
-        <p class="card-hint" style="color:var(--error)">{$embeddingModelSwitchError}</p>
-      {/if}
-    </section>
 
-    <!-- Streaming / episodic approval toggles -->
-    <section class="settings-card row">
-      <div class="card-title">Streaming responses</div>
-      <button
-        type="button"
-        class="switch"
-        class:on={streaming}
-        aria-label="Toggle streaming responses"
-        on:click={toggleStreaming}
-      ><span class="switch-knob" /></button>
-    </section>
+        <label class="news-field-label" for="assistant-name-input">Name</label>
+        <input
+          id="assistant-name-input"
+          class="news-text-input"
+          type="text"
+          maxlength="60"
+          bind:value={assistantNameInput}
+          placeholder="Localist"
+        />
 
-    <section class="settings-card row">
-      <div class="card-title">Episodic write-approval</div>
-      <button
-        type="button"
-        class="switch"
-        class:on={episodicApproval}
-        aria-label="Toggle episodic write-approval"
-        on:click={toggleEpisodicApproval}
-      ><span class="switch-knob" /></button>
-    </section>
+        <button
+          type="button"
+          class="seg-btn news-save-btn"
+          disabled={$assistantNameLoading || assistantNameUnchanged}
+          on:click={handleSaveAssistantName}
+        >Save</button>
 
-    <!-- Appearance -->
-    <section class="settings-card row">
-      <div class="card-title">Theme — currently <strong>{$theme}</strong></div>
-      <button
-        type="button"
-        class="switch"
-        class:on={$theme === 'light'}
-        aria-label="Toggle light/dark theme"
-        on:click={theme.toggle}
-      ><span class="switch-knob" /></button>
-    </section>
+        {#if assistantNameSaveResult}
+          <p class="card-hint">{assistantNameSaveResult}</p>
+        {/if}
+        {#if $assistantNameError}
+          <p class="card-hint" style="color:var(--error)">{$assistantNameError}</p>
+        {/if}
+      </section>
 
-    <!-- Font size -->
-    <section class="settings-card">
-      <div class="card-title">Font Size</div>
-      <p class="card-desc">Scales text throughout the app. Some UI chrome and labels are a fixed size and won't change.</p>
-      <div class="segmented">
-        {#each FONT_SIZES as f}
+      <!-- Embedding & Memory: embedding model for the active backend (§16.25, §16.27)
+           + memory re-embed (§16.26), one card since v0.1.8 -->
+      <section class="settings-card">
+        <div class="card-title">
+          Embedding &amp; Memory — {embeddingHostLabel}
+          {#if worstGateTier}
+            <span
+              class="badge {GATE_TIER_BADGE_CLASS[worstGateTier]}"
+              title={gateTierTooltip}
+            >
+              {GATE_TIER_LABEL[worstGateTier]}
+            </span>
+          {/if}
+        </div>
+        <div class="field-group">
+          <select
+            id="embedding-model"
+            aria-label={`Embedding model for ${embeddingHostLabel}`}
+            class="settings-input"
+            disabled={$embeddingModelSwitchLoading}
+            on:change={onEmbeddingModelSelectChange}
+          >
+            <option value="" selected={!$health.embedding_model}>
+              None — keyword-only fallback
+            </option>
+            {#if embeddingCandidates.length}
+              <optgroup label="Embedding models">
+                {#each embeddingCandidates as m}
+                  <option value={m} selected={m === $health.embedding_model}>{m}</option>
+                {/each}
+              </optgroup>
+            {/if}
+            {#if otherModels.length}
+              <optgroup label="Other models">
+                {#each otherModels as m}
+                  <option value={m} selected={m === $health.embedding_model}>{m}</option>
+                {/each}
+              </optgroup>
+            {/if}
+          </select>
+          {#if embeddingHostIsSeparate}
+            <p class="field-hint">
+              {activeBackendLabel} only does chat, so embeddings run on this Mac through
+              {embeddingHostLabel}. If {embeddingHostLabel} isn't running, memory and document search
+              fall back to keyword matching until it starts.
+            </p>
+          {/if}
+          {#if embeddingsFromOtherBackend}
+            <p class="field-hint" style="color:var(--warning)">
+              Embeddings still come from {embeddingsFromOtherBackend}
+              ({$health.active_embedding_model_name}) — pick a model here to use {embeddingHostLabel}'s own.
+            </p>
+          {/if}
+          <p class="field-hint">
+            Embeddings let Localist search your documents, chat history and memories by meaning. Choose
+            None to search by keywords only. Each backend remembers its own choice. Going back to a model
+            you've used before is instant; a new model searches documents and chat history by keyword
+            until you re-embed. The badge shows how reliably this model decides when to search memory —
+            hover for details.
+          </p>
+        </div>
+        {#if $embeddingModelSwitchLoading}
+          <span class="spinner" aria-hidden="true" />
+        {/if}
+        {#if embeddingModelResult}
+          <p class="card-hint">{embeddingModelResult}</p>
+        {/if}
+        {#if $embeddingModelSwitchError}
+          <p class="card-hint" style="color:var(--error)">{$embeddingModelSwitchError}</p>
+        {/if}
+
+        <div class="card-subtitle">Re-embed Memory</div>
+        <p class="card-hint">
+          Embeds anything this model hasn't embedded yet and re-checks how reliable it is. Running it
+          again redoes only the items that failed.
+        </p>
+        {#if corpusStale || chatTurnsStale}
+          <div class="stale-badges">
+            {#if corpusStale}
+              <span class="badge badge-warning">
+                Document embeddings out of date — re-ranking is running keyword-only.
+              </span>
+            {/if}
+            {#if chatTurnsStale}
+              <span class="badge badge-warning">
+                Chat history embeddings out of date — history search is running keyword-only.
+              </span>
+            {/if}
+          </div>
+        {/if}
+        <div class="field-row">
           <button
             type="button"
-            class="seg-btn"
-            class:active={$fontSize === f.value}
-            on:click={() => fontSize.set(f.value)}
-          >{f.label}</button>
-        {/each}
-      </div>
-    </section>
-
-    <!-- Backend connection -->
-    <section class="settings-card">
-      <div class="card-title">Backend Connection</div>
-      <p class="card-desc">Configure the FastAPI server that the UI connects to.</p>
-
-      <div class="field-group">
-        <label class="field-label" for="backend-url">Server URL</label>
-        <div class="field-row">
-          <input
-            id="backend-url"
-            type="text"
-            class="settings-input"
-            bind:value={backendUrl}
-            on:blur={saveBackendUrl}
-            placeholder="http://127.0.0.1:8000"
-            spellcheck="false"
-          />
-          <button
             class="btn-secondary"
-            on:click={runHealthCheck}
-            disabled={checking}
-            aria-label="Test connection"
+            disabled={$reembedLoading}
+            on:click={handleReembedCorpus}
           >
-            {#if checking}
+            {#if $reembedLoading}
               <span class="spinner" aria-hidden="true" />
-              Checking…
+              Re-embedding…
             {:else}
-              Test connection
+              Re-embed Memory Now
             {/if}
           </button>
         </div>
-
-        <div class="health-readout">
-          <div class="health-row">
-            <span class="health-label">Status</span>
-            <span
-              class="badge"
-              class:badge-success={$health.healthy}
-              class:badge-error={!$health.reachable && !$health.checking}
-              class:badge-warning={$health.reachable && !$health.healthy}
-              class:badge-muted={$health.checking}
-            >
-              {#if $health.checking}checking…
-              {:else if $health.healthy}online
-              {:else if $health.reachable}degraded
-              {:else}offline{/if}
-            </span>
-          </div>
-          <div class="health-row">
-            <span class="health-label">Embeddings</span>
-            <span
-              class="badge"
-              class:badge-success={$health.embed_model_found}
-              class:badge-warning={!$health.embed_model_found}
-              title={$health.embed_model_found
-                ? `Cosine-similarity retrieval active (${$health.active_embedding_model_name ?? $health.embedding_model}${embeddingViaOtherBackend}).`
-                : 'Running in keyword-only fallback — check backend logs for the load error.'}
-            >
-              {$health.embed_model_found ? 'ready' : 'keyword-only fallback'}
-            </span>
-          </div>
-          {#if $health.base_url}
-            <div class="health-row">
-              <span class="health-label">Resolved URL</span>
-              <span class="health-value text-mono">{$health.base_url}</span>
-            </div>
-          {/if}
-          {#if $health.models.length > 0}
-            <div class="health-row">
-              <span class="health-label">Available models</span>
-              <div class="model-chips">
-                {#each $health.models as m}
-                  <span class="badge badge-muted">{m}</span>
-                {/each}
-              </div>
-            </div>
-          {/if}
-          {#if $health.error}
-            <div class="health-row error-row">
-              <span class="health-label">Error</span>
-              <span class="health-value text-mono" style="color:var(--error)">{$health.error}</span>
-            </div>
-          {/if}
-        </div>
-      </div>
-    </section>
-
-    <!-- Assistant name -->
-    <section class="settings-card">
-      <div class="card-title">Assistant Name</div>
-      <p class="card-desc">
-        What the assistant calls itself in chat — updates the system prompt
-        and persona on save; takes effect on your very next message.
-      </p>
-
-      <label class="news-field-label" for="assistant-name-input">Name</label>
-      <input
-        id="assistant-name-input"
-        class="news-text-input"
-        type="text"
-        maxlength="60"
-        bind:value={assistantNameInput}
-        placeholder="Localist"
-      />
-
-      <button
-        type="button"
-        class="seg-btn news-save-btn"
-        disabled={$assistantNameLoading || assistantNameUnchanged}
-        on:click={handleSaveAssistantName}
-      >Save</button>
-
-      {#if assistantNameSaveResult}
-        <p class="card-hint">{assistantNameSaveResult}</p>
-      {/if}
-      {#if $assistantNameError}
-        <p class="card-hint" style="color:var(--error)">{$assistantNameError}</p>
-      {/if}
-    </section>
-
-    <!-- Optional API keys (BRAVE/LANGSEARCH/NEWSAPI/GITHUB — .env-backed, used by localist-mcp;
-         OPENROUTER — read by the backend only) -->
-    <section class="settings-card">
-      <div class="card-title">API Keys</div>
-      <p class="card-desc">
-        Optional keys for web search, news, GitHub and the OpenRouter chat backend. Only
-        LANGSEARCH_API_KEY is required for full web_search functionality — the others enable Brave
-        as a search fallback, the daily news brief, the GitHub Watch Feed and OpenRouter. Values
-        are never shown once saved; leave a field blank to keep its current key unchanged.
-      </p>
-
-      <label class="news-field-label" for="langsearch-key-input">
-        LANGSEARCH_API_KEY {#if $apiKeysStatus.langsearch_api_key_set}<span class="card-hint">(configured)</span>{/if}
-      </label>
-      <input
-        id="langsearch-key-input"
-        class="news-text-input"
-        type="password"
-        autocomplete="off"
-        bind:value={langsearchKeyInput}
-        placeholder={$apiKeysStatus.langsearch_api_key_set ? '••••••••' : 'Not set'}
-      />
-
-      <label class="news-field-label" for="brave-key-input" style="margin-top: var(--sp-3)">
-        BRAVE_API_KEY {#if $apiKeysStatus.brave_api_key_set}<span class="card-hint">(configured)</span>{/if}
-      </label>
-      <input
-        id="brave-key-input"
-        class="news-text-input"
-        type="password"
-        autocomplete="off"
-        bind:value={braveKeyInput}
-        placeholder={$apiKeysStatus.brave_api_key_set ? '••••••••' : 'Not set'}
-      />
-
-      <label class="news-field-label" for="newsapi-key-input" style="margin-top: var(--sp-3)">
-        NEWSAPI_API_KEY {#if $apiKeysStatus.newsapi_api_key_set}<span class="card-hint">(configured)</span>{/if}
-      </label>
-      <input
-        id="newsapi-key-input"
-        class="news-text-input"
-        type="password"
-        autocomplete="off"
-        bind:value={newsapiKeyInput}
-        placeholder={$apiKeysStatus.newsapi_api_key_set ? '••••••••' : 'Not set'}
-      />
-
-      <label class="news-field-label" for="github-token-input" style="margin-top: var(--sp-3)">
-        GITHUB_TOKEN {#if $apiKeysStatus.github_token_set}<span class="card-hint">(configured)</span>{/if}
-      </label>
-      <input
-        id="github-token-input"
-        class="news-text-input"
-        type="password"
-        autocomplete="off"
-        bind:value={githubTokenInput}
-        placeholder={$apiKeysStatus.github_token_set ? '••••••••' : 'Not set'}
-      />
-      <p class="card-hint">
-        Powers the GitHub Watch Feed in Live Feed and raises rate limits for GitHub chat tools. Use
-        a classic token with no scopes selected: Localist only reads public data. When it expires,
-        create a new one and paste it here.
-        <a
-          href={GITHUB_NEW_TOKEN_URL}
-          target="_blank"
-          rel="noopener noreferrer"
-          on:click={handleCreateGithubToken}
-        >Create a token on GitHub</a>
-      </p>
-
-      <label class="news-field-label" for="openrouter-key-input" style="margin-top: var(--sp-3)">
-        OPENROUTER_API_KEY {#if $apiKeysStatus.openrouter_api_key_set}<span class="card-hint">(configured)</span>{/if}
-      </label>
-      <input
-        id="openrouter-key-input"
-        class="news-text-input"
-        type="password"
-        autocomplete="off"
-        bind:value={openrouterKeyInput}
-        placeholder={$apiKeysStatus.openrouter_api_key_set ? '••••••••' : 'Not set'}
-      />
-      <p class="card-hint">
-        Lets you pick OpenRouter as the Runtime Backend, including its free models. Checked with
-        OpenRouter before it's saved, and used only by Localist's backend.
-        <a
-          href={OPENROUTER_KEYS_URL}
-          target="_blank"
-          rel="noopener noreferrer"
-          on:click={handleCreateOpenrouterKey}
-        >Create a key on OpenRouter</a>
-      </p>
-
-      <button
-        type="button"
-        class="seg-btn news-save-btn"
-        style="margin-top: var(--sp-3)"
-        disabled={$apiKeysLoading || (!langsearchKeyInput.trim() && !braveKeyInput.trim() && !newsapiKeyInput.trim() && !githubTokenInput.trim() && !openrouterKeyInput.trim())}
-        on:click={handleSaveApiKeys}
-      >{$apiKeysLoading ? 'Saving…' : 'Save'}</button>
-
-      {#if apiKeysSaveResult}
-        <p class="card-hint">{apiKeysSaveResult}</p>
-      {/if}
-      {#if $apiKeysError}
-        <p class="card-hint" style="color:var(--error)">{$apiKeysError}</p>
-      {/if}
-    </section>
-
-    <!-- Wikipedia (§14.21.8) -->
-    {#if wikipedia}
-      <section class="settings-card">
-        <div class="card-title">Wikipedia</div>
-        <p class="card-desc">
-          Uses Wikipedia's free public API — no account or key. Answers built on it credit Wikipedia
-          (CC BY-SA).
-        </p>
-        <div class="field-group">
-          <label class="checkbox-row">
-            <input
-              type="checkbox"
-              checked={wikipedia.enabled}
-              disabled={wikipediaSaving}
-              on:change={(e) => saveWikipedia({ enabled: e.currentTarget.checked })}
-            />
-            Use Wikipedia
-          </label>
-          <p class="field-hint">
-            Look things up on Wikipedia when you mention it or type <code>/wikipedia</code>, and use it
-            for background in <code>/research</code>. Wikipedia links are always read through its API.
-            <code>/wikipedia</code> still works when this is off.
-          </p>
-
-          <label class="checkbox-row" class:muted={!wikipedia.enabled}>
-            <input
-              type="checkbox"
-              checked={wikipedia.enrich}
-              disabled={wikipediaSaving || !wikipedia.enabled}
-              on:change={(e) => saveWikipedia({ enrich: e.currentTarget.checked })}
-            />
-            Background summary on web searches
-          </label>
-          <p class="field-hint">
-            Add a short Wikipedia summary to ordinary web searches when one article clearly matches.
-            It can occasionally pick the wrong article, so it's off by default.
-            {#if !wikipedia.enabled}Turn on Use Wikipedia to change this.{/if}
-          </p>
-        </div>
-        {#if wikipediaError}
-          <p class="field-hint" style="color:var(--warning)">Couldn't save: {wikipediaError}</p>
-        {:else if wikipediaSaved}
-          <p class="card-hint">{wikipediaSaved}</p>
+        {#if reembedResult}
+          <p class="card-hint">{reembedResult}</p>
+        {/if}
+        {#if reembedWarning}
+          <p class="card-hint" style="color:var(--warning)">{reembedWarning}</p>
+        {/if}
+        {#if $reembedError}
+          <p class="card-hint" style="color:var(--error)">{$reembedError}</p>
         {/if}
       </section>
-    {/if}
 
-    <!-- Data retention (chat history + episodes — independent as of §20.12) -->
-    <section class="settings-card">
-      <div class="card-title">Data Retention</div>
+      <!-- Data retention (chat history + episodes — independent as of §20.12) -->
+      <section class="settings-card">
+        <div class="card-title">Data Retention</div>
 
-      <p class="card-desc">Chat History — how long raw conversation turns are kept before they're permanently deleted.</p>
-      <div class="segmented">
-        {#each EVICTION_PRESETS as p}
-          <button
-            type="button"
-            class="seg-btn"
-            class:active={$retentionSettings.eviction_preset === p.value}
-            disabled={$retentionSettingsLoading}
-            on:click={() => setRetentionPreset(p.value)}
-          >{p.label}</button>
-        {/each}
-      </div>
+        <p class="card-desc">Chat History — how long conversations are kept before they're permanently deleted.</p>
+        <div class="segmented">
+          {#each EVICTION_PRESETS as p}
+            <button
+              type="button"
+              class="seg-btn"
+              class:active={$retentionSettings.eviction_preset === p.value}
+              disabled={$retentionSettingsLoading}
+              on:click={() => setRetentionPreset(p.value)}
+            >{p.label}</button>
+          {/each}
+        </div>
 
-      <p class="card-desc" style="margin-top: var(--sp-4)">
-        Episodic Memory — how long learned facts/preferences are kept before being retracted
-        (reversible — see the Episodes tab's "Reactivate" button). Defaults to Forever: a fact
-        doesn't stop being true just because time passed with no chat about it.
-      </p>
-      <div class="segmented">
-        {#each EVICTION_PRESETS as p}
-          <button
-            type="button"
-            class="seg-btn"
-            class:active={$retentionSettings.episode_eviction_preset === p.value}
-            disabled={$retentionSettingsLoading}
-            on:click={() => setEpisodeRetentionPreset(p.value)}
-          >{p.label}</button>
-        {/each}
-      </div>
-
-      {#if $retentionSettingsError}
-        <p class="card-hint" style="color:var(--error)">{$retentionSettingsError}</p>
-      {/if}
-    </section>
-
-    <!-- Daily News Brief -->
-    <section class="settings-card">
-      <div class="card-title">Daily News Brief</div>
-      <p class="card-desc">
-        Top Stories (anchored to your home country) is fixed; Local is
-        keyword-matched against a place you set (NewsAPI has no true
-        local-news coverage). Pick exactly 3 special-interest topics.
-      </p>
-
-      <label class="news-field-label" for="news-home-country">Home country (2-letter code)</label>
-      <input
-        id="news-home-country"
-        class="news-text-input"
-        type="text"
-        maxlength="2"
-        bind:value={homeCountryInput}
-        placeholder="us"
-      />
-
-      <label class="news-field-label" for="news-local-query">Local area (e.g. a city name)</label>
-      <input
-        id="news-local-query"
-        class="news-text-input"
-        type="text"
-        autocomplete="off"
-        bind:value={localQueryInput}
-        placeholder="e.g. Seattle"
-      />
-
-      <div class="news-field-label">
-        Special-interest topics ({selectedTopics.length}/3 selected)
-      </div>
-      <div class="news-topic-grid">
-        {#each Object.entries($newsPreferences.topic_pool) as [key, label]}
-          <button
-            type="button"
-            class="news-topic-chip"
-            class:active={selectedTopics.includes(key)}
-            disabled={!selectedTopics.includes(key) && selectedTopics.length >= 3}
-            on:click={() => toggleTopic(key)}
-          >{label}</button>
-        {/each}
-      </div>
-      {#if topicsIncomplete}
-        <p class="card-hint" style="color:var(--text-tertiary)">
-          Pick exactly 3 topics to enable Save — this also saves your Local
-          area and Home country changes above; they're sent together in one
-          request.
+        <p class="card-desc" style="margin-top: var(--sp-4)">
+          Episodic Memory — how long learned facts and preferences are kept before they're retired.
+          You can bring them back with Reactivate on the Episodes tab. Forever is the default: a fact
+          doesn't stop being true just because you haven't mentioned it.
         </p>
-      {/if}
+        <div class="segmented">
+          {#each EVICTION_PRESETS as p}
+            <button
+              type="button"
+              class="seg-btn"
+              class:active={$retentionSettings.episode_eviction_preset === p.value}
+              disabled={$retentionSettingsLoading}
+              on:click={() => setEpisodeRetentionPreset(p.value)}
+            >{p.label}</button>
+          {/each}
+        </div>
 
-      <button
-        type="button"
-        class="seg-btn news-save-btn"
-        disabled={$newsPreferencesLoading || topicsIncomplete}
-        title={topicsIncomplete ? 'Select exactly 3 topics to save' : undefined}
-        on:click={handleSaveNewsPreferences}
-      >Save</button>
+        {#if $retentionSettingsError}
+          <p class="card-hint" style="color:var(--error)">{$retentionSettingsError}</p>
+        {/if}
+      </section>
 
-      {#if newsSaveResult}
-        <p class="card-hint">{newsSaveResult}</p>
-      {/if}
-      {#if $newsPreferencesError}
-        <p class="card-hint" style="color:var(--error)">{$newsPreferencesError}</p>
-      {/if}
-    </section>
+      <!-- Streaming / episodic approval toggles -->
+      <section class="settings-card row">
+        <div class="card-title">Streaming responses</div>
+        <button
+          type="button"
+          class="switch"
+          class:on={streaming}
+          aria-label="Toggle streaming responses"
+          on:click={toggleStreaming}
+        ><span class="switch-knob" /></button>
+      </section>
 
-    <!-- Pinned GitHub Repos -->
-    <section class="settings-card">
-      <div class="card-title">Pinned GitHub Repos</div>
-      <p class="card-desc">
-        Track release notes for repos without clicking "Watch" on GitHub —
-        pinning here doesn't subscribe you to that repo's PR/issue emails.
-        Shows up alongside any repos you do watch in the Live Feed panel's
-        GitHub block.
-      </p>
+      <section class="settings-card row">
+        <div class="card-title">Episodic write-approval</div>
+        <button
+          type="button"
+          class="switch"
+          class:on={episodicApproval}
+          aria-label="Toggle episodic write-approval"
+          on:click={toggleEpisodicApproval}
+        ><span class="switch-knob" /></button>
+      </section>
 
-      <label class="news-field-label" for="pinned-repo-input">Add a repo (owner/repo)</label>
-      <div class="pinned-repo-add-row">
+      <!-- Appearance -->
+      <section class="settings-card row">
+        <div class="card-title">Theme — currently <strong>{$theme}</strong></div>
+        <button
+          type="button"
+          class="switch"
+          class:on={$theme === 'light'}
+          aria-label="Toggle light/dark theme"
+          on:click={theme.toggle}
+        ><span class="switch-knob" /></button>
+      </section>
+
+      <!-- Font size -->
+      <section class="settings-card">
+        <div class="card-title">Font Size</div>
+        <p class="card-desc">Scales text throughout the app. A few fixed-size labels won't change.</p>
+        <div class="segmented">
+          {#each FONT_SIZES as f}
+            <button
+              type="button"
+              class="seg-btn"
+              class:active={$fontSize === f.value}
+              on:click={() => fontSize.set(f.value)}
+            >{f.label}</button>
+          {/each}
+        </div>
+      </section>
+    {:else}
+      <!-- Optional API keys (BRAVE/LANGSEARCH/NEWSAPI/GITHUB — .env-backed, used by localist-mcp;
+           OPENROUTER — read by the backend only) -->
+      <section class="settings-card">
+        <div class="card-title">API Keys</div>
+        <p class="card-desc">
+          Keys for web search, news, GitHub and OpenRouter. Only LangSearch is needed for web search;
+          the rest are optional. Saved keys are never shown again — leave a field blank to keep its
+          current key.
+        </p>
+
+        <label class="news-field-label" for="langsearch-key-input">
+          LANGSEARCH_API_KEY {#if $apiKeysStatus.langsearch_api_key_set}<span class="card-hint">(configured)</span>{/if}
+        </label>
         <input
-          id="pinned-repo-input"
+          id="langsearch-key-input"
+          class="news-text-input"
+          type="password"
+          autocomplete="off"
+          bind:value={langsearchKeyInput}
+          placeholder={$apiKeysStatus.langsearch_api_key_set ? '••••••••' : 'Not set'}
+        />
+        <p class="card-hint">
+          Needed for web search.
+          <a
+            href={LANGSEARCH_KEYS_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            on:click={(e) => openKeyPage(e, LANGSEARCH_KEYS_URL)}
+          >Create a key on LangSearch</a>
+        </p>
+
+        <label class="news-field-label" for="brave-key-input" style="margin-top: var(--sp-3)">
+          BRAVE_API_KEY {#if $apiKeysStatus.brave_api_key_set}<span class="card-hint">(configured)</span>{/if}
+        </label>
+        <input
+          id="brave-key-input"
+          class="news-text-input"
+          type="password"
+          autocomplete="off"
+          bind:value={braveKeyInput}
+          placeholder={$apiKeysStatus.brave_api_key_set ? '••••••••' : 'Not set'}
+        />
+        <p class="card-hint">
+          Optional backup search engine, used when LangSearch fails.
+          <a
+            href={BRAVE_KEYS_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            on:click={(e) => openKeyPage(e, BRAVE_KEYS_URL)}
+          >Create a key on Brave Search</a>
+        </p>
+
+        <label class="news-field-label" for="newsapi-key-input" style="margin-top: var(--sp-3)">
+          NEWSAPI_API_KEY {#if $apiKeysStatus.newsapi_api_key_set}<span class="card-hint">(configured)</span>{/if}
+        </label>
+        <input
+          id="newsapi-key-input"
+          class="news-text-input"
+          type="password"
+          autocomplete="off"
+          bind:value={newsapiKeyInput}
+          placeholder={$apiKeysStatus.newsapi_api_key_set ? '••••••••' : 'Not set'}
+        />
+        <p class="card-hint">
+          Powers the Daily News Brief.
+          <a
+            href={NEWSAPI_REGISTER_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            on:click={(e) => openKeyPage(e, NEWSAPI_REGISTER_URL)}
+          >Get a key from NewsAPI</a>
+        </p>
+
+        <label class="news-field-label" for="github-token-input" style="margin-top: var(--sp-3)">
+          GITHUB_TOKEN {#if $apiKeysStatus.github_token_set}<span class="card-hint">(configured)</span>{/if}
+        </label>
+        <input
+          id="github-token-input"
+          class="news-text-input"
+          type="password"
+          autocomplete="off"
+          bind:value={githubTokenInput}
+          placeholder={$apiKeysStatus.github_token_set ? '••••••••' : 'Not set'}
+        />
+        <p class="card-hint">
+          Powers the GitHub Watch Feed and raises GitHub rate limits in chat. Use a classic token with
+          no scopes selected: Localist only reads public data.
+          <a
+            href={GITHUB_NEW_TOKEN_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            on:click={handleCreateGithubToken}
+          >Create a token on GitHub</a>
+        </p>
+
+        <label class="news-field-label" for="openrouter-key-input" style="margin-top: var(--sp-3)">
+          OPENROUTER_API_KEY {#if $apiKeysStatus.openrouter_api_key_set}<span class="card-hint">(configured)</span>{/if}
+        </label>
+        <input
+          id="openrouter-key-input"
+          class="news-text-input"
+          type="password"
+          autocomplete="off"
+          bind:value={openrouterKeyInput}
+          placeholder={$apiKeysStatus.openrouter_api_key_set ? '••••••••' : 'Not set'}
+        />
+        <p class="card-hint">
+          Lets you choose OpenRouter as the Runtime Backend, including its free models. Checked with
+          OpenRouter before it's saved.
+          <a
+            href={OPENROUTER_KEYS_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            on:click={handleCreateOpenrouterKey}
+          >Create a key on OpenRouter</a>
+        </p>
+
+        <button
+          type="button"
+          class="seg-btn news-save-btn"
+          style="margin-top: var(--sp-3)"
+          disabled={$apiKeysLoading || (!langsearchKeyInput.trim() && !braveKeyInput.trim() && !newsapiKeyInput.trim() && !githubTokenInput.trim() && !openrouterKeyInput.trim())}
+          on:click={handleSaveApiKeys}
+        >{$apiKeysLoading ? 'Saving…' : 'Save'}</button>
+
+        {#if apiKeysSaveResult}
+          <p class="card-hint">{apiKeysSaveResult}</p>
+        {/if}
+        {#if $apiKeysError}
+          <p class="card-hint" style="color:var(--error)">{$apiKeysError}</p>
+        {/if}
+      </section>
+
+      <!-- Wikipedia (§14.21.8) -->
+      {#if wikipedia}
+        <section class="settings-card">
+          <div class="card-title">Wikipedia</div>
+          <p class="card-desc">
+            Free, with no account or key. Answers that use it credit Wikipedia.
+          </p>
+          <div class="field-group">
+            <label class="checkbox-row">
+              <input
+                type="checkbox"
+                checked={wikipedia.enabled}
+                disabled={wikipediaSaving}
+                on:change={(e) => saveWikipedia({ enabled: e.currentTarget.checked })}
+              />
+              Use Wikipedia
+            </label>
+            <p class="field-hint">
+              Look things up on Wikipedia when you mention it or type <code>/wikipedia</code>, and use it
+              for background in <code>/research</code>. <code>/wikipedia</code> works even when this is off.
+            </p>
+
+            <label class="checkbox-row" class:muted={!wikipedia.enabled}>
+              <input
+                type="checkbox"
+                checked={wikipedia.enrich}
+                disabled={wikipediaSaving || !wikipedia.enabled}
+                on:change={(e) => saveWikipedia({ enrich: e.currentTarget.checked })}
+              />
+              Background summary on web searches
+            </label>
+            <p class="field-hint">
+              Add a short Wikipedia summary to ordinary web searches when one article clearly matches.
+              It can occasionally pick the wrong article, so it's off by default.
+              {#if !wikipedia.enabled}Turn on Use Wikipedia to change this.{/if}
+            </p>
+          </div>
+          {#if wikipediaError}
+            <p class="field-hint" style="color:var(--warning)">Couldn't save: {wikipediaError}</p>
+          {:else if wikipediaSaved}
+            <p class="card-hint">{wikipediaSaved}</p>
+          {/if}
+        </section>
+      {/if}
+
+      <!-- Pinned GitHub Repos -->
+      <section class="settings-card">
+        <div class="card-title">Pinned GitHub Repos</div>
+        <p class="card-desc">
+          Follow a repo's releases without watching it on GitHub, so you don't get its issue and PR
+          emails. Pinned repos show in the Live Feed's GitHub block.
+        </p>
+
+        <label class="news-field-label" for="pinned-repo-input">Add a repo (owner/repo)</label>
+        <div class="pinned-repo-add-row">
+          <input
+            id="pinned-repo-input"
+            class="news-text-input"
+            type="text"
+            autocomplete="off"
+            bind:value={pinnedRepoInput}
+            placeholder="e.g. ollama/ollama"
+            on:input={() => (pinnedRepoAddError = null)}
+            on:keydown={(e) => e.key === 'Enter' && addPinnedRepo()}
+          />
+          <button type="button" class="seg-btn" on:click={addPinnedRepo}>Add</button>
+        </div>
+        {#if pinnedRepoAddError}
+          <p class="card-hint" style="color:var(--error)">{pinnedRepoAddError}</p>
+        {/if}
+
+        {#if pinnedRepos.length > 0}
+          <div class="news-topic-grid">
+            {#each pinnedRepos as repo (repo)}
+              <span class="pinned-repo-chip">
+                {repo}
+                <button
+                  type="button"
+                  class="pinned-repo-remove"
+                  aria-label={`Remove ${repo}`}
+                  on:click={() => removePinnedRepo(repo)}
+                >&times;</button>
+              </span>
+            {/each}
+          </div>
+        {/if}
+
+        <button
+          type="button"
+          class="seg-btn news-save-btn"
+          disabled={$githubWatchPinsLoading || pinnedReposUnchanged}
+          on:click={handleSavePinnedRepos}
+        >Save</button>
+
+        {#if pinnedReposSaveResult}
+          <p class="card-hint">{pinnedReposSaveResult}</p>
+        {/if}
+        {#if $githubWatchPinsError}
+          <p class="card-hint" style="color:var(--error)">{$githubWatchPinsError}</p>
+        {/if}
+      </section>
+
+      <!-- Daily News Brief -->
+      <section class="settings-card">
+        <div class="card-title">Daily News Brief</div>
+        <p class="card-desc">
+          Top Stories follow your home country. Local shows news that mentions the place you set.
+          Pick exactly 3 topics.
+        </p>
+
+        <label class="news-field-label" for="news-home-country">Home country (2-letter code)</label>
+        <input
+          id="news-home-country"
+          class="news-text-input"
+          type="text"
+          maxlength="2"
+          bind:value={homeCountryInput}
+          placeholder="us"
+        />
+
+        <label class="news-field-label" for="news-local-query">Local area (e.g. a city name)</label>
+        <input
+          id="news-local-query"
           class="news-text-input"
           type="text"
           autocomplete="off"
-          bind:value={pinnedRepoInput}
-          placeholder="e.g. ollama/ollama"
-          on:input={() => (pinnedRepoAddError = null)}
-          on:keydown={(e) => e.key === 'Enter' && addPinnedRepo()}
+          bind:value={localQueryInput}
+          placeholder="e.g. Seattle"
         />
-        <button type="button" class="seg-btn" on:click={addPinnedRepo}>Add</button>
-      </div>
-      {#if pinnedRepoAddError}
-        <p class="card-hint" style="color:var(--error)">{pinnedRepoAddError}</p>
-      {/if}
 
-      {#if pinnedRepos.length > 0}
+        <div class="news-field-label">
+          Special-interest topics ({selectedTopics.length}/3 selected)
+        </div>
         <div class="news-topic-grid">
-          {#each pinnedRepos as repo (repo)}
-            <span class="pinned-repo-chip">
-              {repo}
-              <button
-                type="button"
-                class="pinned-repo-remove"
-                aria-label={`Remove ${repo}`}
-                on:click={() => removePinnedRepo(repo)}
-              >&times;</button>
-            </span>
+          {#each Object.entries($newsPreferences.topic_pool) as [key, label]}
+            <button
+              type="button"
+              class="news-topic-chip"
+              class:active={selectedTopics.includes(key)}
+              disabled={!selectedTopics.includes(key) && selectedTopics.length >= 3}
+              on:click={() => toggleTopic(key)}
+            >{label}</button>
           {/each}
         </div>
-      {/if}
+        {#if topicsIncomplete}
+          <p class="card-hint" style="color:var(--text-tertiary)">
+            Pick exactly 3 topics to enable Save. Save also stores your Local area and Home country.
+          </p>
+        {/if}
 
-      <button
-        type="button"
-        class="seg-btn news-save-btn"
-        disabled={$githubWatchPinsLoading || pinnedReposUnchanged}
-        on:click={handleSavePinnedRepos}
-      >Save</button>
+        <button
+          type="button"
+          class="seg-btn news-save-btn"
+          disabled={$newsPreferencesLoading || topicsIncomplete}
+          title={topicsIncomplete ? 'Select exactly 3 topics to save' : undefined}
+          on:click={handleSaveNewsPreferences}
+        >Save</button>
 
-      {#if pinnedReposSaveResult}
-        <p class="card-hint">{pinnedReposSaveResult}</p>
-      {/if}
-      {#if $githubWatchPinsError}
-        <p class="card-hint" style="color:var(--error)">{$githubWatchPinsError}</p>
-      {/if}
-    </section>
+        {#if newsSaveResult}
+          <p class="card-hint">{newsSaveResult}</p>
+        {/if}
+        {#if $newsPreferencesError}
+          <p class="card-hint" style="color:var(--error)">{$newsPreferencesError}</p>
+        {/if}
+      </section>
 
-    <!-- Logs -->
-    <section class="settings-card">
-      <div class="card-title">Logs</div>
-      <p class="card-desc">
-        The desktop app keeps a log of what the backend and tools did, for
-        troubleshooting. Logs stay on this Mac and include your questions
-        and the pages fetched, never API keys.
-      </p>
-      <div class="card-value text-mono">{logsDir}</div>
-      {#if currentLogFiles.length > 0}
-        <p class="card-hint">
-          {currentLogFiles.map((f) => `${f.name} (${formatBytes(f.size)})`).join(' · ')}
+      <!-- Backend connection -->
+      <section class="settings-card">
+        <div class="card-title">Backend Connection</div>
+        <p class="card-desc">The address of the Localist server this app talks to. Change it only if the server runs somewhere else.</p>
+
+        <div class="field-group">
+          <label class="field-label" for="backend-url">Server URL</label>
+          <div class="field-row">
+            <input
+              id="backend-url"
+              type="text"
+              class="settings-input"
+              bind:value={backendUrl}
+              on:blur={saveBackendUrl}
+              placeholder="http://127.0.0.1:8000"
+              spellcheck="false"
+            />
+            <button
+              class="btn-secondary"
+              on:click={runHealthCheck}
+              disabled={checking}
+              aria-label="Test connection"
+            >
+              {#if checking}
+                <span class="spinner" aria-hidden="true" />
+                Checking…
+              {:else}
+                Test connection
+              {/if}
+            </button>
+          </div>
+
+          <div class="health-readout">
+            <div class="health-row">
+              <span class="health-label">Status</span>
+              <span
+                class="badge"
+                class:badge-success={$health.healthy}
+                class:badge-error={!$health.reachable && !$health.checking}
+                class:badge-warning={$health.reachable && !$health.healthy}
+                class:badge-muted={$health.checking}
+              >
+                {#if $health.checking}checking…
+                {:else if $health.healthy}online
+                {:else if $health.reachable}degraded
+                {:else}offline{/if}
+              </span>
+            </div>
+            <div class="health-row">
+              <span class="health-label">Embeddings</span>
+              <span
+                class="badge"
+                class:badge-success={$health.embed_model_found}
+                class:badge-warning={!$health.embed_model_found}
+                title={$health.embed_model_found
+                  ? `Cosine-similarity retrieval active (${$health.active_embedding_model_name ?? $health.embedding_model}${embeddingViaOtherBackend}).`
+                  : 'Running in keyword-only fallback — check backend logs for the load error.'}
+              >
+                {$health.embed_model_found ? 'ready' : 'keyword-only fallback'}
+              </span>
+            </div>
+            {#if $health.base_url}
+              <div class="health-row">
+                <span class="health-label">Resolved URL</span>
+                <span class="health-value text-mono">{$health.base_url}</span>
+              </div>
+            {/if}
+            {#if $health.models.length > 0}
+              <div class="health-row">
+                <span class="health-label">Available models</span>
+                <div class="model-chips">
+                  {#each $health.models as m}
+                    <span class="badge badge-muted">{m}</span>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+            {#if $health.error}
+              <div class="health-row error-row">
+                <span class="health-label">Error</span>
+                <span class="health-value text-mono" style="color:var(--error)">{$health.error}</span>
+              </div>
+            {/if}
+          </div>
+        </div>
+      </section>
+
+      <!-- Logs -->
+      <section class="settings-card">
+        <div class="card-title">Logs</div>
+        <p class="card-desc">
+          The desktop app keeps a log of what the backend and tools did, for
+          troubleshooting. Logs stay on this Mac and include your questions
+          and the pages fetched, never API keys.
         </p>
-      {:else if !logsEnabled}
-        <p class="card-hint">
-          Running from source: logs go to the terminal, not to files.
-        </p>
-      {/if}
-      <button
-        type="button"
-        class="seg-btn news-save-btn"
-        disabled={!backendUp || logsOpening}
-        on:click={handleShowLogs}
-      >Show logs</button>
-      {#if logsError}
-        <p class="card-hint" style="color:var(--error)">{logsError}</p>
-      {/if}
-    </section>
+        <div class="card-value text-mono">{logsDir}</div>
+        {#if currentLogFiles.length > 0}
+          <p class="card-hint">
+            {currentLogFiles.map((f) => `${f.name} (${formatBytes(f.size)})`).join(' · ')}
+          </p>
+        {:else if !logsEnabled}
+          <p class="card-hint">
+            Running from source: logs go to the terminal, not to files.
+          </p>
+        {/if}
+        <button
+          type="button"
+          class="seg-btn news-save-btn"
+          disabled={!backendUp || logsOpening}
+          on:click={handleShowLogs}
+        >Show logs</button>
+        {#if logsError}
+          <p class="card-hint" style="color:var(--error)">{logsError}</p>
+        {/if}
+      </section>
+    {/if}
 
     <!-- Version -->
     <section class="settings-card row">
@@ -1941,6 +2030,19 @@
     color: var(--text-primary);
   }
 
+  .settings-tabs {
+    align-self: flex-start;
+  }
+
+  .card-subtitle {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    margin-top: var(--sp-2);
+    padding-top: var(--sp-3);
+    border-top: 1px solid var(--border);
+  }
+
   .card-title .badge {
     margin-left: var(--sp-2);
     vertical-align: middle;
@@ -1968,7 +2070,6 @@
     color: var(--text-tertiary);
     line-height: 1.6;
   }
-  .card-hint code,
   .field-hint code {
     font-size: 10.5px;
   }

@@ -409,7 +409,7 @@ _WIKIPEDIA_TURNED_OFF = _ToolResult(
         "ERROR: not used — Wikipedia is turned off in Settings, so no Wikipedia "
         "text was provided. Do not say or imply that Wikipedia says, defines or "
         "states anything; say which source you are using instead (e.g. general "
-        "knowledge). You may mention it can be turned on in Settings → Wikipedia."
+        "knowledge). You may mention it can be turned on in Settings → Advanced → Wikipedia."
     ),
     success    = False,
 )

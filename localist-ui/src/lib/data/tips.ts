@@ -275,23 +275,23 @@ export const tips: Tip[] = [
 	{
 		id: 'settings-github-pins',
 		category: 'ui-action',
-		trigger: 'Settings → Pinned GitHub Repos',
-		example: 'Open Settings and add a repo as owner/repo',
+		trigger: 'Settings → Advanced → Pinned GitHub Repos',
+		example: 'Open Settings, switch to Advanced, and add a repo as owner/repo',
 		description: 'Pins up to 20 repos to show in the Live Feed panel; this does not subscribe you to any GitHub notifications.'
 	},
 	{
 		id: 'settings-news-brief',
 		category: 'ui-action',
-		trigger: 'Settings → Daily News Brief',
-		example: 'Open Settings, set your country/area, and pick 3 topics',
+		trigger: 'Settings → Advanced → Daily News Brief',
+		example: 'Open Settings, switch to Advanced, set your country/area, and pick 3 topics',
 		description: 'Configures your Top Stories (home-country) and Local (keyword-matched) news, built from exactly 3 chosen topics.'
 	},
 	{
 		id: 'settings-api-keys',
 		category: 'ui-action',
-		trigger: 'Settings → API Keys',
-		example: 'Open Settings and paste your LangSearch/Brave/NewsAPI key or GitHub token',
-		description: 'Only LANGSEARCH_API_KEY is required for web_search; Brave adds a search fallback, NewsAPI powers the Daily News Brief, and a GitHub token powers the GitHub Watch Feed. Keys take effect right away and are never echoed back.'
+		trigger: 'Settings → Advanced → API Keys',
+		example: 'Open Settings, switch to Advanced, and paste your LangSearch/Brave/NewsAPI/OpenRouter key or GitHub token',
+		description: 'Only LANGSEARCH_API_KEY is required for web_search; Brave adds a search fallback, NewsAPI powers the Daily News Brief, and a GitHub token powers the GitHub Watch Feed, and an OpenRouter key unlocks the OpenRouter backend. Each key has a link to the page where you create one. Keys take effect right away and are never echoed back.'
 	},
 	{
 		id: 'settings-assistant-name',
@@ -310,8 +310,8 @@ export const tips: Tip[] = [
 	{
 		id: 'settings-embedding-model',
 		category: 'ui-action',
-		trigger: 'Settings → Embedding Model',
-		example: 'Open Settings and choose an Embedding Model (Ollama only)',
-		description: 'Live-switches which model embeds your corpus, or falls back to keyword-only search if set to None; applies immediately and flags your corpus for re-embedding.'
+		trigger: 'Settings → Embedding & Memory',
+		example: 'Open Settings and choose an embedding model, then click Re-embed Memory Now if it asks',
+		description: 'Live-switches which model embeds your corpus, or falls back to keyword-only search if set to None. A model that hasn\'t embedded everything yet shows an out-of-date warning; Re-embed Memory Now, in the same card, fills in only what is missing.'
 	}
 ];

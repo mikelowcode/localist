@@ -1610,3 +1610,65 @@ UI for Ollama hybrid inference (§16.37): a local model until a conversation pas
 - `npm run check` (0 errors) and `npm run build`.
 - The backend round trip was checked live (§14.21.8).
 - The card itself has not been looked at in a browser; check it in the v0.1.8 draft build.
+
+### 7.34 Settings Split into General and Advanced (2026-11-17)
+
+The Settings page had grown to about 20 cards in one column. For v0.1.8 it is split into two tabs,
+and two cards are merged (`localist-ui/src/routes/settings/+page.svelte`).
+
+**Tabs.**
+- A **General | Advanced** switch sits at the top of the page, in the existing `.segmented` style
+  (`role="tab"`). There is no new sidebar entry.
+- **General** keeps choices made day to day and on/off preferences, in this order: Runtime Backend,
+  Chat Model, Hybrid Inference (Ollama only), Assistant Name, Embedding & Memory, Data Retention,
+  Streaming responses, Episodic write-approval, Theme, Font Size.
+- **Advanced** holds keys, integrations and setup: API Keys, Wikipedia, Pinned GitHub Repos, Daily
+  News Brief, Backend Connection, Logs. Wikipedia started on General and was moved here after a
+  review in the dev build (2026-11-17), as an integration rather than an everyday preference.
+- **Version** shows under both tabs.
+- The tab is rendered with `{#if}`, so the other tab's cards are not in the DOM. Their state lives in
+  the page script and survives a tab switch.
+
+**Remembering the tab.** A click saves the tab in `localStorage` (`localist-settings-tab`). Reads
+and writes are wrapped in `try/catch`; without storage the page opens on General.
+
+**Anchor links.** Links such as `ModelStatusBanner`'s `/settings#openrouter-key-input` and
+`/settings#chat-model` still land on their field.
+- `ADVANCED_ANCHORS` lists the element ids inside Advanced cards. Any other non-empty hash means
+  General.
+- On first render the hash wins over the saved tab, so the target exists before SvelteKit scrolls.
+- A reactive statement on `$page.url.hash` handles links followed while Settings is open: it switches
+  tab, waits a `tick()`, then calls `scrollIntoView`. A hash-driven switch is not saved.
+- A new field with an `id` inside an Advanced card must be added to `ADVANCED_ANCHORS`.
+
+**Embedding & Memory card.** The Embedding Model and Re-embed Memory cards are now one card.
+- From top to bottom: the model picker and gate-tier badge, then one combined explanation (the two
+  old hints repeated each other), then a "Re-embed Memory" sub-heading (`.card-subtitle`, with a
+  top border), the out-of-date badges, the **Re-embed Memory Now** button and its result messages.
+- Behaviour is unchanged.
+
+**Create-a-key links.** LangSearch (`langsearch.com/api-keys`), Brave
+(`api-dashboard.search.brave.com/app/keys`, which asks you to log in first) and NewsAPI
+(`newsapi.org/register`) each get a one-line hint and a link under their field, like GitHub and
+OpenRouter already had (§7.28). They open through `openExternal` via a shared `openKeyPage()`.
+
+**Plain-language hints.** Card hints no longer name API routes, spec sections or internals
+(`POST /settings/runtime-backend`, `/api/embed`, "semantic gating", BM25, FastAPI). Each now says
+what the setting does for the user in a sentence or two.
+- Kept on purpose: `LOCALIST_CHAT_MODEL` and `.env` in the override warning (the user has to find
+  that line), and `persona.md` in the prompt-cache warning (the file to lengthen).
+- Messages filled in at runtime (errors, results, live counts) are unchanged. The internal
+  references stay in code comments.
+
+**Text updated with the move.**
+- In `tips.ts`, the API Keys, Pinned GitHub Repos and Daily News Brief tips now read "Settings →
+  Advanced → …", and the embedding tip reads "Settings → Embedding & Memory".
+- `github_watch.py`'s token messages now say "Settings → Advanced → API Keys".
+- Earlier sections that say "Settings → API Keys" (§7.28 and others) are left as written, since they
+  record history.
+
+**Verified.**
+- `npm run check` (0 errors) and `npm run build`.
+- The GitHub-related backend tests pass.
+- Not yet checked in a browser: tab switching, the remembered tab, and the banner's OpenRouter-key
+  link opening Advanced.
